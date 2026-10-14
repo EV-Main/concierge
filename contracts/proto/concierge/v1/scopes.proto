@@ -1,0 +1,264 @@
+syntax = "proto3";
+
+package concierge.v1;
+
+import "concierge/v1/approvals.proto";
+
+// Scopes — a scope is a concierge TENANT seen as a direction: `main` (this plane and
+// banking), `invest`, `sa`. It is the container a direction's resources live in —
+// allocations and tooling alike — and the unit admins are appointed to: an admin of a
+// scope holds `<scope>:admin`. Policy and reasoning: docs/SCOPES-AND-APPROVALS.md.
+//
+// `main` is the implicit root. It has no tenant row and no namespace of its own: its
+// permissions are the seats' (`concierge:*`, `iam:*`, `bank:*`) and its admins are the
+// platform owners. Every other scope's parent is `main`.
+//
+// Three services:
+//   ScopeRegistry       — read the registry. Inside the user auth layer: a first-party
+//                         session or a `typ=service` token. A relying party's restricted
+//                         token opens none of it.
+//   ScopeCatalogService — a scope's services publish what they define beyond
+//                         permissions: approval kinds and notification topics.
+//   ScopeEvents         — the per-scope event stream relying parties project from.
+// The last two are called by services and authenticate by service credential (the doc's
+// "Service callers"), outside the user auth layer like UserEvents.
+//
+// The registry has no write RPC: scopes, their origins and their clients are written by
+// migration and configuration, as `rp_clients` is today.
+
+service ScopeRegistry {
+  // Every scope, `main` first, then by id.
+  rpc ListScopes(ListScopesRequest) returns (ListScopesResponse);
+
+  // One scope by id. NOT_FOUND when there is none.
+  rpc GetScope(GetScopeRequest) returns (Scope);
+}
+
+// What a scope's services define beyond permissions. Permissions and aliases stay on
+// AuthService.PublishCatalog; this is a separate catalog with its own version line, so a
+// service that executes approvals but signs nobody in (banking) has a place to publish.
+service ScopeCatalogService {
+  // Publish the caller's namespace's approval kinds and notification topics, whole: a
+  // kind or topic the new catalog leaves out is withdrawn. A withdrawn kind opens no
+  // new proposal; proposals already open finish under the spec they opened with. A
+  // withdrawn topic stops accepting Emit; existing inbox rows stay.
+  //
+  // Same versioning as PublishCatalog: `version` is the unix seconds of the build
+  // commit; older than the stored one, or equal with different content,
+  // FAILED_PRECONDITION; more than a day ahead of this plane's clock, INVALID_ARGUMENT.
+  // INVALID_ARGUMENT as well for any name outside the caller's namespace, any spec
+  // ApprovalKindSpec or NotificationTopicSpec refuses, more than 64 kinds or 64 topics.
+  rpc PublishScopeCatalog(PublishScopeCatalogRequest) returns (PublishScopeCatalogResponse);
+
+  // The catalog currently in force for the caller's namespace. NOT_FOUND before the
+  // first publication.
+  rpc GetScopeCatalog(GetScopeCatalogRequest) returns (ScopeCatalog);
+}
+
+// The per-scope event stream. A NEW stream beside UserEvents rather than new kinds on
+// UserLifecycleEvent: the money plane stops its single cursor on a lifecycle kind it
+// cannot name, so a scope event there would halt every freeze and KYC change behind it
+// until banking redeployed.
+//
+// Same mechanics as PullUserLifecycle: rows with `position > after_position`, oldest
+// first, capped by `limit`; nothing is ever deleted; dedupe by `event_id`, order per
+// (scope, user) by `sequence`. A caller sees only the scopes it may observe (the doc's
+// "Visibility"), so the positions it sees have gaps.
+service ScopeEvents {
+  rpc PullScopeEvents(PullScopeEventsRequest) returns (PullScopeEventsResponse);
+}
+
+message Scope {
+  // `[a-z][a-z0-9_]{0,31}`; `main` for the root.
+  string id = 1;
+  // The tenant namespace its permissions live in. Equal to `id` for every scope but
+  // `main`, which has none (empty).
+  string namespace = 2;
+  // Empty for `main`; `main` for every other scope today.
+  string parent = 3;
+  // Plain text, at most 80 bytes.
+  string display_name = 4;
+  // The https origins of the scope's hosts (`https://invest.evinvest.ltd`), exactly as a
+  // browser sends `Origin`: `https` only; the host is `evinvest.ltd` or ends in
+  // `.evinvest.ltd`; port only when non-default; no path, no trailing slash, no
+  // wildcard, never `null`. Compared byte for byte; the answer's
+  // `Access-Control-Allow-Origin` is exactly the matched origin, with `Vary: Origin`.
+  //
+  // While the scope is ACTIVE or FROZEN (never once CLOSED) they widen CORS on a fixed
+  // list of sign-in routes only — `/auth/code/request`, `/auth/code/verify`,
+  // `/auth/password/signin`, `/auth/password/signup`, `/auth/email/verify/*`,
+  // `/auth/passkey/signin/*` and `GET /auth/session`, which answers them
+  // `{authenticated, user}` and never a token. Everything that acts on an open session
+  // (`/auth/password/set`, `/auth/passkey/register|remove`, sessions, username, logout,
+  // `/kyc/*`) accepts PUBLIC_ORIGIN alone. An OAuth `returnTo` must be one of these
+  // origins plus a path from `return_paths`.
+  repeated string origins = 5;
+  // The relying-party clients signing people in for this scope. A scope may have none
+  // (`main` is first-party) or several.
+  repeated ScopeClient clients = 6;
+  // The clients that may read THIS scope's events and its users' lifecycle besides its
+  // own: a direction that runs resources of other scopes (invest runs allocations for
+  // `sa`) is named on each scope it serves. Client ids. READ access to this plane's
+  // streams and nothing else: an observer holds no right on the money plane, where a
+  // service's grants are banking's own configuration.
+  repeated string observers = 7;
+  // Unix SECONDS.
+  int64 created_at = 8;
+  // Bumped on every change to anything in this message; SCOPE_CHANGED carries it.
+  uint64 version = 9;
+  ScopeState state = 10;
+  // The paths an OAuth `returnTo` may name on `origins` (`/cabinet`, `/auth/callback`),
+  // each starting with a single `/`, matched exactly — no prefix, no query.
+  repeated string return_paths = 11;
+}
+
+enum ScopeState {
+  SCOPE_STATE_UNSPECIFIED = 0;
+  SCOPE_STATE_ACTIVE = 1;
+  // Stopped, reversibly: no new approval proposal opens in it and the money plane refuses
+  // new debits of its accounts. Its clients still sign people in and its streams are
+  // still read, because a direction has to learn it was frozen.
+  SCOPE_STATE_FROZEN = 2;
+  // Terminal: its clients sign nobody in and nothing new opens in it. Its history stays
+  // readable on every stream.
+  SCOPE_STATE_CLOSED = 3;
+}
+
+message ScopeClient {
+  string client_id = 1;
+  // The `aud` of the access tokens it is issued.
+  string audience = 2;
+  // A disabled client signs nobody in and reads no stream.
+  bool disabled = 3;
+}
+
+message ListScopesRequest {}
+
+message ListScopesResponse {
+  repeated Scope scopes = 1;
+}
+
+message GetScopeRequest {
+  string scope = 1;
+}
+
+// One notification topic a scope's service defines. Account topics a user cannot be
+// without (the consent trace, security notices) stay this plane's own and are not
+// published here.
+message NotificationTopicSpec {
+  // `<namespace>:<segment>(:<segment>)*`, segments `[a-z0-9_-]+`, at most 64 bytes; the
+  // namespace being the publisher's.
+  string topic = 1;
+  // Plain text, at most 60 bytes; what NotificationSettings shows.
+  string label = 2;
+  // Plain text, at most 200 bytes.
+  string description = 3;
+  // Whether an account that never touched the topic receives it. False is the safe
+  // reading of "nobody asked", and the default.
+  bool default_subscribed = 4;
+}
+
+message ScopeCatalog {
+  // The publisher's namespace (`bank`, `invest`, `sa`).
+  string namespace = 1;
+  // 0 for this plane's own built-in `concierge` catalog.
+  uint64 version = 2;
+  repeated ApprovalKindSpec approval_kinds = 3;
+  repeated NotificationTopicSpec notification_topics = 4;
+}
+
+message PublishScopeCatalogRequest {
+  // Unix SECONDS of the build commit (nix `self.lastModified`), as PublishCatalog.
+  uint64 version = 1;
+  repeated ApprovalKindSpec approval_kinds = 2;
+  repeated NotificationTopicSpec notification_topics = 3;
+}
+
+message PublishScopeCatalogResponse {}
+
+message GetScopeCatalogRequest {}
+
+message PullScopeEventsRequest {
+  // Exclusive lower bound; 0 reads from the beginning.
+  int64 after_position = 1;
+  // The server caps it at its own ceiling.
+  uint32 limit = 2;
+}
+
+message PullScopeEventsResponse {
+  // Oldest-first by `position`.
+  repeated ScopeEvent events = 1;
+  // The cursor to pass as the next `after_position`: the MAXIMUM POSITION SCANNED for
+  // this caller — the same rule on every concierge pull stream. It may lie past the last
+  // event returned when the rows after it were not the caller's to see, so a filtered
+  // reader never re-scans them; the request's `after_position` unchanged when nothing was
+  // scanned. To the unfiltered reader (the bridge token) it is the max position returned.
+  int64 next_position = 2;
+}
+
+message ScopeEvent {
+  // A UUID minted when the row is written; the unit of at-least-once delivery.
+  string event_id = 1;
+  int64 position = 2;
+  // The scope the event is about.
+  string scope = 3;
+
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    // The scope was registered or something on it changed. `scope_snapshot` is the
+    // whole scope after the change.
+    SCOPE_CHANGED = 1;
+    // A user's grants inside the scope changed: granted, revoked, or the catalog moved
+    // under them. `grants` is the user's whole concrete set after the change.
+    GRANTS_CHANGED = 2;
+    // A user became visible to the scope: first sign-in through one of its clients, or
+    // first grant inside it. Carries the identity snapshot a projection seeds its row
+    // from, and the lifecycle `sequence` that snapshot is as of, so lifecycle events
+    // at or below it are already reflected.
+    MEMBER_JOINED = 3;
+  }
+  Kind kind = 4;
+
+  // Unix SECONDS.
+  int64 occurred_at = 5;
+
+  // Per-(scope, user) strictly increasing for GRANTS_CHANGED and MEMBER_JOINED; per
+  // scope for SCOPE_CHANGED (the scope's `version`). Apply only what exceeds what is
+  // stored.
+  uint64 sequence = 6;
+
+  // Under SCOPE_CHANGED.
+  Scope scope_snapshot = 7;
+
+  // The user, under GRANTS_CHANGED and MEMBER_JOINED: concierge id and the opaque,
+  // immutable account subject, as on UserLifecycleEvent. A projection keys on
+  // `auth_subject`, the one user key every plane and every approval field shares.
+  string user_id = 8;
+  string auth_subject = 9;
+
+  // Under GRANTS_CHANGED: the user's concrete permissions in the scope's namespace
+  // (no alias, no wildcard) after the change. Present and empty means "holds nothing
+  // here" and MUST be applied; absent never occurs on this kind.
+  ScopeGrants grants = 10;
+
+  // Under MEMBER_JOINED.
+  ScopeMember member = 11;
+}
+
+message ScopeGrants {
+  repeated string permissions = 1;
+}
+
+// What a direction may hold about a person: the identity it addresses them by and the
+// KYC level it layers its own policy on. Never the identity document fields.
+message ScopeMember {
+  string email = 1;
+  bool email_verified = 2;
+  string username = 3;
+  string preferred_name = 4;
+  string status = 5;
+  uint32 kyc_level = 6;
+  uint64 token_version = 7;
+  // The UserLifecycleEvent.sequence this snapshot is as of.
+  uint64 lifecycle_sequence = 8;
+}
