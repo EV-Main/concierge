@@ -1213,7 +1213,10 @@ impl Fx {
 	/// The pass is global — it takes on every due `concierge:*` decision in the database,
 	/// other suites' too — so a test asserts on its own proposals, never on the count.
 	async fn execute(&self) {
-		concierge::approvals::execute_due(self.repo.as_ref()).await.expect("an executor pass");
+		let mut backoff = concierge::approvals::ExecutorBackoff::default();
+		concierge::approvals::execute_due(self.repo.as_ref(), &mut backoff, std::time::Duration::from_secs(30))
+			.await
+			.expect("an executor pass");
 	}
 
 	async fn get(&self, who: UserId, id: &str) -> Approval {
@@ -1265,32 +1268,13 @@ impl Fx {
 	/// catalog and republishes it whole, so publications are serialised and versioned past
 	/// the stored one, or two tests would each publish a catalog missing the other's kind.
 	async fn publish_bank_kind(&self, kind: ApprovalKindSpec) {
-		static BANK_CATALOG: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-		let _serial = BANK_CATALOG.lock().await;
-		let stored = self
-			.catalogs
-			.get_scope_catalog(as_bridge(evconcierge_contracts::concierge::v1::GetScopeCatalogRequest {}))
-			.await
-			.map(tonic::Response::into_inner)
-			.ok();
-		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-		let version = stored.as_ref().map_or(now, |c| c.version + 1).max(now);
-		let mut published = stored.map(|c| c.approval_kinds).unwrap_or_default();
-		published.retain(|k| k.name != kind.name);
-		published.insert(0, kind);
-		published.truncate(64);
-		self.catalogs
-			.publish_scope_catalog(as_bridge(PublishScopeCatalogRequest {
-				version,
-				approval_kinds: published,
-				notification_topics: vec![],
-			}))
-			.await
-			.expect("publish bank's catalog");
+		self.publish_bank(kind).await.expect("publish bank's catalog");
 	}
 
-	async fn bank_kind(&self, scope: &Scope) -> String {
-		let kind = format!("bank:t_{}", &scope.id[2..]);
+	/// The money plane's in-scope transfer, as every suite here publishes it: one spec, so
+	/// suites sharing the catalog never publish it two ways.
+	async fn bank_kind(&self, _scope: &Scope) -> String {
+		let kind = "bank:account_transfer".to_owned();
 		self.publish_bank_kind(ApprovalKindSpec {
 			name: kind.clone(),
 			label: "Transfer".into(),
@@ -1807,8 +1791,8 @@ async fn only_seated_against_votes_reject() {
 
 impl Fx {
 	/// A platform-level `bank:` kind, published beside the money plane's others.
-	async fn bank_platform_kind(&self, scope: &Scope) -> String {
-		let kind = format!("bank:p_{}", &scope.id[2..]);
+	async fn bank_platform_kind(&self, _scope: &Scope) -> String {
+		let kind = "bank:payment".to_owned();
 		self.publish_bank_kind(ApprovalKindSpec {
 			name: kind.clone(),
 			label: "Transfer".into(),
@@ -2126,6 +2110,9 @@ async fn a_retry_with_a_token_is_checked_as_the_first_call_was() {
 // ---------------------------------------------------------------------------------
 
 impl Fx {
+	/// Add `spec` to the money plane's catalog. Every suite in this binary shares that one
+	/// catalog and republishes it whole, so publications are serialised and versioned past
+	/// the stored one, or two tests would each publish a catalog missing the other's kind.
 	async fn publish_bank(&self, spec: ApprovalKindSpec) -> Result<(), tonic::Status> {
 		static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 		let _serial = SERIAL.lock().await;
@@ -2203,14 +2190,7 @@ async fn the_floor_escalates_what_the_catalog_left_out() {
 	fx.publish_bank(bank_spec("bank:account_transfer", ApprovalLevel::Scope, vec![spec("amount", ApprovalFieldType::Amount)], vec![]))
 		.await
 		.expect("a transfer kind with no escalations of its own");
-	fx.publish_bank(bank_spec(
-		"bank:scope_payout",
-		ApprovalLevel::Scope,
-		vec![spec("total", ApprovalFieldType::Amount), spec("recipients", ApprovalFieldType::Count)],
-		vec![],
-	))
-	.await
-	.expect("a payout kind with no escalations of its own");
+	fx.publish_bank(payout_spec()).await.expect("a payout kind with no escalations of its own");
 	fx.at(T0);
 	let propose = |kind: &str, fields: Vec<ApprovalFieldValue>| {
 		fx.services.propose(as_bridge(ProposeRequest {
@@ -2235,10 +2215,38 @@ async fn the_floor_escalates_what_the_catalog_left_out() {
 		key: "recipients".into(),
 		value: Some(Value::Count(n)),
 	};
-	let one = propose("bank:scope_payout", vec![total("10"), recipients(1)]).await.unwrap().into_inner();
+	let distribution = |set: bool| ApprovalFieldValue {
+		key: "distribution".into(),
+		value: Some(Value::Flag(set)),
+	};
+	let one = propose("bank:scope_payout", vec![total("10"), recipients(1), distribution(false)]).await.unwrap().into_inner();
 	assert_eq!(one.level, ApprovalLevel::Scope as i32);
-	let many = propose("bank:scope_payout", vec![total("10"), recipients(2)]).await.unwrap().into_inner();
-	assert_eq!((many.level, many.escalated_by), (ApprovalLevel::Platform as i32, vec!["floor_recipients".to_owned()]));
+	let many = propose("bank:scope_payout", vec![total("10"), recipients(2), distribution(false)]).await.unwrap().into_inner();
+	assert_eq!(many.level, ApprovalLevel::Platform as i32);
+	assert!(many.escalated_by.contains(&"floor_recipients".to_owned()), "{:?}", many.escalated_by);
+	let split = propose("bank:scope_payout", vec![total("10"), recipients(1), distribution(false)]).await.unwrap().into_inner();
+	assert_eq!(
+		split.escalated_by,
+		vec!["floor_daily_recipients".to_owned()],
+		"a second single-recipient payout the same day is a split distribution"
+	);
+	let nobody = propose("bank:scope_payout", vec![total("10"), recipients(0), distribution(false)]).await.unwrap().into_inner();
+	assert!(nobody.escalated_by.contains(&"floor_no_recipients".to_owned()), "{:?}", nobody.escalated_by);
+	let dividend = propose("bank:scope_payout", vec![total("10"), recipients(1), distribution(true)]).await.unwrap().into_inner();
+	assert!(dividend.escalated_by.contains(&"floor_distribution".to_owned()), "{:?}", dividend.escalated_by);
+}
+
+fn payout_spec() -> ApprovalKindSpec {
+	bank_spec(
+		"bank:scope_payout",
+		ApprovalLevel::Scope,
+		vec![
+			spec("total", ApprovalFieldType::Amount),
+			spec("recipients", ApprovalFieldType::Count),
+			spec("distribution", ApprovalFieldType::Flag),
+		],
+		vec![],
+	)
 }
 
 /// A catalog may escalate on a count itself (`ESCALATION_TEST_COUNT_ABOVE`).
@@ -2248,31 +2256,45 @@ async fn a_kind_escalates_on_a_count() {
 	let (_lock, _owners) = fx.owners(2).await;
 	let scope = fx.scope().await;
 	fx.admins(&scope, 2).await;
-	let kind = format!("bank:c_{}", &scope.id[2..]);
-	fx.publish_bank(bank_spec(
-		&kind,
-		ApprovalLevel::Scope,
-		vec![spec("seats", ApprovalFieldType::Count)],
-		vec![ApprovalEscalation {
-			parameter: "crowd".into(),
-			field_key: "seats".into(),
-			test: EscalationTest::CountAbove as i32,
-			default_threshold: "3".into(),
-			currency: String::new(),
-		}],
-	))
-	.await
-	.expect("a count escalation is publishable");
+	let kind = scope.kind("seats");
+	fx.catalogs
+		.publish_scope_catalog(as_client(
+			PublishScopeCatalogRequest {
+				version: 300,
+				approval_kinds: vec![ApprovalKindSpec {
+					name: kind.clone(),
+					label: "Seats".into(),
+					description: String::new(),
+					level: ApprovalLevel::Scope as i32,
+					fields: vec![spec("seats", ApprovalFieldType::Count)],
+					escalations: vec![ApprovalEscalation {
+						parameter: "crowd".into(),
+						field_key: "seats".into(),
+						test: EscalationTest::CountAbove as i32,
+						default_threshold: "3".into(),
+						currency: String::new(),
+					}],
+					proposer: String::new(),
+				}],
+				notification_topics: vec![],
+			},
+			&scope,
+		))
+		.await
+		.expect("a count escalation is publishable");
 	fx.at(T0);
 	let seats = |n: u64| {
-		fx.services.propose(as_bridge(ProposeRequest {
-			kind: kind.clone(),
-			fields: vec![ApprovalFieldValue {
-				key: "seats".into(),
-				value: Some(Value::Count(n)),
-			}],
-			..transfer(&scope, "1")
-		}))
+		fx.services.propose(as_client(
+			ProposeRequest {
+				kind: kind.clone(),
+				fields: vec![ApprovalFieldValue {
+					key: "seats".into(),
+					value: Some(Value::Count(n)),
+				}],
+				..transfer(&scope, "1")
+			},
+			&scope,
+		))
 	};
 	assert_eq!(seats(3).await.unwrap().into_inner().level, ApprovalLevel::Scope as i32, "three is not above three");
 	assert_eq!(seats(4).await.unwrap().into_inner().escalated_by, vec!["crowd".to_owned()]);
@@ -2290,4 +2312,118 @@ async fn an_owner_named_by_a_grant_does_not_decide_it() {
 	let voters: Vec<String> = fx.get(owners[2], &opened.id).await.voters.into_iter().map(|v| v.auth_subject).collect();
 	assert_eq!(voters, vec![fx.auth_subject(owners[2]).await], "neither the opener nor the subject");
 	assert_eq!(code(fx.vote(owners[1], &opened.id, ApprovalVote::For).await), Some(Code::PermissionDenied));
+}
+
+/// The floor binds a catalog stored before it existed, or written past it: a stored
+/// platform kind at scope level, and a stored escalation and scope policy above the cap,
+/// still send the proposal to the owners (review of #142).
+#[tokio::test]
+async fn the_floor_binds_a_stored_catalog_and_policy() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, _owners) = fx.owners(2).await;
+	let invest = Scope {
+		id: "invest".into(),
+		client: "invest".into(),
+		secret: "invest-test-secret-invest-test-secret".into(),
+	};
+	fx.rp
+		.set_secret_hash(&invest.client, Some(Sha256::digest(invest.secret.as_bytes()).as_slice()), 0)
+		.await
+		.expect("the invest client's secret");
+	let catalog = serde_json::json!({
+		"version": 4_000_000_000u64,
+		"notification_topics": [],
+		"approval_kinds": [
+			{"name": "invest:holder_grant", "label": "Grant", "description": "", "level": "scope",
+			 "fields": [{"key": "allocation", "label": "Allocation", "field_type": "text", "required": true, "repeated": false}],
+			 "escalations": []},
+			{"name": "invest:valuation_override", "label": "Mark", "description": "", "level": "scope",
+			 "fields": [{"key": "deviation", "label": "Deviation", "field_type": "bps", "required": true, "repeated": false}],
+			 "escalations": [{"parameter": "max_deviation", "field_key": "deviation", "test": "abs_bps_above", "default_threshold": "2000", "currency": ""}]}
+		]
+	});
+	sqlx::query("INSERT INTO scope_catalogs (namespace, version, catalog, published_at, published_by) VALUES ('invest', $1, $2, 0, 'invest') ON CONFLICT DO NOTHING")
+		.bind(4_000_000_000i64)
+		.bind(&catalog)
+		.execute(&fx.pool)
+		.await
+		.expect("store a catalog written before the floor");
+	let decided: Uuid = sqlx::query_scalar(
+		"INSERT INTO approvals (id, kind, proposer, scope, level, subject_ref, fields, payload_hash, reason, roster_size, threshold, \
+		 policy_version, delay_secs, created_at, expires_at, dedupe_key, state, passed_at, executable_at, decided_at, outcome) \
+		 VALUES (gen_random_uuid(), 'concierge:scope_policy_change', 'concierge', 'invest', 'platform', 'scope_policy:' || gen_random_uuid(), '[]', \
+		 repeat('0', 64), 'r', 2, 2, 1, 86400, $1, $1 + 100, gen_random_uuid()::TEXT, 'executed', $1, $1, $1, 'executed') RETURNING id",
+	)
+	.bind(T0)
+	.fetch_one(&fx.pool)
+	.await
+	.expect("an executed policy change to hang the stored policy off");
+	sqlx::query(
+		"INSERT INTO scope_approval_policies (scope, version, quorum_bps, delay_secs, ttl_secs, thresholds, approval_id, installed_at) \
+		 SELECT 'invest', coalesce(max(version), 1) + 1, 5001, 3600, 259200, \
+		 '[{\"kind\": \"invest:valuation_override\", \"parameter\": \"max_deviation\", \"value\": \"3000\"}]', $1, 0 \
+		 FROM scope_approval_policies WHERE scope = 'invest'",
+	)
+	.bind(decided)
+	.execute(&fx.pool)
+	.await
+	.expect("store a policy written before the floor");
+	fx.at(T0);
+	let propose = |kind: &str, field: ApprovalFieldValue| {
+		fx.services.propose(as_client(
+			ProposeRequest {
+				kind: kind.into(),
+				fields: vec![field],
+				..transfer(&invest, "1")
+			},
+			&invest,
+		))
+	};
+	let grant = propose(
+		"invest:holder_grant",
+		ApprovalFieldValue {
+			key: "allocation".into(),
+			value: Some(Value::Text("service_arb".into())),
+		},
+	)
+	.await
+	.expect("a stored holder grant opens")
+	.into_inner();
+	assert_eq!(grant.level, ApprovalLevel::Platform as i32, "a holder grant is the owners' whatever was stored");
+	let mark = propose(
+		"invest:valuation_override",
+		ApprovalFieldValue {
+			key: "deviation".into(),
+			value: Some(Value::Bps(1500)),
+		},
+	)
+	.await
+	.expect("a mark opens")
+	.into_inner();
+	assert_eq!(mark.level, ApprovalLevel::Platform as i32);
+	assert!(mark.escalated_by.contains(&"floor_deviation".to_owned()), "{:?}", mark.escalated_by);
+}
+
+/// The daily floor counts what is live: five transfers of 999 USDT pass at the scope, a
+/// sixth the same day goes to the owners.
+#[tokio::test]
+async fn the_daily_floor_counts_the_live_transfers() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, _owners) = fx.owners(2).await;
+	let scope = fx.scope().await;
+	fx.admins(&scope, 2).await;
+	let kind = fx.bank_kind(&scope).await;
+	fx.at(T0);
+	let transfer_999 = || {
+		fx.services.propose(as_bridge(ProposeRequest {
+			kind: kind.clone(),
+			fields: vec![amount("999", "USDT")],
+			..transfer(&scope, "999")
+		}))
+	};
+	for _ in 0..5 {
+		assert_eq!(transfer_999().await.unwrap().into_inner().level, ApprovalLevel::Scope as i32);
+	}
+	let sixth = transfer_999().await.unwrap().into_inner();
+	assert_eq!((sixth.level, sixth.escalated_by), (ApprovalLevel::Platform as i32, vec!["floor_daily".to_owned()]));
 }

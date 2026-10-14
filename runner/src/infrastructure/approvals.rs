@@ -677,7 +677,7 @@ impl ApprovalRepository for PgApprovals {
 			ApprovalLevel::Scope => roster.len(),
 		};
 		if deciders == 0 {
-			return Err(DomainError::Precondition("nobody but the one who asked could decide it".into()));
+			return Err(DomainError::Precondition("nobody besides the one who asked and the one it would seat could decide it".into()));
 		}
 		// A service's proposal keeps its floor of two deciders even with the initiator gone:
 		// one owner must not decide another's money alone. The code word lets the proposer
@@ -970,7 +970,7 @@ impl ApprovalRepository for PgApprovals {
 				match policy.check(&kinds) {
 					Err(why) => Some(why),
 					Ok(()) => {
-						install_policy(&mut tx, scope, policy, id, now).await?;
+						install_policy(&mut tx, scope, &policy.anchored(&kinds), id, now).await?;
 						None
 					}
 				}
