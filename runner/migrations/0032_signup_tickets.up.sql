@@ -9,8 +9,9 @@
 -- right against a squatter and wrong against the person who registered a minute ago.
 -- The ticket is what tells the two apart: only the browser that signed up holds it.
 --
--- 256 random bits, stored as a SHA-256 digest (never the ticket), spent once, alive as
--- long as a code (`CODE_TTL_SECS`). It is bound to the account's `token_version` and to
+-- 256 random bits, stored as a SHA-256 digest (never the ticket), spent once, alive a day
+-- (`SIGNUP_TICKET_TTL_SECS`) — longer than its code, which `/auth/password/signup/resend`
+-- replaces under the same ticket. It is bound to the account's `token_version` and to
 -- the password's `updated_at`: a takeover, a revoke-all or a new password since issuance
 -- kills it. Rows are reaped a day past expiry by the insert path.
 --

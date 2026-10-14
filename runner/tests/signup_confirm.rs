@@ -30,11 +30,15 @@ async fn sign_up(fx: &Surface, origin: &str, email: &str, browser: &mut Browser)
 }
 
 async fn confirm(fx: &Surface, origin: &str, ticket: &Value, code: &str, browser: &mut Browser) -> Answer {
+	fx.post("/auth/password/signup/confirm", origin, json!({ "ticket": ticket, "code": code }), browser).await
+}
+
+async fn resend(fx: &Surface, origin: &str, ticket: &Value, turnstile: &str) -> Answer {
 	fx.post(
-		"/auth/password/signup/confirm",
+		"/auth/password/signup/resend",
 		origin,
-		json!({ "ticket": ticket, "code": code, "turnstileToken": "human" }),
-		browser,
+		json!({ "ticket": ticket, "turnstileToken": turnstile }),
+		&mut Browser::default(),
 	)
 	.await
 }
@@ -127,15 +131,11 @@ async fn the_confirmation_is_a_sign_in_step_with_its_guards() {
 
 	let foreign = confirm(&fx, "https://evil.example", &ticket, &code, &mut Browser::default()).await;
 	assert_eq!((foreign.status, foreign.body), (StatusCode::FORBIDDEN, json!({ "error": "origin" })));
-	let bot = fx
-		.post(
-			"/auth/password/signup/confirm",
-			ORIGIN,
-			json!({ "ticket": ticket, "code": code, "turnstileToken": "robot" }),
-			&mut Browser::default(),
-		)
-		.await;
-	assert_eq!((bot.status, bot.body), (StatusCode::FORBIDDEN, json!({ "error": "captcha" })));
+	let foreign = resend(&fx, "https://evil.example", &ticket, "human").await;
+	assert_eq!((foreign.status, foreign.body), (StatusCode::FORBIDDEN, json!({ "error": "origin" })));
+	let bot = resend(&fx, ORIGIN, &ticket, "robot").await;
+	assert_eq!((bot.status, bot.body), (StatusCode::FORBIDDEN, json!({ "error": "captcha" })), "a resend costs a mail");
+	let code = fx.mailed_code(&email, "verify").await;
 
 	let done = confirm(&fx, ORIGIN, &ticket, &code, &mut Browser::default()).await;
 	assert_eq!(done.status, StatusCode::OK, "this plane's own origin confirms too: {:?}", done.body);
@@ -153,5 +153,55 @@ async fn a_sign_up_that_mails_no_code_hands_out_no_ticket() {
 		)
 		.await;
 	assert_eq!(made.body["verification"], "skipped");
-	assert!(made.body.get("ticket").is_none());
+	assert_eq!(made.body["ticket"], Value::Null);
+	assert!(made.body.get("ticket_error").is_none(), "no ticket is owed when no code went out");
+}
+
+/// The ticket outlives its code: a code that expired is recovered by a resend under the
+/// same ticket, and the new code — not the old — confirms.
+#[tokio::test]
+async fn an_expired_code_is_recovered_by_a_resend_under_the_same_ticket() {
+	let fx = fixture!();
+	let email = address("resend");
+	let ticket = sign_up(&fx, INVEST, &email, &mut Browser::default()).await.body["ticket"].clone();
+	let first = fx.mailed_code(&email, "verify").await;
+	sqlx::query("UPDATE email_codes SET expires_at = 0 WHERE email = $1 AND purpose = 'verify'")
+		.bind(&email)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	let late = confirm(&fx, INVEST, &ticket, &first, &mut Browser::default()).await;
+	assert_eq!((late.status, late.body), (StatusCode::BAD_REQUEST, json!({ "error": "code_expired" })));
+
+	let again = resend(&fx, INVEST, &ticket, "human").await;
+	assert_eq!((again.status, again.body.clone()), (StatusCode::OK, json!({ "ok": true })));
+	assert_eq!(again.headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], INVEST);
+	let second = fx.mailed_code(&email, "verify").await;
+	assert_ne!(first, second);
+
+	let done = confirm(&fx, INVEST, &ticket, &second, &mut Browser::default()).await;
+	assert_eq!(done.status, StatusCode::OK, "{:?}", done.body);
+	assert_eq!(state_of(&fx, &email).await, (true, true));
+
+	let spent = resend(&fx, INVEST, &ticket, "human").await;
+	assert_eq!(
+		(spent.status, spent.body),
+		(StatusCode::BAD_REQUEST, json!({ "error": "invalid_ticket" })),
+		"a spent ticket mails nothing"
+	);
+	let unknown = resend(&fx, INVEST, &json!("not-a-ticket"), "human").await;
+	assert_eq!(unknown.body, json!({ "error": "invalid_ticket" }));
+}
+
+#[tokio::test]
+async fn a_resend_is_throttled_like_every_code() {
+	let fx = fixture!();
+	let email = address("throttle");
+	let ticket = sign_up(&fx, INVEST, &email, &mut Browser::default()).await.body["ticket"].clone();
+	// The sign-up's own code is the first of the window.
+	for _ in 1..concierge::ports::CODE_SENDS_PER_WINDOW {
+		assert_eq!(resend(&fx, INVEST, &ticket, "human").await.status, StatusCode::OK);
+	}
+	let throttled = resend(&fx, INVEST, &ticket, "human").await;
+	assert_eq!((throttled.status, throttled.body), (StatusCode::TOO_MANY_REQUESTS, json!({ "error": "throttled" })));
 }

@@ -63,11 +63,11 @@ impl Browser {
 		self.cookies.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
 	}
 
-	fn header(&self) -> String {
+	pub fn header(&self) -> String {
 		self.cookies.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; ")
 	}
 
-	fn absorb(&mut self, headers: &HeaderMap) {
+	pub fn absorb(&mut self, headers: &HeaderMap) {
 		for raw in headers.get_all(header::SET_COOKIE) {
 			let pair = raw.to_str().unwrap().split(';').next().unwrap();
 			let (name, value) = pair.split_once('=').unwrap();

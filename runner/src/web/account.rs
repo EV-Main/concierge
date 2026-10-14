@@ -2,8 +2,13 @@
 //!
 //! `PUBLIC_ORIGIN` only — none of them is on a scope host's CORS list, and every mutation
 //! carries the CSRF double-submit. The reads take none (a double-submit check on a GET can
-//! only ever be wrong) but rotate the session as `/auth/session` does, so they answer with
-//! the refreshed access cookie under `Cache-Control: no-store` and `Vary: Cookie`.
+//! only ever be wrong) but rotate the session as `/auth/session` does, so every answer
+//! after the session was read — a refusal included — carries the refreshed access cookie;
+//! the reads also go out under `Cache-Control: no-store` and `Vary: Cookie`.
+//!
+//! The caller is gated as `authz::caller_gate` gates the gRPC surface: a disabled account,
+//! or a session whose token predates the account's `token_version`, is refused at once,
+//! not when its access token next expires.
 //!
 //! Every answer is JSON, the refusals `{"error":"<code>"}` as on the sign-in routes.
 
@@ -13,12 +18,12 @@ use axum::{
 	http::{HeaderMap, HeaderName, StatusCode, header},
 };
 use axum_extra::extract::cookie::CookieJar;
-use domain::users::{User, Username};
+use domain::users::{User, UserStatus, Username};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-	notification::{settings_of, topic},
+	notification::{settings_json, settings_of, subscriber_of, topic},
 	web::{
 		WebState,
 		routes::{Caller, session_user},
@@ -28,12 +33,25 @@ use crate::{
 
 const NO_STORE: [(HeaderName, &str); 2] = [(header::CACHE_CONTROL, "no-store"), (header::VARY, "Cookie")];
 
-type Read = Result<(CookieJar, [(HeaderName, &'static str); 2], Json<Value>), Refusal>;
-/// A refusal after the session was read still owes the browser its refreshed cookie.
+/// The outer refusal is for a request that never reached a session; the inner one comes
+/// after it, beside the cookie the read rotated.
+type Read = Result<(CookieJar, [(HeaderName, &'static str); 2], Result<Json<Value>, Refusal>), Refusal>;
 type Write = Result<(CookieJar, Result<Json<Value>, Refusal>), Refusal>;
 
 fn unauthenticated() -> Refusal {
 	Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated")
+}
+
+/// The caller's account, gated: `caller_gate`'s two refusals, in its order.
+async fn account(st: &super::Inner, caller: &Caller) -> Result<User, Refusal> {
+	let user = st.users.find_by_id(caller.id).await.map_err(|e| internal("account: not read", e))?.ok_or_else(unauthenticated)?;
+	if user.status() == UserStatus::Disabled {
+		return Err(Refusal::new(StatusCode::FORBIDDEN, "disabled"));
+	}
+	if caller.minted_token_version.is_none_or(|minted| minted < user.token_version()) {
+		return Err(unauthenticated());
+	}
+	Ok(user)
 }
 
 async fn reader(st: &super::Inner, jar: &CookieJar) -> Result<Caller, Refusal> {
@@ -43,61 +61,46 @@ async fn reader(st: &super::Inner, jar: &CookieJar) -> Result<Caller, Refusal> {
 		.ok_or_else(unauthenticated)
 }
 
-async fn account(st: &super::Inner, caller: &Caller) -> Result<User, Refusal> {
-	st.users.find_by_id(caller.id).await.map_err(|e| internal("account: not read", e))?.ok_or_else(unauthenticated)
-}
-
 /// `GET /auth/me` — the first-party `GetMe` minus everything an identity document holds:
 /// no legal name, phone, birth date, nationality, tax residence or address. The level is
 /// here; the evidence behind it is not.
 pub async fn me(State(st): State<WebState>, jar: CookieJar) -> Read {
 	let st = &st.inner;
 	let caller = reader(st, &jar).await?;
-	let user = account(st, &caller).await?;
-	let body = json!({
-		"id": user.id().to_string(),
-		"email": user.email().as_str(),
-		"email_verified": user.email_verified(),
-		"username": user.username().map(Username::as_str),
-		"preferred_name": user.preferred_name(),
-		"role": caller.role.clone(),
-		"role_is_break_glass": caller.role_is_break_glass,
-		"kyc_level": user.kyc_level(),
+	let answer = account(st, &caller).await.map(|user| {
+		Json(json!({
+			"id": user.id().to_string(),
+			"email": user.email().as_str(),
+			"email_verified": user.email_verified(),
+			"username": user.username().map(Username::as_str),
+			"preferred_name": user.preferred_name(),
+			"role": caller.role,
+			"role_is_break_glass": caller.role_is_break_glass,
+			"kyc_level": user.kyc_level(),
+		}))
 	});
-	Ok((caller.refreshed(st, jar), NO_STORE, Json(body)))
+	Ok((caller.refreshed(st, jar), NO_STORE, answer))
 }
 
-/// The settings snapshot, the subscriber row created on first touch so a user never has
-/// to switch notifications ON before they may switch them off.
-async fn settings(st: &super::Inner, user: &User) -> Result<Json<Value>, Refusal> {
-	let sub = st
-		.notifications
-		.subscriber_for_user(user.id().raw(), user.email().as_str(), user.email_verified())
-		.await
-		.map_err(|e| internal("notification settings: subscriber not read", e))?;
-	let settings = settings_of(st.notifications.as_ref(), &sub).await.map_err(|e| internal("notification settings: not read", e))?;
-	Ok(Json(json!({
-		"in_app_enabled": settings.in_app_enabled,
-		"email_enabled": settings.email_enabled,
-		"email": settings.email,
-		"email_verified": settings.email_verified,
-		"topics": settings.topics.iter().map(|t| json!({
-			"topic": t.topic,
-			"label": t.label,
-			"description": t.description,
-			"subscribed": t.subscribed,
-			"email_enabled": t.email_enabled,
-		})).collect::<Vec<_>>(),
-	})))
-}
-
-/// `GET /auth/notifications/settings`.
+/// `GET /auth/notifications/settings` — written nowhere: an account that never touched
+/// its settings reads the defaults its first change would create.
 pub async fn notification_settings(State(st): State<WebState>, jar: CookieJar) -> Read {
 	let st = &st.inner;
 	let caller = reader(st, &jar).await?;
-	let user = account(st, &caller).await?;
-	let body = settings(st, &user).await?;
-	Ok((caller.refreshed(st, jar), NO_STORE, body))
+	let answer = async {
+		let user = account(st, &caller).await?;
+		let sub = st
+			.notifications
+			.subscriber_of_user(user.id().raw())
+			.await
+			.map_err(|e| internal("notification settings: subscriber not read", e))?;
+		let settings = settings_of(st.notifications.as_ref(), user.email().as_str(), user.email_verified(), sub.as_ref())
+			.await
+			.map_err(|e| internal("notification settings: not read", e))?;
+		Ok(Json(settings_json(&settings)))
+	}
+	.await;
+	Ok((caller.refreshed(st, jar), NO_STORE, answer))
 }
 
 #[derive(Deserialize)]
@@ -106,9 +109,8 @@ pub struct ChannelChange {
 	enabled: bool,
 }
 
-/// `POST /auth/notifications/settings/channel` — answers the whole snapshot, re-read, so
-/// the screen renders what the database holds. Both channels off is allowed: "stop
-/// contacting me" is a supported state.
+/// `POST /auth/notifications/settings/channel` — answers the whole snapshot. Both channels
+/// off is allowed: "stop contacting me" is a supported state.
 pub async fn set_channel(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<ChannelChange>) -> Write {
 	let st = &st.inner;
 	let caller = signed_in(st, &jar, &headers).await?;
@@ -119,16 +121,20 @@ pub async fn set_channel(State(st): State<WebState>, jar: CookieJar, headers: He
 			_ => return Err(Refusal::new(StatusCode::BAD_REQUEST, "invalid_channel")),
 		};
 		let user = account(st, &caller).await?;
-		let sub = st
-			.notifications
-			.subscriber_for_user(user.id().raw(), user.email().as_str(), user.email_verified())
+		let mut sub = subscriber_of(st.notifications.as_ref(), &user)
 			.await
 			.map_err(|e| internal("notification settings: subscriber not read", e))?;
 		st.notifications
 			.set_channel_enabled(sub.id, in_app, email)
 			.await
 			.map_err(|e| internal("notification settings: channel not set", e))?;
-		settings(st, &user).await
+		// The one column this request wrote, set on the row in hand rather than re-read.
+		sub.in_app_enabled = in_app.unwrap_or(sub.in_app_enabled);
+		sub.email_enabled = email.unwrap_or(sub.email_enabled);
+		let settings = settings_of(st.notifications.as_ref(), &sub.email, sub.email_verified, Some(&sub))
+			.await
+			.map_err(|e| internal("notification settings: not read", e))?;
+		Ok(Json(settings_json(&settings)))
 	}
 	.await;
 	Ok((caller.refreshed(st, jar), answer))
@@ -151,16 +157,17 @@ pub async fn set_topic(State(st): State<WebState>, jar: CookieJar, headers: Head
 			return Err(Refusal::new(StatusCode::BAD_REQUEST, "unknown_topic"));
 		}
 		let user = account(st, &caller).await?;
-		let sub = st
-			.notifications
-			.subscriber_for_user(user.id().raw(), user.email().as_str(), user.email_verified())
+		let sub = subscriber_of(st.notifications.as_ref(), &user)
 			.await
 			.map_err(|e| internal("notification settings: subscriber not read", e))?;
 		st.notifications
 			.set_topic_subscription(sub.id, &body.topic, body.subscribed, body.email_enabled)
 			.await
 			.map_err(|e| internal("notification settings: topic not set", e))?;
-		settings(st, &user).await
+		let settings = settings_of(st.notifications.as_ref(), &sub.email, sub.email_verified, Some(&sub))
+			.await
+			.map_err(|e| internal("notification settings: not read", e))?;
+		Ok(Json(settings_json(&settings)))
 	}
 	.await;
 	Ok((caller.refreshed(st, jar), answer))

@@ -439,6 +439,9 @@ pub(super) struct Caller {
 	/// reading `/auth/session` reports.
 	pub(super) role: String,
 	pub(super) role_is_break_glass: bool,
+	/// The `token_version` the session's access token was minted under — the half of
+	/// `authz::caller_gate`'s check the live summary cannot supply.
+	pub(super) minted_token_version: Option<u64>,
 	access_token: String,
 	remaining_secs: i64,
 }
@@ -479,10 +482,19 @@ pub(super) async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<O
 			id,
 			role: f.user.role,
 			role_is_break_glass: f.user.role_is_break_glass,
+			minted_token_version: minted_token_version(&f.access_token),
 			access_token: f.access_token,
 			remaining_secs: f.remaining_secs,
 		})
 	}))
+}
+
+/// Read without a signature check, and that is sound only because of where the token
+/// comes from: the server-side session store, never the browser.
+fn minted_token_version(token: &str) -> Option<u64> {
+	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+	let payload = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
+	serde_json::from_slice::<Value>(&payload).ok()?.get("token_version")?.as_u64()
 }
 
 /// Constant-time string equality.

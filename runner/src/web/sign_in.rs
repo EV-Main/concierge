@@ -89,7 +89,7 @@ pub(super) fn code_refusal(refusal: CodeRefusal) -> Refusal {
 	}
 }
 
-async fn sent(st: &super::Inner, issue: CodeIssue) -> Result<Json<Value>, Refusal> {
+pub(super) async fn sent(st: &super::Inner, issue: CodeIssue) -> Result<Json<Value>, Refusal> {
 	match issue {
 		CodeIssue::Sent => {
 			st.mail_wake.notify_one();
@@ -288,14 +288,20 @@ pub async fn sign_up(State(st): State<WebState>, jar: CookieJar, headers: Header
 	};
 	// The ticket goes with the code: it is what lets this browser confirm the address
 	// from a scope's host, where it cannot read the CSRF cookie (`signup::confirm`).
-	let ticket = match verification {
-		"sent" => super::signup::ticket_for(st, user.id()).await,
-		_ => None,
+	// A ticket that could not be stored is SAID, not only logged: the account exists and
+	// is signed in, so failing the request would hide an account the user just made;
+	// `ticket: null` with `ticket_error` tells the dialog to confirm on evinvest.ltd.
+	let (ticket, ticket_error) = match verification {
+		"sent" => match super::signup::ticket_for(st, user.id()).await {
+			Some(ticket) => (Some(ticket), None),
+			None => (None, Some("ticket_unavailable")),
+		},
+		_ => (None, None),
 	};
 	let (jar, _) = signed_in_as(st, jar, &headers, user.id()).await?;
-	let mut answer = json!({ "ok": true, "verification": verification });
-	if let Some(ticket) = ticket {
-		answer["ticket"] = json!(ticket);
+	let mut answer = json!({ "ok": true, "verification": verification, "ticket": ticket });
+	if let Some(error) = ticket_error {
+		answer["ticket_error"] = json!(error);
 	}
 	Ok((jar, Json(answer)))
 }

@@ -153,3 +153,74 @@ async fn a_write_needs_the_csrf_token_and_answers_no_scope_host() {
 		assert!(!answer.headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "{path}");
 	}
 }
+
+async fn user_id(fx: &Surface, browser: &mut Browser) -> uuid::Uuid {
+	uuid::Uuid::parse_str(fx.get("/auth/me", browser).await.body["id"].as_str().unwrap()).unwrap()
+}
+
+fn sets_the_access_cookie(headers: &axum::http::HeaderMap) -> bool {
+	headers.get_all(header::SET_COOKIE).iter().any(|c| c.to_str().unwrap().starts_with("ev_access="))
+}
+
+/// Gated as `authz::caller_gate` gates the gRPC surface — and every refusal after the
+/// session was read still hands the browser its rotated cookie.
+#[tokio::test]
+async fn a_disabled_account_or_a_revoked_token_is_refused_at_once() {
+	let fx = fixture!();
+	let mut browser = signed_in(&fx, &address("gate")).await;
+	let id = user_id(&fx, &mut browser).await;
+
+	sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
+		.bind(id)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	for path in ["/auth/me", "/auth/notifications/settings"] {
+		let refused = fx.get(path, &mut browser).await;
+		assert_eq!((refused.status, refused.body), (StatusCode::UNAUTHORIZED, json!({ "error": "unauthenticated" })), "{path}");
+		assert!(sets_the_access_cookie(&refused.headers), "{path}: the refusal carries the rotated cookie");
+	}
+	let write = fx
+		.post("/auth/notifications/settings/channel", ORIGIN, json!({ "channel": "email", "enabled": false }), &mut browser)
+		.await;
+	assert_eq!(write.status, StatusCode::UNAUTHORIZED);
+
+	let mut browser = signed_in(&fx, &address("disabled")).await;
+	let id = user_id(&fx, &mut browser).await;
+	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(id).execute(&fx.pool).await.unwrap();
+	let refused = fx.get("/auth/me", &mut browser).await;
+	assert_eq!((refused.status, refused.body), (StatusCode::FORBIDDEN, json!({ "error": "disabled" })));
+	assert!(sets_the_access_cookie(&refused.headers));
+}
+
+#[tokio::test]
+async fn reading_the_settings_writes_nothing() {
+	let fx = fixture!();
+	let mut browser = signed_in(&fx, &address("readonly")).await;
+	let id = user_id(&fx, &mut browser).await;
+	let rows = || async {
+		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notification_subscribers WHERE user_id = $1")
+			.bind(id)
+			.fetch_one(&fx.pool)
+			.await
+			.unwrap()
+	};
+	let read = fx.get("/auth/notifications/settings", &mut browser).await;
+	assert_eq!(read.status, StatusCode::OK);
+	assert_eq!(
+		(read.body["in_app_enabled"].clone(), read.body["email_enabled"].clone()),
+		(json!(true), json!(true)),
+		"the defaults a first write creates"
+	);
+	assert_eq!(rows().await, 0, "a read creates no subscriber");
+
+	let written = fx
+		.post("/auth/notifications/settings/channel", ORIGIN, json!({ "channel": "email", "enabled": false }), &mut browser)
+		.await;
+	assert_eq!(rows().await, 1);
+	assert_eq!(
+		fx.get("/auth/notifications/settings", &mut browser).await.body,
+		written.body,
+		"the answered snapshot is the stored one"
+	);
+}

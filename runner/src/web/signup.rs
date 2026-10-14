@@ -22,7 +22,7 @@ use crate::{
 	ports::{SignUpConfirmRefusal, VerifyRefusal},
 	web::{
 		WebState, now_secs, random_token,
-		sign_in::{Refusal, code_refusal, guard, internal, signed_in_as},
+		sign_in::{Refusal, code_refusal, guard, internal, sent, signed_in_as},
 	},
 };
 
@@ -45,24 +45,45 @@ pub(super) async fn ticket_for(st: &super::Inner, user: UserId) -> Option<String
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SignUpConfirm {
 	ticket: String,
 	code: String,
-	turnstile_token: String,
 }
 
 /// `POST /auth/password/signup/confirm` — verify the address and sign in. A ticket that
 /// is unknown, spent, expired, someone else's or outlived by a new password answers
-/// exactly as a wrong code does, so the ticket cannot be probed apart from the code.
+/// exactly as a wrong code does, so the ticket cannot be probed apart from the code. No
+/// Turnstile: the code proves the mailbox, as on `/auth/code/verify`, and its attempts
+/// are counted.
 pub async fn confirm(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<SignUpConfirm>) -> Result<(CookieJar, Json<Value>), Refusal> {
 	let st = &st.inner;
-	guard(st, &headers, Some(&body.turnstile_token)).await?;
+	guard(st, &headers, None).await?;
 	match st.credentials.confirm_signup(&digest(&body.ticket), &body.code, now_secs()).await {
 		Ok(Ok(user)) => signed_in_as(st, jar, &headers, user.id()).await,
 		Ok(Err(SignUpConfirmRefusal::Ticket)) => Err(Refusal::new(StatusCode::BAD_REQUEST, "invalid_code")),
 		Ok(Err(SignUpConfirmRefusal::Verify(VerifyRefusal::Code(refusal)))) => Err(code_refusal(refusal)),
 		Ok(Err(SignUpConfirmRefusal::Verify(VerifyRefusal::Taken))) => Err(Refusal::new(StatusCode::CONFLICT, "email_taken")),
 		Err(e) => Err(internal("sign-up: not confirmed", e)),
+	}
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignUpResend {
+	ticket: String,
+	turnstile_token: String,
+}
+
+/// `POST /auth/password/signup/resend` — a new code for the sign-up under the same ticket,
+/// to the account's address: a late mail or a code that expired while the tab sat open is
+/// recovered without the CSRF path. A mail costs us, so Turnstile and the per-address
+/// throttle apply as on `/auth/code/request`.
+pub async fn resend(State(st): State<WebState>, headers: HeaderMap, Json(body): Json<SignUpResend>) -> Result<Json<Value>, Refusal> {
+	let st = &st.inner;
+	guard(st, &headers, Some(&body.turnstile_token)).await?;
+	match st.credentials.resend_signup_code(&digest(&body.ticket), now_secs()).await {
+		Ok(Some(issue)) => sent(st, issue).await,
+		Ok(None) => Err(Refusal::new(StatusCode::BAD_REQUEST, "invalid_ticket")),
+		Err(e) => Err(internal("sign-up: code not resent", e)),
 	}
 }

@@ -120,15 +120,16 @@ They widen CORS for a **closed list** of sign-in routes and nothing else:
 
 | Accepts a scope origin | `PUBLIC_ORIGIN` only |
 | ---------------------- | -------------------- |
-| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user}`, never a token) | everything acting on an open session: `/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register`, `/auth/passkey/remove`, sessions, username, logout, `/kyc/*` |
+| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`, `/auth/password/signup/resend`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user}`, never a token) | everything acting on an open session: `/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register`, `/auth/passkey/remove`, sessions, username, logout, `/kyc/*` |
 
 A route on the left accepts an `Origin` that is `PUBLIC_ORIGIN` or an origin of a scope
 that is `ACTIVE` or `FROZEN` — a frozen scope's clients still sign people in — and never
 one of a `CLOSED` scope. The right column carries the CSRF double-submit, whose cookie a
 scope host cannot read, so email verification is not offered there. A password sign-up
 started on a scope host is confirmed instead by `/auth/password/signup/confirm` with the
-ticket the sign-up answered (migration 0032): the address is verified and the password
-kept, where a code SIGN-IN on that mailbox would take the unverified account over. The allowlist is re-read from the registry at most
+ticket the sign-up answered (migration 0032; the ticket lives a day, and
+`/auth/password/signup/resend` mails a new code under it): the address is verified and the
+password kept, where a code SIGN-IN on that mailbox would take the unverified account over. The allowlist is re-read from the registry at most
 30 s apart (`web::allowlist`), so closing a scope or removing an origin takes effect
 without a restart. An absolute OAuth `returnTo` must be one of these origins plus a path
 from the scope's `return_paths`, matched exactly, or `/auth/login` answers 400; a

@@ -207,6 +207,7 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/password/signup", post(sign_in::sign_up))
 		.route("/auth/password/signin", post(sign_in::sign_in))
 		.route("/auth/password/signup/confirm", post(signup::confirm))
+		.route("/auth/password/signup/resend", post(signup::resend))
 		.route("/auth/passkey/signin/options", post(passkey::signin_options))
 		.route("/auth/passkey/signin/verify", post(passkey::signin_verify))
 		.layer(cors::layer(allowlist.clone(), Method::POST));

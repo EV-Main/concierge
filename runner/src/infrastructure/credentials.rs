@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::users::{Named, account_named, drain_outbox, free_username, insert_user, load_for_update, lock_email, update_row, verified_holder};
 use crate::ports::{
 	CODE_MAX_ATTEMPTS, CODE_SEND_WINDOW_SECS, CODE_SENDS_PER_WINDOW, CODE_TTL_SECS, CodeIssue, CodePurpose, CodeRefusal, CredentialRepository, PASSWORD_LOCK_SECS, PASSWORD_MAX_FAILURES,
-	PasskeyRow, SignInMethods, SignUp, SignUpConfirmRefusal, StoredPassword, VerifyRefusal,
+	PasskeyRow, SIGNUP_TICKET_TTL_SECS, SignInMethods, SignUp, SignUpConfirmRefusal, StoredPassword, VerifyRefusal,
 };
 
 /// How long a spent or expired sign-up ticket row is kept before the insert path reaps it.
@@ -128,51 +128,9 @@ async fn email_of(conn: &mut PgConnection, user: UserId) -> Result<Email, Domain
 impl CredentialRepository for PgCredentials {
 	async fn issue_code(&self, purpose: CodePurpose, now: i64) -> Result<CodeIssue, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		let (email, purpose, user) = match purpose {
-			CodePurpose::Login(email) => (email, "login", None),
-			CodePurpose::Verify(user) => (email_of(&mut tx, user).await?, "verify", Some(user)),
-		};
-		lock_email(&mut tx, &email).await?;
-		let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM email_codes WHERE email = $1 AND created_at > $2")
-			.bind(email.as_str())
-			.bind(now - CODE_SEND_WINDOW_SECS)
-			.fetch_one(&mut *tx)
-			.await
-			.map_err(repo_err)?;
-		if recent >= CODE_SENDS_PER_WINDOW {
-			return Ok(CodeIssue::Throttled);
-		}
-		sqlx::query("UPDATE email_codes SET burned_at = $4 WHERE email = $1 AND purpose = $2 AND user_id IS NOT DISTINCT FROM $3 AND burned_at IS NULL")
-			.bind(email.as_str())
-			.bind(purpose)
-			.bind(user.map(|u| u.raw()))
-			.bind(now)
-			.execute(&mut *tx)
-			.await
-			.map_err(repo_err)?;
-		let id = Uuid::new_v4();
-		let code = six_digits();
-		let expires_at = now + CODE_TTL_SECS;
-		sqlx::query("INSERT INTO email_codes (id, email, purpose, user_id, code_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-			.bind(id)
-			.bind(email.as_str())
-			.bind(purpose)
-			.bind(user.map(|u| u.raw()))
-			.bind(digest(id, &code))
-			.bind(expires_at)
-			.bind(now)
-			.execute(&mut *tx)
-			.await
-			.map_err(repo_err)?;
-		sqlx::query("INSERT INTO notification_deliveries (kind, recipient, dedupe_key, payload) VALUES ('email_code', $1, $2, $3)")
-			.bind(email.as_str())
-			.bind(format!("email_code:{id}"))
-			.bind(serde_json::json!({ "purpose": purpose, "code": code, "expires_at": expires_at }))
-			.execute(&mut *tx)
-			.await
-			.map_err(repo_err)?;
+		let issue = issue_in(&mut tx, purpose, now).await?;
 		tx.commit().await.map_err(repo_err)?;
-		Ok(CodeIssue::Sent)
+		Ok(issue)
 	}
 
 	async fn redeem_login_code(&self, email: &Email, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError> {
@@ -328,7 +286,7 @@ impl CredentialRepository for PgCredentials {
 		.bind(ticket_hash)
 		.bind(user.raw())
 		.bind(now)
-		.bind(CODE_TTL_SECS)
+		.bind(SIGNUP_TICKET_TTL_SECS)
 		.execute(&mut *tx)
 		.await
 		.map_err(repo_err)?;
@@ -343,32 +301,10 @@ impl CredentialRepository for PgCredentials {
 
 	async fn confirm_signup(&self, ticket_hash: &[u8], code: &str, now: i64) -> Result<Result<User, SignUpConfirmRefusal>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		// Held for the whole confirmation, so two presentations of one ticket cannot both
-		// spend it.
-		let ticket: Option<(Uuid, i64, i64, i64, Option<i64>)> =
-			sqlx::query_as("SELECT user_id, token_version, password_set_at, expires_at, spent_at FROM signup_tickets WHERE ticket_hash = $1 FOR UPDATE")
-				.bind(ticket_hash)
-				.fetch_optional(&mut *tx)
-				.await
-				.map_err(repo_err)?;
-		let Some((user_id, token_version, password_set_at, expires_at, spent_at)) = ticket else {
+		let Some(user) = live_ticket(&mut tx, ticket_hash, now).await? else {
 			return Ok(Err(SignUpConfirmRefusal::Ticket));
 		};
-		if spent_at.is_some() || now >= expires_at {
-			return Ok(Err(SignUpConfirmRefusal::Ticket));
-		}
-		// A takeover bumps `token_version` and drops the password; a "revoke all" bumps the
-		// former and a new password moves the latter. After any of them, the browser that
-		// signed up is no longer the one this account answers to.
-		let current: Option<(i64, Option<i64>)> = sqlx::query_as("SELECT u.token_version, p.updated_at FROM users u LEFT JOIN password_credentials p ON p.user_id = u.id WHERE u.id = $1")
-			.bind(user_id)
-			.fetch_optional(&mut *tx)
-			.await
-			.map_err(repo_err)?;
-		if current != Some((token_version, Some(password_set_at))) {
-			return Ok(Err(SignUpConfirmRefusal::Ticket));
-		}
-		let outcome = verify_with_code(&mut tx, UserId::from_raw(user_id), code, now).await?;
+		let outcome = verify_with_code(&mut tx, user, code, now).await?;
 		if outcome.is_ok() {
 			sqlx::query("UPDATE signup_tickets SET spent_at = $2 WHERE ticket_hash = $1")
 				.bind(ticket_hash)
@@ -382,6 +318,16 @@ impl CredentialRepository for PgCredentials {
 		Ok(outcome.map_err(SignUpConfirmRefusal::Verify))
 	}
 
+	async fn resend_signup_code(&self, ticket_hash: &[u8], now: i64) -> Result<Option<CodeIssue>, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let Some(user) = live_ticket(&mut tx, ticket_hash, now).await? else {
+			return Ok(None);
+		};
+		let issue = issue_in(&mut tx, CodePurpose::Verify(user), now).await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(Some(issue))
+	}
+
 	async fn set_password(&self, user: UserId, code: &str, phc: String, now: i64) -> Result<Result<(), VerifyRefusal>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let outcome = verify_with_code(&mut tx, user, code, now).await?;
@@ -391,6 +337,92 @@ impl CredentialRepository for PgCredentials {
 		tx.commit().await.map_err(repo_err)?;
 		Ok(outcome.map(|_| ()))
 	}
+}
+
+/// Mint a code and queue its mail inside the caller's transaction; a throttled send
+/// writes nothing.
+async fn issue_in(conn: &mut PgConnection, purpose: CodePurpose, now: i64) -> Result<CodeIssue, DomainError> {
+	let (email, purpose, user) = match purpose {
+		CodePurpose::Login(email) => (email, "login", None),
+		CodePurpose::Verify(user) => (email_of(conn, user).await?, "verify", Some(user)),
+	};
+	lock_email(conn, &email).await?;
+	let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM email_codes WHERE email = $1 AND created_at > $2")
+		.bind(email.as_str())
+		.bind(now - CODE_SEND_WINDOW_SECS)
+		.fetch_one(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	if recent >= CODE_SENDS_PER_WINDOW {
+		return Ok(CodeIssue::Throttled);
+	}
+	sqlx::query("UPDATE email_codes SET burned_at = $4 WHERE email = $1 AND purpose = $2 AND user_id IS NOT DISTINCT FROM $3 AND burned_at IS NULL")
+		.bind(email.as_str())
+		.bind(purpose)
+		.bind(user.map(|u| u.raw()))
+		.bind(now)
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	let id = Uuid::new_v4();
+	let code = six_digits();
+	let expires_at = now + CODE_TTL_SECS;
+	sqlx::query("INSERT INTO email_codes (id, email, purpose, user_id, code_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+		.bind(id)
+		.bind(email.as_str())
+		.bind(purpose)
+		.bind(user.map(|u| u.raw()))
+		.bind(digest(id, &code))
+		.bind(expires_at)
+		.bind(now)
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	sqlx::query("INSERT INTO notification_deliveries (kind, recipient, dedupe_key, payload) VALUES ('email_code', $1, $2, $3)")
+		.bind(email.as_str())
+		.bind(format!("email_code:{id}"))
+		.bind(serde_json::json!({ "purpose": purpose, "code": code, "expires_at": expires_at }))
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	Ok(CodeIssue::Sent)
+}
+
+/// The account a sign-up ticket still speaks for, or `None`. The ticket row, the mailbox
+/// lock and the account's rows are held to the end of the caller's transaction, taken in
+/// the order every other writer of the mailbox takes them (advisory lock, then the row),
+/// so nothing that would kill the ticket — a takeover, a revoke-all, a new password — can
+/// land between this check and what the caller does on its strength.
+async fn live_ticket(conn: &mut PgConnection, ticket_hash: &[u8], now: i64) -> Result<Option<UserId>, DomainError> {
+	let ticket: Option<(Uuid, i64, i64, i64, Option<i64>)> =
+		sqlx::query_as("SELECT user_id, token_version, password_set_at, expires_at, spent_at FROM signup_tickets WHERE ticket_hash = $1 FOR UPDATE")
+			.bind(ticket_hash)
+			.fetch_optional(&mut *conn)
+			.await
+			.map_err(repo_err)?;
+	let Some((user_id, token_version, password_set_at, expires_at, spent_at)) = ticket else {
+		return Ok(None);
+	};
+	if spent_at.is_some() || now >= expires_at {
+		return Ok(None);
+	}
+	let user = UserId::from_raw(user_id);
+	let email = email_of(conn, user).await?;
+	lock_email(conn, &email).await?;
+	// A takeover bumps `token_version` and drops the password; a "revoke all" bumps the
+	// former and a new password moves the latter. After any of them, the browser that
+	// signed up is no longer the one this account answers to.
+	let current: i64 = sqlx::query_scalar("SELECT token_version FROM users WHERE id = $1 FOR UPDATE")
+		.bind(user_id)
+		.fetch_one(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	let password: Option<i64> = sqlx::query_scalar("SELECT updated_at FROM password_credentials WHERE user_id = $1 FOR UPDATE")
+		.bind(user_id)
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	Ok((current == token_version && password == Some(password_set_at)).then_some(user))
 }
 
 /// Spend a verification code and mark the account's address verified. The caller commits

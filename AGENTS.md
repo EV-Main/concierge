@@ -185,7 +185,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   proves the mailbox. A password (argon2id) signs up an UNVERIFIED account that works at
   once ("verify my email now" mails a code; `/auth/email/verify/{request,confirm}` later).
   That mail comes with a SIGN-UP TICKET (`signup_tickets`, 0032: 256 bits, a digest at rest,
-  spent once, a code's lifetime, dead once `token_version` or the password moves), and
+  spent once, alive a day while its code lives ten minutes — `/auth/password/signup/resend`
+  mails a new one under it — and dead once `token_version` or the password moves), and
   `/auth/password/signup/confirm {ticket, code}` verifies the address WITHOUT the CSRF
   token — the one confirmation a scope's host can make — and keeps the password: a ticket
   is what tells the person who just signed up from a squatter's mailbox owner, so the
