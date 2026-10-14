@@ -110,6 +110,10 @@ pub enum GrantOutcome {
 	Granted(GrantRecord),
 	/// The actor may not grant this target, or addressed the subject by id as a delegate.
 	Denied,
+	/// `<namespace>:admin` seats its holder on the scope's approval roster
+	/// (`docs/SCOPES-AND-APPROVALS.md` §5.6), so only a persisted owner grants it — never a
+	/// seat that merely holds `iam:tenants:grant`, never by emergency access.
+	OwnersOnly,
 	/// The subject is the actor.
 	ToSelf,
 	/// No tenant owns the target's namespace. Said only to a seat.
@@ -534,6 +538,8 @@ pub enum Proposed {
 	Opened(ApprovalRecord),
 	/// The same `dedupe_key` with the same content: the proposal already open under it.
 	Existing(ApprovalRecord),
+	/// The proposer already holds `MAX_LIVE_PER_PROPOSER` live proposals.
+	Saturated,
 }
 
 /// An account as a reader of a proposal sees it.
@@ -565,6 +571,9 @@ pub struct ApprovalRecord {
 	pub created_at: i64,
 	pub requested_by_client: String,
 	pub decision: Decision,
+	/// The instant this record was read at, on the store's clock: what a reader projects
+	/// `decision` through.
+	pub as_of: i64,
 }
 
 /// What a signed-in person may see (§5, `ListApprovals`): everything as a persisted
@@ -596,36 +605,42 @@ pub enum ApprovalActor<'a> {
 }
 
 /// Approvals (`approvals`, migration 0036). Every write is one transaction holding the
-/// proposal row `FOR UPDATE`, and writes the lazy expiry it finds due even when the act
-/// it was asked for is then refused.
+/// proposal row `FOR UPDATE`, and writes the lazy expiry or lapse it finds due even when
+/// the act it was asked for is then refused. Time is the STORE's, not a replica's: every
+/// deadline is compared on one clock however many replicas write.
 #[async_trait]
 pub trait ApprovalRepository: Send + Sync {
+	/// The store's clock now.
+	async fn now(&self) -> Result<i64, DomainError>;
+
 	/// Open a proposal: resolve its level, freeze the roster, refuse a second live one
 	/// about the same subject, answer an idempotent repeat with the stored proposal.
-	async fn propose(&self, new: NewApproval, now: i64) -> Result<Proposed, DomainError>;
+	async fn propose(&self, new: NewApproval) -> Result<Proposed, DomainError>;
 
 	async fn viewer(&self, user: UserId) -> Result<ApprovalViewer, DomainError>;
 
 	async fn find(&self, id: Uuid) -> Result<Option<ApprovalRecord>, DomainError>;
 
 	/// Newest first, under `viewer`'s visibility.
-	async fn list(&self, viewer: &ApprovalViewer, filter: &ApprovalFilter, now: i64) -> Result<Vec<ApprovalRecord>, DomainError>;
+	async fn list(&self, viewer: &ApprovalViewer, filter: &ApprovalFilter) -> Result<Vec<ApprovalRecord>, DomainError>;
 
 	/// A roster member's vote; refused when they no longer hold the seat the roster was
 	/// drawn from.
-	async fn vote(&self, id: Uuid, voter: UserId, vote: ApprovalVote, now: i64) -> Result<ApprovalRecord, DomainError>;
+	async fn vote(&self, id: Uuid, voter: UserId, vote: ApprovalVote) -> Result<ApprovalRecord, DomainError>;
 
-	async fn veto(&self, id: Uuid, by: UserId, reason: &str, now: i64) -> Result<ApprovalRecord, DomainError>;
+	/// A roster member who still holds the seat, or any persisted owner.
+	async fn veto(&self, id: Uuid, by: UserId, reason: &str) -> Result<ApprovalRecord, DomainError>;
 
 	/// `proposer`'s own proposal only; any other is `NotFound`.
-	async fn withdraw(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, reason: &str, now: i64) -> Result<ApprovalRecord, DomainError>;
+	async fn withdraw(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, reason: &str) -> Result<ApprovalRecord, DomainError>;
 
-	/// `proposer`'s passed proposals past their delay, oldest `executable_at` first.
-	async fn pull(&self, proposer: &str, limit: i64, now: i64) -> Result<Vec<ApprovalRecord>, DomainError>;
+	/// `proposer`'s passed proposals inside their execution window, oldest
+	/// `executable_at` first.
+	async fn pull(&self, proposer: &str, limit: i64) -> Result<Vec<ApprovalRecord>, DomainError>;
 
 	/// `proposer`'s own proposal only; any other is `NotFound`. A repeated outcome
 	/// writes nothing.
-	async fn report(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, outcome: Outcome, detail: &str, now: i64) -> Result<ApprovalRecord, DomainError>;
+	async fn report(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, outcome: Outcome, detail: &str) -> Result<ApprovalRecord, DomainError>;
 
 	/// The policy scope `scope` is measured against; `None` for an unknown scope.
 	async fn policy(&self, scope: &str) -> Result<Option<ScopePolicy>, DomainError>;

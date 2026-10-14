@@ -661,17 +661,21 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   them: a `typ=service` token names no namespace to check against.
 - **An approval is decided by a roster frozen at open and executed only by the namespace
   that proposed it** (`approvals`, `docs/SCOPES-AND-APPROVALS.md` §5). A kind's namespace
-  alone proposes, pulls and reports on it; another namespace's proposal answers exactly as
-  an unknown id. The level, the escalations and the roster are decided in the opening
-  transaction, and opens are serialised per (kind, scope) by an advisory lock because the
-  rolling 24h limit sums LIVE proposals too — without the lock a batch opened together
-  passes under a limit it exceeds. Nobody is excluded from the roster (`requested_by` is
-  what a service says, not a proof); what keeps one person from acting alone is the
-  threshold over the whole roster, `sole_admin` escalation and the two-owner floor. A
-  member who lost the seat after open keeps their place and loses the vote, so a removal
-  contains at once without lowering the bar. Expiry is lazy, executability is a time
-  predicate over `passed`, and nothing sweeps; every transition writes its
-  `approval_events` row in the same transaction.
+  alone proposes, pulls and reports on it, a relying party in its own scope only (the
+  bridge in any); another namespace's proposal answers exactly as an unknown id, and a
+  service never reads the deciders' emails or subjects. The level, the escalations and the
+  roster are decided in the opening transaction, opens are serialised per proposer
+  namespace by an advisory lock (the rolling 24h limit sums LIVE proposals and executions
+  of the last day; a namespace holds at most 200 live), and every instant is the
+  database's `now()`, never a replica's. Nobody is excluded from the roster
+  (`requested_by` is what a service says, not a proof); what keeps one person from acting
+  alone is the threshold over the whole roster, `sole_admin` escalation, the two-owner
+  floor — and that `<ns>:admin`, the scope roster, is granted only by a persisted owner and
+  never delegated (`GrantPermission`, `Catalog::check`). A member who lost the seat after
+  open keeps their place and loses the vote; any owner vetoes any proposal inside its
+  delay. Expiry, executability and the 72 h lapse to `void` are time predicates and
+  nothing sweeps; every transition writes its `approval_events` row in the same
+  transaction.
 - **Each direction has its own inbox, and the server picks it (D21).** The notification
   routes (`/auth/notifications/settings*`) resolve `notification::InboxView` from the
   `Origin`: `PUBLIC_ORIGIN` or none → the platform inbox (built-in topics and `bank:*`), a

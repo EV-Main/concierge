@@ -7,15 +7,30 @@
 //! the expiry and commits it even when the act it was asked for is then refused: the
 //! expiry is a fact, and the refusal is about it.
 //!
-//! Opening is serialised per (kind, scope) by a transaction-scoped advisory lock: the
-//! rolling 24h window sums every live proposal of the pair, and two proposals opened
-//! side by side must see each other or a batch passes under a limit it exceeds together.
+//! Opening is serialised per proposer namespace by a transaction-scoped advisory lock: the
+//! rolling 24h window sums every live proposal of a (kind, scope) and the live cap counts
+//! the namespace's, and two proposals opened side by side must see each other or a batch
+//! passes under a limit it exceeds together. A kind belongs to one namespace, so the one
+//! lock covers both. Locks are then taken in the plane's order: `users` (the owner roster,
+//! `FOR SHARE`) before `tenants`.
+//!
+//! Every instant is the DATABASE's (`now()` of the transaction), never a replica's clock:
+//! deadlines decided by several replicas must be decided on one clock.
 
-use std::collections::HashMap;
+use std::{
+	collections::HashMap,
+	sync::{
+		Arc,
+		atomic::{AtomicI64, Ordering},
+	},
+};
 
 use async_trait::async_trait;
 use domain::{
-	approvals::{self, Decision, Field, FieldValue, MAX_TTL_SECS, Outcome, PLATFORM_DELAY_SECS, PLATFORM_MIN_ROSTER, PLATFORM_QUORUM_BPS, ROLLING_WINDOW_SECS, ScopePolicy, Vote, Voter},
+	approvals::{
+		self, Decision, EXECUTION_WINDOW_SECS, Field, FieldValue, MAX_LIVE_PER_PROPOSER, MAX_TTL_SECS, Outcome, PLATFORM_DELAY_SECS, PLATFORM_MIN_ROSTER, PLATFORM_QUORUM_BPS,
+		ROLLING_WINDOW_SECS, ScopePolicy, Vote, Voter,
+	},
 	error::DomainError,
 	scope_catalog::ApprovalLevel,
 	scopes::{ROOT, ScopeState},
@@ -65,7 +80,7 @@ async fn advisory_lock(conn: &mut PgConnection, key: &str) -> Result<(), DomainE
 }
 
 /// Rows of `COLUMNS` as records, with their rosters read in one query.
-async fn records_of(conn: &mut PgConnection, rows: Vec<PgRow>) -> Result<Vec<ApprovalRecord>, DomainError> {
+async fn records_of(conn: &mut PgConnection, rows: Vec<PgRow>, as_of: i64) -> Result<Vec<ApprovalRecord>, DomainError> {
 	let ids: Vec<Uuid> = rows.iter().map(|r| r.try_get("id")).collect::<Result<_, _>>().map_err(repo_err)?;
 	let voter_rows = sqlx::query(
 		"SELECT v.approval_id, v.user_id, v.vote, v.voted_at, u.auth_subject, u.email FROM approval_voters v JOIN users u ON u.id = v.user_id \
@@ -93,7 +108,7 @@ async fn records_of(conn: &mut PgConnection, rows: Vec<PgRow>) -> Result<Vec<App
 		.map(|row| {
 			let id: Uuid = row.try_get("id").map_err(repo_err)?;
 			let (voters, people): (Vec<Voter>, Vec<ApprovalPerson>) = rosters.remove(&id).unwrap_or_default().into_iter().unzip();
-			record_of(row, voters, people)
+			record_of(row, voters, people, as_of)
 		})
 		.collect()
 }
@@ -107,7 +122,7 @@ fn person(row: &PgRow, subject: &str, email: &str) -> Result<Option<ApprovalPers
 	}))
 }
 
-fn record_of(row: &PgRow, voters: Vec<Voter>, people: Vec<ApprovalPerson>) -> Result<ApprovalRecord, DomainError> {
+fn record_of(row: &PgRow, voters: Vec<Voter>, people: Vec<ApprovalPerson>, as_of: i64) -> Result<ApprovalRecord, DomainError> {
 	let get_i64 = |column: &str| row.try_get::<i64, _>(column).map_err(repo_err);
 	let get_opt = |column: &str| row.try_get::<Option<i64>, _>(column).map_err(repo_err);
 	let fields: Vec<Field> = serde_json::from_value(row.try_get("fields").map_err(repo_err)?).map_err(|e| DomainError::Repository(format!("stored approval fields are unreadable: {e}")))?;
@@ -134,6 +149,7 @@ fn record_of(row: &PgRow, voters: Vec<Voter>, people: Vec<ApprovalPerson>) -> Re
 		policy_version: unsigned(get_i64("policy_version")?, "policy_version")?,
 		created_at: get_i64("created_at")?,
 		requested_by_client: row.try_get("requested_by_client").map_err(repo_err)?,
+		as_of,
 		decision: Decision {
 			state: approvals::ApprovalState::parse(row.try_get("state").map_err(repo_err)?)?,
 			threshold,
@@ -154,7 +170,7 @@ fn record_of(row: &PgRow, voters: Vec<Voter>, people: Vec<ApprovalPerson>) -> Re
 	})
 }
 
-async fn load(conn: &mut PgConnection, id: Uuid, for_update: bool) -> Result<Option<ApprovalRecord>, DomainError> {
+async fn load(conn: &mut PgConnection, id: Uuid, for_update: bool, as_of: i64) -> Result<Option<ApprovalRecord>, DomainError> {
 	let lock = if for_update { " FOR UPDATE OF a" } else { "" };
 	let row = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {COLUMNS}{FROM} WHERE a.id = $1{lock}")))
 		.bind(id)
@@ -162,7 +178,7 @@ async fn load(conn: &mut PgConnection, id: Uuid, for_update: bool) -> Result<Opt
 		.await
 		.map_err(repo_err)?;
 	let Some(row) = row else { return Ok(None) };
-	Ok(records_of(conn, vec![row]).await?.pop())
+	Ok(records_of(conn, vec![row], as_of).await?.pop())
 }
 
 fn not_found(id: Uuid) -> DomainError {
@@ -209,9 +225,9 @@ async fn persist(conn: &mut PgConnection, id: Uuid, decision: &mut Decision, act
 async fn write_events(conn: &mut PgConnection, id: Uuid, decision: &mut Decision, actor: Option<ApprovalActor<'_>>, detail: &serde_json::Value, now: i64) -> Result<(), DomainError> {
 	let version = i64::try_from(decision.version).map_err(|_| DomainError::Repository("approval version overflows".into()))?;
 	for event in std::mem::take(&mut decision.pending) {
-		// Nobody performs a lapse: the expiry is written by whichever act found it due.
+		// Nobody performs an expiry or a lapse: it is written by whichever act found it due.
 		let (person, client, detail) = match (event, actor) {
-			(approvals::ApprovalEvent::Expired, _) | (_, None) => (None, String::new(), serde_json::json!({})),
+			(approvals::ApprovalEvent::Expired | approvals::ApprovalEvent::Lapsed, _) | (_, None) => (None, String::new(), serde_json::json!({})),
 			(_, Some(ApprovalActor::Person(user))) => (Some(user.raw()), String::new(), detail.clone()),
 			(_, Some(ApprovalActor::Service(client))) => (None, client.to_owned(), detail.clone()),
 		};
@@ -248,7 +264,7 @@ async fn finish(
 		persist(&mut tx, record.id, &mut record.decision, Some(actor), &detail, now).await?;
 		result
 	};
-	let stored = load(&mut tx, record.id, false).await?.ok_or_else(|| not_found(record.id))?;
+	let stored = load(&mut tx, record.id, false, now).await?.ok_or_else(|| not_found(record.id))?;
 	tx.commit().await.map_err(repo_err)?;
 	result.map(|()| stored)
 }
@@ -299,27 +315,66 @@ async fn user_by_subject(conn: &mut PgConnection, subject: &str) -> Result<Optio
 		.map_err(repo_err)
 }
 
+/// A persisted, active owner: the seat that vetoes anything (decided) and sees everything.
+async fn is_owner(conn: &mut PgConnection, user: UserId) -> Result<bool, DomainError> {
+	sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND role = 'owner' AND status = 'active')")
+		.bind(user.raw())
+		.fetch_one(conn)
+		.await
+		.map_err(repo_err)
+}
+
+/// Where instants come from: the database's clock, or — for a suite that has to cross a
+/// 72-hour deadline without waiting for it — a value the suite moves.
+#[derive(Clone)]
+enum Clock {
+	Database,
+	Fixed(Arc<AtomicI64>),
+}
+
 pub struct PgApprovals {
 	pool: PgPool,
+	clock: Clock,
 }
 
 impl PgApprovals {
 	pub fn new(pool: PgPool) -> Self {
-		Self { pool }
+		Self { pool, clock: Clock::Database }
 	}
 
-	async fn begin_locked(&self, id: Uuid) -> Result<(sqlx::Transaction<'_, sqlx::Postgres>, ApprovalRecord), DomainError> {
+	/// Every instant read from `now` instead of the database. For suites only.
+	pub fn with_fixed_time(pool: PgPool, now: Arc<AtomicI64>) -> Self {
+		Self { pool, clock: Clock::Fixed(now) }
+	}
+
+	/// The instant on `conn`: inside a transaction, the transaction's own `now()`, so every
+	/// comparison it makes is against one value.
+	async fn instant(&self, conn: &mut PgConnection) -> Result<i64, DomainError> {
+		match &self.clock {
+			Clock::Database => sqlx::query_scalar("SELECT extract(epoch FROM now())::BIGINT").fetch_one(conn).await.map_err(repo_err),
+			Clock::Fixed(now) => Ok(now.load(Ordering::SeqCst)),
+		}
+	}
+
+	async fn begin_locked(&self, id: Uuid) -> Result<(sqlx::Transaction<'_, sqlx::Postgres>, ApprovalRecord, i64), DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		let record = load(&mut tx, id, true).await?.ok_or_else(|| not_found(id))?;
-		Ok((tx, record))
+		let now = self.instant(&mut tx).await?;
+		let record = load(&mut tx, id, true, now).await?.ok_or_else(|| not_found(id))?;
+		Ok((tx, record, now))
 	}
 }
 
 #[async_trait]
 impl ApprovalRepository for PgApprovals {
-	async fn propose(&self, new: NewApproval, now: i64) -> Result<Proposed, DomainError> {
+	async fn now(&self) -> Result<i64, DomainError> {
+		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+		self.instant(&mut conn).await
+	}
+
+	async fn propose(&self, new: NewApproval) -> Result<Proposed, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		advisory_lock(&mut tx, &format!("approval_dedupe:{}:{}", new.proposer, new.dedupe_key)).await?;
+		let now = self.instant(&mut tx).await?;
+		advisory_lock(&mut tx, &format!("approval_proposer:{}", new.proposer)).await?;
 		let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM approvals WHERE proposer = $1 AND dedupe_key = $2")
 			.bind(&new.proposer)
 			.bind(&new.dedupe_key)
@@ -327,7 +382,7 @@ impl ApprovalRepository for PgApprovals {
 			.await
 			.map_err(repo_err)?;
 		if let Some(id) = existing {
-			let stored = load(&mut tx, id, false).await?.ok_or_else(|| not_found(id))?;
+			let stored = load(&mut tx, id, false, now).await?.ok_or_else(|| not_found(id))?;
 			let same = stored.kind == new.kind.name
 				&& stored.scope == new.scope
 				&& stored.subject_ref == new.subject_ref
@@ -340,8 +395,23 @@ impl ApprovalRepository for PgApprovals {
 				Err(DomainError::Conflict(format!("dedupe_key already names proposal {id}, with different content")))
 			};
 		}
-		advisory_lock(&mut tx, &format!("approval_window:{}:{}", new.kind.name, new.scope)).await?;
+		let live: i64 = sqlx::query_scalar(
+			"SELECT count(*) FROM approvals WHERE proposer = $1 \
+			 AND ((state = 'open' AND expires_at > $2) OR (state = 'passed' AND executable_at + $3 > $2))",
+		)
+		.bind(&new.proposer)
+		.bind(now)
+		.bind(EXECUTION_WINDOW_SECS)
+		.fetch_one(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+		if live >= MAX_LIVE_PER_PROPOSER {
+			return Ok(Proposed::Saturated);
+		}
 
+		// `users` before `tenants`, the plane's lock order, so the owner roster is read
+		// first even when this proposal ends up at the scope.
+		let owners = owners(&mut tx).await?;
 		let in_root = new.scope == ROOT;
 		let namespace = if in_root {
 			None
@@ -377,16 +447,20 @@ impl ApprovalRepository for PgApprovals {
 			}
 		}
 
-		let due: Option<Uuid> = sqlx::query_scalar("SELECT id FROM approvals WHERE kind = $1 AND scope = $2 AND subject_ref = $3 AND state = 'open' AND expires_at <= $4")
-			.bind(&new.kind.name)
-			.bind(&new.scope)
-			.bind(&new.subject_ref)
-			.bind(now)
-			.fetch_optional(&mut *tx)
-			.await
-			.map_err(repo_err)?;
+		let due: Option<Uuid> = sqlx::query_scalar(
+			"SELECT id FROM approvals WHERE kind = $1 AND scope = $2 AND subject_ref = $3 \
+			 AND ((state = 'open' AND expires_at <= $4) OR (state = 'passed' AND executable_at + $5 <= $4))",
+		)
+		.bind(&new.kind.name)
+		.bind(&new.scope)
+		.bind(&new.subject_ref)
+		.bind(now)
+		.bind(EXECUTION_WINDOW_SECS)
+		.fetch_optional(&mut *tx)
+		.await
+		.map_err(repo_err)?;
 		if let Some(id) = due {
-			let mut stale = load(&mut tx, id, true).await?.ok_or_else(|| not_found(id))?;
+			let mut stale = load(&mut tx, id, true, now).await?.ok_or_else(|| not_found(id))?;
 			if stale.decision.expire_if_due(now) {
 				persist(&mut tx, id, &mut stale.decision, None, &serde_json::json!({}), now).await?;
 			}
@@ -412,13 +486,16 @@ impl ApprovalRepository for PgApprovals {
 		let fired = match &policy {
 			Some(policy) if new.kind.level == ApprovalLevel::Scope => {
 				let window: Vec<serde_json::Value> = sqlx::query_scalar(
-					"SELECT fields FROM approvals WHERE kind = $1 AND scope = $2 AND level = 'scope' AND created_at > $3 \
-					 AND (state IN ('passed', 'executed') OR (state = 'open' AND expires_at > $4))",
+					"SELECT fields FROM approvals WHERE kind = $1 AND scope = $2 AND level = 'scope' \
+					 AND ((state = 'open' AND expires_at > $3) \
+					      OR (state = 'passed' AND executable_at + $4 > $3) \
+					      OR (state = 'executed' AND decided_at > $3 - $5))",
 				)
 				.bind(&new.kind.name)
 				.bind(&new.scope)
-				.bind(now - ROLLING_WINDOW_SECS)
 				.bind(now)
+				.bind(EXECUTION_WINDOW_SECS)
+				.bind(ROLLING_WINDOW_SECS)
 				.fetch_all(&mut *tx)
 				.await
 				.map_err(repo_err)?;
@@ -435,7 +512,7 @@ impl ApprovalRepository for PgApprovals {
 		let policy_version = policy.as_ref().map_or(0, |p| p.version);
 		let (roster, quorum_bps, delay_secs, ttl_secs) = match (resolution.level, &policy) {
 			(ApprovalLevel::Scope, Some(policy)) => (admins, policy.quorum_bps, policy.delay_secs, policy.ttl_secs.min(MAX_TTL_SECS)),
-			(ApprovalLevel::Platform, _) | (ApprovalLevel::Scope, None) => (owners(&mut tx).await?, PLATFORM_QUORUM_BPS, PLATFORM_DELAY_SECS, MAX_TTL_SECS),
+			(ApprovalLevel::Platform, _) | (ApprovalLevel::Scope, None) => (owners, PLATFORM_QUORUM_BPS, PLATFORM_DELAY_SECS, MAX_TTL_SECS),
 		};
 		if resolution.level == ApprovalLevel::Platform && roster.len() < PLATFORM_MIN_ROSTER {
 			return Err(DomainError::Precondition(format!(
@@ -495,18 +572,14 @@ impl ApprovalRepository for PgApprovals {
 			"dedupe_key": new.dedupe_key,
 		});
 		write_events(&mut tx, new.id, &mut decision, Some(ApprovalActor::Service(actor_client)), &detail, now).await?;
-		let stored = load(&mut tx, new.id, false).await?.ok_or_else(|| not_found(new.id))?;
+		let stored = load(&mut tx, new.id, false, now).await?.ok_or_else(|| not_found(new.id))?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(Proposed::Opened(stored))
 	}
 
 	async fn viewer(&self, user: UserId) -> Result<ApprovalViewer, DomainError> {
 		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
-		let owner: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND role = 'owner')")
-			.bind(user.raw())
-			.fetch_one(&mut *conn)
-			.await
-			.map_err(repo_err)?;
+		let owner = is_owner(&mut conn, user).await?;
 		let admin_of: Vec<String> = sqlx::query_scalar(
 			"SELECT DISTINCT t.id FROM grants g JOIN tenants t ON t.namespace = g.namespace \
 			 WHERE g.user_id = $1 AND g.revoked_at IS NULL AND g.target = g.namespace || ':admin' ORDER BY t.id",
@@ -520,17 +593,24 @@ impl ApprovalRepository for PgApprovals {
 
 	async fn find(&self, id: Uuid) -> Result<Option<ApprovalRecord>, DomainError> {
 		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
-		load(&mut conn, id, false).await
+		let now = self.instant(&mut conn).await?;
+		load(&mut conn, id, false, now).await
 	}
 
-	async fn list(&self, viewer: &ApprovalViewer, filter: &ApprovalFilter, now: i64) -> Result<Vec<ApprovalRecord>, DomainError> {
+	async fn list(&self, viewer: &ApprovalViewer, filter: &ApprovalFilter) -> Result<Vec<ApprovalRecord>, DomainError> {
 		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+		let now = self.instant(&mut conn).await?;
+		// "Awaiting my vote" asks only what the vote would accept: a member who lost the
+		// seat the roster was drawn from is refused it, so is not asked for it either.
 		let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
 			"SELECT {COLUMNS}{FROM} WHERE \
 			 ($1 OR a.scope = ANY($2) OR a.requested_by = $3 OR EXISTS (SELECT 1 FROM approval_voters v WHERE v.approval_id = a.id AND v.user_id = $3)) \
 			 AND ($4::text IS NULL OR a.scope = $4) \
-			 AND ($5::text IS NULL OR (CASE WHEN a.state = 'open' AND a.expires_at <= $6 THEN 'expired' ELSE a.state END) = $5) \
+			 AND ($5::text IS NULL OR (CASE WHEN a.state = 'open' AND a.expires_at <= $6 THEN 'expired' \
+			                               WHEN a.state = 'passed' AND a.executable_at + $11 <= $6 THEN 'void' \
+			                               ELSE a.state END) = $5) \
 			 AND (NOT $7 OR (a.state = 'open' AND a.expires_at > $6 \
+			      AND ((a.level = 'platform' AND $1) OR (a.level = 'scope' AND a.scope = ANY($2))) \
 			      AND EXISTS (SELECT 1 FROM approval_voters v WHERE v.approval_id = a.id AND v.user_id = $3 AND v.vote = 'pending'))) \
 			 AND ($8::bigint IS NULL OR (a.created_at, a.id) < ($8, $9::uuid)) \
 			 ORDER BY a.created_at DESC, a.id DESC LIMIT $10"
@@ -545,14 +625,15 @@ impl ApprovalRepository for PgApprovals {
 		.bind(filter.before.map(|(at, _)| at))
 		.bind(filter.before.map(|(_, id)| id))
 		.bind(filter.limit)
+		.bind(EXECUTION_WINDOW_SECS)
 		.fetch_all(&mut *conn)
 		.await
 		.map_err(repo_err)?;
-		records_of(&mut conn, rows).await
+		records_of(&mut conn, rows, now).await
 	}
 
-	async fn vote(&self, id: Uuid, voter: UserId, vote: Vote, now: i64) -> Result<ApprovalRecord, DomainError> {
-		let (mut tx, mut record) = self.begin_locked(id).await?;
+	async fn vote(&self, id: Uuid, voter: UserId, vote: Vote) -> Result<ApprovalRecord, DomainError> {
+		let (mut tx, mut record, now) = self.begin_locked(id).await?;
 		record.decision.expire_if_due(now);
 		let result = if record.decision.is_voter(voter) && record.decision.state.is_live() && !holds_seat(&mut tx, &record, voter).await? {
 			Err(DomainError::Forbidden("you no longer hold the seat this roster was drawn from".into()))
@@ -562,19 +643,20 @@ impl ApprovalRepository for PgApprovals {
 		finish(tx, record, result, ApprovalActor::Person(voter), serde_json::json!({ "vote": vote.as_str() }), now).await
 	}
 
-	async fn veto(&self, id: Uuid, by: UserId, reason: &str, now: i64) -> Result<ApprovalRecord, DomainError> {
-		let (mut tx, mut record) = self.begin_locked(id).await?;
+	async fn veto(&self, id: Uuid, by: UserId, reason: &str) -> Result<ApprovalRecord, DomainError> {
+		let (mut tx, mut record, now) = self.begin_locked(id).await?;
 		record.decision.expire_if_due(now);
-		let result = if record.decision.is_voter(by) && record.decision.state.is_live() && !holds_seat(&mut tx, &record, by).await? {
+		let owner = is_owner(&mut tx, by).await?;
+		let result = if !owner && record.decision.is_voter(by) && record.decision.state.is_live() && !holds_seat(&mut tx, &record, by).await? {
 			Err(DomainError::Forbidden("you no longer hold the seat this roster was drawn from".into()))
 		} else {
-			record.decision.veto(by, reason, now)
+			record.decision.veto(by, owner, reason, now)
 		};
-		finish(tx, record, result, ApprovalActor::Person(by), serde_json::json!({ "reason": reason }), now).await
+		finish(tx, record, result, ApprovalActor::Person(by), serde_json::json!({ "reason": reason, "as_owner": owner }), now).await
 	}
 
-	async fn withdraw(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, reason: &str, now: i64) -> Result<ApprovalRecord, DomainError> {
-		let (tx, mut record) = self.begin_locked(id).await?;
+	async fn withdraw(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, reason: &str) -> Result<ApprovalRecord, DomainError> {
+		let (tx, mut record, now) = self.begin_locked(id).await?;
 		if record.proposer != proposer {
 			return Err(not_found(id));
 		}
@@ -583,22 +665,25 @@ impl ApprovalRepository for PgApprovals {
 		finish(tx, record, result, actor, serde_json::json!({ "reason": reason }), now).await
 	}
 
-	async fn pull(&self, proposer: &str, limit: i64, now: i64) -> Result<Vec<ApprovalRecord>, DomainError> {
+	async fn pull(&self, proposer: &str, limit: i64) -> Result<Vec<ApprovalRecord>, DomainError> {
 		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+		let now = self.instant(&mut conn).await?;
 		let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-			"SELECT {COLUMNS}{FROM} WHERE a.proposer = $1 AND a.state = 'passed' AND a.executable_at <= $2 ORDER BY a.executable_at, a.id LIMIT $3"
+			"SELECT {COLUMNS}{FROM} WHERE a.proposer = $1 AND a.state = 'passed' AND a.executable_at <= $2 AND a.executable_at + $4 > $2 \
+			 ORDER BY a.executable_at, a.id LIMIT $3"
 		)))
 		.bind(proposer)
 		.bind(now)
 		.bind(limit)
+		.bind(EXECUTION_WINDOW_SECS)
 		.fetch_all(&mut *conn)
 		.await
 		.map_err(repo_err)?;
-		records_of(&mut conn, rows).await
+		records_of(&mut conn, rows, now).await
 	}
 
-	async fn report(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, outcome: Outcome, detail: &str, now: i64) -> Result<ApprovalRecord, DomainError> {
-		let (tx, mut record) = self.begin_locked(id).await?;
+	async fn report(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, outcome: Outcome, detail: &str) -> Result<ApprovalRecord, DomainError> {
+		let (tx, mut record, now) = self.begin_locked(id).await?;
 		if record.proposer != proposer {
 			return Err(not_found(id));
 		}

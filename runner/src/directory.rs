@@ -591,6 +591,10 @@ impl UserDirectory for Directory {
 				grant: Some(permission_grant_to_proto(grant, false)),
 			})),
 			GrantOutcome::Denied => Err(grant_denied(&actor, "grant", target.as_str())),
+			GrantOutcome::OwnersOnly => Err(Status::permission_denied(format!(
+				"`{}` seats its holder on the scope's approval roster: only a platform owner grants it",
+				target.as_str()
+			))),
 			// The rule `HoldUser` and `SetKycLevel` carry: nobody acts on their own account.
 			GrantOutcome::ToSelf => Err(Status::permission_denied("nobody grants to their own account")),
 			GrantOutcome::UnknownTenant => Err(Status::invalid_argument(format!("no tenant owns the `{}` namespace", target.namespace()))),

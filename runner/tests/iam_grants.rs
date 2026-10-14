@@ -158,9 +158,10 @@ impl Fixture {
 		id
 	}
 
-	/// A holder of the tenant's `admin` alias, granted by a seat.
+	/// A holder of the tenant's `admin` alias, granted by an owner: the alias is the
+	/// scope's approval roster and no other seat grants it.
 	async fn delegate(&self) -> UserId {
-		let seat = self.seated("seat", Role::Admin).await;
+		let seat = self.seated("owner", Role::Owner).await;
 		let delegate = self.user("delegate").await;
 		self.grant(seat, delegate, &self.p("admin")).await.unwrap();
 		delegate
@@ -584,6 +585,47 @@ async fn the_write_decides_from_the_actors_persisted_standing() {
 	let elevated = fx.user("elevated").await;
 	let outcome = grants.grant(&member, &operator, &actor(elevated, Role::Owner, true), &action(elevated), 0).await.unwrap();
 	assert!(matches!(outcome, GrantOutcome::Granted(_)), "break-glass elevation still counts inside the transaction");
+}
+
+/// `<ns>:admin` is the scope's approval roster (`docs/SCOPES-AND-APPROVALS.md` §5.6): one
+/// `admin` seat granting it to accounts it controls would pass the scope's quorum with no
+/// owner asked. Only a persisted owner grants it; emergency access seats nobody.
+#[tokio::test]
+async fn only_a_persisted_owner_grants_the_admin_alias() {
+	let Some(fx) = setup().await else { return };
+	let admin = fx.seated("admin", Role::Admin).await;
+	let member = fx.user("member").await;
+	let refused = fx.grant(admin, member, &fx.p("admin")).await.unwrap_err();
+	assert_eq!(refused.code(), Code::PermissionDenied);
+	assert!(refused.message().contains("only a platform owner"), "{}", refused.message());
+	assert!(fx.active_grants(member).await.is_empty());
+	fx.grant(admin, member, &fx.p("operator")).await.expect("other targets stay the seat's");
+
+	let grants = PgGrants::new(fx.pool.clone());
+	let elevated = fx.user("elevated").await;
+	let outcome = grants
+		.grant(
+			&GrantSubject::Id(member),
+			&Target::parse(&fx.p("admin")).unwrap(),
+			&GrantActor {
+				id: elevated,
+				role: Role::Owner,
+				elevated: true,
+			},
+			&AdminAction {
+				actor: Some(elevated),
+				action: "permission_granted",
+				..AdminAction::default()
+			},
+			0,
+		)
+		.await
+		.unwrap();
+	assert!(matches!(outcome, GrantOutcome::OwnersOnly), "break-glass elevation is no persisted seat");
+
+	let owner = fx.seated("owner", Role::Owner).await;
+	fx.grant(owner, member, &fx.p("admin")).await.expect("an owner grants it");
+	fx.revoke(admin, member, &fx.p("admin")).await.expect("taking it away stays one act of any granting seat");
 }
 
 #[tokio::test]

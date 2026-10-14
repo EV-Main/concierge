@@ -17,8 +17,9 @@
 -- The writer checks the scope against the registry inside the opening transaction.
 --
 -- WHY NO `executable` STATE: a passed proposal becomes pullable when the clock passes
--- `executable_at`, and an open one expires when it passes `expires_at`; both are read as
--- predicates, so nothing has to sweep for either to take effect (the consilia's rule).
+-- `executable_at` and lapses to `void` 72 hours later, and an open one expires when it
+-- passes `expires_at`; all three are read as predicates, so nothing has to sweep for any
+-- of them to take effect (the consilia's rule). Instants are the database's `now()`.
 --
 -- Domain time is BIGINT unix seconds, supplied by the application, as everywhere here.
 --
@@ -98,8 +99,12 @@ CREATE UNIQUE INDEX approvals_live_subject_idx ON approvals (kind, scope, subjec
 CREATE UNIQUE INDEX approvals_dedupe_idx ON approvals (proposer, dedupe_key);
 -- `PullApproved`: oldest executable first.
 CREATE INDEX approvals_pull_idx ON approvals (proposer, executable_at) WHERE state = 'passed';
--- The rolling 24h window a scope-level escalation sums over.
-CREATE INDEX approvals_window_idx ON approvals (kind, scope, created_at) WHERE level = 'scope';
+-- The rolling 24h window a scope-level escalation sums over: every LIVE proposal of the
+-- (kind, scope) however old, and the ones EXECUTED in the last day — by when the money moved,
+-- not when the proposal was opened.
+CREATE INDEX approvals_window_idx ON approvals (kind, scope, decided_at) WHERE level = 'scope' AND state IN ('open', 'passed', 'executed');
+-- The live cap per proposer namespace.
+CREATE INDEX approvals_live_idx ON approvals (proposer) WHERE state IN ('open', 'passed');
 -- `ListApprovals`: newest first.
 CREATE INDEX approvals_recent_idx ON approvals (created_at DESC, id DESC);
 CREATE INDEX approvals_requested_by_idx ON approvals (requested_by) WHERE requested_by IS NOT NULL;
@@ -129,7 +134,7 @@ CREATE TABLE approval_events (
     version        BIGINT NOT NULL,
     detail         JSONB NOT NULL DEFAULT '{}',
     at             BIGINT NOT NULL,
-    CONSTRAINT approval_events_event CHECK (event IN ('opened', 'voted', 'passed', 'rejected', 'vetoed', 'expired', 'withdrawn', 'executed', 'execution_failed', 'voided')),
+    CONSTRAINT approval_events_event CHECK (event IN ('opened', 'voted', 'passed', 'rejected', 'vetoed', 'expired', 'withdrawn', 'executed', 'execution_failed', 'voided', 'lapsed')),
     CONSTRAINT approval_events_one_actor CHECK (actor_user_id IS NULL OR actor_client = '')
 );
 

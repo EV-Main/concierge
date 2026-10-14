@@ -163,6 +163,11 @@ impl ApprovalKind {
 			if field.field_type != escalation.test.tests() {
 				return Err(format!("approval kind `{name}` escalation `{parameter}` tests a field of the wrong type"));
 			}
+			// A test over a field the proposer may leave out is a test the proposer may
+			// switch off, and an absent field escalates nothing.
+			if !field.required {
+				return Err(format!("approval kind `{name}` escalation `{parameter}` tests an optional field"));
+			}
 			let threshold = &escalation.default_threshold;
 			let shaped = match escalation.test {
 				EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => is_canonical_amount(threshold) && is_currency(&escalation.currency),
@@ -232,13 +237,18 @@ fn is_unsigned_integer(raw: &str) -> bool {
 	raw == "0" || (!raw.is_empty() && !raw.starts_with('0') && raw.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// `0|[1-9][0-9]*`, then optionally `.` and at most 18 digits not ending in `0` — the
+/// Whole digits an amount may carry: beyond any real sum, and a bound on what one field
+/// costs to store, hash and add up in the rolling window.
+const AMOUNT_WHOLE_DIGITS: usize = 30;
+
+/// `0|[1-9][0-9]{0,29}`, then optionally `.` and at most 18 digits not ending in `0` — the
 /// spelling `ApprovalAmount` requires, so a threshold compares with the amounts it tests.
 pub(crate) fn is_canonical_amount(raw: &str) -> bool {
-	match raw.split_once('.') {
-		None => is_unsigned_integer(raw),
-		Some((whole, fraction)) => is_unsigned_integer(whole) && (1..=18).contains(&fraction.len()) && fraction.bytes().all(|b| b.is_ascii_digit()) && !fraction.ends_with('0'),
-	}
+	let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+	let fraction_ok = raw
+		.contains('.')
+		.then(|| (1..=18).contains(&fraction.len()) && fraction.bytes().all(|b| b.is_ascii_digit()) && !fraction.ends_with('0'));
+	is_unsigned_integer(whole) && whole.len() <= AMOUNT_WHOLE_DIGITS && fraction_ok.unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -329,6 +339,23 @@ mod tests {
 		let mut kind = amount_kind();
 		kind.escalations[0].default_threshold = "1000.5".into();
 		assert_eq!(catalog(vec![kind], vec![]).check("bank", &[]), Ok(()));
+	}
+
+	#[test]
+	fn an_escalation_tests_a_required_field() {
+		let mut kind = amount_kind();
+		kind.fields[1].required = false;
+		assert!(
+			catalog(vec![kind], vec![]).check("bank", &[]).is_err(),
+			"an escalation over a field a proposer may leave out is one it may switch off"
+		);
+	}
+
+	#[test]
+	fn an_amount_has_at_most_thirty_whole_digits() {
+		assert!(is_canonical_amount(&"9".repeat(30)));
+		assert!(is_canonical_amount(&format!("{}.5", "9".repeat(30))));
+		assert!(!is_canonical_amount(&"9".repeat(31)));
 	}
 
 	#[test]

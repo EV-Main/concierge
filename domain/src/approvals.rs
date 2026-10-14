@@ -41,6 +41,15 @@ pub const SCOPE_MIN_ADMINS: usize = 2;
 pub const SOLE_ADMIN: &str = "sole_admin";
 /// `ESCALATION_TEST_ROLLING_24H_AMOUNT_ABOVE`'s window.
 pub const ROLLING_WINDOW_SECS: i64 = 24 * 60 * 60;
+/// How long a passed decision stays executable after its veto delay. Past it the decision
+/// lapses to VOID: a stale approval must not be carried out weeks later against a subject
+/// that has moved on (decided).
+pub const EXECUTION_WINDOW_SECS: i64 = 72 * 60 * 60;
+/// At most this many live proposals per proposer namespace: one leaked credential must
+/// not be able to bury the deciders.
+pub const MAX_LIVE_PER_PROPOSER: i64 = 200;
+/// What `void_reason` says of a decision nobody executed in time.
+pub const LAPSED: &str = "not executed within 72 hours of becoming executable";
 
 pub const DEFAULT_SCOPE_QUORUM_BPS: u32 = 5001;
 pub const DEFAULT_SCOPE_DELAY_SECS: u32 = 60 * 60;
@@ -289,10 +298,12 @@ pub fn amount_sum(a: &str, b: &str) -> String {
 }
 
 /// The escalation parameters of `kind` that fire for these fields under `policy`.
-/// `window` holds the fields of every LIVE or EXECUTED scope-level proposal of the same
-/// kind and scope opened in the trailing [`ROLLING_WINDOW_SECS`] (§5.2, decided): counting
-/// only executed ones would let a batch opened together each pass under the limit and
-/// then execute together above it.
+/// `window` holds the fields of every scope-level proposal of the same kind and scope that
+/// is LIVE (open, or passed and not lapsed) whenever it was opened, or was EXECUTED in the
+/// trailing [`ROLLING_WINDOW_SECS`] (§5.2, decided). Counting only executed ones would let a
+/// batch opened together each pass under the limit and then execute together above it;
+/// counting by the opening instant would drop a live proposal from the window a day after
+/// it was opened, and an execution a day after its proposal rather than after the money moved.
 pub fn fired_escalations(kind: &ApprovalKind, fields: &[Field], policy: &ScopePolicy, window: &[Vec<Field>]) -> Vec<String> {
 	let value_of = |fields: &[Field], key: &str| fields.iter().find(|f| f.key == key).map(|f| f.value.clone());
 	kind.escalations
@@ -494,6 +505,8 @@ pub enum ApprovalEvent {
 	Executed,
 	ExecutionFailed,
 	Voided,
+	/// Passed and never executed within its execution window.
+	Lapsed,
 }
 
 impl ApprovalEvent {
@@ -509,6 +522,7 @@ impl ApprovalEvent {
 			Self::Executed => "executed",
 			Self::ExecutionFailed => "execution_failed",
 			Self::Voided => "voided",
+			Self::Lapsed => "lapsed",
 		}
 	}
 }
@@ -578,19 +592,36 @@ impl Decision {
 		}
 	}
 
-	/// The state a reader sees: an open proposal past its deadline reads as expired before
-	/// anything has written so.
+	/// When a passed decision lapses unexecuted.
+	pub fn execute_by(&self) -> Option<i64> {
+		self.executable_at.map(|at| at.saturating_add(EXECUTION_WINDOW_SECS))
+	}
+
+	/// The state a reader sees: an open proposal past its deadline reads as expired, and a
+	/// passed one past its execution window as void, before anything has written so.
 	pub fn effective_state(&self, now: i64) -> ApprovalState {
-		if self.state == ApprovalState::Open && now >= self.expires_at {
-			ApprovalState::Expired
-		} else {
-			self.state
+		match self.state {
+			ApprovalState::Open if now >= self.expires_at => ApprovalState::Expired,
+			ApprovalState::Passed if self.execute_by().is_some_and(|by| now >= by) => ApprovalState::Void,
+			state => state,
 		}
 	}
 
-	/// Passed, its veto window behind the clock, no outcome yet: what `PullApproved` serves.
+	/// When the effective state was reached: the stored instant, else the deadline a lazy
+	/// transition is projected from.
+	pub fn effective_decided_at(&self, now: i64) -> Option<i64> {
+		match (self.effective_state(now), self.decided_at) {
+			(_, Some(at)) => Some(at),
+			(ApprovalState::Expired, None) => Some(self.expires_at),
+			(ApprovalState::Void, None) => self.execute_by(),
+			(_, None) => None,
+		}
+	}
+
+	/// Passed, its veto window behind the clock and its execution window not, no outcome
+	/// yet: what `PullApproved` serves.
 	pub fn is_executable(&self, now: i64) -> bool {
-		self.state == ApprovalState::Passed && self.executable_at.is_some_and(|at| now >= at)
+		self.effective_state(now) == ApprovalState::Passed && self.executable_at.is_some_and(|at| now >= at)
 	}
 
 	/// Inside the window where a veto or a withdrawal still stops it.
@@ -619,13 +650,18 @@ impl Decision {
 		self.transition(event);
 	}
 
-	/// Writes the lazy expiry. True when it moved.
+	/// Writes the lazy expiry or lapse, dated at the deadline it passed. True when it moved.
 	pub fn expire_if_due(&mut self, now: i64) -> bool {
-		if self.effective_state(now) == ApprovalState::Expired && self.state == ApprovalState::Open {
-			self.close(ApprovalState::Expired, ApprovalEvent::Expired, now);
-			return true;
+		let Some(at) = self.effective_decided_at(now) else { return false };
+		match (self.state, self.effective_state(now)) {
+			(ApprovalState::Open, ApprovalState::Expired) => self.close(ApprovalState::Expired, ApprovalEvent::Expired, at),
+			(ApprovalState::Passed, ApprovalState::Void) => {
+				self.void_reason = LAPSED.to_owned();
+				self.close(ApprovalState::Void, ApprovalEvent::Lapsed, at);
+			}
+			_ => return false,
 		}
-		false
+		true
 	}
 
 	pub fn is_voter(&self, user: UserId) -> bool {
@@ -668,9 +704,11 @@ impl Decision {
 		Ok(())
 	}
 
-	/// One roster member stops it outright, while open or inside the delay.
-	pub fn veto(&mut self, by: UserId, reason: &str, now: i64) -> Result<(), DomainError> {
-		if !self.is_voter(by) {
+	/// One roster member stops it outright, while open or inside the delay — and so does
+	/// any platform owner, on any proposal: containment is never slower than the grant
+	/// (decided).
+	pub fn veto(&mut self, by: UserId, owner: bool, reason: &str, now: i64) -> Result<(), DomainError> {
+		if !owner && !self.is_voter(by) {
 			return Err(DomainError::Forbidden("you are not on this proposal's roster".into()));
 		}
 		if !self.stoppable(now) {
@@ -953,17 +991,36 @@ mod tests {
 		let roster = [uid(), uid()];
 		let outsider = uid();
 		let mut d = Decision::open(&roster, 2, 100, 1000);
-		assert!(matches!(d.veto(outsider, "no", 1), Err(DomainError::Forbidden(_))));
+		assert!(matches!(d.veto(outsider, false, "no", 1), Err(DomainError::Forbidden(_))));
 		d.vote(roster[0], Vote::For, 1).unwrap();
 		d.vote(roster[1], Vote::For, 2).unwrap();
 		let mut late = d.clone();
-		d.veto(roster[0], "changed my mind", 101).unwrap();
+		d.veto(roster[0], false, "changed my mind", 101).unwrap();
 		assert_eq!((d.state, d.vetoed_by), (ApprovalState::Vetoed, Some(roster[0])));
-		assert!(late.veto(roster[0], "too late", 102).is_err());
+		assert!(late.veto(roster[0], false, "too late", 102).is_err());
 		assert!(late.withdraw(102).is_err());
 		let mut early = Decision::open(&roster, 2, 100, 1000);
 		early.withdraw(5).unwrap();
 		assert_eq!(early.state, ApprovalState::Cancelled);
+		let mut owned = Decision::open(&roster, 2, 100, 1000);
+		owned.veto(outsider, true, "an owner off the roster", 5).unwrap();
+		assert_eq!(owned.state, ApprovalState::Vetoed);
+	}
+
+	#[test]
+	fn a_passed_decision_lapses_after_its_execution_window() {
+		let roster = [uid(), uid()];
+		let mut d = Decision::open(&roster, 2, 100, 1000);
+		d.vote(roster[0], Vote::For, 0).unwrap();
+		d.vote(roster[1], Vote::For, 0).unwrap();
+		let by = 100 + EXECUTION_WINDOW_SECS;
+		assert!(d.is_executable(by - 1));
+		assert!(!d.is_executable(by));
+		assert_eq!((d.effective_state(by), d.effective_decided_at(by)), (ApprovalState::Void, Some(by)));
+		assert!(d.expire_if_due(by + 50));
+		assert_eq!((d.state, d.decided_at, d.void_reason.as_str()), (ApprovalState::Void, Some(by), LAPSED));
+		assert_eq!(d.pending.last(), Some(&ApprovalEvent::Lapsed));
+		assert!(d.report(Outcome::Executed, "", by + 60).is_err(), "a lapsed decision takes no report");
 	}
 
 	#[test]

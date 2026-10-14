@@ -42,18 +42,6 @@ use crate::{
 	support::domain_to_status,
 };
 
-/// The clock every rule here is measured against. A port, so a suite reaches a deadline
-/// by moving it rather than by sleeping through 72 hours.
-pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
-
-pub fn system_clock() -> Clock {
-	Arc::new(|| {
-		std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-	})
-}
-
 const DEFAULT_PAGE: u32 = 20;
 const MAX_PAGE: u32 = 100;
 
@@ -74,9 +62,16 @@ fn invalid(why: String) -> Status {
 }
 
 /// The persisted owners see everything; a scope admin their scopes'; anyone a proposal
-/// that names them, as the person it is for or as a member of its roster.
-pub fn visible(viewer: &ApprovalViewer, record: &ApprovalRecord) -> bool {
-	viewer.owner || viewer.admin_of.contains(&record.scope) || record.requested_by.as_ref().is_some_and(|(id, _)| *id == viewer.user) || record.decision.is_voter(viewer.user)
+/// that names them, as a member of its roster or as the person it is for — the last as a
+/// [`Reader::Bystander`]. `None`: invisible, the same `NOT_FOUND` as an unknown id.
+pub fn visible(viewer: &ApprovalViewer, record: &ApprovalRecord) -> Option<Reader> {
+	if viewer.owner || viewer.admin_of.contains(&record.scope) || record.decision.is_voter(viewer.user) {
+		Some(Reader::Decider)
+	} else if record.requested_by.as_ref().is_some_and(|(id, _)| *id == viewer.user) {
+		Some(Reader::Bystander)
+	} else {
+		None
+	}
 }
 
 fn level_to(level: Level) -> cc::ApprovalLevel {
@@ -164,17 +159,53 @@ fn field_from(field: ApprovalFieldValue) -> Result<Field, Status> {
 	Ok(Field { key: field.key, value })
 }
 
-/// The wire form. The state is the one a reader sees at `now`: an open proposal past its
-/// deadline reads as expired, decided at that deadline, before anything wrote so.
-pub fn approval_to(record: ApprovalRecord, now: i64) -> Approval {
+/// Who reads a proposal, for what the wire form may carry about the deciders.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reader {
+	/// One who decides or answers for the scope: a persisted owner, an admin of its scope,
+	/// a member of its roster. Sees every address.
+	Decider,
+	/// Anyone else who may see it — the person it names as `requested_by`: the deciders'
+	/// addresses are not theirs to read.
+	Bystander,
+	/// The proposing service: it learns how its proposal stands, never who the deciders
+	/// are — no address, no cross-plane subject, not who vetoed.
+	Service,
+}
+
+/// The wire form, as `reader` may see it. The state is the one a reader sees at the
+/// record's instant: an open proposal past its deadline reads as expired and a passed one
+/// past its execution window as void, dated at that deadline, before anything wrote so.
+pub fn approval_to(record: ApprovalRecord, reader: Reader) -> Approval {
 	let decision = &record.decision;
+	let now = record.as_of;
 	let state = decision.effective_state(now);
-	let decided_at = match (state, decision.decided_at) {
-		(_, Some(at)) => at,
-		(ApprovalState::Expired, None) => decision.expires_at,
-		(_, None) => 0,
-	};
-	let (requested_by, requested_by_email) = record.requested_by.map(|(_, p)| (p.auth_subject, p.email)).unwrap_or_default();
+	let decided_at = decision.effective_decided_at(now).unwrap_or(0);
+	let (requested_by, mut requested_by_email) = record.requested_by.map(|(_, p)| (p.auth_subject, p.email)).unwrap_or_default();
+	let mut vetoed_by = record.vetoed_by.map(|p| p.auth_subject).unwrap_or_default();
+	let mut voters: Vec<cc::ApprovalVoter> = decision
+		.voters
+		.iter()
+		.zip(record.voters)
+		.map(|(v, p)| cc::ApprovalVoter {
+			auth_subject: p.auth_subject,
+			email: p.email,
+			vote: vote_to(v.vote) as i32,
+			voted_at: v.voted_at,
+		})
+		.collect();
+	match reader {
+		Reader::Decider => {}
+		Reader::Bystander => voters.iter_mut().for_each(|v| v.email.clear()),
+		Reader::Service => {
+			requested_by_email.clear();
+			vetoed_by.clear();
+			for voter in &mut voters {
+				voter.email.clear();
+				voter.auth_subject.clear();
+			}
+		}
+	}
 	Approval {
 		id: record.id.to_string(),
 		kind: record.kind,
@@ -188,17 +219,7 @@ pub fn approval_to(record: ApprovalRecord, now: i64) -> Approval {
 		requested_by,
 		requested_by_email,
 		reason: record.reason,
-		voters: decision
-			.voters
-			.iter()
-			.zip(record.voters)
-			.map(|(v, p)| cc::ApprovalVoter {
-				auth_subject: p.auth_subject,
-				email: p.email,
-				vote: vote_to(v.vote) as i32,
-				voted_at: v.voted_at,
-			})
-			.collect(),
+		voters,
 		threshold: decision.threshold,
 		policy_version: record.policy_version,
 		created_at: record.created_at,
@@ -206,7 +227,7 @@ pub fn approval_to(record: ApprovalRecord, now: i64) -> Approval {
 		passed_at: decision.passed_at.unwrap_or(0),
 		executable_at: decision.executable_at.unwrap_or(0),
 		decided_at,
-		vetoed_by: record.vetoed_by.map(|p| p.auth_subject).unwrap_or_default(),
+		vetoed_by,
 		veto_reason: decision.veto_reason.clone(),
 		void_reason: decision.void_reason.clone(),
 		outcome: outcome_to(decision.outcome) as i32,
@@ -257,22 +278,11 @@ pub struct Approvals {
 	users: Arc<dyn UserDirectoryRepository>,
 	approvals: Arc<dyn ApprovalRepository>,
 	catalogs: Arc<dyn ScopeCatalogRepository>,
-	clock: Clock,
 }
 
 impl Approvals {
 	pub fn new(users: Arc<dyn UserDirectoryRepository>, approvals: Arc<dyn ApprovalRepository>, catalogs: Arc<dyn ScopeCatalogRepository>) -> Self {
-		Self {
-			users,
-			approvals,
-			catalogs,
-			clock: system_clock(),
-		}
-	}
-
-	pub fn with_clock(mut self, clock: Clock) -> Self {
-		self.clock = clock;
-		self
+		Self { users, approvals, catalogs }
 	}
 
 	/// The signed-in person, gated as every user RPC is (status, `token_version`). A
@@ -290,11 +300,10 @@ impl Approvals {
 		self.approvals.viewer(user).await.map_err(domain_to_status)
 	}
 
-	async fn visible_record(&self, viewer: &ApprovalViewer, id: Uuid) -> Result<ApprovalRecord, Status> {
-		match self.approvals.find(id).await.map_err(domain_to_status)? {
-			Some(record) if visible(viewer, &record) => Ok(record),
-			_ => Err(hidden()),
-		}
+	async fn visible_record(&self, viewer: &ApprovalViewer, id: Uuid) -> Result<(ApprovalRecord, Reader), Status> {
+		let record = self.approvals.find(id).await.map_err(domain_to_status)?.ok_or_else(hidden)?;
+		let reader = visible(viewer, &record).ok_or_else(hidden)?;
+		Ok((record, reader))
 	}
 }
 
@@ -339,14 +348,21 @@ impl ApprovalService for Approvals {
 			limit,
 			before: cursor_from(&req.cursor)?,
 		};
-		let now = (self.clock)();
-		let records = self.approvals.list(&viewer, &filter, now).await.map_err(domain_to_status)?;
+		let records = self.approvals.list(&viewer, &filter).await.map_err(domain_to_status)?;
 		let next_cursor = match records.last() {
 			Some(last) if i64::try_from(records.len()).is_ok_and(|n| n == limit) => cursor_to(last),
 			_ => String::new(),
 		};
 		Ok(Response::new(ListApprovalsResponse {
-			approvals: records.into_iter().map(|r| approval_to(r, now)).collect(),
+			approvals: records
+				.into_iter()
+				.map(|r| {
+					// The store filtered by the same rule; a row it let through is at least the
+					// asker's own proposal.
+					let reader = visible(&viewer, &r).unwrap_or(Reader::Bystander);
+					approval_to(r, reader)
+				})
+				.collect(),
 			next_cursor,
 		}))
 	}
@@ -354,8 +370,8 @@ impl ApprovalService for Approvals {
 	async fn get_approval(&self, request: Request<GetApprovalRequest>) -> Result<Response<Approval>, Status> {
 		let viewer = self.viewer(&request).await?;
 		let id = approval_id(&request.into_inner().approval_id)?;
-		let record = self.visible_record(&viewer, id).await?;
-		Ok(Response::new(approval_to(record, (self.clock)())))
+		let (record, reader) = self.visible_record(&viewer, id).await?;
+		Ok(Response::new(approval_to(record, reader)))
 	}
 
 	async fn vote_approval(&self, request: Request<VoteApprovalRequest>) -> Result<Response<Approval>, Status> {
@@ -367,10 +383,9 @@ impl ApprovalService for Approvals {
 			Ok(cc::ApprovalVote::Against) => Vote::Against,
 			Ok(cc::ApprovalVote::Pending | cc::ApprovalVote::Unspecified) | Err(_) => return Err(Status::invalid_argument("a vote is FOR or AGAINST")),
 		};
-		self.visible_record(&viewer, id).await?;
-		let now = (self.clock)();
-		let record = self.approvals.vote(id, viewer.user, vote, now).await.map_err(domain_to_status)?;
-		Ok(Response::new(approval_to(record, now)))
+		let (_, reader) = self.visible_record(&viewer, id).await?;
+		let record = self.approvals.vote(id, viewer.user, vote).await.map_err(domain_to_status)?;
+		Ok(Response::new(approval_to(record, reader)))
 	}
 
 	async fn veto_approval(&self, request: Request<VetoApprovalRequest>) -> Result<Response<Approval>, Status> {
@@ -378,11 +393,10 @@ impl ApprovalService for Approvals {
 		let req = request.into_inner();
 		let id = approval_id(&req.approval_id)?;
 		rules::check_text("a veto reason", &req.reason, REASON_BYTES).map_err(invalid)?;
-		self.visible_record(&viewer, id).await?;
-		let now = (self.clock)();
-		let record = self.approvals.veto(id, viewer.user, &req.reason, now).await.map_err(domain_to_status)?;
+		let (_, reader) = self.visible_record(&viewer, id).await?;
+		let record = self.approvals.veto(id, viewer.user, &req.reason).await.map_err(domain_to_status)?;
 		tracing::warn!(approval = %id, by = %viewer.user, "approval vetoed");
-		Ok(Response::new(approval_to(record, now)))
+		Ok(Response::new(approval_to(record, reader)))
 	}
 
 	async fn cancel_approval(&self, _request: Request<CancelApprovalRequest>) -> Result<Response<Approval>, Status> {
@@ -406,22 +420,11 @@ pub struct ApprovalExecution {
 	callers: ServiceCallers,
 	approvals: Arc<dyn ApprovalRepository>,
 	catalogs: Arc<dyn ScopeCatalogRepository>,
-	clock: Clock,
 }
 
 impl ApprovalExecution {
 	pub fn new(callers: ServiceCallers, approvals: Arc<dyn ApprovalRepository>, catalogs: Arc<dyn ScopeCatalogRepository>) -> Self {
-		Self {
-			callers,
-			approvals,
-			catalogs,
-			clock: system_clock(),
-		}
-	}
-
-	pub fn with_clock(mut self, clock: Clock) -> Self {
-		self.clock = clock;
-		self
+		Self { callers, approvals, catalogs }
 	}
 
 	async fn caller<T>(&self, request: &Request<T>) -> Result<ServiceCaller, Status> {
@@ -457,6 +460,13 @@ impl ApprovalExecutionService for ApprovalExecution {
 		if req.kind.split_once(':').map(|(ns, _)| ns) != Some(namespace.as_str()) {
 			return Err(Status::permission_denied(format!("a proposal is opened only by its kind's namespace; yours is `{namespace}`")));
 		}
+		// A relying party speaks for its own scope only; the money plane, which holds every
+		// scope's accounts, for any (decided).
+		if let ServiceCaller::Client(client) = &caller
+			&& client.scope != req.scope
+		{
+			return Err(Status::permission_denied(format!("a client opens proposals in its own scope `{}` only", client.scope)));
+		}
 		let kind = self
 			.catalogs
 			.current(&namespace)
@@ -490,15 +500,21 @@ impl ApprovalExecutionService for ApprovalExecution {
 			dedupe_key: req.dedupe_key,
 			client,
 		};
-		let now = (self.clock)();
-		let record = match self.approvals.propose(new, now).await.map_err(domain_to_status)? {
+		let record = match self.approvals.propose(new).await.map_err(domain_to_status)? {
 			Proposed::Opened(record) => {
 				tracing::info!(approval = %record.id, kind = %record.kind, scope = %record.scope, level = ?record.level, escalated_by = ?record.escalated_by, "approval proposed");
 				record
 			}
 			Proposed::Existing(record) => record,
+			Proposed::Saturated => {
+				return Err(Status::resource_exhausted(format!(
+					"`{}` already holds {} live proposals; withdraw or wait for some before opening more",
+					caller.namespace(),
+					rules::MAX_LIVE_PER_PROPOSER
+				)));
+			}
 		};
-		Ok(Response::new(approval_to(record, now)))
+		Ok(Response::new(approval_to(record, Reader::Service)))
 	}
 
 	async fn withdraw_proposal(&self, request: Request<WithdrawProposalRequest>) -> Result<Response<Approval>, Status> {
@@ -508,32 +524,30 @@ impl ApprovalExecutionService for ApprovalExecution {
 		if !req.reason.is_empty() {
 			rules::check_text("reason", &req.reason, REASON_BYTES).map_err(invalid)?;
 		}
-		let now = (self.clock)();
 		let record = self
 			.approvals
-			.withdraw(id, caller.namespace(), service_actor(&caller), &req.reason, now)
+			.withdraw(id, caller.namespace(), service_actor(&caller), &req.reason)
 			.await
 			.map_err(|err| match err {
 				domain::error::DomainError::NotFound { .. } => hidden(),
 				other => domain_to_status(other),
 			})?;
-		Ok(Response::new(approval_to(record, now)))
+		Ok(Response::new(approval_to(record, Reader::Service)))
 	}
 
 	async fn get_proposal(&self, request: Request<GetProposalRequest>) -> Result<Response<Approval>, Status> {
 		let caller = self.caller(&request).await?;
 		let id = approval_id(&request.into_inner().approval_id)?;
 		let record = self.own(caller.namespace(), id).await?;
-		Ok(Response::new(approval_to(record, (self.clock)())))
+		Ok(Response::new(approval_to(record, Reader::Service)))
 	}
 
 	async fn pull_approved(&self, request: Request<PullApprovedRequest>) -> Result<Response<PullApprovedResponse>, Status> {
 		let caller = self.caller(&request).await?;
 		let limit = page(request.into_inner().limit);
-		let now = (self.clock)();
-		let records = self.approvals.pull(caller.namespace(), limit, now).await.map_err(domain_to_status)?;
+		let records = self.approvals.pull(caller.namespace(), limit).await.map_err(domain_to_status)?;
 		Ok(Response::new(PullApprovedResponse {
-			approvals: records.into_iter().map(|r| approval_to(r, now)).collect(),
+			approvals: records.into_iter().map(|r| approval_to(r, Reader::Service)).collect(),
 		}))
 	}
 
@@ -554,17 +568,16 @@ impl ApprovalExecutionService for ApprovalExecution {
 		if detail_required || !req.detail.is_empty() {
 			rules::check_text("detail", &req.detail, TEXT_FIELD_BYTES).map_err(invalid)?;
 		}
-		let now = (self.clock)();
 		let record = self
 			.approvals
-			.report(id, caller.namespace(), service_actor(&caller), outcome, &req.detail, now)
+			.report(id, caller.namespace(), service_actor(&caller), outcome, &req.detail)
 			.await
 			.map_err(|err| match err {
 				domain::error::DomainError::NotFound { .. } => hidden(),
 				other => domain_to_status(other),
 			})?;
 		tracing::info!(approval = %id, outcome = outcome.as_str(), by = caller.publisher(), "approval outcome reported");
-		Ok(Response::new(approval_to(record, now)))
+		Ok(Response::new(approval_to(record, Reader::Service)))
 	}
 }
 

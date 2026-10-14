@@ -74,16 +74,12 @@ async fn setup() -> Option<Fx> {
 	db::migrate(&pool).await.expect("apply migrations");
 	let callers = ServiceCallers::new(Some(BRIDGE_TOKEN.into()), Arc::new(PgRelyingParties::new(pool.clone())));
 	let users = Arc::new(PgUsers::new(pool.clone()));
-	let repo = Arc::new(PgApprovals::new(pool.clone()));
 	let catalog_repo = Arc::new(PgScopeCatalogs::new(pool.clone()));
 	let clock = Arc::new(AtomicI64::new(T0));
-	let tick = {
-		let clock = clock.clone();
-		Arc::new(move || clock.load(Ordering::SeqCst))
-	};
+	let repo = Arc::new(PgApprovals::with_fixed_time(pool.clone(), clock.clone()));
 	Some(Fx {
-		people: Approvals::new(users.clone(), repo.clone(), catalog_repo.clone()).with_clock(tick.clone()),
-		services: ApprovalExecution::new(callers.clone(), repo, catalog_repo.clone()).with_clock(tick),
+		people: Approvals::new(users.clone(), repo.clone(), catalog_repo.clone()),
+		services: ApprovalExecution::new(callers.clone(), repo, catalog_repo.clone()),
 		catalogs: ScopeCatalogs::new(callers, catalog_repo),
 		rp: PgRelyingParties::new(pool.clone()),
 		users,
@@ -99,6 +95,12 @@ fn as_client<T>(body: T, scope: &Scope) -> Request<T> {
 	request
 		.metadata_mut()
 		.insert("authorization", MetadataValue::try_from(format!("Bearer {}", scope.secret)).unwrap());
+	request
+}
+
+fn as_bridge<T>(body: T) -> Request<T> {
+	let mut request = Request::new(body);
+	request.metadata_mut().insert("authorization", MetadataValue::try_from(format!("Bearer {BRIDGE_TOKEN}")).unwrap());
 	request
 }
 
@@ -289,6 +291,24 @@ impl Fx {
 		(lock, owners)
 	}
 
+	async fn awaiting(&self, who: UserId, id: &str) -> bool {
+		self.people
+			.list_approvals(as_user(
+				who,
+				ListApprovalsRequest {
+					awaiting_my_vote: true,
+					limit: 100,
+					..Default::default()
+				},
+			))
+			.await
+			.unwrap()
+			.into_inner()
+			.approvals
+			.into_iter()
+			.any(|a| a.id == id)
+	}
+
 	async fn propose(&self, scope: &Scope, request: ProposeRequest) -> Approval {
 		self.services.propose(as_client(request, scope)).await.expect("propose").into_inner()
 	}
@@ -426,7 +446,13 @@ async fn the_person_a_service_names_stays_on_the_roster_and_moves_no_quorum() {
 		)
 		.await;
 	assert_eq!(opened.requested_by, asker);
-	assert!(!opened.requested_by_email.is_empty());
+	let seen = fx
+		.people
+		.get_approval(as_user(admins[1], GetApprovalRequest { approval_id: opened.id.clone() }))
+		.await
+		.unwrap()
+		.into_inner();
+	assert!(!seen.requested_by_email.is_empty(), "the deciders read who asked");
 	assert_eq!((opened.voters.len(), opened.threshold), (2, 2));
 	assert_eq!(
 		state(&fx.vote(admins[0], &opened.id, ApprovalVote::For).await.unwrap()),
@@ -539,7 +565,13 @@ async fn an_amount_above_the_threshold_goes_to_the_platform_owners() {
 	let big = fx.propose(&scope, transfer(&scope, "1000.000000000000000001")).await;
 	assert_eq!(big.level, ApprovalLevel::Platform as i32);
 	assert_eq!(big.escalated_by, vec!["per_operation".to_owned()]);
-	let roster: Vec<String> = big.voters.iter().map(|v| v.auth_subject.clone()).collect();
+	let seen = fx
+		.people
+		.get_approval(as_user(owners[0], GetApprovalRequest { approval_id: big.id.clone() }))
+		.await
+		.unwrap()
+		.into_inner();
+	let roster: Vec<String> = seen.voters.iter().map(|v| v.auth_subject.clone()).collect();
 	for owner in &owners {
 		assert!(roster.contains(&fx.auth_subject(*owner).await), "the roster is the owners");
 	}
@@ -626,7 +658,41 @@ async fn proposals_opened_together_cannot_split_past_the_daily_window() {
 
 	fx.at(T0 + 24 * HOUR + 1);
 	let next_day = fx.propose(&scope, transfer(&scope, "1000")).await;
-	assert_eq!(next_day.level, ApprovalLevel::Scope as i32, "the window trails 24 hours");
+	assert_eq!(
+		(next_day.level, next_day.escalated_by),
+		(ApprovalLevel::Platform as i32, vec!["daily".to_owned()]),
+		"a proposal still open a day later is still live, however long ago it was opened"
+	);
+}
+
+/// An executed proposal counts for 24 hours after it was EXECUTED, not after it was
+/// opened: a proposal executed late is money that moved late.
+#[tokio::test]
+async fn an_execution_counts_against_the_window_for_a_day_after_it_happened() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, _owners) = fx.owners(2).await;
+	let scope = fx.scope().await;
+	let admins = fx.admins(&scope, 2).await;
+	fx.at(T0);
+	let mut batch = Vec::new();
+	for _ in 0..5 {
+		let opened = fx.propose(&scope, transfer(&scope, "1000")).await;
+		assert_eq!(opened.level, ApprovalLevel::Scope as i32);
+		fx.vote(admins[0], &opened.id, ApprovalVote::For).await.unwrap();
+		fx.vote(admins[1], &opened.id, ApprovalVote::For).await.unwrap();
+		batch.push(opened.id);
+	}
+	fx.at(T0 + 25 * HOUR);
+	for id in &batch {
+		fx.report(&scope, id, ApprovalOutcome::Executed, "").await.unwrap();
+	}
+	let level_at = |at: i64| {
+		fx.at(at);
+		async { fx.propose(&scope, transfer(&scope, "1000")).await.level }
+	};
+	assert_eq!(level_at(T0 + 25 * HOUR + 1).await, ApprovalLevel::Platform as i32, "5000 executed an instant ago");
+	assert_eq!(level_at(T0 + 49 * HOUR - 1).await, ApprovalLevel::Platform as i32, "still inside the day after execution");
+	assert_eq!(level_at(T0 + 49 * HOUR + 1).await, ApprovalLevel::Scope as i32, "a day after execution it no longer counts");
 }
 
 #[tokio::test]
@@ -651,8 +717,11 @@ async fn one_namespace_neither_sees_nor_executes_anothers_decisions() {
 	);
 	let mut into_their_scope = transfer(&mine, "10");
 	into_their_scope.scope = theirs.id.clone();
-	let opened_there = fx.propose(&mine, into_their_scope).await;
-	assert_eq!(opened_there.proposer, mine.id, "a proposer may open its kinds in any active scope");
+	assert_eq!(
+		code(fx.services.propose(as_client(into_their_scope, &mine)).await),
+		Some(Code::PermissionDenied),
+		"a relying party opens proposals in its own scope only"
+	);
 
 	let id = || opened.id.clone();
 	assert_eq!(
@@ -764,10 +833,6 @@ async fn propose_refuses_what_it_cannot_render_or_decide() {
 			..transfer(&scope, "1")
 		},
 		ProposeRequest {
-			scope: "s_nowhere_at_all".into(),
-			..transfer(&scope, "1")
-		},
-		ProposeRequest {
 			subject_ref: "payment:NOT-A-UUID".into(),
 			..transfer(&scope, "1")
 		},
@@ -803,6 +868,20 @@ async fn propose_refuses_what_it_cannot_render_or_decide() {
 	for (i, request) in invalid.into_iter().enumerate() {
 		assert_eq!(code(fx.services.propose(as_client(request, &scope)).await), Some(Code::InvalidArgument), "case {i}");
 	}
+	let elsewhere = ProposeRequest {
+		scope: "s_nowhere_at_all".into(),
+		..transfer(&scope, "1")
+	};
+	assert_eq!(
+		code(fx.services.propose(as_client(elsewhere, &scope)).await),
+		Some(Code::PermissionDenied),
+		"a client names no scope but its own, known or not"
+	);
+	let huge = ProposeRequest {
+		fields: vec![text("to_account", "ops"), amount(&"9".repeat(31), "USDT")],
+		..transfer(&scope, "1")
+	};
+	assert_eq!(code(fx.services.propose(as_client(huge, &scope)).await), Some(Code::InvalidArgument), "31 whole digits");
 
 	sqlx::query("UPDATE tenants SET state = 'frozen' WHERE id = $1").bind(&scope.id).execute(&fx.pool).await.unwrap();
 	assert_eq!(
@@ -892,4 +971,208 @@ async fn an_owner_who_lost_the_seat_cannot_vote_on_a_frozen_roster() {
 		.unwrap();
 	assert_eq!(code(fx.vote(owners[0], &opened.id, ApprovalVote::For).await), Some(Code::PermissionDenied));
 	assert_eq!(fx.vote(owners[1], &opened.id, ApprovalVote::For).await.unwrap().voters.len(), 3, "the roster did not move");
+}
+
+/// The money plane speaks for `bank` in every scope; a relying party only in its own.
+#[tokio::test]
+async fn the_bridge_proposes_in_any_scope() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope().await;
+	fx.admins(&scope, 2).await;
+	fx.at(T0);
+	let kind = format!("bank:t_{}", &scope.id[2..]);
+	let version = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+	let mut published = fx
+		.catalogs
+		.get_scope_catalog(as_bridge(evconcierge_contracts::concierge::v1::GetScopeCatalogRequest {}))
+		.await
+		.map(|r| r.into_inner().approval_kinds)
+		.unwrap_or_default();
+	published.retain(|k| k.name != kind);
+	published.insert(
+		0,
+		ApprovalKindSpec {
+			name: kind.clone(),
+			label: "Transfer".into(),
+			description: String::new(),
+			level: ApprovalLevel::Scope as i32,
+			fields: vec![spec("amount", ApprovalFieldType::Amount)],
+			escalations: vec![],
+			proposer: String::new(),
+		},
+	);
+	published.truncate(64);
+	fx.catalogs
+		.publish_scope_catalog(as_bridge(PublishScopeCatalogRequest {
+			version,
+			approval_kinds: published,
+			notification_topics: vec![],
+		}))
+		.await
+		.expect("publish bank's catalog");
+	let opened = fx
+		.services
+		.propose(as_bridge(ProposeRequest {
+			kind,
+			fields: vec![amount("10", "USDT")],
+			..transfer(&scope, "10")
+		}))
+		.await
+		.expect("the bridge opens bank's kinds in any active scope")
+		.into_inner();
+	assert_eq!((opened.proposer.as_str(), opened.requested_by_client.as_str()), ("bank", ""));
+}
+
+/// Containment is never slower than the grant (decided): any persisted owner stops a
+/// proposal inside its veto window, scope-level ones included.
+#[tokio::test]
+async fn an_owner_vetoes_a_scope_decision_inside_its_delay() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(2).await;
+	let scope = fx.scope().await;
+	let admins = fx.admins(&scope, 2).await;
+	fx.at(T0);
+	let opened = fx.propose(&scope, transfer(&scope, "10")).await;
+	assert_eq!(opened.level, ApprovalLevel::Scope as i32);
+	fx.vote(admins[0], &opened.id, ApprovalVote::For).await.unwrap();
+	fx.vote(admins[1], &opened.id, ApprovalVote::For).await.unwrap();
+	let vetoed = fx
+		.people
+		.veto_approval(as_user(
+			owners[0],
+			VetoApprovalRequest {
+				approval_id: opened.id.clone(),
+				reason: "Not with this counterparty".into(),
+			},
+		))
+		.await
+		.expect("an owner off the roster vetoes")
+		.into_inner();
+	assert_eq!(state(&vetoed), ApprovalState::Vetoed);
+	assert_eq!(vetoed.vetoed_by, fx.auth_subject(owners[0]).await);
+}
+
+/// A passed decision is executable for 72 hours after its delay; past that it lapses to
+/// VOID, unexecuted, and a late report is refused (decided).
+#[tokio::test]
+async fn an_unexecuted_decision_lapses_after_its_execution_window() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope().await;
+	let admins = fx.admins(&scope, 2).await;
+	fx.at(T0);
+	let opened = fx.propose(&scope, transfer(&scope, "10")).await;
+	fx.vote(admins[0], &opened.id, ApprovalVote::For).await.unwrap();
+	fx.vote(admins[1], &opened.id, ApprovalVote::For).await.unwrap();
+	let deadline = T0 + HOUR + 72 * HOUR;
+
+	fx.at(deadline - 1);
+	assert_eq!(fx.pull(&scope).await, vec![opened.id.clone()]);
+	fx.at(deadline);
+	assert!(fx.pull(&scope).await.is_empty(), "a lapsed decision is never served");
+	let read = fx
+		.people
+		.get_approval(as_user(admins[0], GetApprovalRequest { approval_id: opened.id.clone() }))
+		.await
+		.unwrap()
+		.into_inner();
+	assert_eq!((state(&read), read.decided_at), (ApprovalState::Void, deadline));
+	assert_eq!(code(fx.report(&scope, &opened.id, ApprovalOutcome::Executed, "").await), Some(Code::FailedPrecondition));
+	let (stored, event): (String, String) =
+		sqlx::query_as("SELECT a.state, e.event FROM approvals a JOIN approval_events e ON e.approval_id = a.id WHERE a.id = $1::uuid ORDER BY e.id DESC LIMIT 1")
+			.bind(&opened.id)
+			.fetch_one(&fx.pool)
+			.await
+			.unwrap();
+	assert_eq!((stored.as_str(), event.as_str()), ("void", "lapsed"), "the refused report wrote the lapse it found");
+}
+
+/// A service learns how its proposal stands, never who the deciders are: their emails
+/// and cross-plane subjects are the identity plane's.
+#[tokio::test]
+async fn services_and_bystanders_never_read_the_deciders_addresses() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope().await;
+	let admins = fx.admins(&scope, 2).await;
+	let asker = fx.user("asker").await;
+	fx.at(T0);
+	let opened = fx
+		.propose(
+			&scope,
+			ProposeRequest {
+				requested_by: fx.auth_subject(asker).await,
+				..transfer(&scope, "10")
+			},
+		)
+		.await;
+	fx.vote(admins[0], &opened.id, ApprovalVote::For).await.unwrap();
+	fx.vote(admins[1], &opened.id, ApprovalVote::For).await.unwrap();
+	let blank = |a: &Approval| a.requested_by_email.is_empty() && a.voters.iter().all(|v| v.email.is_empty() && v.auth_subject.is_empty());
+	assert!(blank(&opened), "Propose");
+	let got = fx
+		.services
+		.get_proposal(as_client(GetProposalRequest { approval_id: opened.id.clone() }, &scope))
+		.await
+		.unwrap()
+		.into_inner();
+	assert!(blank(&got), "GetProposal");
+	assert!(got.voters.iter().all(|v| v.vote == ApprovalVote::For as i32), "the votes themselves are the service's to see");
+	fx.at(T0 + HOUR);
+	let pulled = fx.services.pull_approved(as_client(PullApprovedRequest { limit: 0 }, &scope)).await.unwrap().into_inner();
+	assert!(pulled.approvals.iter().all(blank), "PullApproved");
+
+	let own = fx
+		.people
+		.get_approval(as_user(asker, GetApprovalRequest { approval_id: opened.id.clone() }))
+		.await
+		.unwrap()
+		.into_inner();
+	assert!(own.voters.iter().all(|v| v.email.is_empty()), "the asker sees their proposal, not the deciders' addresses");
+	let admin_view = fx
+		.people
+		.get_approval(as_user(admins[0], GetApprovalRequest { approval_id: opened.id.clone() }))
+		.await
+		.unwrap()
+		.into_inner();
+	assert!(admin_view.voters.iter().all(|v| !v.email.is_empty()));
+}
+
+#[tokio::test]
+async fn awaiting_my_vote_forgets_a_member_who_lost_the_seat() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope().await;
+	let admins = fx.admins(&scope, 3).await;
+	fx.at(T0);
+	let opened = fx.propose(&scope, transfer(&scope, "10")).await;
+	assert!(fx.awaiting(admins[0], &opened.id).await);
+	sqlx::query("UPDATE grants SET revoked_at = 1, revoked_by = granted_by WHERE user_id = $1 AND revoked_at IS NULL")
+		.bind(admins[0].raw())
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	assert!(!fx.awaiting(admins[0], &opened.id).await, "a vote they would be refused is not asked of them");
+}
+
+#[tokio::test]
+async fn a_namespace_holds_a_bounded_number_of_live_proposals() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope().await;
+	fx.admins(&scope, 2).await;
+	fx.at(T0);
+	let mut first = None;
+	for _ in 0..200 {
+		let opened = fx.propose(&scope, transfer(&scope, "0.01")).await;
+		first.get_or_insert(opened.id);
+	}
+	assert_eq!(code(fx.services.propose(as_client(transfer(&scope, "0.01"), &scope)).await), Some(Code::ResourceExhausted));
+	fx.services
+		.withdraw_proposal(as_client(
+			WithdrawProposalRequest {
+				approval_id: first.unwrap(),
+				reason: String::new(),
+			},
+			&scope,
+		))
+		.await
+		.unwrap();
+	fx.propose(&scope, transfer(&scope, "0.01")).await;
 }

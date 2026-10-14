@@ -263,6 +263,12 @@ impl GrantRepository for PgGrants {
 			GrantAuthority::Delegate if matches!(subject, GrantSubject::Id(_)) => return Ok(GrantOutcome::Denied),
 			GrantAuthority::Delegate | GrantAuthority::Seat => {}
 		}
+		// One `admin` seat granting `<ns>:admin` to accounts it controls would fill a
+		// scope's roster and pass its quorum with no owner asked. The persisted row decides,
+		// not `acting_role`: emergency access elevates per request and seats nobody.
+		if target.as_str() == format!("{}:admin", target.namespace()) && !standing_in(&locked, actor.id).is_some_and(|s| s.role == Role::Owner && s.status == UserStatus::Active) {
+			return Ok(GrantOutcome::OwnersOnly);
+		}
 		let Some(tenant) = tenant else {
 			return Ok(GrantOutcome::UnknownTenant);
 		};
