@@ -183,7 +183,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   share it); the plaintext rides only the `email_code` delivery's payload. Asking for a code
   answers alike for every address: whether an account exists is decided once the code
   proves the mailbox. A password (argon2id) signs up an UNVERIFIED account that works at
-  once ("verify my email now" mails a code; `/auth/email/verify/{request,confirm}` later);
+  once ("verify my email now" mails a code; `/auth/email/verify/{request,confirm}` later).
+  That mail comes with a SIGN-UP TICKET (`signup_tickets`, 0032: 256 bits, a digest at rest,
+  spent once, a code's lifetime, dead once `token_version` or the password moves), and
+  `/auth/password/signup/confirm {ticket, code}` verifies the address WITHOUT the CSRF
+  token — the one confirmation a scope's host can make — and keeps the password: a ticket
+  is what tells the person who just signed up from a squatter's mailbox owner, so the
+  takeover above applies to every path but this one;
   sign-up refuses an address that backs a password or is verified somewhere, which tells
   the caller an account exists and is accepted. Sign-in answers one `invalid_credentials`
   for a wrong password and a missing account alike (a decoy hash keeps the timing equal);

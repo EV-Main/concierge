@@ -17,8 +17,11 @@ use uuid::Uuid;
 use super::users::{Named, account_named, drain_outbox, free_username, insert_user, load_for_update, lock_email, update_row, verified_holder};
 use crate::ports::{
 	CODE_MAX_ATTEMPTS, CODE_SEND_WINDOW_SECS, CODE_SENDS_PER_WINDOW, CODE_TTL_SECS, CodeIssue, CodePurpose, CodeRefusal, CredentialRepository, PASSWORD_LOCK_SECS, PASSWORD_MAX_FAILURES,
-	PasskeyRow, SignInMethods, SignUp, StoredPassword, VerifyRefusal,
+	PasskeyRow, SignInMethods, SignUp, SignUpConfirmRefusal, StoredPassword, VerifyRefusal,
 };
+
+/// How long a spent or expired sign-up ticket row is kept before the insert path reaps it.
+const TICKET_RETENTION_SECS: i64 = 24 * 60 * 60;
 
 pub struct PgCredentials {
 	pool: PgPool,
@@ -307,6 +310,76 @@ impl CredentialRepository for PgCredentials {
 			.await
 			.map_err(repo_err)?;
 		Ok(removed.rows_affected() == 1)
+	}
+
+	async fn issue_signup_ticket(&self, user: UserId, ticket_hash: &[u8], now: i64) -> Result<(), DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		// Reaped here rather than by a sweeper: the table only grows on this path.
+		sqlx::query("DELETE FROM signup_tickets WHERE expires_at < $1")
+			.bind(now - TICKET_RETENTION_SECS)
+			.execute(&mut *tx)
+			.await
+			.map_err(repo_err)?;
+		let inserted = sqlx::query(
+			"INSERT INTO signup_tickets (ticket_hash, user_id, token_version, password_set_at, issued_at, expires_at)
+			 SELECT $1, u.id, u.token_version, p.updated_at, $3, $3 + $4
+			 FROM users u JOIN password_credentials p ON p.user_id = u.id WHERE u.id = $2",
+		)
+		.bind(ticket_hash)
+		.bind(user.raw())
+		.bind(now)
+		.bind(CODE_TTL_SECS)
+		.execute(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+		if inserted.rows_affected() == 0 {
+			return Err(DomainError::NotFound {
+				entity: "password account",
+				id: user.to_string(),
+			});
+		}
+		tx.commit().await.map_err(repo_err)
+	}
+
+	async fn confirm_signup(&self, ticket_hash: &[u8], code: &str, now: i64) -> Result<Result<User, SignUpConfirmRefusal>, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		// Held for the whole confirmation, so two presentations of one ticket cannot both
+		// spend it.
+		let ticket: Option<(Uuid, i64, i64, i64, Option<i64>)> =
+			sqlx::query_as("SELECT user_id, token_version, password_set_at, expires_at, spent_at FROM signup_tickets WHERE ticket_hash = $1 FOR UPDATE")
+				.bind(ticket_hash)
+				.fetch_optional(&mut *tx)
+				.await
+				.map_err(repo_err)?;
+		let Some((user_id, token_version, password_set_at, expires_at, spent_at)) = ticket else {
+			return Ok(Err(SignUpConfirmRefusal::Ticket));
+		};
+		if spent_at.is_some() || now >= expires_at {
+			return Ok(Err(SignUpConfirmRefusal::Ticket));
+		}
+		// A takeover bumps `token_version` and drops the password; a "revoke all" bumps the
+		// former and a new password moves the latter. After any of them, the browser that
+		// signed up is no longer the one this account answers to.
+		let current: Option<(i64, Option<i64>)> = sqlx::query_as("SELECT u.token_version, p.updated_at FROM users u LEFT JOIN password_credentials p ON p.user_id = u.id WHERE u.id = $1")
+			.bind(user_id)
+			.fetch_optional(&mut *tx)
+			.await
+			.map_err(repo_err)?;
+		if current != Some((token_version, Some(password_set_at))) {
+			return Ok(Err(SignUpConfirmRefusal::Ticket));
+		}
+		let outcome = verify_with_code(&mut tx, UserId::from_raw(user_id), code, now).await?;
+		if outcome.is_ok() {
+			sqlx::query("UPDATE signup_tickets SET spent_at = $2 WHERE ticket_hash = $1")
+				.bind(ticket_hash)
+				.bind(now)
+				.execute(&mut *tx)
+				.await
+				.map_err(repo_err)?;
+		}
+		// Committed whatever the outcome: a wrong guess must stay counted against the code.
+		tx.commit().await.map_err(repo_err)?;
+		Ok(outcome.map_err(SignUpConfirmRefusal::Verify))
 	}
 
 	async fn set_password(&self, user: UserId, code: &str, phc: String, now: i64) -> Result<Result<(), VerifyRefusal>, DomainError> {

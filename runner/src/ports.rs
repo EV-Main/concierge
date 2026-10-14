@@ -1400,6 +1400,15 @@ pub enum VerifyRefusal {
 	Taken,
 }
 
+/// Why a sign-up confirmation was refused.
+#[derive(Debug)]
+pub enum SignUpConfirmRefusal {
+	/// Unknown, spent, expired, or outlived by a new password or a revoke-all. One
+	/// variant for all of them: the caller answers each the way it answers a wrong code.
+	Ticket,
+	Verify(VerifyRefusal),
+}
+
 /// Emailed codes (and, beside them, passwords): the credentials this plane checks itself
 /// rather than trusting a provider for. Every method is one transaction, and a wrong guess
 /// is counted in it BEFORE the comparison, so an attempt that errors still counts.
@@ -1446,4 +1455,13 @@ pub trait CredentialRepository: Send + Sync {
 	/// session alone cannot plant a password that outlives its revocation. Spending the
 	/// code verifies the address, as [`Self::verify_email`] does.
 	async fn set_password(&self, user: UserId, code: &str, phc: String, now: i64) -> Result<Result<(), VerifyRefusal>, DomainError>;
+
+	/// Store a sign-up ticket (its digest) for `user`, bound to their current
+	/// `token_version` and password, alive for `CODE_TTL_SECS`.
+	async fn issue_signup_ticket(&self, user: UserId, ticket_hash: &[u8], now: i64) -> Result<(), DomainError>;
+
+	/// Spend a sign-up ticket and the verification code beside it: the account's address
+	/// is verified exactly as [`Self::verify_email`] does it — the password stays, nothing
+	/// is taken over. A wrong code is counted against the code and leaves the ticket.
+	async fn confirm_signup(&self, ticket_hash: &[u8], code: &str, now: i64) -> Result<Result<User, SignUpConfirmRefusal>, DomainError>;
 }

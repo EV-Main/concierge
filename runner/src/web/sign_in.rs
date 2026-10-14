@@ -81,7 +81,7 @@ fn email(raw: &str) -> Result<Email, Refusal> {
 	Email::parse(raw).map_err(|_| Refusal(StatusCode::BAD_REQUEST, "invalid_email"))
 }
 
-fn code_refusal(refusal: CodeRefusal) -> Refusal {
+pub(super) fn code_refusal(refusal: CodeRefusal) -> Refusal {
 	match refusal {
 		CodeRefusal::Missing | CodeRefusal::Wrong => Refusal(StatusCode::BAD_REQUEST, "invalid_code"),
 		CodeRefusal::Expired => Refusal(StatusCode::BAD_REQUEST, "code_expired"),
@@ -286,8 +286,18 @@ pub async fn sign_up(State(st): State<WebState>, jar: CookieJar, headers: Header
 			}
 		},
 	};
+	// The ticket goes with the code: it is what lets this browser confirm the address
+	// from a scope's host, where it cannot read the CSRF cookie (`signup::confirm`).
+	let ticket = match verification {
+		"sent" => super::signup::ticket_for(st, user.id()).await,
+		_ => None,
+	};
 	let (jar, _) = signed_in_as(st, jar, &headers, user.id()).await?;
-	Ok((jar, Json(json!({ "ok": true, "verification": verification }))))
+	let mut answer = json!({ "ok": true, "verification": verification });
+	if let Some(ticket) = ticket {
+		answer["ticket"] = json!(ticket);
+	}
+	Ok((jar, Json(answer)))
 }
 
 #[derive(Deserialize)]

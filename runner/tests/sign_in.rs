@@ -387,7 +387,8 @@ async fn ticking_verify_mails_a_code_at_sign_up() {
 	let fx = fixture!();
 	let email = address("now");
 	let answer = fx.sign_up(&email, PASSWORD, true, &mut Browser::default()).await;
-	assert_eq!(answer.body, json!({ "ok": true, "verification": "sent" }));
+	assert_eq!((answer.body["ok"].clone(), answer.body["verification"].clone()), (json!(true), json!("sent")));
+	assert!(answer.body["ticket"].is_string(), "the code goes out with its sign-up ticket");
 	assert_eq!(fx.queued_codes(&email).await, 1);
 }
 
