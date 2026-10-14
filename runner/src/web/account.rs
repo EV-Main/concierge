@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-	notification::{settings_json, settings_of, subscriber_of, topic},
+	notification::{settings_json, settings_of, subscriber_of, topic_known},
 	web::{
 		WebState,
 		routes::{Caller, session_user},
@@ -145,13 +145,16 @@ pub struct TopicChange {
 	email_enabled: bool,
 }
 
-/// `POST /auth/notifications/settings/topic` — a catalogue topic only; answers the whole
-/// snapshot.
+/// `POST /auth/notifications/settings/topic` — a built-in topic or one a scope's catalog in
+/// force publishes; answers the whole snapshot.
 pub async fn set_topic(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<TopicChange>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed_in(st, &jar, &headers).await?;
 	let answer = async {
-		if topic(&body.topic).is_none() {
+		if !topic_known(st.notifications.as_ref(), &body.topic)
+			.await
+			.map_err(|e| internal("notification settings: topics not read", e))?
+		{
 			return Err(Refusal::new(StatusCode::BAD_REQUEST, "unknown_topic"));
 		}
 		let sub = subscriber_of(st.notifications.as_ref(), &user)
