@@ -1,5 +1,7 @@
 -- The shape of a relying party's redirect URI, held at the column: absolute `https://`,
--- a host with no userinfo, no fragment, no whitespace or control characters. A code is
+-- a host with no userinfo, no fragment, no backslash (a browser reads `\` as `/`, so
+-- `https://evil.example\x.evinvest.ltd/` lands on evil.example), no whitespace or
+-- control characters, no NULL element. A code is
 -- sent to whatever is registered here, so a row that breaks the shape is a redirect the
 -- registry should never have been able to hold. `relying_party::check_registered_redirects`
 -- refuses such a row at boot; this is the same rule where a hand-written INSERT meets it.
@@ -22,7 +24,9 @@ SET LOCAL lock_timeout = '3s';
 
 CREATE FUNCTION rp_redirect_uris_wellformed(uris TEXT[]) RETURNS BOOLEAN
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-    SELECT coalesce(bool_and(uri ~ '^https://[^/?#@[:space:][:cntrl:]]+([/?][^#[:space:][:cntrl:]]*)?$'), TRUE)
+    SELECT array_position(uris, NULL) IS NULL AND coalesce(bool_and(
+        uri ~ '^https://[^/?#@\\[:space:][:cntrl:]]+([/?][^#\\[:space:][:cntrl:]]*)?$'
+    ), TRUE)
     FROM unnest(uris) AS uri
 $$;
 
