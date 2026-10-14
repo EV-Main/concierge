@@ -7,9 +7,14 @@ export type Screen =
   | { kind: "codeSent"; email: string }
   | { kind: "password" }
   | { kind: "signup" }
-  /** Signed up and asked to verify now: mail the code (it needs a fresh Turnstile token). */
-  | { kind: "verifyNow"; email: string }
-  | { kind: "verifyCode"; email: string };
+  /**
+   * Signed up and signed in; the mailed code confirms the address through `ticket`.
+   * `sent` false: the plane issued the ticket but the code did not go out (throttled,
+   * failed) — the reader sends it again from this screen.
+   */
+  | { kind: "confirmSignUp"; email: string; ticket: string; sent: boolean }
+  /** Signed up, but no ticket could be stored: the address is confirmed on the platform. */
+  | { kind: "confirmOnPlatform" };
 
 /** `data-intent`: `signup` opens the sign-up screen; `signin` and `login` (the chip's word) the code screen. */
 export function firstScreen(intent: string | null): Screen {

@@ -1,4 +1,16 @@
 {
+  "account.breakGlass": {
+    "en": "Your role comes from emergency access, not from your account. It is temporary and is not a seat.",
+    "t": "Votre rôle vient d’un accès d’urgence, pas de votre compte. Il est temporaire et ne donne aucun siège."
+  },
+  "account.kycLevel": {
+    "en": "Verification level",
+    "t": "Niveau de vérification"
+  },
+  "account.kycLevelValue": {
+    "en": "Level {level}",
+    "t": "Niveau {level}"
+  },
   "account.managedOnPlatform": {
     "en": "These settings are managed on evinvest.ltd, where your account lives.",
     "t": "Ces réglages se gèrent sur evinvest.ltd, où se trouve votre compte."
@@ -146,6 +158,10 @@
   "auth.err.invalidEmail": {
     "en": "Enter a valid email address.",
     "t": "Saisissez une adresse e-mail valide."
+  },
+  "auth.err.invalidTicket": {
+    "en": "This confirmation has expired. You are signed in — verify your email later from your account.",
+    "t": "Cette confirmation a expiré. Vous êtes connecté — vérifiez votre e-mail plus tard depuis votre compte."
   },
   "auth.err.invalidUsername": {
     "en": "3–32 characters: letters, digits, '_', '.' or '-'.",
@@ -319,13 +335,25 @@
     "en": "Username",
     "t": "Nom d’utilisateur"
   },
+  "auth.verify.continue": {
+    "en": "Continue",
+    "t": "Continuer"
+  },
+  "auth.verify.desc": {
+    "en": "Your account is ready. Enter the 6 digit code we sent to {email} to verify it, or skip and verify later in Settings.",
+    "t": "Votre compte est prêt. Saisissez le code à 6 chiffres envoyé à {email} pour le vérifier, ou faites-le plus tard dans les Paramètres."
+  },
   "auth.verify.later": {
     "en": "Verify later",
     "t": "Vérifier plus tard"
   },
-  "auth.verify.start": {
-    "en": "Your account is ready. Send a 6 digit code to {email} to verify it, or skip and verify later.",
-    "t": "Votre compte est prêt. Envoyez un code à 6 chiffres à {email} pour la vérifier, ou passez et vérifiez plus tard."
+  "auth.verify.notSent": {
+    "en": "Your account is ready, but the code to {email} was not sent. Send it again to verify your email, or skip and verify later.",
+    "t": "Votre compte est prêt, mais le code pour {email} n’a pas été envoyé. Renvoyez-le pour vérifier votre e-mail, ou passez et vérifiez plus tard."
+  },
+  "auth.verify.onPlatform": {
+    "en": "Your account is ready. Confirm your email from your account on evinvest.ltd.",
+    "t": "Votre compte est prêt. Confirmez votre e-mail depuis votre compte sur evinvest.ltd."
   },
   "auth.verify.title": {
     "en": "Confirm your email",

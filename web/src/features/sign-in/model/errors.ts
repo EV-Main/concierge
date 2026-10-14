@@ -34,6 +34,9 @@ export function errorText(t: Translate, error: AuthError | "captcha_load"): stri
       return t("auth.err.passkeyCancelled", "Passkey sign in was cancelled.");
     case "passkey_rejected":
       return t("auth.err.passkeyRejected", "That passkey is not registered here. Sign in with a code instead.");
+    // From confirm only: a resend on a dead ticket answers 200 and mails nothing.
+    case "invalid_ticket":
+      return t("auth.err.invalidTicket", "This confirmation has expired. You are signed in — verify your email later from your account.");
     case "passkey_expired":
       return t("auth.err.passkeyExpired", "That took too long. Try the passkey again.");
     default:

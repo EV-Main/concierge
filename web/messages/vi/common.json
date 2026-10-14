@@ -1,4 +1,16 @@
 {
+  "account.breakGlass": {
+    "en": "Your role comes from emergency access, not from your account. It is temporary and is not a seat.",
+    "t": "Vai trò của bạn đến từ quyền truy cập khẩn cấp, không phải từ tài khoản. Vai trò này chỉ tạm thời và không phải là một ghế."
+  },
+  "account.kycLevel": {
+    "en": "Verification level",
+    "t": "Cấp xác minh"
+  },
+  "account.kycLevelValue": {
+    "en": "Level {level}",
+    "t": "Cấp {level}"
+  },
   "account.managedOnPlatform": {
     "en": "These settings are managed on evinvest.ltd, where your account lives.",
     "t": "Các cài đặt này được quản lý trên evinvest.ltd, nơi lưu tài khoản của bạn."
@@ -146,6 +158,10 @@
   "auth.err.invalidEmail": {
     "en": "Enter a valid email address.",
     "t": "Nhập một địa chỉ email hợp lệ."
+  },
+  "auth.err.invalidTicket": {
+    "en": "This confirmation has expired. You are signed in — verify your email later from your account.",
+    "t": "Xác nhận này đã hết hạn. Bạn đã đăng nhập — hãy xác minh email sau trong tài khoản."
   },
   "auth.err.invalidUsername": {
     "en": "3–32 characters: letters, digits, '_', '.' or '-'.",
@@ -319,13 +335,25 @@
     "en": "Username",
     "t": "Tên người dùng"
   },
+  "auth.verify.continue": {
+    "en": "Continue",
+    "t": "Tiếp tục"
+  },
+  "auth.verify.desc": {
+    "en": "Your account is ready. Enter the 6 digit code we sent to {email} to verify it, or skip and verify later in Settings.",
+    "t": "Tài khoản đã sẵn sàng. Nhập mã 6 chữ số đã gửi tới {email} để xác minh, hoặc xác minh sau trong Cài đặt."
+  },
   "auth.verify.later": {
     "en": "Verify later",
     "t": "Xác minh sau"
   },
-  "auth.verify.start": {
-    "en": "Your account is ready. Send a 6 digit code to {email} to verify it, or skip and verify later.",
-    "t": "Tài khoản của bạn đã sẵn sàng. Gửi mã 6 chữ số đến {email} để xác minh, hoặc bỏ qua và xác minh sau."
+  "auth.verify.notSent": {
+    "en": "Your account is ready, but the code to {email} was not sent. Send it again to verify your email, or skip and verify later.",
+    "t": "Tài khoản của bạn đã sẵn sàng, nhưng mã gửi đến {email} chưa được gửi đi. Hãy gửi lại để xác minh email, hoặc bỏ qua và xác minh sau."
+  },
+  "auth.verify.onPlatform": {
+    "en": "Your account is ready. Confirm your email from your account on evinvest.ltd.",
+    "t": "Tài khoản của bạn đã sẵn sàng. Hãy xác minh email trong tài khoản trên evinvest.ltd."
   },
   "auth.verify.title": {
     "en": "Confirm your email",

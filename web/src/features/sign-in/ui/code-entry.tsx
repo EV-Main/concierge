@@ -17,13 +17,15 @@ export interface CodeEntryProps {
   onResend?: () => void;
   onBack: () => void;
   backLabel?: string;
+  /** Offer "Send a new code" at once — nothing went out to wait for. */
+  resendNow?: boolean;
 }
 
 /** Six digits, submitted as the last one lands; a resend waits out RESEND_SECS. */
-export function CodeEntry({ title, description, busy, human, challenge, onCode, onResend, onBack, backLabel }: CodeEntryProps) {
+export function CodeEntry({ title, description, busy, human, challenge, onCode, onResend, onBack, backLabel, resendNow = false }: CodeEntryProps) {
   const t = useT();
   const [code, setCode] = useState("");
-  const [wait, setWait] = useState(RESEND_SECS);
+  const [wait, setWait] = useState(resendNow ? 0 : RESEND_SECS);
 
   useEffect(() => {
     if (wait <= 0) return;

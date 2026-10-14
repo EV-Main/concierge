@@ -1,4 +1,16 @@
 {
+  "account.breakGlass": {
+    "en": "Your role comes from emergency access, not from your account. It is temporary and is not a seat.",
+    "t": "Ihre Rolle stammt aus einem Notfallzugang, nicht aus Ihrem Konto. Sie ist vorübergehend und kein Sitz."
+  },
+  "account.kycLevel": {
+    "en": "Verification level",
+    "t": "Verifizierungsstufe"
+  },
+  "account.kycLevelValue": {
+    "en": "Level {level}",
+    "t": "Stufe {level}"
+  },
   "account.managedOnPlatform": {
     "en": "These settings are managed on evinvest.ltd, where your account lives.",
     "t": "Diese Einstellungen werden auf evinvest.ltd verwaltet, wo Ihr Konto liegt."
@@ -146,6 +158,10 @@
   "auth.err.invalidEmail": {
     "en": "Enter a valid email address.",
     "t": "Gib eine gültige E-Mail-Adresse ein."
+  },
+  "auth.err.invalidTicket": {
+    "en": "This confirmation has expired. You are signed in — verify your email later from your account.",
+    "t": "Diese Bestätigung ist abgelaufen. Sie sind angemeldet — bestätigen Sie Ihre E-Mail später in Ihrem Konto."
   },
   "auth.err.invalidUsername": {
     "en": "3–32 characters: letters, digits, '_', '.' or '-'.",
@@ -319,13 +335,25 @@
     "en": "Username",
     "t": "Benutzername"
   },
+  "auth.verify.continue": {
+    "en": "Continue",
+    "t": "Weiter"
+  },
+  "auth.verify.desc": {
+    "en": "Your account is ready. Enter the 6 digit code we sent to {email} to verify it, or skip and verify later in Settings.",
+    "t": "Dein Konto ist bereit. Gib den 6-stelligen Code ein, den wir an {email} gesendet haben, oder bestätige später in den Einstellungen."
+  },
   "auth.verify.later": {
     "en": "Verify later",
     "t": "Später bestätigen"
   },
-  "auth.verify.start": {
-    "en": "Your account is ready. Send a 6 digit code to {email} to verify it, or skip and verify later.",
-    "t": "Ihr Konto ist bereit. Senden Sie einen 6-stelligen Code an {email}, um sie zu bestätigen, oder überspringen Sie das und bestätigen Sie später."
+  "auth.verify.notSent": {
+    "en": "Your account is ready, but the code to {email} was not sent. Send it again to verify your email, or skip and verify later.",
+    "t": "Ihr Konto ist bereit, aber der Code an {email} wurde nicht gesendet. Senden Sie ihn erneut, um Ihre E-Mail zu bestätigen, oder überspringen Sie das und bestätigen Sie später."
+  },
+  "auth.verify.onPlatform": {
+    "en": "Your account is ready. Confirm your email from your account on evinvest.ltd.",
+    "t": "Ihr Konto ist bereit. Bestätigen Sie Ihre E-Mail in Ihrem Konto auf evinvest.ltd."
   },
   "auth.verify.title": {
     "en": "Confirm your email",

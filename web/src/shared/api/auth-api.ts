@@ -30,6 +30,9 @@ export const AUTH_ERRORS = [
   "passkey_rejected",
   "passkey_registered",
   "passkey_cancelled",
+  "invalid_ticket",
+  "invalid_channel",
+  "unknown_topic",
   "unavailable",
   "internal",
 ] as const;

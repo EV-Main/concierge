@@ -1,4 +1,16 @@
 {
+  "account.breakGlass": {
+    "en": "Your role comes from emergency access, not from your account. It is temporary and is not a seat.",
+    "t": "Ваша роль выдана через аварийный доступ, а не аккаунтом. Она временная и не даёт места в составе."
+  },
+  "account.kycLevel": {
+    "en": "Verification level",
+    "t": "Уровень верификации"
+  },
+  "account.kycLevelValue": {
+    "en": "Level {level}",
+    "t": "Уровень {level}"
+  },
   "account.managedOnPlatform": {
     "en": "These settings are managed on evinvest.ltd, where your account lives.",
     "t": "Эти настройки управляются на evinvest.ltd, где находится ваш аккаунт."
@@ -146,6 +158,10 @@
   "auth.err.invalidEmail": {
     "en": "Enter a valid email address.",
     "t": "Введите корректный адрес почты."
+  },
+  "auth.err.invalidTicket": {
+    "en": "This confirmation has expired. You are signed in — verify your email later from your account.",
+    "t": "Срок подтверждения истёк. Вы уже вошли — подтвердите почту позже в своём аккаунте."
   },
   "auth.err.invalidUsername": {
     "en": "3–32 characters: letters, digits, '_', '.' or '-'.",
@@ -319,13 +335,25 @@
     "en": "Username",
     "t": "Имя пользователя"
   },
+  "auth.verify.continue": {
+    "en": "Continue",
+    "t": "Продолжить"
+  },
+  "auth.verify.desc": {
+    "en": "Your account is ready. Enter the 6 digit code we sent to {email} to verify it, or skip and verify later in Settings.",
+    "t": "Аккаунт готов. Введите 6-значный код, отправленный на {email}, или подтвердите позже в Настройках."
+  },
   "auth.verify.later": {
     "en": "Verify later",
     "t": "Подтвердить позже"
   },
-  "auth.verify.start": {
-    "en": "Your account is ready. Send a 6 digit code to {email} to verify it, or skip and verify later.",
-    "t": "Аккаунт готов. Отправьте 6-значный код на {email}, чтобы подтвердить адрес, или пропустите и подтвердите позже."
+  "auth.verify.notSent": {
+    "en": "Your account is ready, but the code to {email} was not sent. Send it again to verify your email, or skip and verify later.",
+    "t": "Аккаунт готов, но код на {email} не отправлен. Отправьте его ещё раз, чтобы подтвердить почту, или пропустите и подтвердите позже."
+  },
+  "auth.verify.onPlatform": {
+    "en": "Your account is ready. Confirm your email from your account on evinvest.ltd.",
+    "t": "Аккаунт готов. Подтвердите почту в своём аккаунте на evinvest.ltd."
   },
   "auth.verify.title": {
     "en": "Confirm your email",

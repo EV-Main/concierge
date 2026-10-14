@@ -1,6 +1,7 @@
-// The email-code steps, shared by sign-in and by proving an address: `/code/verify` both
-// signs the reader in and marks the address verified, and unlike /email/verify/* it needs
-// no CSRF token, so it is one path on every host. `/code/request` spends a Turnstile token.
+// Signing in with an emailed code, on every host. `/code/request` spends a Turnstile token.
+// Not a way to confirm a new account's address: `/code/verify` opens a session for whoever
+// holds the mailbox, so the sign-up confirmation has its own ticketed routes
+// (features/sign-in/api/sign-in-api.ts).
 
 import { isRecord, str } from "../lib/guard";
 import { anyBody, type AuthApi } from "./auth-api";
