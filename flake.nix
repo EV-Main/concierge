@@ -56,9 +56,11 @@
           # sandbox lacks — let nix's vendor config drive the build instead.
           # web/ has a derivation of its own (webMfe below); left in here, every frontend
           # edit would rebuild the binary. Matched as a path: `runner/src/web` is Rust.
+          # sdk/ (the npm package) ships through npm, never in the image.
           filter = path: _type:
             ! builtins.elem (baseNameOf path) [ "target" ".direnv" ".git" ".cargo" "tmp" "result" ]
-            && path != toString ./web;
+            && path != toString ./web
+            && path != toString ./sdk;
         };
         conciergeBin = rustPlatform.buildRustPackage {
           pname = runnerCargo.name;

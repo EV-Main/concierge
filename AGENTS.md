@@ -89,10 +89,12 @@ retired in favour of `HoldUser` plus `GovernanceService.OpenUserSuspension`.
 | `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `governance` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
 | `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Redis-backed refresh rotation with reuse detection · `Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party `ExchangeCode`/`RefreshClientToken` over the runner's `ClientGrants` port, plus `open_session` for the web surface's sign-ins) reading accounts from the directory over an in-process `Provisioner` channel, the closed `oauth::OAuthProvider` set (Google, GitHub — code + PKCE), **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-prost-build` (protoc from `PROTOC`, else the vendored one). `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
-| Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams; also which consumer-built messages and services must never grow. Implemented so far: the registry (`tenants`, migration 0031; `ScopeRegistry`, `scopes` module), sign-in from a scope's hosts (`web::origins`, `web::cors`, the live allowlist `web::allowlist`), the MFE bundles under `/auth/mfe/*` (`web::mfe`, `WEB_MFE_DIR`), the sign-up ticket that confirms an address from a scope's host (`web::signup`, migration 0032), the relying-party streams (`ScopeEvents`, `UserEvents` by client credential; `scope_events`, `service_caller`, migration 0034) and the stored scope catalog (`ScopeCatalogService`, `scope_catalog`); approvals are contract only | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
+| Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams; also which consumer-built messages and services must never grow. Implemented so far: the registry (`tenants`, migration 0031; `ScopeRegistry`, `scopes` module), sign-in from a scope's hosts (`web::origins`, `web::cors`, the live allowlist `web::allowlist`), the MFE bundles under `/auth/mfe/*` (`web::mfe`, `WEB_MFE_DIR`), the sign-up ticket that confirms an address from a scope's host (`web::signup`, migration 0032), the relying-party streams (`ScopeEvents`, `UserEvents` by client credential; `scope_events`, `service_caller`, migration 0034) the stored scope catalog (`ScopeCatalogService`, `scope_catalog`) and each direction's own inbox (`notification::InboxView`; `ScopeInboxService`, `scope_inbox`, §6); approvals are contract only | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
+| `web/` — the plane's microfrontends (`mfe-concierge-sign-in`, `-account`, `-account-chip`): React + `@evinvest/uikit` custom elements built to `web/dist/` with `registry.json`, served under `/auth/mfe/*`; which actions work on a scope host and which link to the platform | [`web/README.md`](./web/README.md) |
 | `concierge_iam` (+ `_derive`) — permission scopes: `#[derive(Permission)]` enums, `alias!`, the concrete `PermissionSet` a service asks `may` of, `Pattern` containment, the `Catalog` a tenant publishes. I/O-free, wasm-safe, published to crates.io so consumers need no protoc | [`iam/`](./iam) |
 | `concierge_client` — a relying party's calls into this plane: code + PKCE (authorize URL, `ExchangeCode`, `RefreshClientToken`), `GetMe`, `PublishCatalog` / `PublishScopeCatalog` under the client credential; errors as values. `concierge_projection` — the pull engine a direction keeps its users with: `ScopeEvents` + `UserEvents` by client credential (cursor = `next_position`, explicit `limit`), dedupe, per-key ordering, parking and replay; the bookkeeping store on Postgres (feature `pg`) or SQLite (`sqlite`). Clients of this service live here (D22), not in `lib`. Published to crates.io in order `evconcierge_contracts` → `concierge_client`, `concierge_projection` (they depend on contracts by `version` + `path`), so consumers need no protoc and no git dependency. A proto change that reaches these crates is a minor bump of all three on 0.x: an added prost field breaks consumers' struct literals; the projection's README is the integration guide | [`client/`](./client) · [`projection/`](./projection) |
+| `@evinvest/concierge` — the npm package hosts mount the concierge MFEs with (`SignInDialog`, `AccountChip`, `AccountPage`, `useSignInRequired`, the session reader, platform sign-out; peer `@evinvest/mfe`). Lives here, not in `EV-Main/lib`, because lib carries no service's logic: a change to the elements' contract and to their host wrappers lands in one PR. Published by `.github/workflows/npm-publish.yml` (hand-written, not flake-generated; OIDC trusted publishing) on a tag `@evinvest/concierge-v<version>` matching `sdk/package.json`; that tag does not trip the container release (`v*`). Release steps in the package README | [`sdk/`](./sdk) |
 | **Design** — operator (admin) surface over this plane | [§ Design](#design) |
 
 ---
@@ -655,8 +657,28 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   older binary changed beside this one; between boots such a change is not on the stream.
   `ScopeCatalogService` stores approval kinds and notification topics per namespace (the
   bridge token publishes `bank`), versioned like `PublishCatalog`, and executes nothing;
-  a scope's topics are offered in notification settings beside the built-in ones, while
-  `Emit` still refuses them: a `typ=service` token names no namespace to check against.
+  a scope's topics are offered only in that scope's inbox, while `Emit` still refuses
+  them: a `typ=service` token names no namespace to check against.
+- **Each direction has its own inbox, and the server picks it (D21).** The notification
+  routes (`/auth/notifications/settings*`) resolve `notification::InboxView` from the
+  `Origin`: `PUBLIC_ORIGIN` or none → the platform inbox (built-in topics and `bank:*`), a
+  signing-in scope's origin → that scope's catalog topics for its MEMBERS only
+  (`scope_members`; anyone else reads an empty inbox), any other origin → 403. gRPC
+  `NotificationService` with a user's token reads the platform inbox. The summary of every
+  namespace (`?all=1` / metadata `x-ev-inbox-view: all`) is `PUBLIC_ORIGIN` only and needs
+  `concierge:notifications:read_all` (seats `admin`, `owner`). A topic outside the inbox is
+  refused as unknown; the master channel switches are set only from the platform inbox.
+  A direction's frontend reaches its inbox through its OWN backend, which calls
+  `ScopeInboxService` (outside the user auth layer, `BIND` and the TLS listener) with its
+  client credential and the user's concierge id: the client's own scope's namespace only
+  (never an observed scope's), active members only — anyone else reads empty and writes
+  `FAILED_PRECONDITION`. A WRITE also needs the user's access token issued to that client
+  (`x-ev-user-token`, `aud` = its audience, live session) and takes the user from it:
+  following a topic turns on mail, and a client secret alone must not do that to anyone.
+  So the client credential opens `ScopeEvents`, `UserEvents`, `ScopeCatalogService` and
+  `ScopeInboxService`, while a client's USER token is admitted by the auth layer on `GetMe`
+  alone and is otherwise only that second proof on a scope-inbox write. The gRPC summary
+  reads the persisted seat; break-glass does not open it. `docs/SCOPES-AND-APPROVALS.md` §6.
 - **This plane is the identity provider of first-party clients on OTHER origins, and a
   client's token opens exactly one RPC.** A relying party (`relying_party`, registry
   `rp_clients` from `0025`; the Service-Arb panel `sa` (0025) and the invest cabinet `invest` (0031) are seeded) runs authorization code +

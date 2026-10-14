@@ -22,7 +22,7 @@ use concierge::{
 		scope_events::PgScopeEvents,
 		users::{AdminAction, PgUsers},
 	},
-	notification::{settings_of, topic_known},
+	notification::{InboxView, settings_of, topic_known},
 	ports::{GrantActor, GrantOutcome, GrantRepository, GrantSubject, NewCode, NewSession, RelyingPartyRepository, RevokeOutcome, UserDirectoryRepository},
 	scope_catalog::ScopeCatalogs,
 	scope_events::ScopeEvents,
@@ -778,7 +778,7 @@ async fn a_scope_topic_is_offered_beside_the_built_in_ones_until_withdrawn() {
 		.unwrap();
 	assert!(topic_known(&notifications, &topic).await.unwrap());
 	assert!(topic_known(&notifications, "account:verification").await.unwrap(), "the built-in topics stay");
-	let settings = settings_of(&notifications, "someone@example.com", true, None).await.unwrap();
+	let settings = settings_of(&notifications, &InboxView::All, "someone@example.com", true, None).await.unwrap();
 	let offered = settings.topics.iter().find(|t| t.topic == topic).expect("offered in the settings");
 	assert_eq!((offered.label.as_str(), offered.subscribed), ("Marks", false), "nobody follows a scope topic until they ask");
 

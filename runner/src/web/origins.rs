@@ -17,6 +17,8 @@ pub struct ScopeOrigins {
 
 #[derive(Clone, Debug)]
 struct ScopeHosts {
+	id: String,
+	namespace: String,
 	origins: Vec<String>,
 	return_paths: Vec<String>,
 }
@@ -42,6 +44,8 @@ impl ScopeOrigins {
 					ok
 				};
 				ScopeHosts {
+					id: scope.id.clone(),
+					namespace: scope.namespace.clone(),
 					origins: scope.origins.iter().filter(|o| keep("origin", o, is_sign_in_origin)).cloned().collect(),
 					return_paths: scope.return_paths.iter().filter(|p| keep("return path", p, is_return_path)).cloned().collect(),
 				}
@@ -53,6 +57,12 @@ impl ScopeOrigins {
 	/// Byte for byte: no case folding, no default-port normalisation, no prefix.
 	pub fn admits(&self, origin: &str) -> bool {
 		self.origins().any(|o| o == origin)
+	}
+
+	/// The scope `origin` is a host of, as `(id, namespace)`, matched as [`Self::admits`]
+	/// matches.
+	pub fn scope_of(&self, origin: &str) -> Option<(&str, &str)> {
+		self.scopes.iter().find(|s| s.origins.iter().any(|o| o == origin)).map(|s| (s.id.as_str(), s.namespace.as_str()))
 	}
 
 	pub fn origins(&self) -> impl Iterator<Item = &str> {
@@ -111,6 +121,9 @@ mod tests {
 		assert!(!o.admits("https://old.evinvest.ltd"), "a closed scope signs nobody in");
 		assert!(!o.admits("http://bad.evinvest.ltd"), "a malformed stored origin is ignored");
 		assert!(o.admits("https://good.evinvest.ltd"));
+		assert_eq!(o.scope_of("https://sa.evinvest.ltd"), Some(("sa", "sa")));
+		assert_eq!(o.scope_of("https://old.evinvest.ltd"), None, "a closed scope has no inbox on its host");
+		assert_eq!(o.scope_of("https://invest.evinvest.ltd/"), None);
 		for bad in [
 			"https://invest.evinvest.ltd/",
 			"https://INVEST.evinvest.ltd",

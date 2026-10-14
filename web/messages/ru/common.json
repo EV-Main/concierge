@@ -1,0 +1,518 @@
+{
+  "account.breakGlass": {
+    "en": "Your role comes from emergency access, not from your account. It is temporary and is not a seat.",
+    "t": "Ваша роль выдана через аварийный доступ, а не аккаунтом. Она временная и не даёт места в составе."
+  },
+  "account.kycLevel": {
+    "en": "Verification level",
+    "t": "Уровень верификации"
+  },
+  "account.kycLevelValue": {
+    "en": "Level {level}",
+    "t": "Уровень {level}"
+  },
+  "account.managedOnPlatform": {
+    "en": "These settings are managed on evinvest.ltd, where your account lives.",
+    "t": "Эти настройки управляются на evinvest.ltd, где находится ваш аккаунт."
+  },
+  "account.none": {
+    "en": "None",
+    "t": "Нет"
+  },
+  "account.openOnPlatform": {
+    "en": "Open on evinvest.ltd",
+    "t": "Открыть на evinvest.ltd"
+  },
+  "account.signOutHere": {
+    "en": "Sign out on this device.",
+    "t": "Выйти на этом устройстве."
+  },
+  "account.signedOut": {
+    "en": "Sign in to see your account.",
+    "t": "Войдите, чтобы увидеть свой аккаунт."
+  },
+  "account.unavailable": {
+    "en": "This could not be loaded. Try again in a moment.",
+    "t": "Не удалось загрузить. Попробуйте чуть позже."
+  },
+  "auth.cabinet": {
+    "en": "Cabinet",
+    "t": "Кабинет"
+  },
+  "auth.code.back": {
+    "en": "Use a different email",
+    "t": "Другой адрес"
+  },
+  "auth.code.checkSpam": {
+    "en": "It can take a minute. Check your spam folder too.",
+    "t": "Это может занять минуту. Проверьте и папку «Спам»."
+  },
+  "auth.code.desc": {
+    "en": "We sent a 6 digit sign in code to {email}",
+    "t": "Мы отправили 6-значный код входа на {email}"
+  },
+  "auth.code.label": {
+    "en": "Code",
+    "t": "Код"
+  },
+  "auth.code.mailMe": {
+    "en": "Email me a code",
+    "t": "Прислать код на почту"
+  },
+  "auth.code.resend": {
+    "en": "Send a new code",
+    "t": "Отправить новый код"
+  },
+  "auth.code.resendIn": {
+    "en": "Send a new code in {seconds}s",
+    "t": "Новый код через {seconds} с"
+  },
+  "auth.code.title": {
+    "en": "Check your email",
+    "t": "Проверьте почту"
+  },
+  "auth.createAccount": {
+    "en": "Create an account",
+    "t": "Создать аккаунт"
+  },
+  "auth.dialog.heading": {
+    "en": "Sign in or create an account",
+    "t": "Войти или создать аккаунт"
+  },
+  "auth.email.confirm": {
+    "en": "Confirm",
+    "t": "Подтвердить"
+  },
+  "auth.email.unverified": {
+    "en": "Not verified",
+    "t": "Не подтверждена"
+  },
+  "auth.email.unverifiedSub": {
+    "en": "Not verified — identity checks need a verified email",
+    "t": "Не подтверждён — для проверки личности нужен подтверждённый адрес"
+  },
+  "auth.email.verified": {
+    "en": "Verified",
+    "t": "Подтверждён"
+  },
+  "auth.email.verify": {
+    "en": "Verify",
+    "t": "Подтвердить"
+  },
+  "auth.err.attemptsExceeded": {
+    "en": "Too many tries. Send yourself a new code.",
+    "t": "Слишком много попыток. Запросите новый код."
+  },
+  "auth.err.captcha": {
+    "en": "Captcha verification failed. Please try again.",
+    "t": "Проверка капчи не пройдена. Попробуйте ещё раз."
+  },
+  "auth.err.captchaLoad": {
+    "en": "Captcha failed to load. Please refresh the page.",
+    "t": "Капча не загрузилась. Обновите страницу."
+  },
+  "auth.err.captchaUnavailable": {
+    "en": "We could not check the captcha just now. Please try again.",
+    "t": "Не удалось проверить капчу. Попробуйте ещё раз."
+  },
+  "auth.err.codeExpired": {
+    "en": "That code has expired. Send yourself a new code.",
+    "t": "Срок действия кода истёк. Запросите новый."
+  },
+  "auth.err.denied": {
+    "en": "Sign-in was cancelled.",
+    "t": "Вход отменён."
+  },
+  "auth.err.disabled": {
+    "en": "This account is suspended.",
+    "t": "Этот аккаунт заблокирован."
+  },
+  "auth.err.emailTaken": {
+    "en": "An account already exists for that address. Sign in instead — with a code if you forgot the password.",
+    "t": "Для этого адреса уже есть аккаунт. Войдите — с кодом, если забыли пароль."
+  },
+  "auth.err.emailVerifiedElsewhere": {
+    "en": "This address is verified on another account.",
+    "t": "Этот адрес уже подтверждён в другом аккаунте."
+  },
+  "auth.err.exchange": {
+    "en": "We couldn't complete sign-in. Please try again.",
+    "t": "Не удалось завершить вход. Попробуйте ещё раз."
+  },
+  "auth.err.generic": {
+    "en": "Sign-in failed. Please try again.",
+    "t": "Не удалось войти. Попробуйте ещё раз."
+  },
+  "auth.err.invalid": {
+    "en": "That sign-in attempt expired. Please try again.",
+    "t": "Срок этой попытки входа истёк. Попробуйте ещё раз."
+  },
+  "auth.err.invalidCode": {
+    "en": "That code is not right. Try again.",
+    "t": "Неверный код. Попробуйте ещё раз."
+  },
+  "auth.err.invalidCredentials": {
+    "en": "Wrong email, username or password.",
+    "t": "Неверный email, имя пользователя или пароль."
+  },
+  "auth.err.invalidEmail": {
+    "en": "Enter a valid email address.",
+    "t": "Введите корректный адрес почты."
+  },
+  "auth.err.invalidTicket": {
+    "en": "This confirmation has expired. You are signed in — verify your email later from your account.",
+    "t": "Срок подтверждения истёк. Вы уже вошли — подтвердите почту позже в своём аккаунте."
+  },
+  "auth.err.invalidUsername": {
+    "en": "3–32 characters: letters, digits, '_', '.' or '-'.",
+    "t": "3–32 символа: латинские буквы, цифры, '_', '.' или '-'."
+  },
+  "auth.err.passkeyCancelled": {
+    "en": "Passkey sign in was cancelled.",
+    "t": "Вход с ключом доступа отменён."
+  },
+  "auth.err.passkeyExpired": {
+    "en": "That took too long. Try the passkey again.",
+    "t": "Слишком долго. Попробуйте ключ доступа ещё раз."
+  },
+  "auth.err.passkeyRegistered": {
+    "en": "This passkey is registered already.",
+    "t": "Этот ключ доступа уже зарегистрирован."
+  },
+  "auth.err.passkeyRejected": {
+    "en": "That passkey is not registered here. Sign in with a code instead.",
+    "t": "Этот ключ доступа здесь не зарегистрирован. Войдите с кодом."
+  },
+  "auth.err.passwordLocked": {
+    "en": "Too many wrong passwords. Sign in with a code instead.",
+    "t": "Слишком много неверных паролей. Войдите с кодом."
+  },
+  "auth.err.signOut": {
+    "en": "We couldn't sign you out. Please try again.",
+    "t": "Не удалось выйти. Попробуйте ещё раз."
+  },
+  "auth.err.throttled": {
+    "en": "Too many codes went to this address. Try again in a few minutes.",
+    "t": "На этот адрес отправлено слишком много кодов. Попробуйте через несколько минут."
+  },
+  "auth.err.usernameTaken": {
+    "en": "That username is taken.",
+    "t": "Это имя пользователя занято."
+  },
+  "auth.err.weakPassword": {
+    "en": "Use at least 8 characters.",
+    "t": "Минимум 8 символов."
+  },
+  "auth.field.email": {
+    "en": "Email",
+    "t": "Эл. почта"
+  },
+  "auth.field.identifier": {
+    "en": "Email or username",
+    "t": "Email или имя пользователя"
+  },
+  "auth.field.newPassword": {
+    "en": "New password",
+    "t": "Новый пароль"
+  },
+  "auth.field.password": {
+    "en": "Password",
+    "t": "Пароль"
+  },
+  "auth.manageAccount": {
+    "en": "Manage account",
+    "t": "Управление аккаунтом"
+  },
+  "auth.method.code": {
+    "en": "Email code",
+    "t": "Код на почту"
+  },
+  "auth.method.password": {
+    "en": "Password",
+    "t": "Пароль"
+  },
+  "auth.methods.title": {
+    "en": "Sign-in methods",
+    "t": "Способы входа"
+  },
+  "auth.orContinueWith": {
+    "en": "Or continue with",
+    "t": "Или продолжить через"
+  },
+  "auth.passkeys.add": {
+    "en": "Add a passkey",
+    "t": "Добавить ключ доступа"
+  },
+  "auth.passkeys.default": {
+    "en": "Passkey",
+    "t": "Ключ доступа"
+  },
+  "auth.passkeys.remove": {
+    "en": "Remove",
+    "t": "Удалить"
+  },
+  "auth.passkeys.sub": {
+    "en": "Sign in with your fingerprint, face or screen lock — no code, no password",
+    "t": "Вход по отпечатку, лицу или блокировке экрана — без кода и пароля"
+  },
+  "auth.passkeys.title": {
+    "en": "Passkeys",
+    "t": "Ключи доступа"
+  },
+  "auth.password.change": {
+    "en": "Change password",
+    "t": "Сменить пароль"
+  },
+  "auth.password.save": {
+    "en": "Save password",
+    "t": "Сохранить пароль"
+  },
+  "auth.password.set": {
+    "en": "Set password",
+    "t": "Задать пароль"
+  },
+  "auth.signIn": {
+    "en": "Sign in",
+    "t": "Войти"
+  },
+  "auth.signOut": {
+    "en": "Sign out",
+    "t": "Выйти"
+  },
+  "auth.signup.create": {
+    "en": "Create account",
+    "t": "Создать аккаунт"
+  },
+  "auth.signup.desc": {
+    "en": "Your account works right away. A KYC check later needs a verified email.",
+    "t": "Аккаунт работает сразу. Для проверки KYC позже понадобится подтверждённая почта."
+  },
+  "auth.signup.haveAccount": {
+    "en": "Already have an account? Sign in",
+    "t": "Уже есть аккаунт? Войти"
+  },
+  "auth.signup.heading": {
+    "en": "Create an account",
+    "t": "Создать аккаунт"
+  },
+  "auth.signup.verifyNow": {
+    "en": "Verify my email now",
+    "t": "Подтвердить почту сейчас"
+  },
+  "auth.switchAccount": {
+    "en": "Switch account",
+    "t": "Сменить аккаунт"
+  },
+  "auth.useCodeInstead": {
+    "en": "Sign in with a code instead",
+    "t": "Войти с кодом"
+  },
+  "auth.useLoginCode": {
+    "en": "Email me a code",
+    "t": "Прислать код на почту"
+  },
+  "auth.usePasskey": {
+    "en": "Use a passkey",
+    "t": "Войти с ключом доступа"
+  },
+  "auth.usePasswordInstead": {
+    "en": "Sign in with a password instead",
+    "t": "Войти с паролем"
+  },
+  "auth.username.change": {
+    "en": "Change",
+    "t": "Изменить"
+  },
+  "auth.username.none": {
+    "en": "None yet — once set, it signs you in like your email",
+    "t": "Пока нет — когда зададите, с ним можно входить, как с почтой"
+  },
+  "auth.username.save": {
+    "en": "Save",
+    "t": "Сохранить"
+  },
+  "auth.username.title": {
+    "en": "Username",
+    "t": "Имя пользователя"
+  },
+  "auth.verify.continue": {
+    "en": "Continue",
+    "t": "Продолжить"
+  },
+  "auth.verify.desc": {
+    "en": "Your account is ready. Enter the 6 digit code we sent to {email} to verify it, or skip and verify later in Settings.",
+    "t": "Аккаунт готов. Введите 6-значный код, отправленный на {email}, или подтвердите позже в Настройках."
+  },
+  "auth.verify.later": {
+    "en": "Verify later",
+    "t": "Подтвердить позже"
+  },
+  "auth.verify.notSent": {
+    "en": "Your account is ready, but the code to {email} was not sent. Send it again to verify your email, or skip and verify later.",
+    "t": "Аккаунт готов, но код на {email} не отправлен. Отправьте его ещё раз, чтобы подтвердить почту, или пропустите и подтвердите позже."
+  },
+  "auth.verify.onPlatform": {
+    "en": "Your account is ready. Confirm your email from your account on evinvest.ltd.",
+    "t": "Аккаунт готов. Подтвердите почту в своём аккаунте на evinvest.ltd."
+  },
+  "auth.verify.title": {
+    "en": "Confirm your email",
+    "t": "Подтвердите почту"
+  },
+  "notif.a11y.email": {
+    "en": "Email notifications",
+    "t": "Уведомления по эл. почте"
+  },
+  "notif.a11y.emailCopyFor": {
+    "en": "Email copy for {topic}",
+    "t": "Копия на эл. почту по теме «{topic}»"
+  },
+  "notif.a11y.inApp": {
+    "en": "In-app notifications",
+    "t": "Уведомления в кабинете"
+  },
+  "notif.delivery": {
+    "en": "Delivery",
+    "t": "Доставка"
+  },
+  "notif.deliverySub": {
+    "en": "Choose where notifications reach you. Both can be off.",
+    "t": "Выберите, куда приходят уведомления. Можно отключить оба канала."
+  },
+  "notif.emailUnverified": {
+    "en": "{email} · unverified, so email is not sent",
+    "t": "{email} · не подтверждён, поэтому письма не отправляются"
+  },
+  "notif.emailVerified": {
+    "en": "Sent to {email} · verified",
+    "t": "Отправляется на {email} · подтверждён"
+  },
+  "notif.follow": {
+    "en": "Follow",
+    "t": "Подписаться"
+  },
+  "notif.following": {
+    "en": "Following",
+    "t": "Вы подписаны"
+  },
+  "notif.inApp": {
+    "en": "In the app",
+    "t": "В приложении"
+  },
+  "notif.inAppSub": {
+    "en": "On by default. Turn this off and notifications stop appearing in your cabinet.",
+    "t": "Включено по умолчанию. Отключите — и уведомления перестанут появляться в кабинете."
+  },
+  "notif.saveFailed": {
+    "en": "That change was not saved. Try again.",
+    "t": "Изменение не сохранено. Попробуйте ещё раз."
+  },
+  "notif.topicsSub": {
+    "en": "Email a copy for these. Unsubscribing is one click — no confirmation step.",
+    "t": "Копия по этим темам на почту. Отписка — в один клик, без подтверждения."
+  },
+  "notif.unavailable": {
+    "en": "Notification settings are not available here yet.",
+    "t": "Настройки уведомлений здесь пока недоступны."
+  },
+  "notif.whatYouFollow": {
+    "en": "What you follow",
+    "t": "На что вы подписаны"
+  },
+  "settings.device.browser": {
+    "en": "Browser",
+    "t": "Браузер"
+  },
+  "settings.device.generic": {
+    "en": "device",
+    "t": "устройство"
+  },
+  "settings.device.label": {
+    "en": "{browser} · {os}",
+    "t": "{browser} · {os}"
+  },
+  "settings.device.unknown": {
+    "en": "Unknown device",
+    "t": "Неизвестное устройство"
+  },
+  "settings.noSessions": {
+    "en": "No active sessions.",
+    "t": "Активных сеансов нет."
+  },
+  "settings.revoke": {
+    "en": "Revoke",
+    "t": "Отозвать"
+  },
+  "settings.revokeFailed": {
+    "en": "That session could not be signed out. Try again.",
+    "t": "Не удалось завершить этот сеанс. Попробуйте ещё раз."
+  },
+  "settings.securitySub": {
+    "en": "How you sign in and where your account is active",
+    "t": "Как вы входите и где активен ваш аккаунт"
+  },
+  "settings.session.activeNow": {
+    "en": "Active now",
+    "t": "Активен сейчас"
+  },
+  "settings.session.activeNowLower": {
+    "en": "active now",
+    "t": "активен сейчас"
+  },
+  "settings.session.activeRecently": {
+    "en": "active recently",
+    "t": "недавняя активность"
+  },
+  "settings.session.lastActiveDays": {
+    "en": "last active {n}d ago",
+    "t": "активность {n} д назад"
+  },
+  "settings.session.lastActiveHours": {
+    "en": "last active {n}h ago",
+    "t": "активность {n} ч назад"
+  },
+  "settings.session.lastActiveMinutes": {
+    "en": "last active {n}m ago",
+    "t": "активность {n} мин назад"
+  },
+  "settings.sessionsSub": {
+    "en": "Where you're signed in — revoke anything you don't recognise",
+    "t": "Где выполнен вход — отзовите всё, что вам незнакомо"
+  },
+  "settings.signOutOthers": {
+    "en": "Sign out all other devices",
+    "t": "Выйти на других устройствах"
+  },
+  "settings.thisDevice": {
+    "en": "This device",
+    "t": "Текущее"
+  },
+  "ui.account": {
+    "en": "Account",
+    "t": "Аккаунт"
+  },
+  "ui.email": {
+    "en": "Email",
+    "t": "Эл. почта"
+  },
+  "ui.notifications": {
+    "en": "Notifications",
+    "t": "Уведомления"
+  },
+  "ui.profile": {
+    "en": "Profile",
+    "t": "Профиль"
+  },
+  "ui.security": {
+    "en": "Security",
+    "t": "Безопасность"
+  },
+  "ui.services": {
+    "en": "Services",
+    "t": "Сервисы"
+  },
+  "ui.sessionsDevices": {
+    "en": "Sessions & devices",
+    "t": "Сеансы и устройства"
+  }
+}

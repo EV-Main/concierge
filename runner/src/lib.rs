@@ -53,6 +53,7 @@ pub mod ports;
 pub mod relying_party;
 pub mod scope_catalog;
 pub mod scope_events;
+pub mod scope_inbox;
 pub mod scopes;
 pub mod service_caller;
 pub mod support;
