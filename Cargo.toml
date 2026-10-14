@@ -5,8 +5,11 @@ cargo-features = ["codegen-backend"]
 # notification/log modules); `auth` (verification flow + AuthService skeleton) and
 # `contracts` (proto → tonic stubs) are the crates downstream service repos import
 # by git; `domain` is the wasm-safe shared identity source of truth; `iam` (+ its derive)
-# is the permission-scope vocabulary every tenant service links from crates.io.
-members = ["auth", "contracts", "domain", "iam", "iam_derive", "runner"]
+# is the permission-scope vocabulary every tenant service links from crates.io;
+# `client` (`evconcierge_client`) and `projection` (`evconcierge_projection`) are what a
+# relying party calls this plane with and keeps its users with, published to crates.io
+# on top of `contracts`.
+members = ["auth", "client", "contracts", "domain", "iam", "iam_derive", "projection", "runner"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -28,7 +31,9 @@ domain = { path = "domain" }
 dotenvy = "0.15.7"
 ev = { version = "0.24.2", package = "ev_lib", default-features = false, features = ["architecture", "types"] }
 evconcierge_auth = { path = "auth" }
-evconcierge_contracts = { path = "contracts" }
+# `version` too: the published `evconcierge_client` and `evconcierge_projection` resolve it
+# from crates.io, where a bare path dependency cannot go.
+evconcierge_contracts = { version = "0.1.0", path = "contracts" }
 # argon2id for the passwords this plane checks itself.
 argon2 = { version = "0.5", features = ["std"] }
 # Passkeys (WebAuthn): discoverable sign-in needs `conditional-ui`.

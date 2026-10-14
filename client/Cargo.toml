@@ -1,0 +1,26 @@
+[package]
+name = "evconcierge_client"
+version = "0.1.0"
+edition = "2024"
+description = "A relying party's calls into the EV concierge identity plane: code + PKCE sign-in, GetMe, catalog publishing under the client credential."
+license = "BlueOak-1.0.0"
+repository = "https://github.com/EV-Main/concierge"
+readme = "README.md"
+# Tests run against fakes of this repo's own servers; they stay home.
+include = ["Cargo.toml", "README.md", "src/**/*.rs"]
+
+[dependencies]
+base64.workspace = true
+evconcierge_contracts.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "net"] }
+
+[lints]
+workspace = true
