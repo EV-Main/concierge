@@ -68,7 +68,7 @@ async fn the_migration_seeds_invest_and_gives_sa_its_host() {
 	let invest = scopes.iter().find(|s| s.id == "invest").expect("invest is seeded");
 	assert_eq!((invest.namespace.as_str(), invest.parent.as_str(), invest.state), ("invest", "main", ScopeState::Active));
 	assert_eq!(invest.origins, vec![INVEST]);
-	assert_eq!(invest.return_paths, vec!["/cabinet"]);
+	assert_eq!(invest.return_paths, vec!["/cabinet", "/"], "0031 seeded /cabinet, 0035 appended /");
 	assert_eq!(invest.clients.len(), 1);
 	assert_eq!(
 		(invest.clients[0].client_id.as_str(), invest.clients[0].audience.as_str(), invest.clients[0].disabled),
@@ -211,7 +211,7 @@ async fn scope_registry_lists_main_first_and_reads_one_scope() {
 	assert_eq!(invest.parent, "main");
 	assert_eq!(invest.state, cc::ScopeState::Active as i32);
 	assert_eq!(invest.origins, vec![INVEST]);
-	assert_eq!(invest.return_paths, vec!["/cabinet"]);
+	assert_eq!(invest.return_paths, vec!["/cabinet", "/"], "0031 seeded /cabinet, 0035 appended /");
 	assert!(invest.version >= 1);
 	assert_eq!(
 		invest.clients,
