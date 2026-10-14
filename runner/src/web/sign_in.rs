@@ -6,8 +6,8 @@
 //!
 //! The credential POSTs are reachable with no session, so the session's double-submit
 //! check cannot guard them. Two things do instead: the `Origin` header must be this
-//! plane's public origin (a cross-site form cannot sign a browser into an account of the
-//! attacker's choosing), and the ones that cost us a mail or test a password carry a
+//! plane's public origin or a host of a signing-in scope (a cross-site form cannot sign a
+//! browser into an account of the attacker's choosing), and the ones that cost us a mail or test a password carry a
 //! Turnstile token checked here.
 
 use axum::{
@@ -59,9 +59,11 @@ pub(super) fn internal(context: &'static str, err: impl std::fmt::Display) -> Re
 	INTERNAL
 }
 
-/// Same-origin, and — when `turnstile` is given — a human.
+/// From this plane or a scope's host, and — when `turnstile` is given — a human. Only for
+/// the scope routes `router` lists: a route acting on an open session must not widen its
+/// origin through this.
 pub(super) async fn guard(st: &super::Inner, headers: &HeaderMap, turnstile: Option<&str>) -> Result<(), Refusal> {
-	if headers.get("origin").and_then(|v| v.to_str().ok()) != Some(st.public_origin.as_str()) {
+	if !headers.get("origin").and_then(|v| v.to_str().ok()).is_some_and(|origin| st.allowlist.admits(origin)) {
 		return Err(Refusal(StatusCode::FORBIDDEN, "origin"));
 	}
 	let Some(token) = turnstile else { return Ok(()) };

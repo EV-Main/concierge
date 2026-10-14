@@ -26,6 +26,7 @@
 //!   relying_party   — this plane as the IdP of first-party clients on other origins:
 //!                     the registry, one-time codes and client refresh families behind
 //!                     `/auth/authorize` and `AuthService.ExchangeCode`
+//!   scopes          — the scope registry's read service (`ScopeRegistry`)
 //!   web             — the site-level auth HTTP surface (login/callback/session cookies)
 //!   notification    — the notification plane: subscribers, the in-app inbox, queued email
 //!   dispatch        — the background loops: draining the outbound email queue, and the
@@ -47,5 +48,6 @@ pub mod notification;
 pub mod platform;
 pub mod ports;
 pub mod relying_party;
+pub mod scopes;
 pub mod support;
 pub mod web;

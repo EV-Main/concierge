@@ -1,9 +1,12 @@
 # Scopes, approvals and the relying-party event streams — contract
 
-Status: **contract only.** The wire is in `contracts/proto/concierge/v1/scopes.proto`,
-`approvals.proto` and the comments on `events.proto`; nothing here is implemented in
-`runner/` yet, no service below is mounted, and calling one answers `UNIMPLEMENTED`.
-Banking, the `lib` projections, invest and admin build against this document.
+Status: **partly implemented.** The wire is in `contracts/proto/concierge/v1/scopes.proto`,
+`approvals.proto` and the comments on `events.proto`. Implemented in `runner/`: the
+registry (§3: `tenants` columns from migration 0031, `ScopeRegistry` mounted inside the
+user auth layer) and sign-in from a scope's hosts (§3.1: CORS and the `Origin` check on
+the closed route list, the passkey verifier's origins, OAuth `returnTo`). Every other
+service below is not mounted yet and answers `UNIMPLEMENTED`. Banking, the `lib`
+projections, invest and admin build against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it
@@ -107,8 +110,9 @@ a resource (D2): an admin of a scope holds the `<scope>:admin` alias, which dele
 `origins` are the scope's hosts exactly as a browser sends `Origin`, and they are held to
 rules a configuration slip cannot loosen:
 
-- `https` only; the host is `evinvest.ltd` or ends in `.evinvest.ltd`; a port only when
-  non-default; no path, no trailing slash, no wildcard, never `null`;
+- `https` only; the host ends in `.evinvest.ltd` — the bare `evinvest.ltd` is
+  `PUBLIC_ORIGIN`, never a scope's; a port (1-65535) only when non-default; no path, no
+  trailing slash, no wildcard, never `null`;
 - compared byte for byte; the answer carries `Access-Control-Allow-Origin` set to exactly
   the matched origin and `Vary: Origin`.
 
@@ -116,12 +120,17 @@ They widen CORS for a **closed list** of sign-in routes and nothing else:
 
 | Accepts a scope origin | `PUBLIC_ORIGIN` only |
 | ---------------------- | -------------------- |
-| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/email/verify/*`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user}`, never a token) | everything acting on an open session: `/auth/password/set`, `/auth/passkey/register`, `/auth/passkey/remove`, sessions, username, logout, `/kyc/*` |
+| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user}`, never a token) | everything acting on an open session: `/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register`, `/auth/passkey/remove`, sessions, username, logout, `/kyc/*` |
 
 A route on the left accepts an `Origin` that is `PUBLIC_ORIGIN` or an origin of a scope
 that is `ACTIVE` or `FROZEN` — a frozen scope's clients still sign people in — and never
-one of a `CLOSED` scope. An OAuth `returnTo` must be one of these origins plus a path
-from the scope's `return_paths`, matched exactly.
+one of a `CLOSED` scope. The right column carries the CSRF double-submit, whose cookie a
+scope host cannot read, so email verification is not offered there: a scope host proves
+a mailbox by signing in with a code. The allowlist is re-read from the registry at most
+30 s apart (`web::allowlist`), so closing a scope or removing an origin takes effect
+without a restart. An absolute OAuth `returnTo` must be one of these origins plus a path
+from the scope's `return_paths`, matched exactly, or `/auth/login` answers 400; a
+relative or empty one lands on `/` as it always did.
 
 ---
 
@@ -143,7 +152,11 @@ names it an observer. The bridge token sees everything.
 scanned** for the caller — past the last event returned when the rows after it were not
 the caller's to see, so a filtered reader never re-scans them; unchanged when nothing
 was scanned. To the unfiltered reader (the bridge token) that is the max position
-returned, which is what banking stores today.
+returned, which is what banking stores today. A page that **fills `limit`** stops scanning at its last
+event, so its `next_position` is exactly that event's `position`; with `limit = 1` and
+one event returned, `next_position` is that event's position. `lib`'s
+`concierge_projection` relies on this to replay a parked event (§4.3) and confirm it got
+that one; the scan runs past the last event only when the page did not fill.
 
 **`UserEvents.PullUserLifecycle`**, read by a client credential: same request,
 filtered by visibility, and each row redacted — `seat_permissions` absent and

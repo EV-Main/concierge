@@ -258,6 +258,10 @@ pub struct ClientRecord {
 	pub disabled: bool,
 	/// The tenant namespace whose catalog it publishes and whose permissions its tokens read.
 	pub namespace: String,
+	/// Its scope is CLOSED: the client signs nobody in and its sessions end at their next
+	/// refresh, as if disabled. A FROZEN scope's client keeps working — a direction has to
+	/// learn it was frozen.
+	pub scope_closed: bool,
 }
 
 /// A one-time authorization code to store (`rp_codes`). Only its digest is persisted.
@@ -342,6 +346,8 @@ pub enum SessionRevocation {
 	TokensRevoked,
 	/// The `evinvest.ltd` session it was authorized by ended — single logout.
 	UpstreamRevoked,
+	/// The client's scope was closed.
+	ScopeClosed,
 }
 
 impl SessionRevocation {
@@ -351,6 +357,7 @@ impl SessionRevocation {
 			Self::AccessDenied => "access_denied",
 			Self::TokensRevoked => "tokens_revoked",
 			Self::UpstreamRevoked => "upstream_revoked",
+			Self::ScopeClosed => "scope_closed",
 		}
 	}
 }
@@ -394,6 +401,40 @@ pub trait RelyingPartyRepository: Send + Sync {
 	/// Whether an access token issued under family `id` for `audience` may still be
 	/// honoured: the family is live and belongs to a client with that audience.
 	async fn session_live(&self, id: Uuid, audience: &str, now: i64) -> Result<bool, DomainError>;
+}
+
+/// A registered scope (`tenants`, migration 0031). `main` is implicit and never one.
+#[derive(Clone, Debug)]
+pub struct ScopeRecord {
+	pub id: String,
+	pub namespace: String,
+	pub parent: String,
+	pub display_name: String,
+	pub origins: Vec<String>,
+	pub return_paths: Vec<String>,
+	pub observers: Vec<String>,
+	pub clients: Vec<ScopeClientRecord>,
+	pub created_at: i64,
+	pub version: u64,
+	pub state: domain::scopes::ScopeState,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScopeClientRecord {
+	pub client_id: String,
+	pub audience: String,
+	pub disabled: bool,
+}
+
+/// The scope registry. Read-only: scopes are written by migration and configuration.
+#[async_trait]
+pub trait ScopeRepository: Send + Sync {
+	/// Every registered scope with its clients, by id. A row that does not decode is
+	/// left out (and reported), not an error.
+	async fn scopes(&self) -> Result<Vec<ScopeRecord>, DomainError>;
+
+	/// One scope by id; `None` when there is none or its row does not decode.
+	async fn scope(&self, id: &str) -> Result<Option<ScopeRecord>, DomainError>;
 }
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
