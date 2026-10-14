@@ -220,11 +220,27 @@ async fn a_resend_is_throttled_like_every_code() {
 async fn a_sign_up_whose_code_was_throttled_still_gets_its_ticket() {
 	let fx = fixture!();
 	let email = address("crowded");
+	// The window is per address AND purpose, so it is filled with verification codes: an
+	// unverified twin on the same address (legal — only a verified address is unique)
+	// asked for them.
+	let twin = uuid::Uuid::new_v4();
+	sqlx::query("INSERT INTO users (id, auth_subject, email, email_verified) VALUES ($1, $1::text, $2, FALSE)")
+		.bind(twin)
+		.bind(&email)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
 	for _ in 0..concierge::ports::CODE_SENDS_PER_WINDOW {
-		let asked = fx
-			.post("/auth/code/request", ORIGIN, json!({ "email": email, "turnstileToken": "human" }), &mut Browser::default())
-			.await;
-		assert_eq!(asked.status, StatusCode::OK);
+		sqlx::query(
+			"INSERT INTO email_codes (id, email, purpose, user_id, code_hash, expires_at, created_at) \
+			 VALUES ($1, $2, 'verify', $3, sha256('x'::bytea), extract(epoch FROM now())::BIGINT + 600, extract(epoch FROM now())::BIGINT)",
+		)
+		.bind(uuid::Uuid::new_v4())
+		.bind(&email)
+		.bind(twin)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
 	}
 	let made = sign_up(&fx, INVEST, &email, &mut Browser::default()).await;
 	assert_eq!(made.body["verification"], "throttled");

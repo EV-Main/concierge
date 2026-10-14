@@ -1329,10 +1329,19 @@ pub const CODE_TTL_SECS: i64 = 600;
 pub const SIGNUP_TICKET_TTL_SECS: i64 = 24 * 60 * 60;
 /// Wrong guesses a code survives before it burns (`email_codes_attempts`).
 pub const CODE_MAX_ATTEMPTS: i32 = 5;
-/// Codes one address may be sent per [`CODE_SEND_WINDOW_SECS`], counted in the table so
-/// the cap holds across replicas.
+/// Codes one address may be sent per [`CODE_SEND_WINDOW_SECS`] for one purpose, counted
+/// in the table so the cap holds across replicas. Per purpose, so a session asking for
+/// verification codes cannot spend the budget the address's owner needs to sign in.
 pub const CODE_SENDS_PER_WINDOW: i64 = 5;
 pub const CODE_SEND_WINDOW_SECS: i64 = 900;
+/// Verification codes one account may be sent per [`VERIFY_BUDGET_WINDOW_SECS`]. The
+/// per-window cap alone lets a session mail its address 480 codes a day.
+pub const VERIFY_CODES_PER_DAY: i64 = 10;
+/// Wrong verification codes one account may present per [`VERIFY_BUDGET_WINDOW_SECS`],
+/// summed across its codes: each code burns on its fifth wrong guess, so without this a
+/// day of fresh codes is fifty guesses at the mailbox.
+pub const VERIFY_WRONG_PER_DAY: i64 = 20;
+pub const VERIFY_BUDGET_WINDOW_SECS: i64 = 24 * 60 * 60;
 
 /// What a code is for. A sign-in code proves a mailbox to whoever asks; a verification
 /// code proves the signed-in account's own address and is bound to that account.
@@ -1346,8 +1355,12 @@ pub enum CodePurpose {
 pub enum CodeIssue {
 	/// Stored and queued for the mailer.
 	Sent,
-	/// The address was sent [`CODE_SENDS_PER_WINDOW`] codes in the window already.
+	/// The address was sent [`CODE_SENDS_PER_WINDOW`] codes for this purpose in the window
+	/// already, or the account [`VERIFY_CODES_PER_DAY`] verification codes in a day.
 	Throttled,
+	/// The account presented [`VERIFY_WRONG_PER_DAY`] wrong verification codes in a day;
+	/// none is issued until the oldest of them leaves the window.
+	Exhausted,
 }
 
 /// Why a presented code did not prove the mailbox.

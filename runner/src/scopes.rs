@@ -6,9 +6,14 @@
 //! talk to the others, and nothing here names a person. A relying party's restricted token
 //! never reaches it — the layer admits that token on `GetMe` alone.
 //!
-//! It reads the same port the sign-in allowlist (`web::allowlist`) refreshes from, under
-//! the same rule for a malformed row (left out, reported), so both describe one registry;
-//! the RPC reads it on every call, the allowlist at most `REFRESH_EVERY` behind.
+//! It reads the same port the sign-in allowlist (`web::allowlist`) refreshes from, so both
+//! describe one registry; the RPC reads it on every call, the allowlist at most
+//! `REFRESH_EVERY` behind. They do NOT share a rule for a malformed row: the RPC answers
+//! every row as stored — closed scopes, and an origin or path that breaks the shape rules,
+//! included — while the allowlist leaves such a row out and reports it
+//! (`web::origins::ScopeOrigins::from_scopes`). The registry's CHECKs are what keep such a
+//! row out of the table; a consumer that signs people in or redirects on this answer
+//! applies the shape rules itself (`domain::scopes`).
 //!
 //! `Result<_, Status>` is tonic's mandated handler signature; `Status` is a large type
 //! we don't control, so the large-err lint does not apply in this module.

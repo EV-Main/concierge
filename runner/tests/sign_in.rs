@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use axum::{
 	Router,
 	body::Body,
-	http::{Request, StatusCode, header},
+	http::{Method, Request, StatusCode, header},
 };
 use common::web::{Browser, address};
 use concierge::{
@@ -22,7 +22,7 @@ use concierge::{
 		notifications::PgNotifications,
 		users::PgUsers,
 	},
-	ports::{CODE_MAX_ATTEMPTS, CODE_SENDS_PER_WINDOW, UserDirectoryRepository},
+	ports::{CODE_MAX_ATTEMPTS, CODE_SEND_WINDOW_SECS, CODE_SENDS_PER_WINDOW, UserDirectoryRepository, VERIFY_CODES_PER_DAY, VERIFY_WRONG_PER_DAY},
 	web::{self, KycDeps},
 };
 use domain::error::DomainError;
@@ -319,9 +319,13 @@ impl Fx {
 		.await
 	}
 
+	async fn request_verification(&self, turnstile: &str, browser: &mut Browser) -> Answer {
+		self.post("/auth/email/verify/request", json!({ "turnstileToken": turnstile }), browser).await
+	}
+
 	/// Mail the signed-in account a verification code and read it back.
 	async fn verification_code(&self, browser: &mut Browser) -> String {
-		let answer = self.post("/auth/email/verify/request", json!({}), browser).await;
+		let answer = self.request_verification("human", browser).await;
 		assert_eq!(answer.body, json!({ "ok": true }));
 		let email = self.session(browser).await["user"]["email"].as_str().unwrap().to_owned();
 		self.mailed_code(&email).await
@@ -503,6 +507,191 @@ async fn the_session_states_a_guests_permissions_and_then_the_seats() {
 	assert!(held.contains(&"concierge:self:profile"), "an account holds its own record");
 }
 
+impl Fx {
+	/// Any request as `browser` sends it from this plane's origin, the CSRF header included.
+	async fn send(&self, method: Method, path: &str, body: Option<Value>, extra: &[(&str, &str)], browser: &mut Browser) -> Answer {
+		let mut request = Request::builder().method(method).uri(path).header(header::ORIGIN, ORIGIN);
+		if !browser.cookies.is_empty() {
+			request = request.header(header::COOKIE, browser.header());
+		}
+		if let Some(csrf) = browser.get("ev_csrf") {
+			request = request.header("x-ev-csrf", csrf);
+		}
+		for (name, value) in extra {
+			request = request.header(*name, *value);
+		}
+		if body.is_some() {
+			request = request.header(header::CONTENT_TYPE, "application/json");
+		}
+		let body = body.map_or_else(Body::empty, |b| Body::from(b.to_string()));
+		let response = self.router.clone().oneshot(request.body(body).unwrap()).await.unwrap();
+		browser.absorb(response.headers());
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+		Answer {
+			status,
+			body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+		}
+	}
+
+	async fn user_id(&self, email: &str) -> Uuid {
+		sqlx::query_scalar("SELECT id FROM users WHERE email = $1 ORDER BY created_at DESC LIMIT 1")
+			.bind(email)
+			.fetch_one(&self.pool)
+			.await
+			.unwrap()
+	}
+
+	/// Move every code queued for `email` out of the send window, keeping it inside the day.
+	async fn age_codes(&self, email: &str) {
+		sqlx::query("UPDATE email_codes SET created_at = created_at - $2 WHERE email = $1")
+			.bind(email)
+			.bind(CODE_SEND_WINDOW_SECS + 1)
+			.execute(&self.pool)
+			.await
+			.unwrap();
+	}
+}
+
+#[tokio::test]
+async fn a_verification_mail_needs_a_person_on_one_of_our_hosts() {
+	let fx = fixture!();
+	let email = address("verify-human");
+	let mut browser = Browser::default();
+	fx.sign_up(&email, PASSWORD, false, &mut browser).await;
+	for token in ["robot", "elsewhere", ""] {
+		let answer = fx.request_verification(token, &mut browser).await;
+		assert_eq!((answer.status, answer.body), (StatusCode::FORBIDDEN, json!({ "error": "captcha" })), "{token:?}");
+	}
+	let bare = fx.post("/auth/email/verify/request", json!({}), &mut browser).await;
+	assert_eq!((bare.status, bare.body), (StatusCode::FORBIDDEN, json!({ "error": "captcha" })), "a client that sends no token");
+	assert_eq!(fx.queued_codes(&email).await, 0);
+	let elsewhere = fx
+		.post("/auth/code/request", json!({ "email": email, "turnstileToken": "elsewhere" }), &mut Browser::default())
+		.await;
+	assert_eq!(elsewhere.body, json!({ "error": "captcha" }), "a challenge solved on a host that is not ours proves nothing here");
+}
+
+#[tokio::test]
+async fn verification_codes_do_not_spend_the_sign_in_budget() {
+	let fx = fixture!();
+	let email = address("budget");
+	let mut browser = Browser::default();
+	fx.sign_up(&email, PASSWORD, false, &mut browser).await;
+	for _ in 0..CODE_SENDS_PER_WINDOW {
+		assert_eq!(fx.request_verification("human", &mut browser).await.body, json!({ "ok": true }));
+	}
+	let throttled = fx.request_verification("human", &mut browser).await;
+	assert_eq!((throttled.status, throttled.body), (StatusCode::TOO_MANY_REQUESTS, json!({ "error": "throttled" })));
+	assert_eq!(fx.request_code(&email).await.status, StatusCode::OK, "the mailbox's owner can still ask for a sign-in code");
+}
+
+#[tokio::test]
+async fn an_account_is_sent_a_bounded_number_of_verification_codes_a_day() {
+	let fx = fixture!();
+	let email = address("daily");
+	let mut browser = Browser::default();
+	fx.sign_up(&email, PASSWORD, false, &mut browser).await;
+	for sent in 0..VERIFY_CODES_PER_DAY {
+		if sent > 0 && sent % CODE_SENDS_PER_WINDOW == 0 {
+			fx.age_codes(&email).await;
+		}
+		assert_eq!(fx.request_verification("human", &mut browser).await.body, json!({ "ok": true }), "code {sent}");
+	}
+	fx.age_codes(&email).await;
+	let refused = fx.request_verification("human", &mut browser).await;
+	assert_eq!((refused.status, refused.body), (StatusCode::TOO_MANY_REQUESTS, json!({ "error": "throttled" })));
+}
+
+#[tokio::test]
+async fn wrong_verification_codes_are_capped_per_account_across_codes() {
+	assert_eq!((VERIFY_WRONG_PER_DAY, CODE_MAX_ATTEMPTS), (20, 5), "the walk below spends exactly the daily budget");
+	let fx = fixture!();
+	let email = address("guesser");
+	let mut browser = Browser::default();
+	fx.sign_up(&email, PASSWORD, false, &mut browser).await;
+	const CONFIRM: &str = "/auth/email/verify/confirm";
+	// Three codes burned on their fifth wrong guess: fifteen.
+	for _ in 0..3 {
+		let code = fx.verification_code(&mut browser).await;
+		for _ in 0..CODE_MAX_ATTEMPTS {
+			fx.post(CONFIRM, json!({ "code": wrong(&code) }), &mut browser).await;
+		}
+	}
+	// Four on the next, which a newer code then supersedes: nineteen.
+	let code = fx.verification_code(&mut browser).await;
+	for _ in 0..CODE_MAX_ATTEMPTS - 1 {
+		fx.post(CONFIRM, json!({ "code": wrong(&code) }), &mut browser).await;
+	}
+	let last = fx.verification_code(&mut browser).await;
+	let twentieth = fx.post(CONFIRM, json!({ "code": wrong(&last) }), &mut browser).await;
+	assert_eq!(twentieth.body, json!({ "error": "invalid_code" }));
+	let right = fx.post(CONFIRM, json!({ "code": last }), &mut browser).await;
+	assert_eq!(right.body, json!({ "error": "attempts_exceeded" }), "even the right code, once the day's guesses are spent");
+	assert_eq!(fx.session(&browser).await["user"]["emailVerified"], false);
+	let refused = fx.request_verification("human", &mut browser).await;
+	assert_eq!((refused.status, refused.body), (StatusCode::TOO_MANY_REQUESTS, json!({ "error": "attempts_exceeded" })));
+}
+
+#[tokio::test]
+async fn a_disabled_account_or_a_stale_session_mutates_nothing_and_is_signed_out() {
+	let fx = fixture!();
+	let email = address("gated");
+	let mut browser = Browser::default();
+	fx.sign_in_with_code(&email, &mut browser).await;
+	let id = fx.user_id(&email).await;
+
+	sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
+		.bind(id)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	let held = browser.clone();
+	let stale = fx.post("/auth/username", json!({ "username": "stale_session" }), &mut browser).await;
+	assert_eq!((stale.status, stale.body), (StatusCode::UNAUTHORIZED, json!({ "error": "unauthenticated" })));
+	assert!(browser.get("ev_session").is_none(), "the cookies are cleared");
+	assert_eq!(fx.session(&held).await["authenticated"], false, "and the session is closed, not only forgotten by the browser");
+	let username: Option<String> = sqlx::query_scalar("SELECT username FROM users WHERE id = $1").bind(id).fetch_one(&fx.pool).await.unwrap();
+	assert_ne!(username.as_deref(), Some("stale_session"));
+
+	let mut browser = Browser::default();
+	fx.sign_in_with_code(&email, &mut browser).await;
+	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(id).execute(&fx.pool).await.unwrap();
+	let disabled = fx.post("/auth/username", json!({ "username": "disabled_one" }), &mut browser).await;
+	assert_eq!((disabled.status, disabled.body), (StatusCode::FORBIDDEN, json!({ "error": "disabled" })));
+	assert!(browser.get("ev_session").is_none());
+}
+
+#[tokio::test]
+async fn a_session_revoked_elsewhere_plants_no_credential() {
+	let fx = fixture!();
+	let email = address("revoked");
+	for (path, body) in [
+		("/auth/password/set", json!({ "password": PASSWORD, "code": "000000" })),
+		("/auth/passkey/register/options", json!({})),
+	] {
+		let mut victim = Browser::default();
+		fx.sign_in_with_code(&email, &mut victim).await;
+		let mut other = Browser::default();
+		fx.sign_in_with_code(&email, &mut other).await;
+		let listed = fx.send(Method::GET, "/auth/sessions", None, &[], &mut other).await;
+		let victim_session = listed.body["sessions"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.filter(|s| s["current"] == false)
+			.map(|s| s["id"].as_str().unwrap().to_owned())
+			.collect::<Vec<_>>();
+		for id in victim_session {
+			let revoked = fx.send(Method::DELETE, "/auth/sessions", Some(json!({ "session_id": id })), &[], &mut other).await;
+			assert_eq!(revoked.status, StatusCode::OK);
+		}
+		let answer = fx.post(path, body, &mut victim).await;
+		assert_eq!((answer.status, answer.body), (StatusCode::UNAUTHORIZED, json!({ "error": "unauthenticated" })), "{path}");
+		assert!(victim.get("ev_session").is_none(), "{path}");
+	}
+}
+
 mod passkeys {
 	use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
 	use webauthn_rs::prelude::{CreationChallengeResponse, PublicKeyCredential, RequestChallengeResponse, Url};
@@ -644,5 +833,54 @@ mod passkeys {
 			)
 			.await;
 		assert_eq!(done.body, json!({ "error": "passkey_rejected" }));
+	}
+
+	#[tokio::test]
+	async fn an_unverified_address_registers_no_passkey() {
+		let fx = fixture!();
+		let mut browser = Browser::default();
+		fx.sign_up(&address("unverified-key"), PASSWORD, false, &mut browser).await;
+		let begun = fx.post("/auth/passkey/register/options", json!({}), &mut browser).await;
+		assert_eq!((begun.status, begun.body), (StatusCode::FORBIDDEN, json!({ "error": "email_unverified" })));
+	}
+
+	/// Keyed on the address Cloudflare names, not on a hop of `X-Forwarded-For` the caller
+	/// writes. A fixed window may roll over once mid-loop, so the refusal is looked for
+	/// within two budgets rather than at an exact call.
+	#[tokio::test]
+	async fn sign_in_ceremonies_are_budgeted_per_address() {
+		let fx = fixture!();
+		let budget = web::SIGN_IN_STARTS_PER_MINUTE as usize;
+		let mut refused_at = None;
+		for call in 0..=2 * budget {
+			let spoofed = format!("198.51.100.{}", call % 250);
+			let answer = fx
+				.send(
+					Method::POST,
+					"/auth/passkey/signin/options",
+					Some(json!({})),
+					&[("cf-connecting-ip", "203.0.113.7"), ("x-forwarded-for", &spoofed)],
+					&mut Browser::default(),
+				)
+				.await;
+			if answer.status == StatusCode::TOO_MANY_REQUESTS {
+				assert_eq!(answer.body, json!({ "error": "throttled" }));
+				refused_at = Some(call);
+				break;
+			}
+			assert_eq!(answer.status, StatusCode::OK);
+		}
+		let refused_at = refused_at.expect("the budget runs out");
+		assert!(refused_at >= budget, "refused after {refused_at} calls, under the budget of {budget}");
+		let other = fx
+			.send(
+				Method::POST,
+				"/auth/passkey/signin/options",
+				Some(json!({})),
+				&[("cf-connecting-ip", "203.0.113.8")],
+				&mut Browser::default(),
+			)
+			.await;
+		assert_eq!(other.status, StatusCode::OK, "another address has its own budget");
 	}
 }

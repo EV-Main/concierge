@@ -12,7 +12,7 @@ use std::{collections::HashMap, time::Duration};
 
 use axum::{Json, extract::State, http::HeaderMap};
 use axum_extra::extract::cookie::CookieJar;
-use domain::users::UserId;
+use domain::users::{User, UserId};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -25,7 +25,8 @@ use crate::{
 	ports::PasskeyRow,
 	web::{
 		WebState, now_secs, random_token,
-		sign_in::{Answered, Refusal, guard, internal, signed_in, signed_in_as},
+		routes::ClientIp,
+		sign_in::{Answered, Refusal, Signed, guard, internal, signed_in, signed_in_as, signed_in_live},
 	},
 };
 
@@ -33,6 +34,9 @@ use crate::{
 const CEREMONY_TTL: Duration = webauthn_rs::DEFAULT_AUTHENTICATOR_TIMEOUT;
 /// The unauthenticated sign-in route feeds this store; the cap bounds it whatever the rate.
 const MAX_CEREMONIES: usize = 10_000;
+/// Sign-in ceremonies one address may begin per minute. A person begins one per attempt;
+/// the headroom is for many people behind one NAT.
+pub const SIGN_IN_STARTS_PER_MINUTE: u32 = 30;
 
 pub struct Ceremonies<T> {
 	open: Mutex<HashMap<String, (T, i64)>>,
@@ -97,16 +101,26 @@ fn rejected() -> Refusal {
 	Refusal::new(axum::http::StatusCode::UNAUTHORIZED, "passkey_rejected")
 }
 
+/// A passkey on an address nobody has proven is a credential the mailbox's owner cannot
+/// see coming: whoever registered the address could enrol one and keep signing in after
+/// the owner proves the mailbox and takes the account over.
+fn unverified_refused(user: &User) -> Result<(), Refusal> {
+	match user.email_verified() {
+		true => Ok(()),
+		false => Err(Refusal::new(axum::http::StatusCode::FORBIDDEN, "email_unverified")),
+	}
+}
+
 /// `POST /auth/passkey/register/options` — begin registering a passkey for the signed-in
 /// account. Asks for a discoverable credential, which is what lets it sign in without an
 /// account named first.
 pub async fn register_options(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Answered {
 	let st = &st.inner;
-	let caller = signed_in(st, &jar, &headers).await?;
+	let Signed { caller, user } = signed_in_live(st, &jar, &headers).await?;
 	let id = caller.id;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
-		let user = st.users.find_by_id(id).await.map_err(|e| internal("passkey: account not read", e))?.ok_or(rejected())?;
+		unverified_refused(&user)?;
 		let existing = st.credentials.passkeys(id).await.map_err(|e| internal("passkey: credentials not read", e))?;
 		let exclude = existing
 			.iter()
@@ -141,10 +155,11 @@ pub struct RegisterVerify {
 /// `POST /auth/passkey/register/verify` — finish registering, and keep the passkey.
 pub async fn register_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<RegisterVerify>) -> Answered {
 	let st = &st.inner;
-	let caller = signed_in(st, &jar, &headers).await?;
+	let Signed { caller, user } = signed_in_live(st, &jar, &headers).await?;
 	let id = caller.id;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
+		unverified_refused(&user)?;
 		let name = body.name.trim();
 		if name.is_empty() || name.chars().count() > 64 {
 			return Err(Refusal::new(axum::http::StatusCode::BAD_REQUEST, "invalid_name"));
@@ -173,10 +188,16 @@ pub async fn register_verify(State(st): State<WebState>, jar: CookieJar, headers
 	Ok((jar, answer))
 }
 
-/// `POST /auth/passkey/signin/options` — begin a sign-in nobody is named in.
-pub async fn signin_options(State(st): State<WebState>, headers: HeaderMap) -> Result<Json<Value>, Refusal> {
+/// `POST /auth/passkey/signin/options` — begin a sign-in nobody is named in. Neither a
+/// session nor Turnstile stands in front of it and every call holds a ceremony in memory,
+/// so each address gets a budget: past it, a flood evicts its own ceremonies and nobody
+/// else's.
+pub async fn signin_options(State(st): State<WebState>, headers: HeaderMap, ip: ClientIp) -> Result<Json<Value>, Refusal> {
 	let st = &st.inner;
-	guard(st, &headers, None).await?;
+	guard(st, &headers, &ip, None).await?;
+	if !st.passkey_sign_in_starts.check(&ip.0) {
+		return Err(Refusal::new(axum::http::StatusCode::TOO_MANY_REQUESTS, "throttled"));
+	}
 	let webauthn = st.allowlist.current().webauthn.clone();
 	let (options, state) = webauthn.start_discoverable_authentication().map_err(|e| internal("passkey: sign-in not begun", e))?;
 	let ceremony = st.passkey_sign_ins.put((state, webauthn)).await;
@@ -191,9 +212,9 @@ pub struct SigninVerify {
 
 /// `POST /auth/passkey/signin/verify` — the authenticator named the account (its user handle
 /// is the account id); check the assertion against that account's passkey and sign in.
-pub async fn signin_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<SigninVerify>) -> Result<(CookieJar, Json<Value>), Refusal> {
+pub async fn signin_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Json(body): Json<SigninVerify>) -> Result<(CookieJar, Json<Value>), Refusal> {
 	let st = &st.inner;
-	guard(st, &headers, None).await?;
+	guard(st, &headers, &ip, None).await?;
 	let (state, webauthn) = st.passkey_sign_ins.take(&body.ceremony).await.ok_or_else(expired)?;
 	let (account, credential_id) = webauthn.identify_discoverable_authentication(&body.credential).map_err(|e| {
 		tracing::info!(error = %e, "passkey: assertion names no account");
@@ -216,7 +237,7 @@ pub async fn signin_verify(State(st): State<WebState>, jar: CookieJar, headers: 
 		.passkey_used(&credential_id, updated, now_secs())
 		.await
 		.map_err(|e| internal("passkey: use not recorded", e))?;
-	signed_in_as(st, jar, &headers, account).await
+	signed_in_as(st, jar, &headers, &ip, account).await
 }
 
 #[derive(Deserialize)]
@@ -228,7 +249,7 @@ pub struct Remove {
 /// `POST /auth/passkey/remove` — forget one of the signed-in account's passkeys.
 pub async fn remove(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<Remove>) -> Answered {
 	let st = &st.inner;
-	let caller = signed_in(st, &jar, &headers).await?;
+	let Signed { caller, .. } = signed_in(st, &jar, &headers).await?;
 	let id = caller.id;
 	let jar = caller.refreshed(st, jar);
 	let answer = match st.credentials.remove_passkey(id, &body.credential_id).await {

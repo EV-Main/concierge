@@ -1101,3 +1101,44 @@ async fn a_replica_without_the_secret_variable_keeps_the_stored_secret() {
 	let (code, verifier) = fx.code_for(user).await;
 	fx.exchange(&code, &verifier).await.expect("the client still authenticates with the secret another replica set");
 }
+
+/// The column refuses what `check_registered_redirects` refuses at boot, so a hand-written
+/// INSERT cannot register a redirect the plane would then send codes to.
+#[tokio::test]
+async fn the_registry_refuses_a_redirect_uri_of_the_wrong_shape() {
+	let fx = fixture!();
+	// Each attempt in its own transaction, rolled back: nothing is left registered.
+	let register = |uri: &'static str| {
+		let pool = fx.pool.clone();
+		async move {
+			let mut tx = pool.begin().await.unwrap();
+			let id = format!("shape_{}", uuid::Uuid::new_v4().simple().to_string().get(..12).unwrap());
+			sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, TRUE, 0)")
+				.bind(&id)
+				.execute(&mut *tx)
+				.await
+				.unwrap();
+			sqlx::query("INSERT INTO rp_clients (client_id, audience, redirect_uris, created_at, tenant_id) VALUES ($1, $1, ARRAY[$2], 0, $1)")
+				.bind(&id)
+				.bind(uri)
+				.execute(&mut *tx)
+				.await
+				.map(|_| ())
+		}
+	};
+	for bad in [
+		"http://rp.test/cb",
+		"https://rp.test/cb#fragment",
+		"https://user@rp.test/cb",
+		"https://rp.test/c b",
+		"https://rp.test/cb\n",
+		"https:///cb",
+		"rp.test/cb",
+	] {
+		let err = register(bad).await.expect_err(bad);
+		assert!(err.to_string().contains("rp_clients_redirect_uris_shape"), "{bad:?}: {err}");
+	}
+	for good in ["https://rp.test/auth/callback", "https://rp.test:8443/cb?x=1", "https://rp.test?x=1"] {
+		register(good).await.unwrap_or_else(|e| panic!("{good:?}: {e}"));
+	}
+}

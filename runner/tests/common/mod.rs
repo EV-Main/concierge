@@ -161,11 +161,16 @@ pub async fn signing_auth(users: std::sync::Arc<dyn concierge::ports::UserDirect
 	evconcierge_auth::AuthService::try_new(config, provisioner).await.expect("auth service")
 }
 
-/// A Turnstile siteverify that passes exactly the token `human`. Returns its URL.
+/// A Turnstile siteverify that passes exactly the token `human`, solved on the suites'
+/// own host — and `elsewhere`, solved by a person on a host that is not ours. Returns its URL.
 pub async fn stub_turnstile() -> String {
 	use axum::{Form, Json, Router, routing::post};
 	async fn verify(Form(form): Form<std::collections::HashMap<String, String>>) -> Json<serde_json::Value> {
-		Json(serde_json::json!({ "success": form.get("response").map(String::as_str) == Some("human") }))
+		Json(match form.get("response").map(String::as_str) {
+			Some("human") => serde_json::json!({ "success": true, "hostname": "evinvest.test" }),
+			Some("elsewhere") => serde_json::json!({ "success": true, "hostname": "evil.example" }),
+			_ => serde_json::json!({ "success": false }),
+		})
 	}
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the turnstile stub");
 	let addr = listener.local_addr().unwrap();

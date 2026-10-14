@@ -42,9 +42,20 @@ impl Challenge {
 	}
 }
 
+/// The longest `returnTo` kept. A landing path is short; anything longer is a payload.
+const MAX_RETURN_TO: usize = 2048;
+
 /// Keep a post-login redirect target same-origin to defeat open-redirects.
+///
+/// Browsers strip TAB, CR and LF from a URL before parsing it, so `/\t/evil.example` is
+/// followed as `//evil.example` — another host — while every byte check below still sees
+/// a path. Whitespace, control bytes and anything outside ASCII are refused before those
+/// checks rather than taught to them one quirk at a time.
 pub fn safe_return_to(raw: Option<&str>) -> String {
 	let Some(raw) = raw else { return "/".to_string() };
+	if raw.len() > MAX_RETURN_TO || raw.bytes().any(|b| b <= 0x20 || b >= 0x7f) {
+		return "/".to_string();
+	}
 	if !raw.starts_with('/') {
 		return "/".to_string();
 	}
@@ -108,5 +119,27 @@ impl OAuthTxStore {
 	pub async fn take(&self, id: &str) -> Option<OAuthTx> {
 		let tx = self.txns.lock().await.remove(id)?;
 		(now_secs() - tx.created_at <= OAUTH_TX_TTL).then_some(tx)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn a_path_a_browser_would_read_as_another_host_lands_home() {
+		for raw in [
+			"/\t/evil.example", "/\t\t/evil", "/\n/evil", "/\r/evil", "/ /evil", "/\x7f/evil", "/\u{a0}/evil", "//evil", "/\\evil",
+		] {
+			assert_eq!(safe_return_to(Some(raw)), "/", "{raw:?}");
+		}
+		assert_eq!(safe_return_to(Some(&format!("/{}", "a".repeat(MAX_RETURN_TO)))), "/");
+	}
+
+	#[test]
+	fn an_ordinary_path_is_kept() {
+		for raw in ["/", "/cabinet", "/api/auth/authorize?client_id=sa&state=x%20y"] {
+			assert_eq!(safe_return_to(Some(raw)), raw);
+		}
 	}
 }

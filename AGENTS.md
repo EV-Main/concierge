@@ -162,7 +162,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   turns it into an account under advisory locks on the subject and the mailbox: a linked
   provider subject (`user_identities`) opens its account; else a PROVEN mailbox opens the
   account it is verified on; else it TAKES OVER the account that registered it unverified
-  with a password — sessions revoked, password dropped, audited `taken_over_by_mailbox` —
+  with a password — sessions revoked; password and passkeys dropped; handle, profile and
+  notification settings reset; audited `taken_over_by_mailbox` with the passkeys counted —
   because that registration may be a squat waiting for the owner (pre-hijack); else a new
   account, verified iff the mailbox was proven. A provider address never moves onto a
   mailbox another account proved. This is why `users_verified_email_idx` makes a VERIFIED
@@ -177,11 +178,19 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   signs people in (login CSRF; `web::allowlist`, `docs/SCOPES-AND-APPROVALS.md` §3.1), and the ones that
   cost a mail or test a password check a Cloudflare Turnstile token server-side
   (`TURNSTILE_SECRET`, required in every environment — development runs Cloudflare's
-  always-pass test secret, and there is no arm that skips the check). Codes are six digits,
+  always-pass test secret, production refuses to boot with any of Cloudflare's test
+  secrets, and there is no arm that skips the check), including the session-bound
+  `/auth/email/verify/request`; a verdict counts only for a challenge solved on
+  `PUBLIC_ORIGIN`'s host or a signing-in scope's. The client address behind `remoteip`, the
+  session's device record and the per-address limits is `Cf-Connecting-IP`, else the TCP
+  peer — never a client-written `X-Forwarded-For` hop (`web::routes::ClientIp`). Codes are six digits,
   SHA-256 bound to their row at rest, ten minutes, attempts counted before the
   constant-time compare and burned on the fifth wrong guess, superseded by a newer one,
-  and capped at five sends per address per 15 minutes counted IN THE TABLE (replicas
-  share it); the plaintext rides only the `email_code` delivery's payload. Asking for a code
+  and capped at five sends per address AND purpose per 15 minutes counted IN THE TABLE
+  (replicas share it), so verification codes never spend the sign-in budget; one account
+  is sent at most ten verification codes and may present at most twenty wrong ones a day,
+  past which no code is issued or accepted (`attempts_exceeded`); the plaintext rides only
+  the `email_code` delivery's payload. Asking for a code
   answers alike for every address: whether an account exists is decided once the code
   proves the mailbox. A password (argon2id) signs up an UNVERIFIED account that works at
   once ("verify my email now" mails a code; `/auth/email/verify/{request,confirm}` later).
@@ -198,13 +207,18 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   ten failures lock the PASSWORD for 15 minutes and never the code path, so nobody locks an
   owner out of their account by guessing at it. Setting a password spends a verification
   code, so a stolen session cannot plant a credential that outlives its revocation; "forgot
-  password" is a code sign-in. An account handle is an email OR a username, through one
+  password" is a code sign-in. Every signed-in mutation is gated as `authz::caller_gate` is
+  (`web::sign_in::gate`): a disabled account or a session minted under an older
+  `token_version` is refused and its session ended, cookies cleared; the ones that plant a
+  credential (password set, passkey registration) also check the refresh family first-hand,
+  as `/auth/authorize` does. An account handle is an email OR a username, through one
   resolver (`infrastructure::users::account_named`): an email names the accounts it is
   verified on or backs a password of, and only when it names none is the handle read as a
   username — a chosen username matches `[a-z0-9_.-]{3,32}` and never contains `@`, a
   default one is the local part, else the whole address, else none. Nothing ever requires
   the username. A PASSKEY (WebAuthn, `web::passkey`, `passkey_credentials`) is registered by a
-  signed-in account and signs in without an account named first: it must be discoverable
+  signed-in account with a VERIFIED address (else `email_unverified`) and signs in without an
+  account named first; starting that sign-in is budgeted per client address. It must be discoverable
   (`residentKey: required`), its user handle is the account id, the relying party is
   `PUBLIC_ORIGIN`'s host, and the origins accepted are that one plus the registered scope
   origins under it — exact origins, never any subdomain. A credential this plane
@@ -662,7 +676,11 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   revoke-all path (`revoke_all`, refresh reuse, a suspension, a `token_version` bump)
   call `ClientGrants::upstream_revoked`, which expires the codes and revokes the sessions
   (`upstream_revoked`) in one transaction, codes first. Best-effort: a failure there is
-  reported to Sentry, not returned. A wrong refresh secret presented by the right client
+  reported to Sentry, not returned. A scope's host signs the browser out of THIS origin by
+  sending it to `GET /auth/logout/confirm?return_to=<absolute returnTo>` (`web::logout`): a
+  page with one button whose form posts back the session's CSRF token, rendered from the
+  session and never from the query; the POST closes the session as `/auth/logout` does and
+  answers 303 to `return_to`. A plain GET never signs anybody out. A wrong refresh secret presented by the right client
   for a live session revokes it (`refresh_reuse`), not only a rotated-out one.
   `RP_DEV_REDIRECT_URIS` (`client=http://localhost:<port>/…`, loopback only) adds dev
   redirect targets and refuses to boot in production. Sign-ins are recorded by

@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::users::{Named, account_named, drain_outbox, free_username, insert_user, load_for_update, lock_email, update_row, verified_holder};
 use crate::ports::{
 	CODE_MAX_ATTEMPTS, CODE_SEND_WINDOW_SECS, CODE_SENDS_PER_WINDOW, CODE_TTL_SECS, CodeIssue, CodePurpose, CodeRefusal, CredentialRepository, PASSWORD_LOCK_SECS, PASSWORD_MAX_FAILURES,
-	PasskeyRow, SIGNUP_TICKET_TTL_SECS, SignInMethods, SignUp, SignUpConfirmRefusal, StoredPassword, VerifyRefusal,
+	PasskeyRow, SIGNUP_TICKET_TTL_SECS, SignInMethods, SignUp, SignUpConfirmRefusal, StoredPassword, VERIFY_BUDGET_WINDOW_SECS, VERIFY_CODES_PER_DAY, VERIFY_WRONG_PER_DAY, VerifyRefusal,
 };
 
 /// How long a spent or expired sign-up ticket row is kept before the insert path reaps it.
@@ -91,13 +91,19 @@ async fn redeem(conn: &mut PgConnection, email: &Email, purpose: &str, user: Opt
 	if row.expires_at <= now {
 		return Ok(Err(CodeRefusal::Expired));
 	}
+	if let Some(user) = user
+		&& verify_spent(conn, email, user, now).await?.wrong >= VERIFY_WRONG_PER_DAY
+	{
+		return Ok(Err(CodeRefusal::Exhausted));
+	}
 	let attempts = row.attempts + 1;
 	let presented = digest(row.id, code.trim());
 	let matches = presented.len() == row.code_hash.len() && bool::from(presented.ct_eq(&row.code_hash));
 	let burned = matches || attempts >= CODE_MAX_ATTEMPTS;
+	// `attempts` stores WRONG guesses only, so the account's daily sum is a count of them.
 	sqlx::query("UPDATE email_codes SET attempts = $2, burned_at = $3 WHERE id = $1")
 		.bind(row.id)
-		.bind(attempts)
+		.bind(if matches { row.attempts } else { attempts })
 		.bind(burned.then_some(now))
 		.execute(&mut *conn)
 		.await
@@ -160,7 +166,7 @@ impl CredentialRepository for PgCredentials {
 			return Ok(SignUp::Taken);
 		}
 		let id = UserId::new();
-		let user = User::provision(id, AuthSubject::parse(&id.to_string())?, email.clone(), false, free_username(&mut tx, email).await?);
+		let user = User::provision(id, AuthSubject::parse(&id.to_string())?, email.clone(), false, free_username(&mut tx, email, None).await?);
 		let mut user = insert_user(&mut tx, user).await?;
 		write_password(&mut tx, id, &phc, now).await?;
 		drain_outbox(&mut tx, &mut user).await?;
@@ -355,10 +361,43 @@ async fn issue_in(conn: &mut PgConnection, purpose: CodePurpose, now: i64) -> Re
 	issue_locked(conn, &email, purpose, user, now).await
 }
 
+/// What one account spent of its daily verification budget on its address.
+struct VerifySpent {
+	issued: i64,
+	wrong: i64,
+}
+
+/// Counted on the account's current address as well as its id: a code sent to an address
+/// it no longer has can verify nothing, and the address leads the only index the table has.
+async fn verify_spent(conn: &mut PgConnection, email: &Email, user: UserId, now: i64) -> Result<VerifySpent, DomainError> {
+	let (issued, wrong): (i64, i64) = sqlx::query_as(
+		"SELECT count(*), COALESCE(sum(attempts), 0)::BIGINT FROM email_codes \
+		 WHERE email = $1 AND purpose = 'verify' AND user_id = $2 AND created_at > $3",
+	)
+	.bind(email.as_str())
+	.bind(user.raw())
+	.bind(now - VERIFY_BUDGET_WINDOW_SECS)
+	.fetch_one(&mut *conn)
+	.await
+	.map_err(repo_err)?;
+	Ok(VerifySpent { issued, wrong })
+}
+
 /// [`issue_in`] for a caller already holding `email`'s lock.
 async fn issue_locked(conn: &mut PgConnection, email: &Email, purpose: &str, user: Option<UserId>, now: i64) -> Result<CodeIssue, DomainError> {
-	let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM email_codes WHERE email = $1 AND created_at > $2")
+	// The guess cap first: it outlasts the send window, so it is the answer worth giving.
+	if let Some(user) = user {
+		let spent = verify_spent(conn, email, user, now).await?;
+		if spent.wrong >= VERIFY_WRONG_PER_DAY {
+			return Ok(CodeIssue::Exhausted);
+		}
+		if spent.issued >= VERIFY_CODES_PER_DAY {
+			return Ok(CodeIssue::Throttled);
+		}
+	}
+	let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM email_codes WHERE email = $1 AND purpose = $2 AND created_at > $3")
 		.bind(email.as_str())
+		.bind(purpose)
 		.bind(now - CODE_SEND_WINDOW_SECS)
 		.fetch_one(&mut *conn)
 		.await

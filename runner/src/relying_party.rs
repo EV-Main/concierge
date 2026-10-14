@@ -94,12 +94,12 @@ pub fn parse_dev_redirects(raw: &str, production: bool) -> Result<HashMap<String
 
 /// A redirect URI this plane will ever send a code to: absolute, no fragment (a code in a
 /// fragment is where the client cannot read it and scripts can), no whitespace, no
-/// userinfo.
+/// userinfo, no backslash (browsers read it as `/`, which moves the host).
 fn valid_redirect_shape(uri: &str) -> bool {
 	let rest = uri.strip_prefix("https://").or_else(|| uri.strip_prefix("http://"));
 	let Some(rest) = rest else { return false };
 	let authority = rest.split(['/', '?']).next().unwrap_or("");
-	!authority.is_empty() && !authority.contains('@') && !uri.contains('#') && !uri.chars().any(char::is_whitespace)
+	!authority.is_empty() && !authority.contains('@') && !uri.contains('#') && !uri.contains('\\') && !uri.chars().any(char::is_whitespace)
 }
 
 /// Refuse to serve a registry row that would redirect somewhere it should not.
@@ -605,7 +605,14 @@ mod tests {
 			scope_closed: false,
 		};
 		assert!(check_registered_redirects(&client("https://sa.evinvest.ltd/auth/callback")).is_ok());
-		for bad in ["http://sa.evinvest.ltd/cb", "https://sa.evinvest.ltd/cb#x", "https://u@sa.evinvest.ltd/cb", "https:///cb"] {
+		for bad in [
+			"http://sa.evinvest.ltd/cb",
+			"https://sa.evinvest.ltd/cb#x",
+			"https://u@sa.evinvest.ltd/cb",
+			"https:///cb",
+			"https://evil.example\\sa.evinvest.ltd/cb",
+			"https://sa.evinvest.ltd\\cb",
+		] {
 			assert!(check_registered_redirects(&client(bad)).is_err(), "{bad:?} must be refused");
 		}
 	}

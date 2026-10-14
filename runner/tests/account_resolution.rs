@@ -86,6 +86,37 @@ impl Fx {
 		id
 	}
 
+	/// What a squatter leaves on the account besides the password: a passkey, a handle, a
+	/// profile, and notification settings with mail switched off.
+	async fn plant(&self, id: UserId, email: &str) {
+		sqlx::query("UPDATE users SET username = 'squatter_handle', legal_name = 'Not The Owner' WHERE id = $1")
+			.bind(id.raw())
+			.execute(&self.pool)
+			.await
+			.unwrap();
+		sqlx::query("INSERT INTO passkey_credentials (credential_id, user_id, passkey, name, created_at) VALUES ($1, $2, '{}'::jsonb, 'squatter key', 0)")
+			.bind(format!("cred-{}", Uuid::new_v4().simple()))
+			.bind(id.raw())
+			.execute(&self.pool)
+			.await
+			.unwrap();
+		let subscriber: Uuid = sqlx::query_scalar(
+			"INSERT INTO notification_subscribers (user_id, email, email_verified, in_app_enabled, email_enabled, unsubscribe_token) \
+			 VALUES ($1, $2, FALSE, FALSE, FALSE, $3) RETURNING id",
+		)
+		.bind(id.raw())
+		.bind(email)
+		.bind(Uuid::new_v4().simple().to_string())
+		.fetch_one(&self.pool)
+		.await
+		.unwrap();
+		sqlx::query("INSERT INTO notification_subscriptions (subscriber_id, topic) VALUES ($1, 'account:security')")
+			.bind(subscriber)
+			.execute(&self.pool)
+			.await
+			.unwrap();
+	}
+
 	async fn has_password(&self, id: UserId) -> bool {
 		sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM password_credentials WHERE user_id = $1)")
 			.bind(id.raw())
@@ -158,6 +189,7 @@ async fn proving_a_mailbox_takes_over_an_unverified_password_registration() {
 	let fx = fixture!();
 	let email = address("squat");
 	let squatted = fx.password_account(&email).await;
+	fx.plant(squatted, &email).await;
 	let before = fx.users.find_by_id(squatted).await.unwrap().unwrap();
 
 	let sub = subject();
@@ -168,12 +200,38 @@ async fn proving_a_mailbox_takes_over_an_unverified_password_registration() {
 	assert!(!fx.has_password(squatted).await, "and the squatter's password goes with them");
 	assert_eq!(fx.identities(squatted).await, vec![("google".to_owned(), sub)]);
 
-	let audited: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_action WHERE subject_user_id = $1 AND action = 'taken_over_by_mailbox'")
+	let audited: Vec<serde_json::Value> = sqlx::query_scalar("SELECT detail FROM admin_action WHERE subject_user_id = $1 AND action = 'taken_over_by_mailbox'")
+		.bind(squatted.raw())
+		.fetch_all(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(audited.len(), 1);
+	assert_eq!(audited[0]["passkeys_removed"], 1, "the audit row counts the passkeys that went");
+
+	let passkeys: i64 = sqlx::query_scalar("SELECT count(*) FROM passkey_credentials WHERE user_id = $1")
 		.bind(squatted.raw())
 		.fetch_one(&fx.pool)
 		.await
 		.unwrap();
-	assert_eq!(audited, 1);
+	assert_eq!(passkeys, 0, "a passkey the squatter enrolled signs nobody back in");
+	assert_eq!(
+		owner.username(),
+		domain::users::Username::defaults_for(&Email::parse(&email).unwrap()).first(),
+		"the squatter's handle gives way to the address's default"
+	);
+	assert_eq!(owner.legal_name(), None, "nothing the squatter wrote into the profile stays");
+	let (in_app, mail): (bool, bool) = sqlx::query_as("SELECT in_app_enabled, email_enabled FROM notification_subscribers WHERE user_id = $1")
+		.bind(squatted.raw())
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert!(in_app && mail, "a squatter who switched mail off does not silence the owner");
+	let topics: i64 = sqlx::query_scalar("SELECT count(*) FROM notification_subscriptions s JOIN notification_subscribers n ON n.id = s.subscriber_id WHERE n.user_id = $1")
+		.bind(squatted.raw())
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(topics, 0);
 }
 
 #[tokio::test]

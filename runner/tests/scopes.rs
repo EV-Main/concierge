@@ -371,6 +371,7 @@ async fn a_route_acting_on_an_open_session_answers_no_scope_host() {
 		"/auth/sessions",
 		"/auth/username",
 		"/auth/logout",
+		"/auth/logout/confirm",
 		"/kyc/start",
 	] {
 		let (_, headers) = preflight(&router, path, INVEST, "POST").await;
