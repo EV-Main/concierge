@@ -16,6 +16,18 @@ package concierge.v1;
 //
 // The seam is authenticated with a shared bridge service token (env
 // BRIDGE_SERVICE_TOKEN on both ends). Graduate to mTLS/SPIFFE at platform scale.
+//
+// RELYING PARTIES read the same RPC with their client credential instead
+// (docs/SCOPES-AND-APPROVALS.md, "Service callers"). The request is unchanged — the
+// filter comes from WHO is asking, never from a field a caller could widen: a client
+// sees only users visible to its scope and to the scopes that name it an observer, and
+// each row is redacted for it (`seat_permissions` absent, `permissions` empty — the
+// money plane's seat set is not a direction's business). The bridge token keeps the
+// unfiltered stream.
+//
+// `Kind` below is the MONEY plane's vocabulary and grows only when banking must act on
+// the new kind: banking halts its cursor on a kind it cannot name. Scope and grant
+// changes travel on ScopeEvents (scopes.proto) for that reason.
 service UserEvents {
   rpc PullUserLifecycle(PullUserLifecycleRequest) returns (PullUserLifecycleResponse);
 }

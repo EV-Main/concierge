@@ -55,7 +55,9 @@ message EmitRequest {
   // Target subscriber, by concierge canonical user id (a UUID). Account-less
   // subscribers are not addressable by Emit — they receive topic broadcasts only.
   string user_id = 1;
-  // Topic key, e.g. "fund:quy-nhon". Must be in the server-side allowlist.
+  // Topic key, e.g. "fund:quy-nhon". Must be in the server-side allowlist; scope-owned
+  // topics (`invest:fund:quy-nhon`) are published through ScopeCatalogService, and a
+  // caller may emit only its own namespace's.
   string topic = 2;
   // Machine-readable event kind within the topic, e.g. "nav_updated".
   string kind = 3;

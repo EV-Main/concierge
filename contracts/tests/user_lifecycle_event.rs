@@ -7,7 +7,7 @@
 //! distinct, non-colliding field numbers (a collision would mis-decode and drop a
 //! value). No DB, no services.
 
-use evconcierge_contracts::concierge::v1::{SeatPermissions, UserLifecycleEvent, user_lifecycle_event::Kind};
+use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, SeatPermissions, UserLifecycleEvent, user_lifecycle_event::Kind};
 use prost::Message;
 
 #[test]
@@ -68,4 +68,38 @@ fn an_empty_seat_set_is_told_apart_from_an_unstated_one() {
 		Some(SeatPermissions { bank: vec![] })
 	);
 	assert_eq!(UserLifecycleEvent::decode(unstated.encode_to_vec().as_slice()).unwrap().seat_permissions, None);
+}
+
+#[test]
+fn the_lifecycle_vocabulary_is_the_money_planes_and_nothing_more() {
+	// banking halts its single cursor on a kind it cannot name, so a scope or grant kind
+	// here would stop every freeze and KYC change behind it until banking redeployed. Those
+	// travel on ScopeEvents. Growing this list is a two-repo decision, never a side effect.
+	let names: Vec<&str> = (0..=16).filter_map(|n| Kind::try_from(n).ok()).map(|k| k.as_str_name()).collect();
+	assert_eq!(
+		names,
+		[
+			"KIND_UNSPECIFIED",
+			"CREATED",
+			"SUSPENDED",
+			"REINSTATED",
+			"KYC_CHANGED",
+			"SESSIONS_REVOKED",
+			"ROLE_CHANGED",
+			"PERMISSIONS_CHANGED"
+		]
+	);
+	for scope_kind in ["SCOPE_CHANGED", "GRANTS_CHANGED", "MEMBER_JOINED"] {
+		assert_eq!(Kind::from_str_name(scope_kind), None, "{scope_kind} belongs on ScopeEvents");
+	}
+}
+
+#[test]
+fn the_pull_request_banking_builds_still_has_exactly_its_two_fields() {
+	// banking builds this with a struct literal and no `..Default::default()`; a field
+	// added here breaks its build at the next pin bump. A relying party's filter comes from
+	// its credential, not from the request. This literal fails to compile first.
+	let request = PullUserLifecycleRequest { after_position: 7, limit: 256 };
+	let decoded = PullUserLifecycleRequest::decode(request.encode_to_vec().as_slice()).expect("round trips");
+	assert_eq!(decoded, request);
 }

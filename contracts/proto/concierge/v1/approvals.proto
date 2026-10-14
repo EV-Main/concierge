@@ -1,0 +1,448 @@
+syntax = "proto3";
+
+package concierge.v1;
+
+// Approvals — the consilium, generalised from the owners' votes in governance.proto into
+// one service every scope uses. The policy and the reasoning behind each rule are in
+// docs/SCOPES-AND-APPROVALS.md; what follows is the wire.
+//
+// A KIND is declared by the service that executes it (`bank:payment`,
+// `invest:valuation_override`, `concierge:scope_admin_grant`) and published in that
+// service's scope catalog (scopes.proto, ScopeCatalogService). The kind says WHO decides
+// (`level`), which typed fields describe the subject (the mail is rendered from them —
+// no service ever hands this plane markup), and which of those fields escalate a
+// scope-level decision to the platform owners.
+//
+// A PROPOSAL is opened by the executing service for one scope, names the subject it is
+// about only by an opaque `subject_ref` the service resolves itself, and is decided by a
+// roster frozen at open:
+//   APPROVAL_LEVEL_PLATFORM — the platform owners (persisted `owner` seats, never
+//                             break-glass);
+//   APPROVAL_LEVEL_SCOPE    — the active holders of `<scope>:admin`.
+// The initiator never votes. A passed proposal waits out its veto delay, after which
+// the executor PULLS it, executes it idempotently and reports the outcome. This plane
+// never calls an executor: the arrow stays the one the bridge has.
+//
+// Two services, two kinds of caller:
+//   ApprovalService          — people, over a first-party session (inside the user auth
+//                              layer). A relying party's restricted token opens none of it.
+//   ApprovalExecutionService — the executing services, by service credential (outside
+//                              the user auth layer, like UserEvents). See the doc's
+//                              "Service callers".
+
+// ApprovalService — the human side: read, vote, veto, cancel, and open the kinds this
+// plane executes itself.
+service ApprovalService {
+  // The kinds currently published, platform built-ins included. Any signed-in caller:
+  // kinds are vocabulary, not decisions.
+  rpc ListApprovalKinds(ListApprovalKindsRequest) returns (ListApprovalKindsResponse);
+
+  // The policy a scope's proposals are measured against. The scope's admins and the
+  // platform owners.
+  rpc GetScopeApprovalPolicy(GetScopeApprovalPolicyRequest) returns (ScopeApprovalPolicy);
+
+  // Proposals the caller may see: every one to a platform owner; to a scope admin, those
+  // of their scopes; to anyone, those they initiated. Newest first. Nothing is deleted.
+  rpc ListApprovals(ListApprovalsRequest) returns (ListApprovalsResponse);
+
+  // One proposal, under ListApprovals' visibility. Invisible and unknown are the same
+  // NOT_FOUND.
+  rpc GetApproval(GetApprovalRequest) returns (Approval);
+
+  // A roster member's vote while the proposal is OPEN. The initiator and anyone off the
+  // frozen roster: PERMISSION_DENIED. A vote is final — re-voting the same way is a
+  // no-op, the other way FAILED_PRECONDITION.
+  rpc VoteApproval(VoteApprovalRequest) returns (Approval);
+
+  // Stop a proposal outright while it is OPEN, or PASSED and still inside its delay.
+  // Any roster member except the initiator, who cancels instead. A reason is required:
+  // it is what everyone else reads when their decision is overruled by one person.
+  rpc VetoApproval(VetoApprovalRequest) returns (Approval);
+
+  // The initiator withdraws while OPEN or PASSED inside its delay. Past the delay the
+  // executor owns the proposal and only ReportOutcome moves it.
+  rpc CancelApproval(CancelApprovalRequest) returns (Approval);
+
+  // Open `concierge:scope_admin_grant`: grant `<scope>:admin`. Always platform level.
+  // A seat holding `iam:tenants:grant` may open one. While this kind exists,
+  // UserDirectory.GrantPermission refuses a `<scope>:admin` target and names this RPC;
+  // taking the grant away stays RevokePermission, one act.
+  rpc ProposeScopeAdminGrant(ProposeScopeAdminGrantRequest) returns (Approval);
+
+  // Open `concierge:scope_policy_change`: replace a scope's approval policy. Always
+  // platform level — a scope that could lower its own thresholds would decide for itself
+  // what needs the owners. A seat holding `iam:tenants:grant`, or an admin of the scope,
+  // may open one.
+  rpc ProposeScopePolicyChange(ProposeScopePolicyChangeRequest) returns (Approval);
+}
+
+// ApprovalExecutionService — the executing services. A caller acts only on kinds of its
+// own namespace; anything else is PERMISSION_DENIED.
+service ApprovalExecutionService {
+  // Open a proposal. The level is resolved HERE, from the kind, the fields and the
+  // scope's policy, and frozen with the roster; the caller cannot ask for one.
+  //
+  // INVALID_ARGUMENT: unknown kind, unknown scope, a field the kind does not declare or
+  // of the wrong type, a required field missing, a text field over its bound or carrying
+  // a control character or a link. FAILED_PRECONDITION: the initiator is not an active
+  // account, or the resolved roster has nobody but the initiator. ALREADY_EXISTS: a live
+  // (OPEN or PASSED) proposal of the same kind, scope and subject_ref exists — one
+  // subject is decided once at a time.
+  //
+  // Idempotent by `dedupe_key`: the same key with the same content answers the existing
+  // proposal; with different content, ALREADY_EXISTS.
+  rpc Propose(ProposeRequest) returns (Approval);
+
+  // The caller withdraws its own proposal (the subject went away: the payment was
+  // cancelled, the allocation closed). Same window as CancelApproval.
+  rpc WithdrawProposal(WithdrawProposalRequest) returns (Approval);
+
+  // One proposal of the caller's namespace, any state.
+  rpc GetProposal(GetProposalRequest) returns (Approval);
+
+  // Proposals of the caller's namespace that are PASSED with `executable_at` behind the
+  // clock and no outcome reported, oldest `executable_at` first. A pull claims nothing:
+  // a proposal is served again on every pull until its outcome is reported, so the
+  // executor must be idempotent per proposal id and must check `payload_hash` against
+  // the subject it holds before it acts.
+  rpc PullApproved(PullApprovedRequest) returns (PullApprovedResponse);
+
+  // Close a pulled proposal. Repeating the same outcome is a no-op; a different one is
+  // FAILED_PRECONDITION. Reporting on a proposal that is not executable:
+  // FAILED_PRECONDITION.
+  rpc ReportOutcome(ReportOutcomeRequest) returns (Approval);
+}
+
+// Who decides. Declared per kind; a SCOPE kind may still resolve to PLATFORM per
+// proposal (ApprovalEscalation, and a scope with fewer than two admins).
+enum ApprovalLevel {
+  APPROVAL_LEVEL_UNSPECIFIED = 0;
+  APPROVAL_LEVEL_PLATFORM = 1;
+  APPROVAL_LEVEL_SCOPE = 2;
+}
+
+// The value types a kind's fields may carry. A closed set: this plane renders each one
+// itself, so a type it cannot render is a type a service cannot use.
+enum ApprovalFieldType {
+  APPROVAL_FIELD_TYPE_UNSPECIFIED = 0;
+  // One line of plain text, at most 200 bytes, no control characters, no link
+  // (`://`, `www.`). Shown attributed to the proposing service, never as our wording.
+  APPROVAL_FIELD_TYPE_TEXT = 1;
+  // An ApprovalAmount.
+  APPROVAL_FIELD_TYPE_AMOUNT = 2;
+  // Signed basis points, rendered as a percentage here.
+  APPROVAL_FIELD_TYPE_BPS = 3;
+  APPROVAL_FIELD_TYPE_FLAG = 4;
+  // A concierge user id, rendered as that account's email — resolved here, so a
+  // service cannot put a name in front of the voters that is not the account's.
+  APPROVAL_FIELD_TYPE_USER = 5;
+  // Unix SECONDS.
+  APPROVAL_FIELD_TYPE_TIMESTAMP = 6;
+  APPROVAL_FIELD_TYPE_COUNT = 7;
+}
+
+// How one field escalates a SCOPE-level kind to the platform.
+enum EscalationTest {
+  ESCALATION_TEST_UNSPECIFIED = 0;
+  // An AMOUNT field above the threshold. A currency other than the parameter's escalates.
+  ESCALATION_TEST_AMOUNT_ABOVE = 1;
+  // The AMOUNT field plus every live or executed scope-level proposal of the same kind
+  // and scope opened in the trailing 24 hours, above the threshold.
+  ESCALATION_TEST_ROLLING_24H_AMOUNT_ABOVE = 2;
+  // A BPS field whose absolute value is above the threshold.
+  ESCALATION_TEST_ABS_BPS_ABOVE = 3;
+  // A FLAG field that is set. Takes no threshold.
+  ESCALATION_TEST_FLAG_SET = 4;
+}
+
+enum ApprovalState {
+  APPROVAL_STATE_UNSPECIFIED = 0;
+  // Collecting votes until `expires_at`.
+  APPROVAL_STATE_OPEN = 1;
+  // The threshold was met. Vetoable until `executable_at`; from then on the executor
+  // pulls it. "Executable" is this state with the clock past `executable_at`, not a
+  // state of its own, so no sweep has to run for a proposal to become pullable.
+  APPROVAL_STATE_PASSED = 2;
+  // The executor reported it carried the decision out.
+  APPROVAL_STATE_EXECUTED = 3;
+  // The executor tried and failed. Terminal: a retry is a new proposal.
+  APPROVAL_STATE_EXECUTION_FAILED = 4;
+  // Enough votes AGAINST that the threshold can no longer be reached.
+  APPROVAL_STATE_REJECTED = 5;
+  APPROVAL_STATE_VETOED = 6;
+  APPROVAL_STATE_EXPIRED = 7;
+  // Withdrawn by the initiator or by the proposing service.
+  APPROVAL_STATE_CANCELLED = 8;
+  // Passed, but could not be applied: the subject had moved by the time it executed,
+  // or the executor reported OUTCOME_VOID.
+  APPROVAL_STATE_VOID = 9;
+}
+
+enum ApprovalVote {
+  APPROVAL_VOTE_UNSPECIFIED = 0;
+  APPROVAL_VOTE_PENDING = 1;
+  APPROVAL_VOTE_FOR = 2;
+  APPROVAL_VOTE_AGAINST = 3;
+}
+
+enum ApprovalOutcome {
+  APPROVAL_OUTCOME_UNSPECIFIED = 0;
+  APPROVAL_OUTCOME_EXECUTED = 1;
+  APPROVAL_OUTCOME_FAILED = 2;
+  // Not carried out because it no longer applies; nothing was attempted.
+  APPROVAL_OUTCOME_VOID = 3;
+}
+
+// One kind, as its executing service publishes it.
+message ApprovalKindSpec {
+  // `<namespace>:<name>`, the namespace being the publisher's. `[a-z][a-z0-9_]*` per part.
+  string name = 1;
+  // Plain text, at most 80 bytes; what a voter reads as the subject line.
+  string label = 2;
+  // Plain text, at most 500 bytes.
+  string description = 3;
+  // The level the kind is decided at before escalation. A PLATFORM kind carries no
+  // escalations (INVALID_ARGUMENT).
+  ApprovalLevel level = 4;
+  // In display order. At most 16.
+  repeated ApprovalFieldSpec fields = 5;
+  repeated ApprovalEscalation escalations = 6;
+}
+
+message ApprovalFieldSpec {
+  // `[a-z][a-z0-9_]{0,31}`, unique within the kind.
+  string key = 1;
+  // Plain text, at most 60 bytes.
+  string label = 2;
+  ApprovalFieldType type = 3;
+  bool required = 4;
+}
+
+// One escalation parameter. Its threshold lives in the scope's policy, so a scope's
+// owners tune it with ProposeScopePolicyChange; `default_threshold` is what a scope
+// uses until its policy names the parameter.
+message ApprovalEscalation {
+  // `[a-z][a-z0-9_]{0,31}`, unique within the kind; the key ApprovalThreshold names.
+  string parameter = 1;
+  // The field tested; its type must match `test`.
+  string field_key = 2;
+  EscalationTest test = 3;
+  // Decimal string: an amount for the AMOUNT tests, an integer of bps for ABS_BPS_ABOVE,
+  // empty for FLAG_SET.
+  string default_threshold = 4;
+  // The currency an AMOUNT test is denominated in (`USDT`). Empty otherwise.
+  string currency = 5;
+}
+
+// Money as the proposing service spells it, never a float. `value` is a CANONICAL
+// non-negative decimal — `0|[1-9][0-9]*`, then optionally `.` and at most 18 digits not
+// ending in `0` (`1200.5`, never `1200.50` or `01200.5`) — and anything else is
+// INVALID_ARGUMENT, because `payload_hash` is taken over the spelling. `currency` is
+// `[A-Z][A-Z0-9]{1,15}` (`USDT`; a unit code for units).
+message ApprovalAmount {
+  string value = 1;
+  string currency = 2;
+}
+
+message ApprovalFieldValue {
+  string key = 1;
+  oneof value {
+    string text = 2;
+    ApprovalAmount amount = 3;
+    int64 bps = 4;
+    bool flag = 5;
+    string user_id = 6;
+    int64 timestamp = 7;
+    uint64 count = 8;
+  }
+}
+
+// A scope's approval policy. The platform level has no policy of its own: its roster,
+// quorum and delay are the owners' consilium's.
+message ScopeApprovalPolicy {
+  string scope = 1;
+  // Bumped on every executed scope_policy_change; a proposal records the version it was
+  // measured against.
+  uint64 version = 2;
+  // Share of the voting roster that must vote FOR, in basis points:
+  // threshold = max(1, ceil(voters * quorum_bps / 10000)). 5001..=10000; the default
+  // 5001 is "more than half".
+  uint32 quorum_bps = 3;
+  // Veto window after a proposal passes. Default 3600.
+  uint32 delay_secs = 4;
+  // How long a proposal may stay OPEN. Default 259200 (72h), which is also the ceiling.
+  uint32 ttl_secs = 5;
+  // Overrides of a kind's `default_threshold`. A parameter not named here uses the default.
+  repeated ApprovalThreshold thresholds = 6;
+}
+
+message ApprovalThreshold {
+  string kind = 1;
+  string parameter = 2;
+  // Same spelling as ApprovalEscalation.default_threshold.
+  string value = 3;
+}
+
+message ApprovalVoter {
+  string user_id = 1;
+  string email = 2;
+  ApprovalVote vote = 3;
+  // Unix SECONDS; 0 while PENDING.
+  int64 voted_at = 4;
+}
+
+message Approval {
+  string id = 1;
+  string kind = 2;
+  string scope = 3;
+  // The level the proposal was resolved to at open, frozen.
+  ApprovalLevel level = 4;
+  // Why a SCOPE kind resolved to PLATFORM: the escalation `parameter`s that fired, or
+  // `sole_admin`. Empty when it did not escalate.
+  repeated string escalated_by = 5;
+  ApprovalState state = 6;
+  // The proposing service's own reference to the subject (a payment id, an allocation
+  // slug). Opaque here: at most 256 bytes of printable ASCII, never rendered to voters.
+  string subject_ref = 7;
+  repeated ApprovalFieldValue fields = 8;
+  // SHA-256, lowercase hex, over the canonical encoding of kind, scope, subject_ref and
+  // fields (the doc defines it). The executor recomputes it from its own record and
+  // refuses to act on a mismatch.
+  string payload_hash = 9;
+  string initiator_user_id = 10;
+  string initiator_email = 11;
+  // The initiator's words. Required; same rules as a TEXT field, at most 500 bytes.
+  string reason = 12;
+  // The frozen roster minus the initiator, with their votes.
+  repeated ApprovalVoter voters = 13;
+  uint32 threshold = 14;
+  // ScopeApprovalPolicy.version the proposal was measured against at open, escalated or
+  // not; 0 in scope `main`, which has no policy.
+  uint64 policy_version = 15;
+  // Unix SECONDS. `passed_at`, `executable_at` and `decided_at` are 0 until they happen.
+  int64 created_at = 16;
+  int64 expires_at = 17;
+  int64 passed_at = 18;
+  int64 executable_at = 19;
+  int64 decided_at = 20;
+  // Who vetoed and why, under VETOED.
+  string vetoed_by_user_id = 21;
+  string veto_reason = 22;
+  // Under VOID: why.
+  string void_reason = 23;
+  // As reported, under EXECUTED, EXECUTION_FAILED and VOID-by-report.
+  ApprovalOutcome outcome = 24;
+  // The executor's account of the outcome: same rules as a TEXT field.
+  string outcome_detail = 25;
+  // The namespace that proposed it and executes it.
+  string executor = 26;
+  uint64 version = 27;
+}
+
+message ListApprovalKindsRequest {}
+
+message ListApprovalKindsResponse {
+  repeated ApprovalKindSpec kinds = 1;
+}
+
+message GetScopeApprovalPolicyRequest {
+  string scope = 1;
+}
+
+message ListApprovalsRequest {
+  // Empty: every scope the caller may see.
+  string scope = 1;
+  // UNSPECIFIED: every state.
+  ApprovalState state = 2;
+  // Only proposals the caller still has to vote on.
+  bool awaiting_my_vote = 3;
+  // 0: the server default. Clamped server-side.
+  uint32 limit = 4;
+  // Opaque, from a previous response; empty starts at the newest.
+  string cursor = 5;
+}
+
+message ListApprovalsResponse {
+  repeated Approval approvals = 1;
+  // Empty when there is no further page.
+  string next_cursor = 2;
+}
+
+message GetApprovalRequest {
+  string approval_id = 1;
+}
+
+message VoteApprovalRequest {
+  string approval_id = 1;
+  // FOR or AGAINST.
+  ApprovalVote vote = 2;
+}
+
+message VetoApprovalRequest {
+  string approval_id = 1;
+  // Required.
+  string reason = 2;
+}
+
+message CancelApprovalRequest {
+  string approval_id = 1;
+}
+
+message ProposeScopeAdminGrantRequest {
+  string scope = 1;
+  oneof subject {
+    string user_id = 2;
+    // An email or a username, resolved as GrantPermissionRequest.account is.
+    string account = 3;
+  }
+  // Required.
+  string reason = 4;
+}
+
+message ProposeScopePolicyChangeRequest {
+  // The policy to install; `version` is ignored and assigned on execution. Validated at
+  // open AND re-validated at execution, against the catalogs then in force.
+  ScopeApprovalPolicy policy = 1;
+  // Required.
+  string reason = 2;
+}
+
+message ProposeRequest {
+  string kind = 1;
+  string scope = 2;
+  string subject_ref = 3;
+  // The person who asked for it, by concierge user id. Required: the proposing service
+  // checked they may ask; this plane keeps them off the roster.
+  string initiator_user_id = 4;
+  // Required; see Approval.reason.
+  string reason = 5;
+  repeated ApprovalFieldValue fields = 6;
+  // Idempotency key, unique per executor namespace, at most 128 bytes.
+  string dedupe_key = 7;
+}
+
+message WithdrawProposalRequest {
+  string approval_id = 1;
+  // Recorded on the proposal's history.
+  string reason = 2;
+}
+
+message GetProposalRequest {
+  string approval_id = 1;
+}
+
+message PullApprovedRequest {
+  // 0: the server default. Clamped server-side.
+  uint32 limit = 1;
+}
+
+message PullApprovedResponse {
+  repeated Approval approvals = 1;
+}
+
+message ReportOutcomeRequest {
+  string approval_id = 1;
+  ApprovalOutcome outcome = 2;
+  // Required for FAILED and VOID; same rules as a TEXT field.
+  string detail = 3;
+}
