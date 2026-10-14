@@ -34,7 +34,8 @@ package concierge.v1;
 //   ApprovalExecutionService — the executing services, by service credential (outside
 //                              the user auth layer, like UserEvents). See the doc's
 //                              "Service callers".
-// Neither is served yet: both are contract and answer UNIMPLEMENTED.
+// Both are served, except the `concierge:*` kinds (CancelApproval, ProposeScopeAdminGrant,
+// ProposeScopePolicyChange), which answer UNIMPLEMENTED until this plane executes them.
 
 // ApprovalService — the human side: read, vote, veto, cancel, and open the kinds this
 // plane executes itself.

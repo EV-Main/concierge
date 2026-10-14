@@ -30,6 +30,8 @@ use ev::error_monitoring::{self, Config as SentryConfig};
 use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, oauth::OAuthProvider, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
 	CheckRequest, CheckResponse,
+	approval_execution_service_server::ApprovalExecutionServiceServer,
+	approval_service_server::ApprovalServiceServer,
 	auth_service_server::AuthServiceServer,
 	governance_service_server::GovernanceServiceServer,
 	health_service_server::{HealthService, HealthServiceServer},
@@ -284,7 +286,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		Arc::new(infrastructure::relying_parties::PgRelyingParties::new(pool.clone())),
 	);
 	let scope_events = concierge::scope_events::ScopeEvents::new(service_callers.clone(), Arc::new(infrastructure::scope_events::PgScopeEvents::new(pool.clone())));
-	let scope_catalogs = concierge::scope_catalog::ScopeCatalogs::new(service_callers.clone(), Arc::new(infrastructure::scope_catalogs::PgScopeCatalogs::new(pool.clone())));
+	let catalog_repo: Arc<dyn concierge::ports::ScopeCatalogRepository> = Arc::new(infrastructure::scope_catalogs::PgScopeCatalogs::new(pool.clone()));
+	let scope_catalogs = concierge::scope_catalog::ScopeCatalogs::new(service_callers.clone(), catalog_repo.clone());
+	// Approvals (`docs/SCOPES-AND-APPROVALS.md` §5): the proposers' side is a service seam
+	// like the catalog it reads kinds from; the people's side sits inside the auth layer.
+	let approval_repo: Arc<dyn concierge::ports::ApprovalRepository> = Arc::new(infrastructure::approvals::PgApprovals::new(pool.clone()));
+	let approval_execution = concierge::approvals::ApprovalExecution::new(service_callers.clone(), approval_repo.clone(), catalog_repo.clone());
 
 	// The TLS listener for the same seam (banking#199, phase 2). Validated and READ here,
 	// before anything is served: a half-configured listener or an unreadable PEM is a
@@ -458,6 +465,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	let tls_mail_relay = mail_relay.clone();
 	let tls_scope_events = scope_events.clone();
 	let tls_scope_catalogs = scope_catalogs.clone();
+	let tls_approval_execution = approval_execution.clone();
 	let tls_scope_inbox = scope_inbox.clone();
 	let bridge_tls_server = async {
 		let Some(listener) = bridge_tls else {
@@ -476,6 +484,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(MailRelayServiceServer::new(tls_mail_relay))
 			.add_service(ScopeEventsServer::new(tls_scope_events))
 			.add_service(ScopeCatalogServiceServer::new(tls_scope_catalogs))
+			.add_service(ApprovalExecutionServiceServer::new(tls_approval_execution))
 			.add_service(ScopeInboxServiceServer::new(tls_scope_inbox))
 			.serve_with_shutdown(listener.bind, await_signal())
 			.await
@@ -491,6 +500,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(UserEventsServer::new(bridge))
 			.add_service(ScopeEventsServer::new(scope_events))
 			.add_service(ScopeCatalogServiceServer::new(scope_catalogs))
+			.add_service(ApprovalExecutionServiceServer::new(approval_execution))
 			.add_service(ScopeInboxServiceServer::new(scope_inbox))
 			// Both governance seams are mounted OUTSIDE the user auth layer, for the two
 			// different reasons the layer exists to distinguish: the approval surface is
@@ -510,9 +520,10 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			))))
 			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), grants, break_glass.clone()).with_grant_write_limiter(grant_write_limiter))))
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass, platform_repo))))
-			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))
+			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users.clone(), subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 			.add_service(auth.layer(ScopeRegistryServer::new(concierge::scopes::ScopeRegistry::new(scope_repo))))
+			.add_service(auth.layer(ApprovalServiceServer::new(concierge::approvals::Approvals::new(users, approval_repo, catalog_repo))))
 			.serve_with_shutdown(config.bind, await_signal())
 			.await
 			.context("concierge gRPC server error")

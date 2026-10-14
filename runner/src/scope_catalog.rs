@@ -117,7 +117,7 @@ fn kind_from(spec: ApprovalKindSpec) -> Result<ApprovalKind, String> {
 	})
 }
 
-fn kind_to(kind: ApprovalKind, proposer: &str) -> ApprovalKindSpec {
+pub(crate) fn kind_to(kind: ApprovalKind, proposer: &str) -> ApprovalKindSpec {
 	ApprovalKindSpec {
 		name: kind.name,
 		label: kind.label,
