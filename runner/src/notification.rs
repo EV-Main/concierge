@@ -386,6 +386,91 @@ pub fn settings_json(settings: &NotificationSettings) -> serde_json::Value {
 	})
 }
 
+/// One page of `sub`'s inbox within `view`. Shared by the user's RPC and a scope's
+/// ([`crate::scope_inbox`]), so the two can never page or filter differently.
+pub(crate) async fn inbox_page(
+	notifications: &dyn NotificationRepository,
+	sub: &SubscriberRow,
+	view: &InboxView,
+	req: &ListNotificationsRequest,
+) -> Result<ListNotificationsResponse, Status> {
+	// Switching the in-app channel off hides the inbox rather than deleting it:
+	// the record survives, so turning the channel back on restores history.
+	if !sub.in_app_enabled {
+		return Ok(ListNotificationsResponse::default());
+	}
+
+	let limit = match req.limit {
+		0 => DEFAULT_PAGE,
+		n => n.min(MAX_PAGE),
+	};
+	let cursor = match req.cursor.as_str() {
+		"" => None,
+		raw => Some(Uuid::parse_str(raw).map_err(|_| Status::invalid_argument("cursor must be a notification id"))?),
+	};
+	let topic_filter = match req.topic.as_str() {
+		"" => None,
+		t if topic_offered(notifications, view, t).await.map_err(domain_to_status)? => Some(t),
+		_ => return Err(Status::invalid_argument("unknown topic")),
+	};
+	let within = view.topics();
+
+	// One extra row tells us whether a further page exists, with no second query.
+	let mut rows = notifications
+		.list(sub.id, cursor, i64::from(limit) + 1, req.unread_only, topic_filter, &within)
+		.await
+		.map_err(domain_to_status)?;
+	let next_cursor = if rows.len() > limit as usize {
+		rows.truncate(limit as usize);
+		rows.last().map(|r| r.id.to_string()).unwrap_or_default()
+	} else {
+		String::new()
+	};
+
+	let unread_count = notifications.unread_count(sub.id, &within).await.map_err(domain_to_status)? as u32;
+	Ok(ListNotificationsResponse {
+		notifications: rows
+			.into_iter()
+			.map(|r| NotificationMsg {
+				id: r.id.to_string(),
+				topic: r.topic,
+				kind: r.kind,
+				title: r.title,
+				body: r.body,
+				link: r.link,
+				occurred_at: r.occurred_at,
+				created_at: r.created_at,
+				read_at: r.read_at,
+			})
+			.collect(),
+		next_cursor,
+		unread_count,
+	})
+}
+
+/// Unread within `view`; nothing while the in-app channel is off.
+pub(crate) async fn inbox_unread(notifications: &dyn NotificationRepository, sub: &SubscriberRow, view: &InboxView) -> Result<u32, Status> {
+	if !sub.in_app_enabled {
+		return Ok(0);
+	}
+	Ok(notifications.unread_count(sub.id, &view.topics()).await.map_err(domain_to_status)? as u32)
+}
+
+/// Marks `ids` (or everything unread with `all`) within `view` only.
+pub(crate) async fn inbox_mark_read(notifications: &dyn NotificationRepository, subscriber_id: Uuid, view: &InboxView, ids: &[String], all: bool) -> Result<MarkReadResponse, Status> {
+	let ids = ids
+		.iter()
+		.map(|raw| Uuid::parse_str(raw).map_err(|_| Status::invalid_argument("notification id must be a UUID")))
+		.collect::<Result<Vec<_>, _>>()?;
+	if !all && ids.is_empty() {
+		return Err(Status::invalid_argument("provide notification ids or set all"));
+	}
+	let within = view.topics();
+	let marked = notifications.mark_read(subscriber_id, &ids, all, &within).await.map_err(domain_to_status)? as u32;
+	let unread_count = notifications.unread_count(subscriber_id, &within).await.map_err(domain_to_status)? as u32;
+	Ok(MarkReadResponse { marked, unread_count })
+}
+
 #[tonic::async_trait]
 impl NotificationService for Notifications {
 	async fn emit(&self, request: Request<EmitRequest>) -> Result<Response<EmitResponse>, Status> {
@@ -447,89 +532,21 @@ impl NotificationService for Notifications {
 		let view = self.view(&request).await?;
 		let req = request.get_ref();
 
-		// Switching the in-app channel off hides the inbox rather than deleting it:
-		// the record survives, so turning the channel back on restores history.
-		if !sub.in_app_enabled {
-			return Ok(Response::new(ListNotificationsResponse::default()));
-		}
-
-		let limit = match req.limit {
-			0 => DEFAULT_PAGE,
-			n => n.min(MAX_PAGE),
-		};
-		let cursor = match req.cursor.as_str() {
-			"" => None,
-			raw => Some(Uuid::parse_str(raw).map_err(|_| Status::invalid_argument("cursor must be a notification id"))?),
-		};
-		let topic_filter = match req.topic.as_str() {
-			"" => None,
-			t if topic_offered(self.notifications.as_ref(), &view, t).await.map_err(domain_to_status)? => Some(t),
-			_ => return Err(Status::invalid_argument("unknown topic")),
-		};
-		let within = view.topics();
-
-		// One extra row tells us whether a further page exists, with no second query.
-		let mut rows = self
-			.notifications
-			.list(sub.id, cursor, i64::from(limit) + 1, req.unread_only, topic_filter, &within)
-			.await
-			.map_err(domain_to_status)?;
-		let next_cursor = if rows.len() > limit as usize {
-			rows.truncate(limit as usize);
-			rows.last().map(|r| r.id.to_string()).unwrap_or_default()
-		} else {
-			String::new()
-		};
-
-		let unread_count = self.notifications.unread_count(sub.id, &within).await.map_err(domain_to_status)? as u32;
-		Ok(Response::new(ListNotificationsResponse {
-			notifications: rows
-				.into_iter()
-				.map(|r| NotificationMsg {
-					id: r.id.to_string(),
-					topic: r.topic,
-					kind: r.kind,
-					title: r.title,
-					body: r.body,
-					link: r.link,
-					occurred_at: r.occurred_at,
-					created_at: r.created_at,
-					read_at: r.read_at,
-				})
-				.collect(),
-			next_cursor,
-			unread_count,
-		}))
+		Ok(Response::new(inbox_page(self.notifications.as_ref(), &sub, &view, req).await?))
 	}
 
 	async fn get_unread_count(&self, request: Request<GetUnreadCountRequest>) -> Result<Response<GetUnreadCountResponse>, Status> {
 		let sub = self.caller(&request).await?;
 		let view = self.view(&request).await?;
-		let unread_count = if sub.in_app_enabled {
-			self.notifications.unread_count(sub.id, &view.topics()).await.map_err(domain_to_status)? as u32
-		} else {
-			0
-		};
+		let unread_count = inbox_unread(self.notifications.as_ref(), &sub, &view).await?;
 		Ok(Response::new(GetUnreadCountResponse { unread_count }))
 	}
 
 	async fn mark_read(&self, request: Request<MarkReadRequest>) -> Result<Response<MarkReadResponse>, Status> {
 		let sub = self.caller(&request).await?;
-		let within = self.view(&request).await?.topics();
+		let view = self.view(&request).await?;
 		let req = request.get_ref();
-
-		let ids = req
-			.ids
-			.iter()
-			.map(|raw| Uuid::parse_str(raw).map_err(|_| Status::invalid_argument("notification id must be a UUID")))
-			.collect::<Result<Vec<_>, _>>()?;
-		if !req.all && ids.is_empty() {
-			return Err(Status::invalid_argument("provide notification ids or set all"));
-		}
-
-		let marked = self.notifications.mark_read(sub.id, &ids, req.all, &within).await.map_err(domain_to_status)? as u32;
-		let unread_count = self.notifications.unread_count(sub.id, &within).await.map_err(domain_to_status)? as u32;
-		Ok(Response::new(MarkReadResponse { marked, unread_count }))
+		Ok(Response::new(inbox_mark_read(self.notifications.as_ref(), sub.id, &view, &req.ids, req.all).await?))
 	}
 
 	async fn get_notification_settings(&self, request: Request<GetNotificationSettingsRequest>) -> Result<Response<NotificationSettings>, Status> {

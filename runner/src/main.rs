@@ -40,6 +40,7 @@ use evconcierge_contracts::concierge::v1::{
 	platform_service_server::PlatformServiceServer,
 	scope_catalog_service_server::ScopeCatalogServiceServer,
 	scope_events_server::ScopeEventsServer,
+	scope_inbox_service_server::ScopeInboxServiceServer,
 	scope_registry_server::ScopeRegistryServer,
 	user_directory_server::UserDirectoryServer,
 	user_events_server::UserEventsServer,
@@ -275,7 +276,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		Arc::new(infrastructure::relying_parties::PgRelyingParties::new(pool.clone())),
 	);
 	let scope_events = concierge::scope_events::ScopeEvents::new(service_callers.clone(), Arc::new(infrastructure::scope_events::PgScopeEvents::new(pool.clone())));
-	let scope_catalogs = concierge::scope_catalog::ScopeCatalogs::new(service_callers, Arc::new(infrastructure::scope_catalogs::PgScopeCatalogs::new(pool.clone())));
+	let scope_catalogs = concierge::scope_catalog::ScopeCatalogs::new(service_callers.clone(), Arc::new(infrastructure::scope_catalogs::PgScopeCatalogs::new(pool.clone())));
 
 	// The TLS listener for the same seam (banking#199, phase 2). Validated and READ here,
 	// before anything is served: a half-configured listener or an unreadable PEM is a
@@ -295,6 +296,8 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	let pg_notifications = Arc::new(infrastructure::notifications::PgNotifications::new(pool.clone()));
 	let notification_repo: Arc<dyn concierge::ports::NotificationRepository> = pg_notifications.clone();
 	let dispatch_repo: Arc<dyn concierge::ports::NotificationDispatchRepository> = pg_notifications;
+	// A direction's own inbox, read by its backend with its client credential (D21).
+	let scope_inbox = concierge::scope_inbox::ScopeInbox::new(service_callers, notification_repo.clone(), users.clone());
 
 	// The ownership consilium. The broadcast channel is only an immediacy optimisation
 	// for the live feed — each stream ALSO re-reads the revision from Postgres on an
@@ -438,7 +441,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	);
 
 	// The TLS listener serves ONLY the service seams: the lifecycle pull and the mail push
-	// banking dials through `CONCIERGE_BRIDGE_ADDR`, and the scope stream and catalog
+	// banking dials through `CONCIERGE_BRIDGE_ADDR`, and the scope stream, catalog and inbox
 	// (`docs/SCOPES-AND-APPROVALS.md` §1). No gRPC-Web, no `accept_http1` — nothing a
 	// browser reaches — and the credential checks stay inside the handlers, so TLS
 	// is added proof, not a replacement. Unconfigured ⇒ resolves at once and lets the
@@ -447,6 +450,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	let tls_mail_relay = mail_relay.clone();
 	let tls_scope_events = scope_events.clone();
 	let tls_scope_catalogs = scope_catalogs.clone();
+	let tls_scope_inbox = scope_inbox.clone();
 	let bridge_tls_server = async {
 		let Some(listener) = bridge_tls else {
 			return Ok(());
@@ -464,6 +468,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(MailRelayServiceServer::new(tls_mail_relay))
 			.add_service(ScopeEventsServer::new(tls_scope_events))
 			.add_service(ScopeCatalogServiceServer::new(tls_scope_catalogs))
+			.add_service(ScopeInboxServiceServer::new(tls_scope_inbox))
 			.serve_with_shutdown(listener.bind, await_signal())
 			.await
 			.context("concierge bridge TLS server error")
@@ -478,6 +483,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(UserEventsServer::new(bridge))
 			.add_service(ScopeEventsServer::new(scope_events))
 			.add_service(ScopeCatalogServiceServer::new(scope_catalogs))
+			.add_service(ScopeInboxServiceServer::new(scope_inbox))
 			// Both governance seams are mounted OUTSIDE the user auth layer, for the two
 			// different reasons the layer exists to distinguish: the approval surface is
 			// reached by a person holding an emailed token who may not be signed in, and

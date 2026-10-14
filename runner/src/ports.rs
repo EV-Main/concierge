@@ -1251,6 +1251,10 @@ pub trait NotificationRepository: Send + Sync {
 	/// scope's inbox.
 	async fn is_scope_member(&self, scope: &str, user_id: Uuid) -> Result<bool, DomainError>;
 
+	/// [`Self::is_scope_member`] for an ACTIVE account only. False for an unknown id too, so
+	/// a relying party asking about an arbitrary id learns no more than its stream says.
+	async fn is_active_scope_member(&self, scope: &str, user_id: Uuid) -> Result<bool, DomainError>;
+
 	/// Account-less subscribe (double opt-in). Returns the confirmation token ONLY
 	/// when a confirmation mail was actually queued — already-confirmed addresses and
 	/// throttled repeats both return `None`, and the caller must not tell them apart.

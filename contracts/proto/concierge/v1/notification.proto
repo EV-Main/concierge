@@ -19,7 +19,8 @@ package concierge.v1;
 // user RPC below — the list, its topic filter, the unread count, MarkRead (including
 // `all`), the settings and SetTopicSubscription — is confined to that inbox. The summary
 // of every namespace is asked for with the metadata `x-ev-inbox-view: all` and needs the
-// permission `concierge:notifications:read_all`, else PERMISSION_DENIED.
+// permission `concierge:notifications:read_all`, else PERMISSION_DENIED. A direction's own
+// inbox is read by its backend through ScopeInboxService (scope_inbox.proto).
 //
 // SUBSCRIBERS. Account-less ("anonymous") subscribers are the SAME record as
 // signed-in ones, distinguished only by having no user id — one table, one

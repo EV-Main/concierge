@@ -25,6 +25,7 @@ says so and why.
 | `ScopeRegistry` | scopes.proto | first-party session, `typ=service` token | inside the user auth layer | served (`runner/src/scopes.rs`) |
 | `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, like `UserEvents` | contract, `UNIMPLEMENTED` |
 | `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | contract, `UNIMPLEMENTED` |
+| `ScopeInboxService` | scope_inbox.proto | a relying party's client credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_inbox.rs`, §6) |
 | `ApprovalService` | approvals.proto | first-party session | inside the user auth layer | contract, `UNIMPLEMENTED` |
 | `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | contract, `UNIMPLEMENTED` |
 | `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and** a relying party's client credential | as today | bridge token only; the client credential is contract |
@@ -464,6 +465,7 @@ server from where the request came from, never by a request field
 | web, `Origin` = an origin of a scope that still signs in (§3.1) | that scope's | its catalog's topics only, and only for a MEMBER of the scope (`scope_members`, §4.1); anyone else gets an empty list, not a refusal |
 | web, any other `Origin` | — | `403 {"error":"origin_not_allowed"}` |
 | gRPC `NotificationService` with a user's access token | platform | as above |
+| gRPC `ScopeInboxService` with a client credential, `user_id` in the request | the client's own scope's | as for the scope's host above, for an ACTIVE member; anyone else reads empty and writes `FAILED_PRECONDITION` |
 | web `?all=1` on `PUBLIC_ORIGIN` / gRPC metadata `x-ev-inbox-view: all` | summary | every namespace; needs `concierge:notifications:read_all` (seats `admin` and `owner`), else `403 {"error":"forbidden"}` / `PERMISSION_DENIED`; on a scope's host always `403` |
 
 The rule covers the settings read, following a topic (a topic outside the inbox is
@@ -475,12 +477,27 @@ On the web the summary is decided from the PERSISTED seat; break-glass elevation
 console, not everyone's notifications. The summary is metadata on gRPC and not a request
 field because banking builds these request messages with struct literals (§1).
 
-What the scope inbox does not have yet: a transport. The account routes stay off the
-scope hosts' CORS list (§3.1), so a browser on a scope's host cannot read the answer, and
-the mutations carry the CSRF double-submit whose cookie a scope host cannot read; and a
-relying party's client credential names no user, while its users' tokens open only
-`GetMe`. Choosing between credentialed CORS for these routes and a client-token path on
-`NotificationService` is open (§7).
+**How a direction reaches its own inbox (decided 2026-10-14).** Its frontend talks to its
+own backend, and the backend calls `ScopeInboxService` with the client credential, naming
+the user by the concierge id it knows from its own session (its access token's `sub`,
+`ScopeEvent.user_id`). Neither credentialed CORS on the account routes nor the client's
+user token on `NotificationService`: the account routes stay off the scope hosts' CORS
+list (§3.1), and a client's user token still opens `GetMe` alone.
+
+- The namespace is the calling client's scope's, never a request field. An observer of a
+  scope (§3) gets its stream, never its inbox.
+- The user must be an ACTIVE member (`scope_members`, §4.1). An unknown id, a non-member
+  and a disabled account are one case: the list, the count and the settings answer empty
+  (the settings carry no address either), mark-read and following a topic answer
+  `FAILED_PRECONDITION`. The client learns nothing its stream did not tell it.
+- A topic outside the namespace's catalog in force is `INVALID_ARGUMENT`, as an unknown one;
+  mark-read of another inbox's id marks nothing (`marked` counts what flipped).
+- A disabled or unknown client and a wrong secret are `UNAUTHENTICATED`, a closed scope
+  `FAILED_PRECONDITION`, the bridge token `PERMISSION_DENIED` (`bank:` topics are the
+  platform inbox's).
+- The master channel switches are not offered: they act on every inbox, so they stay on
+  `PUBLIC_ORIGIN` (`NotificationService.SetChannelEnabled`, the account MFE).
+- Pages are explicit: `limit` 0 means 20, at most 100, `next_cursor` empty on the last.
 
 As implemented: a scope catalog's topics are offered in the inbox of their scope (gRPC and
 `/auth/notifications/settings`), may be followed and filtered on there, and disappear from
@@ -512,9 +529,8 @@ position scanned (§4.2); `Scope.state` (§3).
 2. A direction receives `kyc_level` on the lifecycle stream and in `ScopeMember` (D5),
    although `GetMe` withholds it from relying parties today.
 3. Topic labels are one language; the frontends carry five locales.
-4. How a scope's host reaches its own inbox (§6): credentialed CORS on the notification
-   routes plus a CSRF scheme a scope host can satisfy, or a relying-party token admitted
-   on `NotificationService` (today a client's token opens only `GetMe`).
+4. ~~How a scope's host reaches its own inbox~~ — decided 2026-10-14: through its own
+   backend and `ScopeInboxService` with the client credential (§6).
 
 **Known limitation until `typ=service` tokens:** a namespace is the unit of
 `ApprovalExecutionService`, so several clients of one namespace are indistinguishable

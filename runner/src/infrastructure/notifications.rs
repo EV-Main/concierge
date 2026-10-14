@@ -411,6 +411,18 @@ impl NotificationRepository for PgNotifications {
 		Ok(result.map_err(repo_err)?.rows_affected())
 	}
 
+	async fn is_active_scope_member(&self, scope: &str, user_id: Uuid) -> Result<bool, DomainError> {
+		sqlx::query_scalar(
+			"SELECT EXISTS (SELECT 1 FROM scope_members m JOIN users u ON u.id = m.user_id \
+			 WHERE m.scope = $1 AND m.user_id = $2 AND u.status = 'active')",
+		)
+		.bind(scope)
+		.bind(user_id)
+		.fetch_one(&self.pool)
+		.await
+		.map_err(repo_err)
+	}
+
 	async fn is_scope_member(&self, scope: &str, user_id: Uuid) -> Result<bool, DomainError> {
 		sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM scope_members WHERE scope = $1 AND user_id = $2)")
 			.bind(scope)
