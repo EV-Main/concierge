@@ -2,9 +2,12 @@
 //! the directory `WEB_MFE_DIR` names (`docs/SCOPES-AND-APPROVALS.md` §3.1, the plan's
 //! §4.1/§4.3: hosts load them by manifest and allow this origin in their CSP).
 //!
-//! Files only: no index, no listing, nothing outside the directory — a path segment that
-//! could climb out of it (`..`, `.`, a dotfile, a backslash) or a symlink that resolves
-//! outside it answers 404, the same as a file that is not there. GET and HEAD only.
+//! The serving itself — conditional requests (ETag, Last-Modified, 304), ranges, the
+//! content type — is tower-http's `ServeDir`. What is decided here is what it may be
+//! asked for: files only, no index, no listing, nothing outside the directory. A path
+//! segment that could climb out of it (`..`, `.`, a dotfile, a backslash) or a symlink
+//! that resolves outside it answers 404, the same as a file that is not there — checked
+//! here because `ServeDir` follows symlinks wherever they point. GET and HEAD only.
 //! Read-only and public, so CORS answers a scope's origin without credentials: a host
 //! fetches the manifest and the bundles anonymously.
 
@@ -15,36 +18,41 @@ use std::{
 
 use axum::{
 	Router,
-	extract::{Path as UrlPath, State},
+	extract::{Path as UrlPath, Request, State},
 	http::{
-		HeaderMap, HeaderValue, StatusCode,
+		HeaderValue, StatusCode, Uri,
 		header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ORIGIN, VARY, X_CONTENT_TYPE_OPTIONS},
 	},
 	response::{IntoResponse, Response},
 	routing::get,
 };
 use color_eyre::eyre::{Context, Result, ensure};
+use tower::ServiceExt;
+use tower_http::services::ServeDir;
 
-use crate::web::origins::ScopeOrigins;
+use crate::web::allowlist::SignInAllowlist;
 
 /// The manifest hosts read to find the current bundles. It names hashed files, so it is
 /// the one thing that must go stale quickly.
 pub const MANIFEST: &str = "registry.json";
 
+const PREFIX: &str = "/auth/mfe";
 const SHORT_CACHE: &str = "public, max-age=300";
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 pub struct MfeAssets {
 	root: PathBuf,
-	origins: ScopeOrigins,
+	files: ServeDir,
+	allowlist: Arc<SignInAllowlist>,
 }
 
 impl MfeAssets {
 	/// The directory, resolved once so every request is checked against its real path.
-	pub fn open(dir: &Path, origins: ScopeOrigins) -> Result<Self> {
+	pub fn open(dir: &Path, allowlist: Arc<SignInAllowlist>) -> Result<Self> {
 		let root = std::fs::canonicalize(dir).with_context(|| format!("WEB_MFE_DIR {} cannot be resolved", dir.display()))?;
 		ensure!(root.is_dir(), "WEB_MFE_DIR {} is not a directory", root.display());
-		Ok(Self { root, origins })
+		let files = ServeDir::new(&root).append_index_html_on_directories(false);
+		Ok(Self { root, files, allowlist })
 	}
 }
 
@@ -53,30 +61,53 @@ pub fn mount(router: Router, assets: MfeAssets) -> Router {
 	router.merge(Router::new().route("/auth/mfe/{*path}", get(serve)).with_state(Arc::new(assets)))
 }
 
-async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<String>, headers: HeaderMap) -> Response {
-	let mut response = match read(&assets.root, &path).await {
-		Some((name, body)) => {
-			let mut response = body.into_response();
-			let h = response.headers_mut();
-			h.insert(CONTENT_TYPE, HeaderValue::from_static(content_type(&name)));
-			h.insert(CACHE_CONTROL, HeaderValue::from_static(if is_hashed(&name) { IMMUTABLE } else { SHORT_CACHE }));
-			h.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-			response
+async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<String>, mut request: Request) -> Response {
+	let origin = request.headers().get(ORIGIN).cloned();
+	let mut response = match serveable(&assets.root, &path).await {
+		Some(name) => {
+			// `ServeDir` sees the path below the mount, still percent-encoded: it decodes
+			// it itself, to the same file just checked.
+			let rest = request.uri().path().strip_prefix(PREFIX).unwrap_or("/").to_owned();
+			match Uri::try_from(rest) {
+				Ok(uri) => *request.uri_mut() = uri,
+				Err(_) => return StatusCode::NOT_FOUND.into_response(),
+			}
+			let response = match assets.files.clone().oneshot(request).await {
+				Ok(response) => response.into_response(),
+				Err(never) => match never {},
+			};
+			describe(response, &name)
 		}
 		None => StatusCode::NOT_FOUND.into_response(),
 	};
-	let h = response.headers_mut();
-	h.append(VARY, HeaderValue::from_static("Origin"));
-	if let Some(origin) = headers.get(ORIGIN).filter(|o| o.to_str().is_ok_and(|o| assets.origins.admits(o))) {
-		h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+	let headers = response.headers_mut();
+	headers.append(VARY, HeaderValue::from_static("Origin"));
+	if let Some(origin) = origin
+		&& let Ok(raw) = origin.to_str()
+		&& assets.allowlist.current().await.origins.admits(raw)
+	{
+		headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
 	}
 	response
 }
 
-/// The file `path` names under `root`, or `None` for anything that is not a regular file
-/// inside it. A read error is logged and answered as absent: the caller is a browser
-/// that can do nothing with the difference.
-async fn read(root: &Path, path: &str) -> Option<(String, Vec<u8>)> {
+/// Lifetime and type for what `ServeDir` answered about `name`.
+fn describe(mut response: Response, name: &str) -> Response {
+	let status = response.status();
+	let headers = response.headers_mut();
+	if matches!(status, StatusCode::OK | StatusCode::PARTIAL_CONTENT | StatusCode::NOT_MODIFIED) {
+		headers.insert(CACHE_CONTROL, HeaderValue::from_static(if is_hashed(name) { IMMUTABLE } else { SHORT_CACHE }));
+		if status != StatusCode::NOT_MODIFIED && matches!(extension(name), Some("js" | "mjs")) {
+			headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"));
+		}
+	}
+	headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+	response
+}
+
+/// The file name `path` names under `root`, or `None` for anything that is not a regular
+/// file inside it.
+async fn serveable(root: &Path, path: &str) -> Option<String> {
 	let segments: Vec<&str> = path.split('/').collect();
 	if !segments.iter().all(|s| is_plain_segment(s)) {
 		return None;
@@ -87,53 +118,30 @@ async fn read(root: &Path, path: &str) -> Option<(String, Vec<u8>)> {
 	if !resolved.starts_with(root) || !tokio::fs::metadata(&resolved).await.ok()?.is_file() {
 		return None;
 	}
-	match tokio::fs::read(&resolved).await {
-		Ok(body) => Some(((*segments.last()?).to_owned(), body)),
-		Err(e) => {
-			tracing::error!(path = %resolved.display(), error = %e, "mfe asset not read");
-			None
-		}
-	}
+	segments.last().map(|s| (*s).to_owned())
 }
 
 fn is_plain_segment(segment: &str) -> bool {
 	!segment.is_empty() && !segment.starts_with('.') && !segment.contains(['\\', '\0'])
 }
 
-fn content_type(name: &str) -> &'static str {
-	match name.rsplit_once('.').map(|(_, ext)| ext) {
-		Some("js" | "mjs") => "text/javascript; charset=utf-8",
-		Some("css") => "text/css; charset=utf-8",
-		Some("json" | "map") => "application/json",
-		Some("html") => "text/html; charset=utf-8",
-		Some("svg") => "image/svg+xml",
-		Some("png") => "image/png",
-		Some("webp") => "image/webp",
-		Some("ico") => "image/x-icon",
-		Some("woff2") => "font/woff2",
-		Some("woff") => "font/woff",
-		Some("wasm") => "application/wasm",
-		Some("txt") => "text/plain; charset=utf-8",
-		_ => "application/octet-stream",
-	}
+fn extension(name: &str) -> Option<&str> {
+	name.rsplit_once('.').map(|(_, ext)| ext)
 }
 
-/// Whether the name carries a content hash (esbuild's `[name]-[hash]`, 8 characters of
-/// `A-Z0-9`, or a lowercase hex digest), so its bytes can never change under it. Anything
-/// unrecognised gets the short lifetime: a missed hash costs a revalidation, a false one
-/// pins a stale file in browsers for a year.
+/// Whether the name is esbuild's `<name>-<HASH>.<ext>`: eight characters of `A-Z0-9`
+/// directly before the one extension. Only then can its bytes never change under the
+/// name; anything else (the manifest, `LICENSES.txt`, a source map `x-HASH.js.map`) gets
+/// the short lifetime — a missed hash costs a revalidation, a false one pins a stale file
+/// in browsers for a year.
 fn is_hashed(name: &str) -> bool {
-	if name == MANIFEST {
+	let Some((stem, ext)) = name.rsplit_once('.') else {
 		return false;
-	}
-	let mut tokens: Vec<&str> = name.split(['-', '.']).collect();
-	tokens.pop();
-	tokens.iter().any(|t| {
-		(8..=64).contains(&t.len())
-			&& t.bytes().all(|b| b.is_ascii_alphanumeric())
-			&& (t.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-				|| (t.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) && t.bytes().any(|b| b.is_ascii_digit())))
-	})
+	};
+	let Some((base, hash)) = stem.rsplit_once('-') else {
+		return false;
+	};
+	!base.is_empty() && !ext.is_empty() && ext.bytes().all(|b| b.is_ascii_alphanumeric()) && hash.len() == 8 && hash.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -141,11 +149,24 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn only_content_hashed_names_are_immutable() {
-		for hashed in ["sign-in-ABCD2345.js", "chunk-Q7ZK3M2P.js", "index-ABCD2345.css", "sign-in-ABCD2345.js.map", "app.3f9a1c0b.js"] {
+	fn only_esbuild_hashed_names_are_immutable() {
+		for hashed in ["sign-in-ABCD2345.js", "chunk-Q7ZK3M2P.js", "index-ABCD2345.css", "a-ZZZZZZZZ.woff2"] {
 			assert!(is_hashed(hashed), "{hashed}");
 		}
-		for plain in [MANIFEST, "sign-in.js", "settings.js", "Settings.js", "favicon.ico", "registry-v2.json", "ABCD2345"] {
+		for plain in [
+			MANIFEST,
+			"MANIFEST.json",
+			"LICENSES.txt",
+			"sign-in.js",
+			"Settings.js",
+			"sign-in-ABCD2345.js.map",
+			"app.3f9a1c0b.js",
+			"sign-in-abcd2345.js",
+			"sign-in-ABCD234.js",
+			"-ABCD2345.js",
+			"ABCD2345",
+			"sign-in-ABCD2345",
+		] {
 			assert!(!is_hashed(plain), "{plain}");
 		}
 	}
