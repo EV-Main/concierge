@@ -20,6 +20,7 @@ pub mod allowlist;
 mod authorize;
 mod cors;
 mod kyc;
+mod logout;
 pub mod mfe;
 mod oauth;
 pub mod origins;
@@ -46,16 +47,19 @@ use evconcierge_auth::{AuthService, oauth::OAuthProvider};
 /// enforces. A test that hard-coded the number would keep passing after someone raised
 /// it, and the number is what stands between one account and the vendor balance.
 pub use kyc::START_MAX_PER_WINDOW;
+/// Re-exported for the same reason: the suite drives the passkey sign-in up to this budget.
+pub use passkey::SIGN_IN_STARTS_PER_MINUTE;
 pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
 use tokio::sync::Notify;
-pub use turnstile::{SITEVERIFY, Turnstile};
+pub use turnstile::{SITEVERIFY, Turnstile, is_test_secret};
 use webauthn_rs::{
 	Webauthn,
 	prelude::{DiscoverableAuthentication, PasskeyRegistration},
 };
 
 use crate::{
+	notification::RateLimiter,
 	ports::{CredentialRepository, GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
 	relying_party::RelyingParties,
 	web::{allowlist::SignInAllowlist, oauth::OAuthTxStore, passkey::Ceremonies, single_flight::KeyedLocks},
@@ -137,6 +141,7 @@ impl WebState {
 				allowlist: sign_in.allowlist,
 				passkey_registrations: Ceremonies::default(),
 				passkey_sign_ins: Ceremonies::default(),
+				passkey_sign_in_starts: RateLimiter::new(std::time::Duration::from_secs(60), passkey::SIGN_IN_STARTS_PER_MINUTE),
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
@@ -220,6 +225,10 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/login", get(routes::login))
 		.route("/callback/auth/{provider}", get(routes::callback))
 		.route("/auth/logout", post(routes::logout))
+		// The sign-out a scope's host sends the browser to, so that leaving the scope
+		// leaves this origin's session too. A page, not a call: a script on a scope host
+		// must never be able to end the session by itself, so a person presses the button.
+		.route("/auth/logout/confirm", get(logout::page).post(logout::confirm))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
 		.route("/auth/email/verify/request", post(sign_in::request_verification))
 		.route("/auth/email/verify/confirm", post(sign_in::confirm_verification))
@@ -281,6 +290,8 @@ struct Inner {
 	/// reading of the allowlist even if it is rebuilt in between.
 	passkey_registrations: Ceremonies<(UserId, PasskeyRegistration, Arc<Webauthn>)>,
 	passkey_sign_ins: Ceremonies<(DiscoverableAuthentication, Arc<Webauthn>)>,
+	/// Per client address, in process: a replica's own ceremony store is what it protects.
+	passkey_sign_in_starts: RateLimiter,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
 	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/<provider>`.
 	public_origin: String,

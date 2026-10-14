@@ -8,8 +8,9 @@
 //!
 //! The caller is gated as `authz::caller_gate` gates the gRPC surface: a disabled account,
 //! or a session whose token predates the account's `token_version`, is refused at once,
-//! not when its access token next expires. On a read that refusal also ends the session
-//! and clears its cookies, as a sign-out does: the session has nothing left to answer.
+//! not when its access token next expires. That refusal also ends the session and clears
+//! its cookies, as a sign-out does, on a read and a mutation alike: the session has
+//! nothing left to answer (`sign_in::gate`, shared with every signed-in mutation).
 //!
 //! Every answer is JSON, the refusals `{"error":"<code>"}` as on the sign-in routes.
 
@@ -19,7 +20,7 @@ use axum::{
 	http::{HeaderMap, HeaderName, StatusCode, header},
 };
 use axum_extra::extract::cookie::CookieJar;
-use domain::users::{User, UserStatus, Username};
+use domain::users::Username;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -27,8 +28,8 @@ use crate::{
 	notification::{settings_json, settings_of, subscriber_of, topic},
 	web::{
 		WebState,
-		routes::{Caller, clear_session, close, session_user},
-		sign_in::{Answered, Refusal, internal, signed_in},
+		routes::{Caller, session_user},
+		sign_in::{Answered, Denied, Refusal, Signed, end_session, gate, internal, signed_in},
 	},
 };
 
@@ -38,59 +39,18 @@ const NO_STORE: [(HeaderName, &str); 2] = [(header::CACHE_CONTROL, "no-store"), 
 /// after it, beside the cookies the read rotated or cleared.
 type Read = Result<(CookieJar, [(HeaderName, &'static str); 2], Result<Json<Value>, Refusal>), Refusal>;
 
-/// Why the gate refused: the session is over, or something else went wrong.
-enum Denied {
-	SessionOver(Refusal),
-	Other(Refusal),
-}
-
-impl From<Refusal> for Denied {
-	fn from(refusal: Refusal) -> Self {
-		Self::Other(refusal)
-	}
-}
-
-impl From<Denied> for Refusal {
-	fn from(denied: Denied) -> Self {
-		match denied {
-			Denied::SessionOver(refusal) | Denied::Other(refusal) => refusal,
-		}
-	}
-}
-
-fn unauthenticated() -> Refusal {
-	Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated")
-}
-
-/// The caller's account, gated: `caller_gate`'s two refusals, in its order.
-async fn account(st: &super::Inner, caller: &Caller) -> Result<User, Denied> {
-	let user = st.users.find_by_id(caller.id).await.map_err(|e| internal("account: not read", e))?.ok_or_else(unauthenticated)?;
-	if user.status() == UserStatus::Disabled {
-		return Err(Denied::SessionOver(Refusal::new(StatusCode::FORBIDDEN, "disabled")));
-	}
-	if caller.minted_token_version.is_none_or(|minted| minted < user.token_version()) {
-		return Err(Denied::SessionOver(unauthenticated()));
-	}
-	Ok(user)
-}
-
 /// A read's answer and the cookies that go with it: rotated, or — when the gate found the
 /// session over — the session closed and its cookies cleared.
 async fn read_answer(st: &super::Inner, jar: CookieJar, caller: Caller, answer: Result<Json<Value>, Denied>) -> Read {
 	match answer {
 		Ok(body) => Ok((caller.refreshed(st, jar), NO_STORE, Ok(body))),
 		Err(Denied::Other(refusal)) => Ok((caller.refreshed(st, jar), NO_STORE, Err(refusal))),
-		Err(Denied::SessionOver(refusal)) => {
-			if let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_owned())
-				&& let Err(e) = close(st, &id).await
-			{
-				// The cookies are cleared regardless; a session the store still holds dies
-				// at its next refresh, which re-reads the same account.
-				tracing::error!(error = ?e, "account: session over but not closed");
-			}
-			Ok((clear_session(st, jar), NO_STORE, Err(refusal)))
-		}
+		Err(Denied::SessionOver(refusal)) => Ok((end_session(st, jar).await, NO_STORE, Err(refusal))),
 	}
+}
+
+fn unauthenticated() -> Refusal {
+	Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated")
 }
 
 async fn reader(st: &super::Inner, jar: &CookieJar) -> Result<Caller, Refusal> {
@@ -106,7 +66,7 @@ async fn reader(st: &super::Inner, jar: &CookieJar) -> Result<Caller, Refusal> {
 pub async fn me(State(st): State<WebState>, jar: CookieJar) -> Read {
 	let st = &st.inner;
 	let caller = reader(st, &jar).await?;
-	let answer = account(st, &caller).await.map(|user| {
+	let answer = gate(st, &caller).await.map(|user| {
 		Json(json!({
 			"id": user.id().to_string(),
 			"email": user.email().as_str(),
@@ -127,7 +87,7 @@ pub async fn notification_settings(State(st): State<WebState>, jar: CookieJar) -
 	let st = &st.inner;
 	let caller = reader(st, &jar).await?;
 	let answer = async {
-		let user = account(st, &caller).await?;
+		let user = gate(st, &caller).await?;
 		let sub = st
 			.notifications
 			.subscriber_of_user(user.id().raw())
@@ -152,14 +112,13 @@ pub struct ChannelChange {
 /// off is allowed: "stop contacting me" is a supported state.
 pub async fn set_channel(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<ChannelChange>) -> Answered {
 	let st = &st.inner;
-	let caller = signed_in(st, &jar, &headers).await?;
+	let Signed { caller, user } = signed_in(st, &jar, &headers).await?;
 	let answer = async {
 		let (in_app, email) = match body.channel.as_str() {
 			"in_app" => (Some(body.enabled), None),
 			"email" => (None, Some(body.enabled)),
 			_ => return Err(Refusal::new(StatusCode::BAD_REQUEST, "invalid_channel")),
 		};
-		let user = account(st, &caller).await.map_err(Refusal::from)?;
 		let mut sub = subscriber_of(st.notifications.as_ref(), &user)
 			.await
 			.map_err(|e| internal("notification settings: subscriber not read", e))?;
@@ -190,12 +149,11 @@ pub struct TopicChange {
 /// snapshot.
 pub async fn set_topic(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<TopicChange>) -> Answered {
 	let st = &st.inner;
-	let caller = signed_in(st, &jar, &headers).await?;
+	let Signed { caller, user } = signed_in(st, &jar, &headers).await?;
 	let answer = async {
 		if topic(&body.topic).is_none() {
 			return Err(Refusal::new(StatusCode::BAD_REQUEST, "unknown_topic"));
 		}
-		let user = account(st, &caller).await.map_err(Refusal::from)?;
 		let sub = subscriber_of(st.notifications.as_ref(), &user)
 			.await
 			.map_err(|e| internal("notification settings: subscriber not read", e))?;

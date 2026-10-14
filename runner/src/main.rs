@@ -149,6 +149,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			std::env::var("REDIS_URL").is_ok_and(|v| !v.is_empty()),
 			"production requires REDIS_URL (web sessions + refresh state must survive restarts)"
 		);
+		// A test secret passes (or fails) every token without a person behind it, so in
+		// production it would quietly switch the check off.
+		ensure!(
+			!web::is_test_secret(&config.turnstile_secret),
+			"production requires a real TURNSTILE_SECRET, not one of Cloudflare's test secrets"
+		);
 	}
 	// The inbound verifier must expect exactly what issuance stamps, so read the
 	// issuer/audience off the loaded (env-resolved, plane-asserted) `auth_config`
@@ -396,7 +402,9 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		None => web::router(web_state),
 	};
 	let web_server = async {
-		axum::serve(web_listener, web_router)
+		// The peer address is the per-address limits' fallback when Cloudflare names no
+		// client (`web::routes::ClientIp`).
+		axum::serve(web_listener, web_router.into_make_service_with_connect_info::<std::net::SocketAddr>())
 			.with_graceful_shutdown(await_signal())
 			.await
 			.context("concierge auth web server error")

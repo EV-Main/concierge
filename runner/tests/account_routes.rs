@@ -167,8 +167,9 @@ async fn session_rows(fx: &Surface, browser: &mut Browser) -> bool {
 	fx.get("/auth/session", browser).await.body["authenticated"] == true
 }
 
-/// Gated as `authz::caller_gate` gates the gRPC surface. On a read the refusal ends the
-/// session as a sign-out does: its cookies are cleared, and it is gone server-side too.
+/// Gated as `authz::caller_gate` gates the gRPC surface. The refusal ends the session as a
+/// sign-out does, on a read and a write alike: its cookies are cleared, and it is gone
+/// server-side too.
 #[tokio::test]
 async fn a_revoked_token_ends_the_session_on_a_read() {
 	let fx = fixture!();
@@ -189,17 +190,21 @@ async fn a_revoked_token_ends_the_session_on_a_read() {
 }
 
 #[tokio::test]
-async fn a_disabled_account_ends_the_session_on_a_read_and_is_refused_a_write() {
+async fn a_disabled_account_ends_the_session_on_a_read_and_on_a_write() {
 	let fx = fixture!();
-	let mut reader = signed_in(&fx, &address("disabled")).await;
+	let email = address("disabled");
+	let mut reader = signed_in(&fx, &email).await;
+	let mut writer = signed_in(&fx, &email).await;
 	let id = user_id(&fx, &mut reader).await;
-	let mut writer = reader.clone();
+	let kept = writer.clone();
 	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(id).execute(&fx.pool).await.unwrap();
 
 	let write = fx
 		.post("/auth/notifications/settings/channel", ORIGIN, json!({ "channel": "email", "enabled": false }), &mut writer)
 		.await;
 	assert_eq!((write.status, write.body), (StatusCode::FORBIDDEN, json!({ "error": "disabled" })));
+	assert!(clears_the_session(&write.headers), "a refused write clears the cookies as a read does");
+	assert!(!session_rows(&fx, &mut kept.clone()).await, "and closes the session");
 
 	let refused = fx.get("/auth/me", &mut reader).await;
 	assert_eq!((refused.status, refused.body), (StatusCode::FORBIDDEN, json!({ "error": "disabled" })));

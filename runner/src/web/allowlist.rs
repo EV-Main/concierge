@@ -73,6 +73,12 @@ impl SignInAllowlist {
 		origin == self.public_origin || self.current().origins.admits(origin)
 	}
 
+	/// Whether `host` — a bare hostname, as Turnstile reports where a challenge was solved
+	/// — is the public origin's or a signing-in scope's.
+	pub fn admits_host(&self, host: &str) -> bool {
+		host_of(&self.public_origin) == Some(host) || self.current().origins.origins().any(|origin| host_of(origin) == Some(host))
+	}
+
 	/// Read the registry and swap the snapshot when a scope changed. Returns whether it
 	/// did. A failed read keeps the snapshot in hand: an outage of the registry must not
 	/// sign everyone out of every scope host.
@@ -114,6 +120,12 @@ pub async fn run_refresh(allowlist: Arc<SignInAllowlist>, every: Duration) {
 	}
 }
 
+/// `https://host[:port]` → `host`.
+fn host_of(origin: &str) -> Option<&str> {
+	let (_, authority) = origin.split_once("://")?;
+	authority.split([':', '/']).next().filter(|host| !host.is_empty())
+}
+
 fn key_of(scopes: &[ScopeRecord]) -> Vec<(String, u64)> {
 	scopes.iter().map(|s| (s.id.clone(), s.version)).collect()
 }
@@ -126,4 +138,21 @@ fn snapshot(public_origin: &str, scopes: &[ScopeRecord]) -> Result<Snapshot> {
 		webauthn,
 		key: key_of(scopes),
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::web::origins::ScopeOrigins;
+
+	#[test]
+	fn a_turnstile_host_is_the_public_origins_or_nothing_else_here() {
+		let allowlist = SignInAllowlist::fixed("https://evinvest.ltd", ScopeOrigins::none()).unwrap();
+		assert!(allowlist.admits_host("evinvest.ltd"));
+		for host in ["evil.example", "invest.evinvest.ltd", "evinvest.ltd.evil.example", ""] {
+			assert!(!allowlist.admits_host(host), "{host:?}");
+		}
+		assert_eq!(host_of("http://localhost:58843"), Some("localhost"));
+		assert_eq!(host_of("https://invest.evinvest.ltd"), Some("invest.evinvest.ltd"));
+	}
 }

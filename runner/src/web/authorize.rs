@@ -26,7 +26,11 @@ use uuid::Uuid;
 
 use crate::{
 	relying_party::{Admission, Requester, is_s256_challenge},
-	web::{WebState, routes::client_ip, session::Fresh},
+	web::{
+		WebState,
+		routes::{ClientIp, live_family_of},
+		session::Fresh,
+	},
 };
 
 /// The public path of this route — what `returnTo` must name for the login to come back.
@@ -51,7 +55,7 @@ pub struct AuthorizeQuery {
 	auth_error: Option<String>,
 }
 
-pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Query(q): Query<AuthorizeQuery>) -> Response {
+pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ClientIp(ip): ClientIp, Query(q): Query<AuthorizeQuery>) -> Response {
 	let st = &st.inner;
 	let Some(relying_parties) = st.relying_parties.as_ref() else {
 		return page(StatusCode::SERVICE_UNAVAILABLE, "Sign-in for this application is not available right now.");
@@ -136,7 +140,6 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 		}
 	};
 	let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
-	let ip = client_ip(&headers);
 	let requester = Requester {
 		upstream_family: &upstream_family,
 		client_ip: &ip,
@@ -153,33 +156,14 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 }
 
 /// The browser's `evinvest.ltd` session and the refresh family behind it, or `None` when
-/// there is no session to act on.
-///
-/// `WebSessions::fresh` alone is not enough: it asks upstream only when the stored access
-/// token is about to lapse, so a session signed out from another device or revoked from
-/// the console still reads as live here for up to the access TTL. Handing out a new
-/// credential on that is exactly what the revocation was meant to stop, so the family is
-/// checked first-hand, and a dead one takes the locker entry with it.
+/// there is no session to act on. The family is checked first-hand (`live_family_of`):
+/// handing out a new credential on a session revoked elsewhere is exactly what the
+/// revocation was meant to stop.
 async fn live_session(st: &super::Inner, session_id: &str) -> color_eyre::Result<Option<(Fresh, String)>> {
 	let Some(fresh) = st.sessions.fresh(session_id, &st.auth).await? else {
 		return Ok(None);
 	};
-	// Read AFTER `fresh`, which may have rotated it.
-	let Some(refresh_token) = st.sessions.refresh_token(session_id).await? else {
-		return Ok(None);
-	};
-	match st
-		.auth
-		.live_family(&refresh_token)
-		.await
-		.map_err(|err| color_eyre::eyre::eyre!("refresh family unreadable: {err}"))?
-	{
-		Some(family) => Ok(Some((fresh, family))),
-		None => {
-			st.sessions.forget(session_id).await?;
-			Ok(None)
-		}
-	}
+	Ok(live_family_of(st, session_id).await?.map(|family| (fresh, family)))
 }
 
 /// The client's redirect_uri, once it is known to be registered.
