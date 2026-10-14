@@ -291,12 +291,14 @@ pub async fn sign_up(State(st): State<WebState>, jar: CookieJar, headers: Header
 	// A ticket that could not be stored is SAID, not only logged: the account exists and
 	// is signed in, so failing the request would hide an account the user just made;
 	// `ticket: null` with `ticket_error` tells the dialog to confirm on evinvest.ltd.
-	let (ticket, ticket_error) = match verification {
-		"sent" => match super::signup::ticket_for(st, user.id()).await {
+	// Whenever a code was ASKED for, sent or not: a throttled or failed send is exactly
+	// what `signup::resend` recovers, and it needs the ticket to do it.
+	let (ticket, ticket_error) = match body.verify {
+		true => match super::signup::ticket_for(st, user.id()).await {
 			Some(ticket) => (Some(ticket), None),
 			None => (None, Some("ticket_unavailable")),
 		},
-		_ => (None, None),
+		false => (None, None),
 	};
 	let (jar, _) = signed_in_as(st, jar, &headers, user.id()).await?;
 	let mut answer = json!({ "ok": true, "verification": verification, "ticket": ticket });

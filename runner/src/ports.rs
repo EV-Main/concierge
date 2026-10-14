@@ -1413,6 +1413,8 @@ pub enum SignUpConfirmRefusal {
 	/// Unknown, spent, expired, or outlived by a new password or a revoke-all. One
 	/// variant for all of them: the caller answers each the way it answers a wrong code.
 	Ticket,
+	/// The account is disabled. Decided before anything is written.
+	Disabled,
 	Verify(VerifyRefusal),
 }
 
@@ -1473,6 +1475,7 @@ pub trait CredentialRepository: Send + Sync {
 	async fn confirm_signup(&self, ticket_hash: &[u8], code: &str, now: i64) -> Result<Result<User, SignUpConfirmRefusal>, DomainError>;
 
 	/// Mail a fresh verification code to the account a live sign-up ticket speaks for,
-	/// under the same throttle as every code. `None` when the ticket speaks for nobody.
+	/// under the same throttle as every code. `None` when the ticket speaks for nobody —
+	/// unknown, spent, expired, outlived, or its account disabled — and nothing is mailed.
 	async fn resend_signup_code(&self, ticket_hash: &[u8], now: i64) -> Result<Option<CodeIssue>, DomainError>;
 }

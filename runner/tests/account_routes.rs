@@ -158,39 +158,52 @@ async fn user_id(fx: &Surface, browser: &mut Browser) -> uuid::Uuid {
 	uuid::Uuid::parse_str(fx.get("/auth/me", browser).await.body["id"].as_str().unwrap()).unwrap()
 }
 
-fn sets_the_access_cookie(headers: &axum::http::HeaderMap) -> bool {
-	headers.get_all(header::SET_COOKIE).iter().any(|c| c.to_str().unwrap().starts_with("ev_access="))
+/// The browser was told to drop its session: the session cookie comes back empty.
+fn clears_the_session(headers: &axum::http::HeaderMap) -> bool {
+	headers.get_all(header::SET_COOKIE).iter().any(|c| c.to_str().unwrap().starts_with("ev_session=;"))
 }
 
-/// Gated as `authz::caller_gate` gates the gRPC surface — and every refusal after the
-/// session was read still hands the browser its rotated cookie.
-#[tokio::test]
-async fn a_disabled_account_or_a_revoked_token_is_refused_at_once() {
-	let fx = fixture!();
-	let mut browser = signed_in(&fx, &address("gate")).await;
-	let id = user_id(&fx, &mut browser).await;
+async fn session_rows(fx: &Surface, browser: &mut Browser) -> bool {
+	fx.get("/auth/session", browser).await.body["authenticated"] == true
+}
 
-	sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
-		.bind(id)
-		.execute(&fx.pool)
-		.await
-		.unwrap();
+/// Gated as `authz::caller_gate` gates the gRPC surface. On a read the refusal ends the
+/// session as a sign-out does: its cookies are cleared, and it is gone server-side too.
+#[tokio::test]
+async fn a_revoked_token_ends_the_session_on_a_read() {
+	let fx = fixture!();
 	for path in ["/auth/me", "/auth/notifications/settings"] {
+		let mut browser = signed_in(&fx, &address("gate")).await;
+		let id = user_id(&fx, &mut browser).await;
+		let kept = browser.clone();
+		sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
+			.bind(id)
+			.execute(&fx.pool)
+			.await
+			.unwrap();
 		let refused = fx.get(path, &mut browser).await;
 		assert_eq!((refused.status, refused.body), (StatusCode::UNAUTHORIZED, json!({ "error": "unauthenticated" })), "{path}");
-		assert!(sets_the_access_cookie(&refused.headers), "{path}: the refusal carries the rotated cookie");
+		assert!(clears_the_session(&refused.headers), "{path}: the cookies are cleared");
+		assert!(!session_rows(&fx, &mut kept.clone()).await, "{path}: the session is closed, not only forgotten by this browser");
 	}
-	let write = fx
-		.post("/auth/notifications/settings/channel", ORIGIN, json!({ "channel": "email", "enabled": false }), &mut browser)
-		.await;
-	assert_eq!(write.status, StatusCode::UNAUTHORIZED);
+}
 
-	let mut browser = signed_in(&fx, &address("disabled")).await;
-	let id = user_id(&fx, &mut browser).await;
+#[tokio::test]
+async fn a_disabled_account_ends_the_session_on_a_read_and_is_refused_a_write() {
+	let fx = fixture!();
+	let mut reader = signed_in(&fx, &address("disabled")).await;
+	let id = user_id(&fx, &mut reader).await;
+	let mut writer = reader.clone();
 	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(id).execute(&fx.pool).await.unwrap();
-	let refused = fx.get("/auth/me", &mut browser).await;
+
+	let write = fx
+		.post("/auth/notifications/settings/channel", ORIGIN, json!({ "channel": "email", "enabled": false }), &mut writer)
+		.await;
+	assert_eq!((write.status, write.body), (StatusCode::FORBIDDEN, json!({ "error": "disabled" })));
+
+	let refused = fx.get("/auth/me", &mut reader).await;
 	assert_eq!((refused.status, refused.body), (StatusCode::FORBIDDEN, json!({ "error": "disabled" })));
-	assert!(sets_the_access_cookie(&refused.headers));
+	assert!(clears_the_session(&refused.headers));
 }
 
 #[tokio::test]

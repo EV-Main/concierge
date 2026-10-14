@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use domain::{
 	error::DomainError,
-	users::{AuthSubject, Email, User, UserId},
+	users::{AuthSubject, Email, User, UserId, UserStatus},
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
@@ -301,10 +301,15 @@ impl CredentialRepository for PgCredentials {
 
 	async fn confirm_signup(&self, ticket_hash: &[u8], code: &str, now: i64) -> Result<Result<User, SignUpConfirmRefusal>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		let Some(user) = live_ticket(&mut tx, ticket_hash, now).await? else {
+		let Some((account, email)) = live_ticket(&mut tx, ticket_hash, now).await? else {
 			return Ok(Err(SignUpConfirmRefusal::Ticket));
 		};
-		let outcome = verify_with_code(&mut tx, user, code, now).await?;
+		// Before anything is written: a refusal here verifies no address, spends no code
+		// and keeps the ticket. The transaction is dropped, not committed.
+		if account.status() == UserStatus::Disabled {
+			return Ok(Err(SignUpConfirmRefusal::Disabled));
+		}
+		let outcome = verify_locked(&mut tx, account, &email, code, now).await?;
 		if outcome.is_ok() {
 			sqlx::query("UPDATE signup_tickets SET spent_at = $2 WHERE ticket_hash = $1")
 				.bind(ticket_hash)
@@ -320,10 +325,10 @@ impl CredentialRepository for PgCredentials {
 
 	async fn resend_signup_code(&self, ticket_hash: &[u8], now: i64) -> Result<Option<CodeIssue>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		let Some(user) = live_ticket(&mut tx, ticket_hash, now).await? else {
+		let Some((account, email)) = live_ticket(&mut tx, ticket_hash, now).await?.filter(|(account, _)| account.status() != UserStatus::Disabled) else {
 			return Ok(None);
 		};
-		let issue = issue_in(&mut tx, CodePurpose::Verify(user), now).await?;
+		let issue = issue_locked(&mut tx, &email, "verify", Some(account.id()), now).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(Some(issue))
 	}
@@ -347,6 +352,11 @@ async fn issue_in(conn: &mut PgConnection, purpose: CodePurpose, now: i64) -> Re
 		CodePurpose::Verify(user) => (email_of(conn, user).await?, "verify", Some(user)),
 	};
 	lock_email(conn, &email).await?;
+	issue_locked(conn, &email, purpose, user, now).await
+}
+
+/// [`issue_in`] for a caller already holding `email`'s lock.
+async fn issue_locked(conn: &mut PgConnection, email: &Email, purpose: &str, user: Option<UserId>, now: i64) -> Result<CodeIssue, DomainError> {
 	let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM email_codes WHERE email = $1 AND created_at > $2")
 		.bind(email.as_str())
 		.bind(now - CODE_SEND_WINDOW_SECS)
@@ -388,12 +398,13 @@ async fn issue_in(conn: &mut PgConnection, purpose: CodePurpose, now: i64) -> Re
 	Ok(CodeIssue::Sent)
 }
 
-/// The account a sign-up ticket still speaks for, or `None`. The ticket row, the mailbox
-/// lock and the account's rows are held to the end of the caller's transaction, taken in
-/// the order every other writer of the mailbox takes them (advisory lock, then the row),
-/// so nothing that would kill the ticket — a takeover, a revoke-all, a new password — can
-/// land between this check and what the caller does on its strength.
-async fn live_ticket(conn: &mut PgConnection, ticket_hash: &[u8], now: i64) -> Result<Option<UserId>, DomainError> {
+/// The account a sign-up ticket still speaks for, with its address, or `None`. The
+/// ticket row, the mailbox lock and the account's rows are held to the end of the
+/// caller's transaction, taken in the order every other writer of the mailbox takes them
+/// (advisory lock, then the row), so nothing that would kill the ticket — a takeover, a
+/// revoke-all, a new password — can land between this check and what the caller does on
+/// its strength. The caller works on the account and address returned, never re-locking.
+async fn live_ticket(conn: &mut PgConnection, ticket_hash: &[u8], now: i64) -> Result<Option<(User, Email)>, DomainError> {
 	let ticket: Option<(Uuid, i64, i64, i64, Option<i64>)> =
 		sqlx::query_as("SELECT user_id, token_version, password_set_at, expires_at, spent_at FROM signup_tickets WHERE ticket_hash = $1 FOR UPDATE")
 			.bind(ticket_hash)
@@ -409,20 +420,18 @@ async fn live_ticket(conn: &mut PgConnection, ticket_hash: &[u8], now: i64) -> R
 	let user = UserId::from_raw(user_id);
 	let email = email_of(conn, user).await?;
 	lock_email(conn, &email).await?;
-	// A takeover bumps `token_version` and drops the password; a "revoke all" bumps the
-	// former and a new password moves the latter. After any of them, the browser that
-	// signed up is no longer the one this account answers to.
-	let current: i64 = sqlx::query_scalar("SELECT token_version FROM users WHERE id = $1 FOR UPDATE")
-		.bind(user_id)
-		.fetch_one(&mut *conn)
-		.await
-		.map_err(repo_err)?;
+	let account = load_for_update(conn, user).await?;
 	let password: Option<i64> = sqlx::query_scalar("SELECT updated_at FROM password_credentials WHERE user_id = $1 FOR UPDATE")
 		.bind(user_id)
 		.fetch_optional(&mut *conn)
 		.await
 		.map_err(repo_err)?;
-	Ok((current == token_version && password == Some(password_set_at)).then_some(user))
+	// A takeover bumps `token_version` and drops the password; a "revoke all" bumps the
+	// former and a new password moves the latter. After any of them, the browser that
+	// signed up is no longer the one this account answers to. An address that moved
+	// between the read and the lock is not the one the ticket's code went to.
+	let live = i64::try_from(account.token_version()).is_ok_and(|v| v == token_version) && password == Some(password_set_at) && *account.email() == email;
+	Ok(live.then_some((account, email)))
 }
 
 /// Spend a verification code and mark the account's address verified. The caller commits
@@ -430,16 +439,22 @@ async fn live_ticket(conn: &mut PgConnection, ticket_hash: &[u8], now: i64) -> R
 async fn verify_with_code(conn: &mut PgConnection, user: UserId, code: &str, now: i64) -> Result<Result<User, VerifyRefusal>, DomainError> {
 	let email = email_of(conn, user).await?;
 	lock_email(conn, &email).await?;
-	if let Err(refusal) = redeem(conn, &email, "verify", Some(user), code, now).await? {
-		return Ok(Err(VerifyRefusal::Code(refusal)));
-	}
-	if verified_holder(conn, &email).await?.is_some_and(|holder| holder != user) {
-		return Ok(Err(VerifyRefusal::Taken));
-	}
-	let mut account = load_for_update(conn, user).await?;
-	// Moved between the read and the lock: the code proved the old address.
+	let account = load_for_update(conn, user).await?;
+	// Moved between the read and the lock: a code for this account went to the old address.
 	if *account.email() != email {
 		return Ok(Err(VerifyRefusal::Code(CodeRefusal::Missing)));
+	}
+	verify_locked(conn, account, &email, code, now).await
+}
+
+/// [`verify_with_code`] for a caller already holding `email`'s lock and `account`'s row,
+/// with `account` on that address.
+async fn verify_locked(conn: &mut PgConnection, mut account: User, email: &Email, code: &str, now: i64) -> Result<Result<User, VerifyRefusal>, DomainError> {
+	if let Err(refusal) = redeem(conn, email, "verify", Some(account.id()), code, now).await? {
+		return Ok(Err(VerifyRefusal::Code(refusal)));
+	}
+	if verified_holder(conn, email).await?.is_some_and(|holder| holder != account.id()) {
+		return Ok(Err(VerifyRefusal::Taken));
 	}
 	account.verify_email();
 	update_row(conn, &account).await?;
