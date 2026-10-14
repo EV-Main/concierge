@@ -291,6 +291,9 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// Approvals (`docs/SCOPES-AND-APPROVALS.md` §5): the proposers' side is a service seam
 	// like the catalog it reads kinds from; the people's side sits inside the auth layer.
 	let approval_repo: Arc<dyn concierge::ports::ApprovalRepository> = Arc::new(infrastructure::approvals::PgApprovals::new(pool.clone()));
+	// This plane's own approvals (`concierge:*`) are carried out by this loop once passed:
+	// there is no other proposer to pull them.
+	tokio::spawn(concierge::approvals::run_executor(approval_repo.clone(), std::time::Duration::from_secs(30)));
 	let approval_execution = concierge::approvals::ApprovalExecution::new(service_callers.clone(), approval_repo.clone(), catalog_repo.clone());
 
 	// The TLS listener for the same seam (banking#199, phase 2). Validated and READ here,
@@ -519,11 +522,11 @@ async fn run(config: config::AppConfig) -> Result<()> {
 				governance_revisions,
 			))))
 			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), grants, break_glass.clone()).with_grant_write_limiter(grant_write_limiter))))
-			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass, platform_repo))))
+			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass.clone(), platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users.clone(), subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 			.add_service(auth.layer(ScopeRegistryServer::new(concierge::scopes::ScopeRegistry::new(scope_repo))))
-			.add_service(auth.layer(ApprovalServiceServer::new(concierge::approvals::Approvals::new(users, approval_repo, catalog_repo))))
+			.add_service(auth.layer(ApprovalServiceServer::new(concierge::approvals::Approvals::new(users, break_glass, approval_repo, catalog_repo))))
 			.serve_with_shutdown(config.bind, await_signal())
 			.await
 			.context("concierge gRPC server error")

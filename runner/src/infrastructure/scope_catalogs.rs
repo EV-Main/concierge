@@ -32,6 +32,20 @@ pub(crate) async fn current_topics<'e>(executor: impl PgExecutor<'e>) -> Result<
 	Ok(topics)
 }
 
+/// The approval kinds of every namespace's catalog in force: what a scope policy's
+/// thresholds are checked against when it is installed.
+pub(crate) async fn current_kinds<'e>(executor: impl PgExecutor<'e>) -> Result<Vec<domain::scope_catalog::ApprovalKind>, DomainError> {
+	let catalogs: Vec<serde_json::Value> = sqlx::query_scalar("SELECT DISTINCT ON (namespace) catalog FROM scope_catalogs ORDER BY namespace, version DESC")
+		.fetch_all(executor)
+		.await
+		.map_err(repo_err)?;
+	let mut kinds = Vec::new();
+	for catalog in catalogs {
+		kinds.extend(parse(catalog)?.approval_kinds);
+	}
+	Ok(kinds)
+}
+
 pub struct PgScopeCatalogs {
 	pool: PgPool,
 }

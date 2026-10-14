@@ -22,8 +22,11 @@ package concierge.v1;
 //   APPROVAL_LEVEL_PLATFORM — the platform owners (persisted `owner` seats, never
 //                             break-glass);
 //   APPROVAL_LEVEL_SCOPE    — the active holders of `<scope>:admin`.
-// Nobody is excluded from the roster: a service cannot prove which person asked it, so
-// the person it names (`requested_by`) is information, not a fact the quorum can rest on.
+// Nobody is excluded from the roster of a service's proposal: a service cannot prove which
+// person asked it, so the person it names (`requested_by`) is information, not a fact the
+// quorum can rest on. The opener of a `concierge:*` proposal is proven by their session
+// and is kept off its roster: they do not vote on what they asked for. A FOR counts only
+// while its voter still holds the seat the roster was drawn from.
 // A passed proposal waits out its veto delay, after which the proposer PULLS it,
 // executes it idempotently — one decision, one execution — and reports the outcome, within
 // 72 hours of `executable_at`; a decision nobody executed by then lapses to VOID. Every
@@ -36,8 +39,8 @@ package concierge.v1;
 //   ApprovalExecutionService — the executing services, by service credential (outside
 //                              the user auth layer, like UserEvents). See the doc's
 //                              "Service callers".
-// Both are served, except the `concierge:*` kinds (CancelApproval, ProposeScopeAdminGrant,
-// ProposeScopePolicyChange), which answer UNIMPLEMENTED until this plane executes them.
+// Both are served. The `concierge:*` kinds are carried out by this plane's own executor
+// once passed, within the same execution window.
 
 // ApprovalService — the human side: read, vote, veto, cancel, and open the kinds this
 // plane executes itself.
@@ -59,9 +62,10 @@ service ApprovalService {
   // NOT_FOUND.
   rpc GetApproval(GetApprovalRequest) returns (Approval);
 
-  // A roster member's vote while the proposal is OPEN; anyone off the frozen roster is
-  // PERMISSION_DENIED. A vote is final — re-voting the same way is a no-op, the other way
-  // FAILED_PRECONDITION.
+  // A roster member's vote while the proposal is OPEN; anyone off the frozen roster, and a
+  // member who no longer holds the seat it was drawn from, is PERMISSION_DENIED. A vote is
+  // final — re-voting the same way is a no-op, the other way FAILED_PRECONDITION. A FOR
+  // cast by someone who has since lost the seat is not counted towards the threshold.
   rpc VoteApproval(VoteApprovalRequest) returns (Approval);
 
   // Stop a proposal outright while it is OPEN, or PASSED and still inside its delay.
@@ -77,11 +81,12 @@ service ApprovalService {
   rpc CancelApproval(CancelApprovalRequest) returns (Approval);
 
   // Open `concierge:scope_admin_grant`: grant `<scope>:admin`. Always platform level.
-  // A seat holding `iam:tenants:grant` may open one. While this kind exists,
-  // UserDirectory.GrantPermission refuses a `<scope>:admin` target and names this RPC.
-  // Until it is served, GrantPermission grants `<scope>:admin` to a persisted platform
-  // owner's call only (PERMISSION_DENIED to any other seat; break-glass is no owner), and
-  // no catalog may delegate it.
+  // A seat holding `iam:tenants:grant` may open one, for an ACTIVE account other than its
+  // own that does not hold the alias yet (FAILED_PRECONDITION if it does), in an ACTIVE
+  // scope other than `main` (INVALID_ARGUMENT). The opener is kept off the roster. Once
+  // passed, this plane's executor grants it, `granted_by` the opener, or voids it if the
+  // account or the scope is no longer active. UserDirectory.GrantPermission refuses a
+  // `<scope>:admin` target to every caller and names this RPC, and no catalog may delegate it.
   // Taking the grant away needs no approval and stays RevokePermission, one act:
   // containing a rogue admin must never be the slower path.
   rpc ProposeScopeAdminGrant(ProposeScopeAdminGrantRequest) returns (Approval);
@@ -89,8 +94,13 @@ service ApprovalService {
   // Open `concierge:scope_policy_change`: replace a scope's approval policy. Always
   // platform level — a scope that could lower its own thresholds would decide for itself
   // what needs the owners. A seat holding `iam:tenants:grant`, or an admin of the scope,
-  // may open one. Compartment limits are not part of it: they are the money plane's
-  // `bank:compartment_policy`.
+  // may open one; the opener is kept off the roster. The policy is checked at open and
+  // again when the executor installs it, against the catalogs then in force (a policy that
+  // no longer fits is VOID): quorum 5001..=10000 bps, delay 3600..=259200 s (an owner always
+  // has an hour to stop a scope's decision), lifetime 3600..=259200 s, each threshold an
+  // escalation of a scope-level kind in force, spelled as its test takes it. One change per
+  // scope is live at a time. Installed as the scope's next `version`. Compartment limits are
+  // not part of it: they are the money plane's `bank:compartment_policy`.
   rpc ProposeScopePolicyChange(ProposeScopePolicyChangeRequest) returns (Approval);
 }
 
@@ -113,7 +123,7 @@ service ApprovalExecutionService {
   // not ACTIVE, or the resolved roster is too small to decide (fewer than two platform
   // owners). PERMISSION_DENIED: a relying party naming a scope other than its own.
   // RESOURCE_EXHAUSTED: the namespace already holds 200 live (OPEN, or PASSED and not
-  // lapsed) proposals. ALREADY_EXISTS: a live
+  // lapsed) proposals in this scope. ALREADY_EXISTS: a live
   // (OPEN or PASSED) proposal of the same kind, scope and subject_ref exists — one
   // subject is decided once at a time.
   //
@@ -129,9 +139,9 @@ service ApprovalExecutionService {
   rpc GetProposal(GetProposalRequest) returns (Approval);
 
   // Proposals of the caller's namespace that are PASSED with `executable_at` behind the
-  // clock, less than 72 hours behind it, and no outcome reported, oldest `executable_at`
-  // first. The proposer must not START executing a decision past `executable_at` + 72h:
-  // it has lapsed, and a report on it is refused. A pull claims nothing:
+  // clock and `execute_by` more than an hour ahead of it, and no outcome reported, oldest
+  // `executable_at` first: whatever is served still has an hour to be reported. Past
+  // `execute_by` the decision has lapsed and a report on it is refused. A pull claims nothing:
   // a proposal is served again on every pull until its outcome is reported, so the
   // proposer must be idempotent per proposal id — one decision is one execution, unique
   // by `id` on its side — and must check `payload_hash` against the operation it stored
@@ -309,7 +319,8 @@ message ScopeApprovalPolicy {
   // threshold = max(1, ceil(roster * quorum_bps / 10000)). 5001..=10000; the default
   // 5001 is "more than half of the roster".
   uint32 quorum_bps = 3;
-  // Veto window after a proposal passes. Default 3600.
+  // Veto window after a proposal passes. Default 3600, and never less: an owner always has
+  // an hour to stop a scope's decision.
   uint32 delay_secs = 4;
   // How long a proposal may stay OPEN. Default 259200 (72h), which is also the ceiling.
   uint32 ttl_secs = 5;
@@ -387,6 +398,10 @@ message Approval {
   // The client whose credential opened it (`x-ev-client-id`; empty for the bridge token
   // and for this plane's own kinds). Information for the audit trail only.
   string requested_by_client = 28;
+  // Unix SECONDS: when a passed decision lapses to VOID unexecuted — `executable_at` + 72h;
+  // 0 until it passes. PullApproved serves it until an hour before this, so whatever a
+  // proposer pulls it still has that hour to report.
+  int64 execute_by = 29;
 }
 
 message ListApprovalKindsRequest {}

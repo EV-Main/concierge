@@ -31,12 +31,14 @@
 //!   scope_catalog   — `ScopeCatalogService`: approval kinds and notification topics per namespace
 //!   service_caller  — who calls a service-credential RPC: the bridge token or a client secret
 //!   approvals       — `ApprovalService` (people) and `ApprovalExecutionService` (proposers):
-//!                     the consilium generalised to every scope
+//!                     the consilium generalised to every scope, plus the executor loop of
+//!                     this plane's own `concierge:*` kinds
 //!   web             — the site-level auth HTTP surface (login/callback/session cookies)
 //!   notification    — the notification plane: subscribers, the in-app inbox, queued email
 //!   dispatch        — the background loops: draining the outbound email queue, and the
-//!                     hold sweep (the ONE thing here that sweeps — a lapse must be a
-//!                     write, or the money plane never learns the account is unfrozen)
+//!                     hold sweep (a lapse must be a write, or the money plane never learns
+//!                     the account is unfrozen); with the approval executor, the only loops
+//!                     that act on their own
 //!   log             — DEFERRED stub (no platform audit surface yet)
 
 pub mod approvals;

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	error::DomainError,
-	scope_catalog::{ApprovalKind, ApprovalLevel, EscalationTest, FieldType, is_canonical_amount, is_currency, plain_text},
+	scope_catalog::{ApprovalKind, ApprovalLevel, EscalationTest, FieldSpec, FieldType, is_canonical_amount, is_currency, plain_text},
 	users::UserId,
 };
 
@@ -45,9 +45,23 @@ pub const ROLLING_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// lapses to VOID: a stale approval must not be carried out weeks later against a subject
 /// that has moved on (decided).
 pub const EXECUTION_WINDOW_SECS: i64 = 72 * 60 * 60;
-/// At most this many live proposals per proposer namespace: one leaked credential must
-/// not be able to bury the deciders.
+/// At most this many live proposals per proposer namespace and scope: one leaked
+/// credential must not be able to bury a scope's deciders.
 pub const MAX_LIVE_PER_PROPOSER: i64 = 200;
+/// `PullApproved` stops serving a decision this long before it lapses, so whatever a
+/// proposer pulled it still has this long to report — a pull at the last second would
+/// otherwise hand out work whose report is already too late.
+pub const PULL_MARGIN_SECS: i64 = 60 * 60;
+/// A scope's veto window is never shorter: an hour is the least an owner gets to see a
+/// scope decision and stop it (decided).
+pub const MIN_SCOPE_DELAY_SECS: u32 = 60 * 60;
+/// The shortest lifetime a scope policy may give an open proposal.
+pub const MIN_SCOPE_TTL_SECS: u32 = 60 * 60;
+
+/// This plane's own namespace: the proposer and executor of the built-in kinds.
+pub const OWN_NAMESPACE: &str = "concierge";
+pub const SCOPE_ADMIN_GRANT: &str = "concierge:scope_admin_grant";
+pub const SCOPE_POLICY_CHANGE: &str = "concierge:scope_policy_change";
 /// What `void_reason` says of a decision nobody executed in time.
 pub const LAPSED: &str = "not executed within 72 hours of becoming executable";
 
@@ -67,7 +81,7 @@ const AMOUNT_SCALE: usize = 18;
 
 /// A scope's approval policy. Scope `main` has none: its roster, quorum and delay are the
 /// owners' consilium's.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScopePolicy {
 	pub version: u64,
 	pub quorum_bps: u32,
@@ -76,7 +90,7 @@ pub struct ScopePolicy {
 	pub thresholds: Vec<Threshold>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Threshold {
 	pub kind: String,
 	pub parameter: String,
@@ -96,9 +110,111 @@ impl Default for ScopePolicy {
 }
 
 impl ScopePolicy {
+	/// A policy a scope may be measured against, given the kinds in force (every
+	/// namespace's): a quorum of more than half, a delay of at least an hour, a lifetime
+	/// within the ceiling, and each override naming a scope-level kind's escalation once,
+	/// spelled as that escalation's threshold is. Checked when it is proposed AND when it is
+	/// installed, because the catalogs move in between.
+	pub fn check(&self, kinds: &[ApprovalKind]) -> Result<(), String> {
+		if !(5001..=10_000).contains(&self.quorum_bps) {
+			return Err("quorum_bps is more than half of the roster: 5001..=10000".into());
+		}
+		if !(MIN_SCOPE_DELAY_SECS..=MAX_TTL_SECS).contains(&self.delay_secs) {
+			return Err(format!(
+				"delay_secs is {MIN_SCOPE_DELAY_SECS}..={MAX_TTL_SECS}: an owner gets at least an hour to stop a scope's decision"
+			));
+		}
+		if !(MIN_SCOPE_TTL_SECS..=MAX_TTL_SECS).contains(&self.ttl_secs) {
+			return Err(format!("ttl_secs is {MIN_SCOPE_TTL_SECS}..={MAX_TTL_SECS}"));
+		}
+		for (i, t) in self.thresholds.iter().enumerate() {
+			if self.thresholds[..i].iter().any(|o| o.kind == t.kind && o.parameter == t.parameter) {
+				return Err(format!("threshold `{}`/`{}` is given twice", t.kind, t.parameter));
+			}
+			let escalation = kinds
+				.iter()
+				.filter(|k| k.name == t.kind && k.level == ApprovalLevel::Scope)
+				.flat_map(|k| k.escalations.iter())
+				.find(|e| e.parameter == t.parameter)
+				.ok_or_else(|| format!("threshold `{}`/`{}` names no escalation of a scope-level kind in force", t.kind, t.parameter))?;
+			let shaped = match escalation.test {
+				EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => is_canonical_amount(&t.value),
+				EscalationTest::AbsBpsAbove => t.value.parse::<u64>().is_ok_and(|v| v.to_string() == t.value),
+				EscalationTest::FlagSet => false,
+			};
+			if !shaped {
+				return Err(format!("threshold `{}`/`{}` is not a value its test takes", t.kind, t.parameter));
+			}
+		}
+		Ok(())
+	}
+
 	fn threshold_of<'a>(&'a self, kind: &str, parameter: &str, default: &'a str) -> &'a str {
 		self.thresholds.iter().find(|t| t.kind == kind && t.parameter == parameter).map_or(default, |t| t.value.as_str())
 	}
+}
+
+/// The kinds this plane proposes and executes itself, at catalog version 0 (§5.3). Both
+/// are the platform's: who administers a scope, and what a scope's decisions are measured
+/// against, must not be decided by the scope.
+pub fn builtin_kinds() -> Vec<ApprovalKind> {
+	let field = |key: &str, label: &str, field_type: FieldType| FieldSpec {
+		key: key.into(),
+		label: label.into(),
+		field_type,
+		required: true,
+	};
+	vec![
+		ApprovalKind {
+			name: SCOPE_ADMIN_GRANT.into(),
+			label: "Appoint a scope admin".into(),
+			description: "Grant the scope's admin alias, which seats its holder on the scope's approval roster.".into(),
+			level: ApprovalLevel::Platform,
+			fields: vec![field("account", "Account", FieldType::User)],
+			escalations: Vec::new(),
+		},
+		ApprovalKind {
+			name: SCOPE_POLICY_CHANGE.into(),
+			label: "Change a scope's approval policy".into(),
+			description: "Replace the quorum, veto delay, lifetime and escalation thresholds a scope's proposals are measured against.".into(),
+			level: ApprovalLevel::Platform,
+			fields: vec![
+				field("quorum_bps", "Quorum, basis points of the roster", FieldType::Count),
+				field("delay_secs", "Veto delay, seconds", FieldType::Count),
+				field("ttl_secs", "Lifetime, seconds", FieldType::Count),
+				field("thresholds", "Threshold overrides", FieldType::Count),
+			],
+			escalations: Vec::new(),
+		},
+	]
+}
+
+/// What a passed `concierge:*` proposal does when this plane's executor carries it out.
+/// Stored with the proposal at open, because the executor acts on what was approved and on
+/// nothing read later.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Action {
+	/// Grant `scope`'s `<namespace>:admin` to `user`, recorded as granted by `granted_by`,
+	/// the person who opened the proposal.
+	GrantAdmin { user: uuid::Uuid, scope: String, granted_by: uuid::Uuid },
+	/// Install `policy` as `scope`'s next version.
+	InstallPolicy { scope: String, policy: ScopePolicy },
+}
+
+/// The fields a policy change shows its voters; the overrides themselves travel in the
+/// [`Action`].
+pub fn policy_fields(policy: &ScopePolicy) -> Vec<Field> {
+	let count = |key: &str, value: u64| Field {
+		key: key.into(),
+		value: FieldValue::Count(value),
+	};
+	vec![
+		count("quorum_bps", u64::from(policy.quorum_bps)),
+		count("delay_secs", u64::from(policy.delay_secs)),
+		count("ttl_secs", u64::from(policy.ttl_secs)),
+		count("thresholds", u64::try_from(policy.thresholds.len()).unwrap_or(u64::MAX)),
+	]
 }
 
 /// Money as the proposer spells it. The spelling is canonical (checked at open), because
@@ -311,15 +427,15 @@ pub fn fired_escalations(kind: &ApprovalKind, fields: &[Field], policy: &ScopePo
 		.filter(|e| {
 			let threshold = policy.threshold_of(&kind.name, &e.parameter, &e.default_threshold);
 			let value = value_of(fields, &e.field_key);
-			// An absent optional field adds nothing to test; a field of another type cannot
-			// reach here past `check_fields`. Matched per test so a new test is a compile
-			// error rather than an escalation that silently never fires.
+			// A field that cannot be compared — absent, of another type, in another currency —
+			// escalates: what this plane cannot measure goes to the owners (fail safe). Only
+			// an unset FLAG stays down, because absent is what "not set" looks like. Matched
+			// per test so a new test is a compile error rather than an escalation that
+			// silently never fires.
 			match e.test {
-				// A different currency than the parameter's cannot be compared, so it goes to
-				// the owners: fail safe.
-				EscalationTest::AmountAbove => matches!(value, Some(FieldValue::Amount(a)) if a.currency != e.currency || amount_above(&a.value, threshold)),
+				EscalationTest::AmountAbove => !matches!(value, Some(FieldValue::Amount(a)) if a.currency == e.currency && !amount_above(&a.value, threshold)),
 				EscalationTest::Rolling24hAmountAbove => {
-					let Some(FieldValue::Amount(a)) = value else { return false };
+					let Some(FieldValue::Amount(a)) = value else { return true };
 					if a.currency != e.currency {
 						return true;
 					}
@@ -332,7 +448,7 @@ pub fn fired_escalations(kind: &ApprovalKind, fields: &[Field], policy: &ScopePo
 						.fold(a.value, |sum, v| amount_sum(&sum, &v));
 					amount_above(&total, threshold)
 				}
-				EscalationTest::AbsBpsAbove => matches!(value, Some(FieldValue::Bps(bps)) if threshold.parse::<u64>().map_or(true, |limit| bps.unsigned_abs() > limit)),
+				EscalationTest::AbsBpsAbove => !matches!(value, Some(FieldValue::Bps(bps)) if threshold.parse::<u64>().is_ok_and(|limit| bps.unsigned_abs() <= limit)),
 				EscalationTest::FlagSet => matches!(value, Some(FieldValue::Flag(true))),
 			}
 		})
@@ -619,9 +735,15 @@ impl Decision {
 	}
 
 	/// Passed, its veto window behind the clock and its execution window not, no outcome
-	/// yet: what `PullApproved` serves.
+	/// yet: what `ReportOutcome` accepts.
 	pub fn is_executable(&self, now: i64) -> bool {
 		self.effective_state(now) == ApprovalState::Passed && self.executable_at.is_some_and(|at| now >= at)
+	}
+
+	/// Executable with at least [`PULL_MARGIN_SECS`] left to report: what `PullApproved`
+	/// serves and what this plane's own executor starts.
+	pub fn is_pullable(&self, now: i64) -> bool {
+		self.is_executable(now) && self.execute_by().is_some_and(|by| now < by - PULL_MARGIN_SECS)
 	}
 
 	/// Inside the window where a veto or a withdrawal still stops it.
@@ -669,8 +791,11 @@ impl Decision {
 	}
 
 	/// A roster member's vote. Final: the same vote again is a no-op, the other one is
-	/// refused. Call [`Self::expire_if_due`] first.
-	pub fn vote(&mut self, voter: UserId, vote: Vote, now: i64) -> Result<(), DomainError> {
+	/// refused. Call [`Self::expire_if_due`] first. `unseated` are roster members who no
+	/// longer hold the seat the roster was drawn from: their FOR is not counted (decided) —
+	/// a vote is the seat's, so removing an admin takes back what they carried, and the
+	/// threshold stays where it was frozen.
+	pub fn vote(&mut self, voter: UserId, vote: Vote, now: i64, unseated: &[UserId]) -> Result<(), DomainError> {
 		if vote == Vote::Pending {
 			return Err(DomainError::Validation("a vote is FOR or AGAINST".into()));
 		}
@@ -690,8 +815,8 @@ impl Decision {
 		self.voters[index].vote = vote;
 		self.voters[index].voted_at = now;
 		self.transition(ApprovalEvent::Voted);
-		let count = |v: Vote| self.voters.iter().filter(|x| x.vote == v).count();
-		let (fors, againsts) = (count(Vote::For), count(Vote::Against));
+		let fors = self.voters.iter().filter(|x| x.vote == Vote::For && !unseated.contains(&x.user_id)).count();
+		let againsts = self.voters.iter().filter(|x| x.vote == Vote::Against).count();
 		let threshold = usize::try_from(self.threshold).unwrap_or(usize::MAX);
 		if fors >= threshold {
 			self.state = ApprovalState::Passed;
@@ -769,7 +894,7 @@ mod tests {
 	use uuid::Uuid;
 
 	use super::*;
-	use crate::scope_catalog::{Escalation, FieldSpec};
+	use crate::scope_catalog::Escalation;
 
 	fn uid() -> UserId {
 		UserId::from_raw(Uuid::new_v4())
@@ -906,6 +1031,7 @@ mod tests {
 		let policy = ScopePolicy::default();
 		let fire = |fields: Vec<Field>, window: &[Vec<Field>]| fired_escalations(&kind, &fields, &policy, window);
 		assert!(fire(vec![amount("1000", "USDT")], &[]).is_empty(), "at the threshold is not above it");
+		assert_eq!(fire(vec![], &[]), vec!["per_operation", "daily"], "an amount it cannot measure goes to the owners");
 		assert_eq!(fire(vec![amount("1000.1", "USDT")], &[]), vec!["per_operation"]);
 		assert_eq!(fire(vec![amount("1", "USDC")], &[]), vec!["per_operation", "daily"], "another currency escalates");
 		let window = vec![vec![amount("1000", "USDT")]; 4];
@@ -960,15 +1086,15 @@ mod tests {
 	fn passes_on_threshold_then_waits_out_the_delay() {
 		let roster = [uid(), uid(), uid()];
 		let mut d = Decision::open(&roster, 2, 3600, 1000);
-		d.vote(roster[0], Vote::For, 10).unwrap();
+		d.vote(roster[0], Vote::For, 10, &[]).unwrap();
 		assert_eq!(d.state, ApprovalState::Open);
-		d.vote(roster[0], Vote::For, 11).unwrap();
-		assert!(d.vote(roster[0], Vote::Against, 12).is_err(), "a vote is final");
-		d.vote(roster[1], Vote::For, 20).unwrap();
+		d.vote(roster[0], Vote::For, 11, &[]).unwrap();
+		assert!(d.vote(roster[0], Vote::Against, 12, &[]).is_err(), "a vote is final");
+		d.vote(roster[1], Vote::For, 20, &[]).unwrap();
 		assert_eq!((d.state, d.executable_at), (ApprovalState::Passed, Some(3620)));
 		assert!(!d.is_executable(3619));
 		assert!(d.is_executable(3620));
-		assert!(matches!(d.vote(roster[2], Vote::Against, 30), Err(DomainError::Precondition(_))));
+		assert!(matches!(d.vote(roster[2], Vote::Against, 30, &[]), Err(DomainError::Precondition(_))));
 		assert!(d.report(Outcome::Executed, "", 3619).is_err(), "inside the delay");
 		assert_eq!(d.report(Outcome::Executed, "", 3620).unwrap(), Reported::Applied);
 		assert_eq!(d.report(Outcome::Executed, "again", 4000).unwrap(), Reported::Repeated);
@@ -980,9 +1106,9 @@ mod tests {
 	fn rejected_once_the_threshold_is_out_of_reach() {
 		let roster = [uid(), uid(), uid()];
 		let mut d = Decision::open(&roster, 2, 0, 1000);
-		d.vote(roster[0], Vote::Against, 1).unwrap();
+		d.vote(roster[0], Vote::Against, 1, &[]).unwrap();
 		assert_eq!(d.state, ApprovalState::Open);
-		d.vote(roster[1], Vote::Against, 2).unwrap();
+		d.vote(roster[1], Vote::Against, 2, &[]).unwrap();
 		assert_eq!(d.state, ApprovalState::Rejected);
 	}
 
@@ -992,8 +1118,8 @@ mod tests {
 		let outsider = uid();
 		let mut d = Decision::open(&roster, 2, 100, 1000);
 		assert!(matches!(d.veto(outsider, false, "no", 1), Err(DomainError::Forbidden(_))));
-		d.vote(roster[0], Vote::For, 1).unwrap();
-		d.vote(roster[1], Vote::For, 2).unwrap();
+		d.vote(roster[0], Vote::For, 1, &[]).unwrap();
+		d.vote(roster[1], Vote::For, 2, &[]).unwrap();
 		let mut late = d.clone();
 		d.veto(roster[0], false, "changed my mind", 101).unwrap();
 		assert_eq!((d.state, d.vetoed_by), (ApprovalState::Vetoed, Some(roster[0])));
@@ -1011,8 +1137,8 @@ mod tests {
 	fn a_passed_decision_lapses_after_its_execution_window() {
 		let roster = [uid(), uid()];
 		let mut d = Decision::open(&roster, 2, 100, 1000);
-		d.vote(roster[0], Vote::For, 0).unwrap();
-		d.vote(roster[1], Vote::For, 0).unwrap();
+		d.vote(roster[0], Vote::For, 0, &[]).unwrap();
+		d.vote(roster[1], Vote::For, 0, &[]).unwrap();
 		let by = 100 + EXECUTION_WINDOW_SECS;
 		assert!(d.is_executable(by - 1));
 		assert!(!d.is_executable(by));
@@ -1024,6 +1150,79 @@ mod tests {
 	}
 
 	#[test]
+	fn a_for_vote_without_the_seat_does_not_count() {
+		let roster = [uid(), uid(), uid()];
+		let mut d = Decision::open(&roster, 2, 0, 1000);
+		d.vote(roster[0], Vote::For, 1, &[]).unwrap();
+		d.vote(roster[1], Vote::For, 2, &[roster[0]]).unwrap();
+		assert_eq!(d.state, ApprovalState::Open);
+		d.vote(roster[2], Vote::For, 3, &[roster[0]]).unwrap();
+		assert_eq!(d.state, ApprovalState::Passed);
+	}
+
+	#[test]
+	fn pulling_stops_before_the_lapse() {
+		let roster = [uid(), uid()];
+		let mut d = Decision::open(&roster, 2, 100, 1000);
+		d.vote(roster[0], Vote::For, 0, &[]).unwrap();
+		d.vote(roster[1], Vote::For, 0, &[]).unwrap();
+		let by = 100 + EXECUTION_WINDOW_SECS;
+		assert!(d.is_pullable(by - PULL_MARGIN_SECS - 1));
+		assert!(!d.is_pullable(by - PULL_MARGIN_SECS));
+		assert!(d.is_executable(by - 1), "a pulled decision is still reportable");
+	}
+
+	#[test]
+	fn a_policy_measures_against_the_kinds_in_force() {
+		let kinds = vec![transfer_kind()];
+		let threshold = |parameter: &str, value: &str| Threshold {
+			kind: "bank:account_transfer".into(),
+			parameter: parameter.into(),
+			value: value.into(),
+		};
+		let ok = ScopePolicy {
+			thresholds: vec![threshold("per_operation", "500")],
+			..ScopePolicy::default()
+		};
+		assert_eq!(ok.check(&kinds), Ok(()));
+		for bad in [
+			ScopePolicy { delay_secs: 3599, ..ok.clone() },
+			ScopePolicy { quorum_bps: 5000, ..ok.clone() },
+			ScopePolicy {
+				ttl_secs: MAX_TTL_SECS + 1,
+				..ok.clone()
+			},
+			ScopePolicy {
+				thresholds: vec![threshold("nothing", "1")],
+				..ok.clone()
+			},
+			ScopePolicy {
+				thresholds: vec![threshold("per_operation", "1.50")],
+				..ok.clone()
+			},
+			ScopePolicy {
+				thresholds: vec![threshold("distribution", "")],
+				..ok.clone()
+			},
+			ScopePolicy {
+				thresholds: vec![threshold("per_operation", "1"), threshold("per_operation", "2")],
+				..ok.clone()
+			},
+		] {
+			assert!(bad.check(&kinds).is_err(), "{bad:?}");
+		}
+		assert!(ok.check(&[]).is_err(), "a kind withdrawn since");
+	}
+
+	#[test]
+	fn the_built_in_kinds_are_the_platforms() {
+		for kind in builtin_kinds() {
+			assert_eq!(kind.level, ApprovalLevel::Platform, "{}", kind.name);
+			assert!(kind.name.starts_with("concierge:"));
+		}
+	}
+
+	#[test]
 	fn expiry_is_lazy() {
 		let roster = [uid(), uid()];
 		let mut d = Decision::open(&roster, 2, 0, 1000);
@@ -1032,6 +1231,6 @@ mod tests {
 		assert_eq!(d.state, ApprovalState::Open, "reading wrote nothing");
 		assert!(d.expire_if_due(1000));
 		assert_eq!((d.state, d.decided_at), (ApprovalState::Expired, Some(1000)));
-		assert!(d.vote(roster[0], Vote::For, 1001).is_err());
+		assert!(d.vote(roster[0], Vote::For, 1001, &[]).is_err());
 	}
 }

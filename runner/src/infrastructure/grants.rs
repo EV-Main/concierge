@@ -263,11 +263,10 @@ impl GrantRepository for PgGrants {
 			GrantAuthority::Delegate if matches!(subject, GrantSubject::Id(_)) => return Ok(GrantOutcome::Denied),
 			GrantAuthority::Delegate | GrantAuthority::Seat => {}
 		}
-		// One `admin` seat granting `<ns>:admin` to accounts it controls would fill a
-		// scope's roster and pass its quorum with no owner asked. The persisted row decides,
-		// not `acting_role`: emergency access elevates per request and seats nobody.
-		if target.as_str() == format!("{}:admin", target.namespace()) && !standing_in(&locked, actor.id).is_some_and(|s| s.role == Role::Owner && s.status == UserStatus::Active) {
-			return Ok(GrantOutcome::OwnersOnly);
+		// A seat granting `<ns>:admin` to accounts it controls would fill a scope's roster
+		// and pass its quorum with no owner asked; the owners decide it as an approval.
+		if target.as_str() == format!("{}:admin", target.namespace()) {
+			return Ok(GrantOutcome::ByApprovalOnly);
 		}
 		let Some(tenant) = tenant else {
 			return Ok(GrantOutcome::UnknownTenant);
@@ -471,4 +470,70 @@ impl GrantRepository for PgGrants {
 		tx.commit().await.map_err(repo_err)?;
 		Ok(PublishOutcome::Published)
 	}
+}
+
+/// What an executed `concierge:scope_admin_grant` did.
+pub(crate) enum ApprovedGrant {
+	Granted,
+	/// Already held: one decision, one execution, and a repeat writes nothing.
+	AlreadyHeld,
+	/// Cannot be carried out as approved; the proposal is void for this reason.
+	Inapplicable(&'static str),
+}
+
+/// Grant `<namespace>:admin` on the authority of an executed approval, inside the caller's
+/// transaction — the one that records the outcome, so the grant and the decision it
+/// executes commit together. The decision is the authority: no seat is consulted, and the
+/// grant names the person who opened the proposal as `granted_by`.
+pub(crate) async fn grant_by_approval(conn: &mut PgConnection, user: UserId, scope: &str, granted_by: UserId, approval: Uuid, now: i64) -> Result<ApprovedGrant, DomainError> {
+	let locked = lock_users(conn, &[user, granted_by]).await?;
+	if user == granted_by {
+		return Ok(ApprovedGrant::Inapplicable("the account is the one who asked for it"));
+	}
+	if !standing_in(&locked, user).is_some_and(|s| s.status == UserStatus::Active) {
+		return Ok(ApprovedGrant::Inapplicable("the account is no longer active"));
+	}
+	if standing_in(&locked, granted_by).is_none() {
+		return Ok(ApprovedGrant::Inapplicable("the account that asked for it is gone"));
+	}
+	let tenant: Option<(String, String)> = sqlx::query_as("SELECT namespace, state FROM tenants WHERE id = $1 FOR SHARE")
+		.bind(scope)
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	let Some((namespace, state)) = tenant else {
+		return Ok(ApprovedGrant::Inapplicable("the scope is gone"));
+	};
+	if state != "active" {
+		return Ok(ApprovedGrant::Inapplicable("the scope is no longer active"));
+	}
+	let namespace = namespace.as_str();
+	let target = format!("{namespace}:admin");
+	let held: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM grants WHERE user_id = $1 AND target = $2 AND revoked_at IS NULL)")
+		.bind(user.raw())
+		.bind(&target)
+		.fetch_one(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	if held {
+		return Ok(ApprovedGrant::AlreadyHeld);
+	}
+	let id: i64 = sqlx::query_scalar("INSERT INTO grants (user_id, namespace, target, granted_by, granted_at) VALUES ($1, $2, $3, $4, $5) RETURNING id")
+		.bind(user.raw())
+		.bind(namespace)
+		.bind(&target)
+		.bind(granted_by.raw())
+		.bind(now)
+		.fetch_one(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	let action = AdminAction {
+		actor: Some(granted_by),
+		action: "permission_granted",
+		detail: Some(serde_json::json!({ "target": target, "grant_id": id, "approval_id": approval })),
+		..AdminAction::default()
+	};
+	record_action(conn, user, &action, now).await?;
+	scope_events::grants_moved(conn, namespace, user).await?;
+	Ok(ApprovedGrant::Granted)
 }

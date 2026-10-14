@@ -591,8 +591,8 @@ impl UserDirectory for Directory {
 				grant: Some(permission_grant_to_proto(grant, false)),
 			})),
 			GrantOutcome::Denied => Err(grant_denied(&actor, "grant", target.as_str())),
-			GrantOutcome::OwnersOnly => Err(Status::permission_denied(format!(
-				"`{}` seats its holder on the scope's approval roster: only a platform owner grants it",
+			GrantOutcome::ByApprovalOnly => Err(Status::permission_denied(format!(
+				"`{}` seats its holder on the scope's approval roster: it is granted by the platform owners' decision, opened with ApprovalService.ProposeScopeAdminGrant",
 				target.as_str()
 			))),
 			// The rule `HoldUser` and `SetKycLevel` carry: nobody acts on their own account.
