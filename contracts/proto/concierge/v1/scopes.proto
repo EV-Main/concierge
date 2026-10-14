@@ -21,8 +21,7 @@ import "concierge/v1/approvals.proto";
 //                         permissions: approval kinds and notification topics.
 //   ScopeEvents         — the per-scope event stream relying parties project from.
 // The last two are called by services and authenticate by service credential (the doc's
-// "Service callers"), outside the user auth layer like UserEvents. Only ScopeRegistry is
-// served today; the other two are contract and answer UNIMPLEMENTED.
+// "Service callers"), outside the user auth layer like UserEvents.
 //
 // The registry has no write RPC: scopes, their origins and their clients are written by
 // migration and configuration, as `rp_clients` is today.

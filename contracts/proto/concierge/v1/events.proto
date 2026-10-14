@@ -17,9 +17,8 @@ package concierge.v1;
 // The seam is authenticated with a shared bridge service token (env
 // BRIDGE_SERVICE_TOKEN on both ends). Graduate to mTLS/SPIFFE at platform scale.
 //
-// RELYING PARTIES are to read the same RPC with their client credential instead
-// (docs/SCOPES-AND-APPROVALS.md, "Service callers") — contract only: today the RPC
-// admits the bridge token alone. The request is unchanged — the
+// RELYING PARTIES read the same RPC with their client credential instead
+// (docs/SCOPES-AND-APPROVALS.md, "Service callers"). The request is unchanged — the
 // filter comes from WHO is asking, never from a field a caller could widen: a client
 // sees only users visible to its scope and to the scopes that name it an observer, and
 // each row is redacted for it (`seat_permissions` absent, `permissions` empty — the
