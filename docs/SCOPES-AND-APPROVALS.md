@@ -137,6 +137,12 @@ paths>`. That is a page on this origin with one button; the button's form carrie
 session's CSRF token and comes back with a 303 to `return_to`. Without a session the page
 answers the 303 at once.
 
+**Every scope whose hosts mount the account chip or the account page lists `/` in its
+`return_paths`.** Both (`web/` and `@evinvest/concierge` in `sdk/`) sign out to the host's
+root, `<scope origin>/`, and the page above answers any `return_to` whose path is not in
+the list with 400 — the host's own session ends and the `evinvest.ltd` one stays. `sa` has
+listed `/` since migration 0031; `invest` since 0035, which appended it beside `/cabinet`.
+
 A route on the left accepts an `Origin` that is `PUBLIC_ORIGIN` or an origin of a scope
 that is `ACTIVE` or `FROZEN` — a frozen scope's clients still sign people in — and never
 one of a `CLOSED` scope. The right column carries the CSRF double-submit, whose cookie a

@@ -296,7 +296,7 @@ async fn an_absolute_return_to_outside_the_registry_is_refused() {
 	for target in [
 		"https://evil.example/",
 		"https://invest.evinvest.ltd",
-		"https://invest.evinvest.ltd/",
+		"https://invest.evinvest.ltd/elsewhere",
 		"https://invest.evinvest.ltd/cabinet/",
 		"https://invest.evinvest.ltd/cabinet?next=https://evil.example",
 		"https://invest.evinvest.ltd/cabinet#x",

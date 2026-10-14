@@ -98,6 +98,25 @@ async fn without_a_session_the_page_sends_the_browser_straight_back() {
 	assert_eq!((back.status, back.location()), (StatusCode::SEE_OTHER, Some(invest_landing().as_str())));
 }
 
+/// The account chip and `@evinvest/concierge` sign out to the host's root, so a scope
+/// that mounts them must list `/` (migration 0035 for `invest`); without it the page
+/// answered 400 and the platform session outlived the host's.
+#[tokio::test]
+async fn the_invest_hosts_root_is_a_landing() {
+	let fx = fixture!();
+	let root = format!("{INVEST}/");
+	let mut browser = signed_in(&fx).await;
+	let held = browser.clone();
+	let shown = page(&fx, &root, &mut browser).await;
+	assert_eq!((shown.status, shown.location()), (StatusCode::OK, None), "{}", shown.html);
+	assert_eq!(shown.hidden("return_to"), root);
+	let pressed = press(&fx, &shown.hidden("csrf"), &root, &mut browser).await;
+	assert_eq!((pressed.status, pressed.location()), (StatusCode::SEE_OTHER, Some(root.as_str())));
+	assert!(!authenticated(&fx, &mut held.clone()).await, "signing out at the root ends the session server-side");
+	let back = page(&fx, &root, &mut Browser::default()).await;
+	assert_eq!((back.status, back.location()), (StatusCode::SEE_OTHER, Some(root.as_str())));
+}
+
 #[tokio::test]
 async fn a_landing_nobody_registered_gets_a_page_never_a_redirect() {
 	let fx = fixture!();
