@@ -20,10 +20,7 @@ use axum::{
 use concierge::{
 	infrastructure::{db, governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
 	ports::UserDirectoryRepository,
-	web::{
-		self, KycDeps,
-		allowlist::{REFRESH_EVERY, SignInAllowlist},
-	},
+	web::{self, KycDeps, allowlist::SignInAllowlist},
 };
 use evconcierge_auth::{OAuthClientConfig, oauth::OAuthProvider};
 use serde_json::{Value, json};
@@ -87,11 +84,7 @@ async fn setup() -> Option<Fx> {
 	};
 	sign_in.providers.push(OAuthProvider::github_at(&client, &format!("{stub}/login/oauth/access_token"), &stub));
 	// The seeded registry: `invest` lands on `/cabinet`, `sa` on `/` and `/auth/login`.
-	sign_in.allowlist = Arc::new(
-		SignInAllowlist::live(Arc::new(PgScopes::new(pool.clone())), ORIGIN, REFRESH_EVERY)
-			.await
-			.expect("read the scope registry"),
-	);
+	sign_in.allowlist = Arc::new(SignInAllowlist::live(Arc::new(PgScopes::new(pool.clone())), ORIGIN).await.expect("read the scope registry"));
 	let state = web::WebState::try_new(
 		common::signing_auth(users.clone()).await,
 		ORIGIN.to_string(),
@@ -311,7 +304,10 @@ async fn an_absolute_return_to_outside_the_registry_is_refused() {
 		"https://sa.evinvest.ltd/cabinet",
 		"https://evinvest.ltd/cabinet",
 		"http://invest.evinvest.ltd/cabinet",
-		"javascript:alert(1)",
+		"https://evinvest.test.evil.example/cabinet",
+		"https://evinvest.test@evil.example/cabinet",
+		"https://evinvest.test:8443/cabinet",
+		"HTTPS://evil.example/",
 	] {
 		let out = fx.login(target).await;
 		assert_eq!(out.status(), StatusCode::BAD_REQUEST, "{target}");
@@ -319,15 +315,31 @@ async fn an_absolute_return_to_outside_the_registry_is_refused() {
 	}
 }
 
-/// What worked before the registry keeps working: a value that is not a URL lands on `/`
-/// silently, as it always did, instead of failing the sign-in.
+/// What worked before the registry keeps working: a value that is not an `http(s)` URL —
+/// empty, relative, or another scheme — lands on `/` silently, as it always did, instead
+/// of failing the sign-in.
 #[tokio::test]
 async fn a_relative_or_empty_return_to_still_lands_on_the_root() {
 	let fx = fixture!();
-	for target in ["", "cabinet", "//evil.example/cabinet", "/\\evil.example"] {
+	for target in ["", "cabinet", "//evil.example/cabinet", "/\\evil.example", "javascript:alert(1)", "foo:bar", "section:wallet"] {
 		let code = format!("code-{}", Uuid::new_v4().simple());
 		fx.will_answer(&code, github_id(), json!([{ "email": address("relative"), "primary": true, "verified": true }]));
 		let (landing, _) = fx.sign_in_returning(&code, target).await;
 		assert_eq!(landing, "/", "{target:?}");
+	}
+}
+
+/// An absolute URL on this plane's own origin is a same-origin path, and lands there.
+#[tokio::test]
+async fn an_absolute_return_to_on_the_public_origin_lands_on_its_path() {
+	let fx = fixture!();
+	for (target, landing) in [
+		(format!("{ORIGIN}/cabinet?tab=wallet"), "/cabinet?tab=wallet"),
+		(ORIGIN.to_owned(), "/"),
+		(format!("{ORIGIN}//evil.example"), "/"),
+	] {
+		let code = format!("code-{}", Uuid::new_v4().simple());
+		fx.will_answer(&code, github_id(), json!([{ "email": address("public"), "primary": true, "verified": true }]));
+		assert_eq!(fx.sign_in_returning(&code, &target).await.0, landing, "{target}");
 	}
 }
