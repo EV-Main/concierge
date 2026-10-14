@@ -56,7 +56,7 @@ fn root() -> cc::Scope {
 	}
 }
 
-fn wire(scope: ScopeRecord) -> cc::Scope {
+pub(crate) fn wire(scope: ScopeRecord) -> cc::Scope {
 	cc::Scope {
 		id: scope.id,
 		namespace: scope.namespace,

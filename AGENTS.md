@@ -89,7 +89,7 @@ retired in favour of `HoldUser` plus `GovernanceService.OpenUserSuspension`.
 | `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `governance` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
 | `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Redis-backed refresh rotation with reuse detection · `Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party `ExchangeCode`/`RefreshClientToken` over the runner's `ClientGrants` port, plus `open_session` for the web surface's sign-ins) reading accounts from the directory over an in-process `Provisioner` channel, the closed `oauth::OAuthProvider` set (Google, GitHub — code + PKCE), **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-prost-build` (protoc from `PROTOC`, else the vendored one). `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
-| Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams; also which consumer-built messages and services must never grow. Implemented so far: the registry (`tenants`, migration 0031; `ScopeRegistry`, `scopes` module), sign-in from a scope's hosts (`web::origins`, `web::cors`, the live allowlist `web::allowlist`) and the MFE bundles under `/auth/mfe/*` (`web::mfe`, `WEB_MFE_DIR`), and the sign-up ticket that confirms an address from a scope's host (`web::signup`, migration 0032); the rest is contract only | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
+| Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams; also which consumer-built messages and services must never grow. Implemented so far: the registry (`tenants`, migration 0031; `ScopeRegistry`, `scopes` module), sign-in from a scope's hosts (`web::origins`, `web::cors`, the live allowlist `web::allowlist`), the MFE bundles under `/auth/mfe/*` (`web::mfe`, `WEB_MFE_DIR`), the sign-up ticket that confirms an address from a scope's host (`web::signup`, migration 0032), the relying-party streams (`ScopeEvents`, `UserEvents` by client credential; `scope_events`, `service_caller`, migration 0034) and the stored scope catalog (`ScopeCatalogService`, `scope_catalog`); approvals are contract only | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
 | `concierge_iam` (+ `_derive`) — permission scopes: `#[derive(Permission)]` enums, `alias!`, the concrete `PermissionSet` a service asks `may` of, `Pattern` containment, the `Catalog` a tenant publishes. I/O-free, wasm-safe, published to crates.io so consumers need no protoc | [`iam/`](./iam) |
 | **Design** — operator (admin) surface over this plane | [§ Design](#design) |
@@ -508,7 +508,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   (`support::authenticate_service`), the Didit webhook HMAC (`infrastructure::kyc::didit`),
   the consilium self-decision code (`infrastructure::governance`), the refresh-token secret
   (`evconcierge_auth::management`), a relying party's client secret and refresh secret
-  (`relying_party`, both compared as fixed-width digests), an emailed sign-in or verification
+  (`relying_party` and, for the service seams, `service_caller`; compared as fixed-width digests), an emailed sign-in or verification
   code (`infrastructure::credentials`) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
   Whether any one of them is a practical timing oracle is not the test — a plane that
   states this discipline and then has one check quietly doing `!=` (#52) is a plane whose
@@ -630,6 +630,32 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   and the delegate's own grants are held `FOR SHARE`. A caller with no authority is denied
   before learning whether the subject exists; a refusal is logged at `warn!` (ids and
   target, and for an ungrantable address its category — never the address).
+- **A relying party reads this plane's streams with its client secret, and sees only whom its
+  scopes can see.** `ScopeEvents.PullScopeEvents` and `UserEvents.PullUserLifecycle` take
+  either the bridge token (everything, unredacted — banking's page is unchanged) or
+  `x-ev-client-id` + `Bearer <client_secret>` (`service_caller`: an unknown, disabled or
+  secretless client and a wrong secret are one `UNAUTHENTICATED`). A client reads its own
+  scope and every scope whose `observers` name it. A user becomes VISIBLE to a scope
+  (`scope_members`, only ever inserted) on their first relying-party session with one of its
+  clients or their first grant in its namespace, and MEMBER_JOINED carries the identity
+  snapshot as of the user's `row_version`, taken under the `users` row `FOR SHARE` so no
+  lifecycle row can commit between the two. The lifecycle stream then serves a client only
+  rows past that snapshot, with `seat_permissions` absent and `permissions` empty;
+  `kyc_level` is carried (D5). GRANTS_CHANGED re-states the concrete set `GetMe` would
+  answer that tenant's client (persisted seat, never break-glass), written in the SAME
+  transaction as the grant, the revocation, the catalog publication or the ROLE_CHANGED
+  that moved it; SCOPE_CHANGED is written by a trigger on `tenants`, because the registry
+  has no writer in this binary. Every `scope_outbox` append goes through
+  `scope_outbox_append`, which takes the stream's advisory lock, so position order is
+  commit order — the same argument as `user_outbox`. Locks are always taken users →
+  tenants (`FOR SHARE`) → `scope_members` → the stream lock. A filtered reader's
+  `next_position` is the maximum position scanned (`support::filtered_page`). The boot
+  (`db::migrate` → `scope_events::reconcile`) backfills members and re-states sets an
+  older binary changed beside this one; between boots such a change is not on the stream.
+  `ScopeCatalogService` stores approval kinds and notification topics per namespace (the
+  bridge token publishes `bank`), versioned like `PublishCatalog`, and executes nothing;
+  a scope's topics are offered in notification settings beside the built-in ones, while
+  `Emit` still refuses them: a `typ=service` token names no namespace to check against.
 - **This plane is the identity provider of first-party clients on OTHER origins, and a
   client's token opens exactly one RPC.** A relying party (`relying_party`, registry
   `rp_clients` from `0025`; the Service-Arb panel `sa` (0025) and the invest cabinet `invest` (0031) are seeded) runs authorization code +

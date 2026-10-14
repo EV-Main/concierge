@@ -987,6 +987,7 @@ pub(crate) async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Re
 	if events.is_empty() {
 		return Ok(());
 	}
+	let seat_moved = events.contains(&UserEvent::RoleChanged);
 
 	// Serialize outbox appends against COMMIT order. `position` is a BIGSERIAL assigned at
 	// INSERT time, but two concurrent transactions can be assigned positions in one order
@@ -1029,6 +1030,12 @@ pub(crate) async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Re
 		.execute(&mut *conn)
 		.await
 		.map_err(repo_err)?;
+	}
+	// A tenant whose granting seats hold all of it hands a seat change straight to every
+	// relying party that can see this user, so the scope stream re-states their set in the
+	// same transaction as the ROLE_CHANGED.
+	if seat_moved {
+		super::scope_events::seat_moved(conn, user.id()).await?;
 	}
 	Ok(())
 }

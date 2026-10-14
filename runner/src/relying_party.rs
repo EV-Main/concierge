@@ -602,6 +602,7 @@ mod tests {
 			secret_hash: None,
 			disabled: false,
 			namespace: "sa".into(),
+			scope: "sa".into(),
 			scope_closed: false,
 		};
 		assert!(check_registered_redirects(&client("https://sa.evinvest.ltd/auth/callback")).is_ok());

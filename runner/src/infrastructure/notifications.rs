@@ -482,6 +482,10 @@ impl NotificationRepository for PgNotifications {
 		tx.commit().await.map_err(repo_err)?;
 		Ok(true)
 	}
+
+	async fn scope_topics(&self) -> Result<Vec<domain::scope_catalog::NotificationTopic>, DomainError> {
+		super::scope_catalogs::current_topics(&self.pool).await
+	}
 }
 
 #[async_trait]

@@ -23,6 +23,8 @@ pub mod governance;
 
 pub mod iam;
 
+pub mod scope_catalog;
+
 pub mod scopes;
 
 pub mod users;

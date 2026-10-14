@@ -87,6 +87,16 @@ pub fn topic(key: &str) -> Option<&'static Topic> {
 	TOPICS.iter().find(|t| t.key == key)
 }
 
+/// Whether `key` is a topic a subscriber may follow: one of this plane's own, or one a
+/// scope's catalog in force publishes. A withdrawn scope topic stops being offered; the
+/// subscriptions and inbox rows under it stay.
+pub async fn topic_known(notifications: &dyn NotificationRepository, key: &str) -> Result<bool, DomainError> {
+	if topic(key).is_some() {
+		return Ok(true);
+	}
+	Ok(notifications.scope_topics().await?.iter().any(|t| t.topic == key))
+}
+
 /// Fixed-window request counter keyed by caller-supplied identity (an IP).
 ///
 /// Deliberately per-process and in-memory: this is the cheap first line, not the layer
@@ -213,14 +223,21 @@ pub async fn settings_of(notifications: &dyn NotificationRepository, email: &str
 		Some(sub) => notifications.subscriptions(sub.id).await?,
 		None => Vec::new(),
 	};
-	let topics = TOPICS
+	let scoped = notifications.scope_topics().await?;
+	let catalogue = TOPICS
 		.iter()
-		.map(|t| {
-			let row = held.iter().find(|s| s.topic == t.key);
+		.map(|t| (t.key, t.label, t.description))
+		.chain(scoped.iter().map(|t| (t.topic.as_str(), t.label.as_str(), t.description.as_str())));
+	// `default_subscribed` is not applied here: an unsubscribe deletes the row, so "never
+	// touched" cannot be told from "switched off", and showing a topic followed that the
+	// subscriber turned off would be the worse mistake.
+	let topics = catalogue
+		.map(|(key, label, description)| {
+			let row = held.iter().find(|s| s.topic == key);
 			TopicSubscription {
-				topic: t.key.to_owned(),
-				label: t.label.to_owned(),
-				description: t.description.to_owned(),
+				topic: key.to_owned(),
+				label: label.to_owned(),
+				description: description.to_owned(),
 				subscribed: row.is_some(),
 				email_enabled: row.map(|r| r.email_enabled).unwrap_or(true),
 			}
@@ -262,6 +279,11 @@ impl NotificationService for Notifications {
 
 		let user_id = Uuid::parse_str(&req.user_id).map_err(|_| Status::invalid_argument("user_id must be a UUID"))?;
 		if topic(&req.topic).is_none() {
+			// A scope's topic is emitted only by its own namespace, and a `typ=service`
+			// token names no namespace yet: refused rather than open to every service.
+			if topic_known(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)? {
+				return Err(Status::permission_denied("a scope's topic is emitted only by its own namespace's service"));
+			}
 			return Err(Status::invalid_argument("unknown topic"));
 		}
 		// Checked here as well as by the CHECK constraints, so an over-long title is a
@@ -325,7 +347,7 @@ impl NotificationService for Notifications {
 		};
 		let topic_filter = match req.topic.as_str() {
 			"" => None,
-			t if topic(t).is_some() => Some(t),
+			t if topic_known(self.notifications.as_ref(), t).await.map_err(domain_to_status)? => Some(t),
 			_ => return Err(Status::invalid_argument("unknown topic")),
 		};
 
@@ -418,7 +440,7 @@ impl NotificationService for Notifications {
 	async fn set_topic_subscription(&self, request: Request<SetTopicSubscriptionRequest>) -> Result<Response<NotificationSettings>, Status> {
 		let sub = self.caller(&request).await?;
 		let req = request.get_ref();
-		if topic(&req.topic).is_none() {
+		if !topic_known(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)? {
 			return Err(Status::invalid_argument("unknown topic"));
 		}
 		self.notifications
@@ -481,7 +503,7 @@ impl NotificationService for Notifications {
 		}
 		let topic_filter = match req.topic.as_str() {
 			"" => None,
-			t if topic(t).is_some() => Some(t),
+			t if topic_known(self.notifications.as_ref(), t).await.map_err(domain_to_status)? => Some(t),
 			_ => return Err(Status::invalid_argument("unknown topic")),
 		};
 		let unsubscribed = self.notifications.unsubscribe(&req.token, topic_filter).await.map_err(domain_to_status)?;

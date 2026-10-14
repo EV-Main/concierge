@@ -5,11 +5,12 @@ Status: **partly implemented.** The wire is in `contracts/proto/concierge/v1/sco
 registry (§3: `tenants` columns from migration 0031, `ScopeRegistry` mounted inside the
 user auth layer; a CLOSED scope's clients are refused), sign-in from a scope's hosts
 (§3.1: CORS and the `Origin` check on the closed route list, the passkey verifier's
-origins, OAuth `returnTo`, the sign-up ticket of migration 0032) and the micro-frontend
-bundles under `/auth/mfe/*` (§3.1). Every other service below is not mounted yet and
-answers `UNIMPLEMENTED`; nothing emits `ScopeEvents`, and `PullUserLifecycle` still admits
-the bridge token alone (§1). Banking, the `lib` projections, invest and admin build
-against this document.
+origins, OAuth `returnTo`, the sign-up ticket of migration 0032), the micro-frontend
+bundles under `/auth/mfe/*` (§3.1), the relying-party streams (§4: `ScopeEvents` and
+`UserEvents` read by a client credential, migration 0034) and the scope catalog's storage
+(`ScopeCatalogService`, §5.1, §6 — kinds are stored, nothing is proposed or executed yet).
+The approval services are not mounted yet and answer `UNIMPLEMENTED`. Banking, the `lib`
+projections, invest and admin build against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it
@@ -171,6 +172,11 @@ is unaffected; the image sets it only once `web/` exists in this repository.
 
 ### 4.1 Visibility
 
+Implemented in `runner/` as `scope_members` (migration 0034): a row is inserted, never
+deleted, on the user's first relying-party session with one of the scope's clients
+(`joined_by = sign_in`) or their first grant in its namespace (`grant`), in the same
+transaction. Grants and sessions that predate the table are backfilled at boot.
+
 A user is **visible to scope S** once they have signed in through one of S's clients, or
 held a grant in S's namespace. Visibility only grows: an account whose grants are all
 revoked stays visible, because the direction still has to learn that it was suspended.
@@ -217,6 +223,23 @@ two events can never disagree about the current set.
 
 Banking reads `ScopeEvents` with the bridge token, learns scopes and their `state` from
 `SCOPE_CHANGED` and opens compartments only for known scopes.
+
+As implemented (`scope_events`, `bridge`, `infrastructure::scope_events`):
+
+- every event is written in the transaction of the change it describes — a grant or
+  revocation, a tenant catalog publication, a ROLE_CHANGED (a seat moves what it holds
+  where `granting_seats_hold_all`), a relying-party session — and `SCOPE_CHANGED` by a
+  trigger on `tenants`, which also fires for a client's audience, disabled flag or tenant
+  moving (0031 bumps the scope's `version` for those);
+- `GRANTS_CHANGED` carries what `GetMe` answers that scope's client — by the PERSISTED seat;
+  emergency access is per request and never on the stream — and is written only when the
+  set actually moved;
+- a client is served lifecycle rows of a user only past the `lifecycle_sequence` its
+  `MEMBER_JOINED` carried: history before the user became visible is not a direction's;
+- a filtered scan reads at most 5 000 rows per call, and the cursor moves past what it
+  scanned;
+- what a binary of the previous release changes during a rollout (a grant, a role, a
+  catalog) reaches the stream at the next boot (`scope_events::reconcile`), not before.
 
 ### 4.3 A kind the consumer cannot name
 
@@ -430,6 +453,15 @@ service may `Emit` only its own namespace's topics. Topics a user cannot be with
 payment-consent trace, security notices) stay this plane's own. Today's
 `fund:quy-nhon` and `account:money-movement` move to `invest:` and `bank:`; carrying the
 existing subscriptions across is the implementation's migration.
+
+As implemented: a scope catalog's topics are offered in the notification settings (gRPC and
+`/auth/notifications/settings`), may be followed and filtered on, and disappear from the
+offer when a later catalog withdraws them. Not yet: `Emit` refuses a scope topic, because a
+`typ=service` token names no namespace to hold "only its own topics" against;
+`default_subscribed` is stored but not applied (an unsubscribe deletes the subscription
+row, so "never touched" cannot be told from "switched off"); `SubscribeAnonymous` takes
+built-in topics only; and the move of `fund:quy-nhon` / `account:money-movement` to
+`invest:` / `bank:` has not happened.
 
 ---
 

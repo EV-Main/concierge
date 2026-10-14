@@ -31,6 +31,7 @@ use domain::{
 	error::DomainError,
 	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
 	iam::{Catalog, Target},
+	scope_catalog::{NotificationTopic, ScopeCatalog},
 	users::{Email, ProfileFields, User, UserId, Username},
 };
 use uuid::Uuid;
@@ -258,6 +259,8 @@ pub struct ClientRecord {
 	pub disabled: bool,
 	/// The tenant namespace whose catalog it publishes and whose permissions its tokens read.
 	pub namespace: String,
+	/// The scope (tenant id) the client signs people in for.
+	pub scope: String,
 	/// Its scope is CLOSED: the client signs nobody in and its sessions end at their next
 	/// refresh, as if disabled. A FROZEN scope's client keeps working — a direction has to
 	/// learn it was frozen.
@@ -435,6 +438,70 @@ pub trait ScopeRepository: Send + Sync {
 
 	/// One scope by id; `None` when there is none or its row does not decode.
 	async fn scope(&self, id: &str) -> Result<Option<ScopeRecord>, DomainError>;
+}
+
+/// What a direction may hold about a person it can see (`ScopeMember`): never the
+/// identity document fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberSnapshot {
+	pub email: String,
+	pub email_verified: bool,
+	pub username: String,
+	pub preferred_name: String,
+	pub status: String,
+	pub kyc_level: u32,
+	pub token_version: u64,
+	/// The `user_outbox.sequence` (the user's `row_version`) this snapshot is as of.
+	pub lifecycle_sequence: u64,
+}
+
+/// The body of one `scope_outbox` row, decoded.
+#[derive(Clone, Debug)]
+pub enum ScopeEventBody {
+	ScopeChanged(ScopeRecord),
+	GrantsChanged(Vec<String>),
+	MemberJoined(MemberSnapshot),
+	/// A kind a newer binary wrote.
+	Unknown(String),
+}
+
+/// One scanned row of the scope stream. `visible` says whether the caller may see it; the
+/// position still moves the cursor when it may not.
+#[derive(Clone, Debug)]
+pub struct ScopeEventRecord {
+	pub position: i64,
+	pub visible: bool,
+	pub event_id: Uuid,
+	pub scope: String,
+	pub occurred_at: i64,
+	pub sequence: u64,
+	/// The user and their `auth_subject`, under every kind but SCOPE_CHANGED.
+	pub user: Option<(Uuid, String)>,
+	pub body: ScopeEventBody,
+}
+
+/// The read side of the relying-party streams (`scope_outbox`, `scope_members`). The
+/// writes happen inside the transactions that change what they describe, in the adapters
+/// that own those transactions.
+#[async_trait]
+pub trait ScopeEventRepository: Send + Sync {
+	/// The scopes `client_id` of scope `own` reads: its own, and every scope naming it an
+	/// observer.
+	async fn observed_by(&self, client_id: &str, own: &str) -> Result<Vec<String>, DomainError>;
+
+	/// Up to `scan` rows past `after`, oldest first; `visible = None` sees every row.
+	async fn scan(&self, after: i64, scan: i64, visible: Option<&[String]>) -> Result<Vec<ScopeEventRecord>, DomainError>;
+}
+
+/// Every scope catalog ever published (`scope_catalogs`), one row per version.
+#[async_trait]
+pub trait ScopeCatalogRepository: Send + Sync {
+	/// Store `catalog` as `namespace`'s newest, unless it is what is stored already
+	/// (`Unchanged`) or does not supersede it (`Stale`). Serialised per namespace.
+	async fn publish(&self, namespace: &str, published_by: &str, catalog: &ScopeCatalog, now: i64) -> Result<PublishOutcome, DomainError>;
+
+	/// The catalog in force for `namespace`; `None` before its first publication.
+	async fn current(&self, namespace: &str) -> Result<Option<ScopeCatalog>, DomainError>;
 }
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
@@ -1180,6 +1247,10 @@ pub trait NotificationRepository: Send + Sync {
 
 	/// One-click unsubscribe. `None` topic switches the email channel off entirely.
 	async fn unsubscribe(&self, token: &str, topic: Option<&str>) -> Result<bool, DomainError>;
+
+	/// The notification topics of every scope catalog in force, beside this plane's own
+	/// built-ins (`notification::TOPICS`).
+	async fn scope_topics(&self) -> Result<Vec<NotificationTopic>, DomainError>;
 }
 
 /// Port for draining the outbound email queue. Split from [`NotificationRepository`]
