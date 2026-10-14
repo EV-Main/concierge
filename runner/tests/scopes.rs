@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
 	Router,
@@ -17,6 +17,7 @@ use concierge::{
 	scopes::ScopeRegistry,
 	web::{
 		self, KycDeps,
+		allowlist::SignInAllowlist,
 		mfe::{self, MfeAssets},
 		origins::ScopeOrigins,
 	},
@@ -144,6 +145,11 @@ async fn the_registry_refuses_what_could_widen_sign_in() {
 		"https://xevinvest.ltd",
 		"https://evinvest.ltd.evil.example",
 		"https://x.evinvest.ltd:443",
+		"https://x.evinvest.ltd:0",
+		"https://x.evinvest.ltd:65536",
+		"https://x.evinvest.ltd:99999",
+		"https://evinvest.ltd",
+		"https://evinvest.ltd:8443",
 		"null",
 	] {
 		let refused = sqlx::query("UPDATE tenants SET origins = ARRAY[$2] WHERE id = $1").bind(&id).bind(origin).execute(&pool).await;
@@ -153,6 +159,19 @@ async fn the_registry_refuses_what_could_widen_sign_in() {
 		let refused = sqlx::query("UPDATE tenants SET return_paths = ARRAY[$2] WHERE id = $1").bind(&id).bind(path).execute(&pool).await;
 		assert!(refused.is_err(), "{path}");
 	}
+	// `bool_and` skips NULLs; the CHECKs must not, or the row would fail to decode later.
+	for column in ["origins", "return_paths", "observers"] {
+		let null = sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE tenants SET {column} = ARRAY[NULL]::TEXT[] WHERE id = $1")))
+			.bind(&id)
+			.execute(&pool)
+			.await;
+		assert!(null.is_err(), "a NULL element in {column}");
+	}
+	let accepted = sqlx::query("UPDATE tenants SET origins = ARRAY['https://x.evinvest.ltd:65535'] WHERE id = $1")
+		.bind(&id)
+		.execute(&pool)
+		.await;
+	assert!(accepted.is_ok(), "the highest port is a port");
 	let main = sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ('main', $1, FALSE, 0)")
 		.bind(tag())
 		.execute(&pool)
@@ -228,7 +247,8 @@ async fn sign_in_surface(pool: &PgPool) -> (Router, String) {
 		.unwrap();
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let mut sign_in = common::sign_in_with_turnstile(pool, &common::stub_turnstile().await);
-	sign_in.scope_origins = ScopeOrigins::from_scopes(&PgScopes::new(pool.clone()).scopes().await.unwrap());
+	// Re-read on every request, so a test sees the registry change it just made.
+	sign_in.allowlist = Arc::new(SignInAllowlist::live(Arc::new(PgScopes::new(pool.clone())), PUBLIC, Duration::ZERO).await.unwrap());
 	let state = web::WebState::try_new(
 		common::signing_auth(users.clone()).await,
 		PUBLIC.to_string(),
@@ -338,6 +358,8 @@ async fn a_route_acting_on_an_open_session_answers_no_scope_host() {
 	let pool = pool!();
 	let (router, _) = sign_in_surface(&pool).await;
 	for path in [
+		"/auth/email/verify/request",
+		"/auth/email/verify/confirm",
 		"/auth/password/set",
 		"/auth/passkey/register/options",
 		"/auth/passkey/remove",
@@ -428,6 +450,7 @@ fn bundles() -> (Router, Bundles) {
 	std::fs::write(dir.join("sign-in-ABCD2345.js"), "export {};").unwrap();
 	std::fs::write(dir.join("chunks").join("chunk-Q7ZK3M2P.js"), "export {};").unwrap();
 	std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
+	std::fs::write(dir.join("LICENSES.txt"), "MIT").unwrap();
 	std::fs::write(outside.join("secret.txt"), "outside").unwrap();
 	std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("escape.txt")).unwrap();
 
@@ -444,7 +467,8 @@ fn bundles() -> (Router, Bundles) {
 		version: 1,
 		state: ScopeState::Active,
 	}]);
-	let router = mfe::mount(Router::new(), MfeAssets::open(&dir, origins).expect("open the bundle directory"));
+	let allowlist = Arc::new(SignInAllowlist::fixed(PUBLIC, origins).unwrap());
+	let router = mfe::mount(Router::new(), MfeAssets::open(&dir, allowlist).expect("open the bundle directory"));
 	(router, Bundles { dir: base, outside })
 }
 
@@ -478,6 +502,33 @@ async fn the_manifest_is_short_lived_and_hashed_bundles_are_immutable() {
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
 	assert!(body.is_empty(), "HEAD carries no body");
+
+	let (_, headers, _) = fetch(&router, Method::GET, "/auth/mfe/LICENSES.txt", None).await;
+	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300", "an all-caps name is no content hash");
+}
+
+async fn fetch_with(router: &Router, path: &str, name: header::HeaderName, value: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
+	let response = router.clone().oneshot(Request::get(path).header(name, value).body(Body::empty()).unwrap()).await.unwrap();
+	let (status, headers) = (response.status(), response.headers().clone());
+	(status, headers, axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec())
+}
+
+#[tokio::test]
+async fn the_bundles_revalidate_and_serve_ranges() {
+	let (router, _bundles) = bundles();
+	let (_, headers, _) = fetch(&router, Method::GET, "/auth/mfe/registry.json", None).await;
+	let etag = headers[header::ETAG].to_str().unwrap().to_owned();
+	assert!(headers.contains_key(header::LAST_MODIFIED));
+
+	let (status, headers, body) = fetch_with(&router, "/auth/mfe/registry.json", header::IF_NONE_MATCH, &etag).await;
+	assert_eq!(status, StatusCode::NOT_MODIFIED);
+	assert!(body.is_empty());
+	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300", "a 304 renews the same lifetime");
+
+	let (status, headers, body) = fetch_with(&router, "/auth/mfe/sign-in-ABCD2345.js", header::RANGE, "bytes=0-5").await;
+	assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+	assert_eq!(body, b"export");
+	assert_eq!(headers[header::CONTENT_TYPE], "text/javascript; charset=utf-8");
 }
 
 #[tokio::test]
@@ -522,10 +573,95 @@ async fn nothing_outside_the_files_is_served() {
 #[tokio::test]
 async fn a_missing_bundle_directory_is_not_mounted() {
 	let missing = std::env::temp_dir().join(format!("concierge-mfe-missing-{}", Uuid::new_v4().simple()));
-	assert!(MfeAssets::open(&missing, ScopeOrigins::none()).is_err());
+	let none = || Arc::new(SignInAllowlist::fixed(PUBLIC, ScopeOrigins::none()).unwrap());
+	assert!(MfeAssets::open(&missing, none()).is_err());
 	let file = std::env::temp_dir().join(format!("concierge-mfe-file-{}", Uuid::new_v4().simple()));
 	std::fs::write(&file, "not a directory").unwrap();
-	assert!(MfeAssets::open(&file, ScopeOrigins::none()).is_err());
+	assert!(MfeAssets::open(&file, none()).is_err());
 	// Best effort: a leftover temp file fails nothing.
 	let _ = std::fs::remove_file(&file);
+}
+
+// ── a live registry ────────────────────────────────────────────────────────────────
+
+/// Closing a scope, or dropping an origin from it, stops it being let in by the next
+/// reading of the registry — no restart.
+#[tokio::test]
+async fn a_closed_scope_or_a_removed_origin_stops_signing_in_without_a_restart() {
+	let pool = pool!();
+	let (router, _) = sign_in_surface(&pool).await;
+	let id = tag();
+	let origin = format!("https://{id}.evinvest.ltd");
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, origins, return_paths) VALUES ($1, $1, FALSE, 0, ARRAY[$2], ARRAY['/'])")
+		.bind(&id)
+		.bind(&origin)
+		.execute(&pool)
+		.await
+		.unwrap();
+	assert_eq!(
+		preflight(&router, "/auth/code/request", &origin, "POST").await.0,
+		StatusCode::NO_CONTENT,
+		"registered after the router was built"
+	);
+
+	sqlx::query("UPDATE tenants SET state = 'frozen' WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
+	assert_eq!(
+		preflight(&router, "/auth/code/request", &origin, "POST").await.0,
+		StatusCode::NO_CONTENT,
+		"a frozen scope still signs in"
+	);
+
+	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
+	let (_, headers) = preflight(&router, "/auth/code/request", &origin, "POST").await;
+	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "closed");
+	let (status, _, body) = call(
+		&router,
+		Method::POST,
+		"/auth/code/request",
+		&origin,
+		Some(json!({ "email": "x@example.com", "turnstileToken": "human" })),
+	)
+	.await;
+	assert_eq!((status, body), (StatusCode::FORBIDDEN, json!({ "error": "origin" })));
+
+	sqlx::query("UPDATE tenants SET state = 'active', origins = '{}' WHERE id = $1")
+		.bind(&id)
+		.execute(&pool)
+		.await
+		.unwrap();
+	let (_, headers) = preflight(&router, "/auth/code/request", &origin, "POST").await;
+	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "removed");
+}
+
+/// A row that does not decode costs its own scope, never the plane's start. The CHECKs
+/// make such a row unwritable, so this one is planted with them dropped — in a database
+/// of its own.
+#[tokio::test]
+async fn a_malformed_registry_row_is_left_out_not_fatal() {
+	let Some(url) = common::database_url() else { return };
+	let scratch = common::Scratch::create(&url).await;
+	for constraint in ["tenants_origins", "tenants_state"] {
+		sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE tenants DROP CONSTRAINT {constraint}")))
+			.execute(&scratch.pool)
+			.await
+			.unwrap();
+	}
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, origins) VALUES ('nulls', 'nulls', FALSE, 0, ARRAY[NULL]::TEXT[])")
+		.execute(&scratch.pool)
+		.await
+		.unwrap();
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, state) VALUES ('bogus', 'bogus', FALSE, 0, 'paused')")
+		.execute(&scratch.pool)
+		.await
+		.unwrap();
+
+	let repo = Arc::new(PgScopes::new(scratch.pool.clone()));
+	let ids: Vec<String> = repo.scopes().await.expect("the registry reads").into_iter().map(|s| s.id).collect();
+	assert_eq!(ids, vec!["invest", "sa"], "the two bad rows are left out");
+	assert!(repo.scope("nulls").await.unwrap().is_none());
+	assert!(repo.scope("invest").await.unwrap().is_some());
+	let allowlist = SignInAllowlist::live(repo, PUBLIC, Duration::ZERO).await.expect("the allowlist builds over a bad row");
+	assert!(allowlist.admits(INVEST).await);
+
+	scratch.drop_database().await;
 }

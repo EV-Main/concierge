@@ -16,6 +16,7 @@
 //! modules) minus everything banking: the money-plane pair is the cabinet's own
 //! concern, minted zone-side from the verified access token.
 
+pub mod allowlist;
 mod authorize;
 mod cors;
 mod kyc;
@@ -43,20 +44,16 @@ use evconcierge_auth::{AuthService, oauth::OAuthProvider};
 /// enforces. A test that hard-coded the number would keep passing after someone raised
 /// it, and the number is what stands between one account and the vendor balance.
 pub use kyc::START_MAX_PER_WINDOW;
-pub use passkey::verifier as passkey_verifier;
 pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
 use tokio::sync::Notify;
 pub use turnstile::{SITEVERIFY, Turnstile};
-use webauthn_rs::{
-	Webauthn,
-	prelude::{DiscoverableAuthentication, PasskeyRegistration},
-};
+use webauthn_rs::prelude::{DiscoverableAuthentication, PasskeyRegistration};
 
 use crate::{
 	ports::{CredentialRepository, GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
 	relying_party::RelyingParties,
-	web::{oauth::OAuthTxStore, origins::ScopeOrigins, passkey::Ceremonies, single_flight::KeyedLocks},
+	web::{allowlist::SignInAllowlist, oauth::OAuthTxStore, passkey::Ceremonies, single_flight::KeyedLocks},
 };
 
 /// Cookie names + shared attributes. `__Host-` prefixed when secure (production);
@@ -132,8 +129,7 @@ impl WebState {
 				turnstile: sign_in.turnstile,
 				credentials: sign_in.credentials,
 				mail_wake: sign_in.mail_wake,
-				webauthn: sign_in.webauthn,
-				scope_origins: sign_in.scope_origins,
+				allowlist: sign_in.allowlist,
 				passkey_registrations: Ceremonies::default(),
 				passkey_sign_ins: Ceremonies::default(),
 				public_origin: public_origin.trim_end_matches('/').to_string(),
@@ -159,11 +155,9 @@ pub struct SignInDeps {
 	pub credentials: Arc<dyn CredentialRepository>,
 	/// The mail dispatcher's wake-up: a queued code leaves now rather than on the next tick.
 	pub mail_wake: Arc<Notify>,
-	/// The WebAuthn verifier: its relying party is `PUBLIC_ORIGIN`'s host, and it accepts
-	/// that origin and the scope origins under it.
-	pub webauthn: Arc<Webauthn>,
-	/// The scope hosts the sign-in routes answer besides `PUBLIC_ORIGIN`.
-	pub scope_origins: ScopeOrigins,
+	/// The scope hosts the sign-in routes answer besides `PUBLIC_ORIGIN`, and the passkey
+	/// verifier built over them — both following the registry.
+	pub allowlist: Arc<SignInAllowlist>,
 }
 
 /// What the identity-verification routes need, gathered so the composition root hands
@@ -233,8 +227,8 @@ impl Inner {
 	/// a scope that still signs people in. Only the routes in `origins::SIGN_IN_ROUTES`
 	/// may ask; everything acting on an open session compares against `PUBLIC_ORIGIN`
 	/// alone.
-	fn sign_in_origin(&self, origin: &str) -> bool {
-		origin == self.public_origin || self.scope_origins.admits(origin)
+	async fn sign_in_origin(&self, origin: &str) -> bool {
+		origin == self.public_origin || self.allowlist.admits(origin).await
 	}
 }
 
@@ -264,8 +258,7 @@ struct Inner {
 	turnstile: Turnstile,
 	credentials: Arc<dyn CredentialRepository>,
 	mail_wake: Arc<Notify>,
-	webauthn: Arc<Webauthn>,
-	scope_origins: ScopeOrigins,
+	allowlist: Arc<SignInAllowlist>,
 	passkey_registrations: Ceremonies<(UserId, PasskeyRegistration)>,
 	passkey_sign_ins: Ceremonies<DiscoverableAuthentication>,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).

@@ -1,28 +1,25 @@
 //! Sign-in from a scope's hosts (`docs/SCOPES-AND-APPROVALS.md` §3.1): which foreign
 //! origins the sign-in routes answer, and where an OAuth sign-in may land on them.
 //!
-//! A snapshot taken at boot. The registry has no write RPC — origins, states and return
-//! paths change by migration, and a migration arrives with a boot — so reading the
-//! table on every preflight would buy nothing but a query.
+//! Kept current by `allowlist::SignInAllowlist`, which rebuilds a [`ScopeOrigins`] from
+//! the registry.
 
 use domain::scopes::{is_return_path, is_sign_in_origin};
 
 use crate::ports::ScopeRecord;
 
 /// Exact path + method of every route a scope origin may call. Closed on purpose: a
-/// route acting on an open session (password set, passkey register/remove, sessions,
-/// username, logout, `/kyc/*`) answers `PUBLIC_ORIGIN` alone, so a script on a scope's
-/// host can start a sign-in but never act for the account it signed in.
+/// route acting on an open session (email verification, password set, passkey
+/// register/remove, sessions, username, logout, `/kyc/*`) answers `PUBLIC_ORIGIN` alone,
+/// so a script on a scope's host can start a sign-in but never act for the account it
+/// signed in. Those routes carry the CSRF double-submit, whose cookie a scope host cannot
+/// read anyway; listing them would only promise a flow that cannot complete. A scope host
+/// proves a mailbox by signing in with a code (`/auth/code/request` + `verify`).
 pub(super) const SIGN_IN_ROUTES: &[SignInRoute] = &[
 	SignInRoute::post("/auth/code/request"),
 	SignInRoute::post("/auth/code/verify"),
 	SignInRoute::post("/auth/password/signin"),
 	SignInRoute::post("/auth/password/signup"),
-	// These two act on a session and keep its CSRF check: listing them lets a scope host
-	// READ the answer, it does not let it pass the double-submit, whose cookie it cannot
-	// read.
-	SignInRoute::post("/auth/email/verify/request").with_csrf_header(),
-	SignInRoute::post("/auth/email/verify/confirm").with_csrf_header(),
 	SignInRoute::post("/auth/passkey/signin/options"),
 	SignInRoute::post("/auth/passkey/signin/verify"),
 	SignInRoute {
@@ -45,13 +42,6 @@ impl SignInRoute {
 			path,
 			method: "POST",
 			request_headers: "content-type",
-		}
-	}
-
-	const fn with_csrf_header(self) -> Self {
-		Self {
-			request_headers: "content-type, x-ev-csrf",
-			..self
 		}
 	}
 }
@@ -201,6 +191,8 @@ mod tests {
 	fn the_route_list_is_closed() {
 		assert!(sign_in_route("/auth/session").is_some_and(|r| r.method == "GET"));
 		for acting in [
+			"/auth/email/verify/request",
+			"/auth/email/verify/confirm",
 			"/auth/password/set",
 			"/auth/passkey/register/options",
 			"/auth/passkey/remove",

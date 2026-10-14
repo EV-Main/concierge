@@ -82,17 +82,20 @@ impl SessionInfo {
 /// transaction server-side, and redirect the browser to the provider's consent screen.
 ///
 /// `returnTo` is a path on this origin, or — for a sign-in started on a scope's host — that
-/// host's origin plus one of its scope's `return_paths`, byte for byte. Any other absolute
-/// target is refused first, before even the provider is looked up, rather than quietly
-/// rewritten: a host that sent it has a registry entry to fix.
+/// host's origin plus one of its scope's `return_paths`, byte for byte. Any other ABSOLUTE
+/// target (one with a scheme) is refused first, before even the provider is looked up,
+/// rather than quietly rewritten: a host that sent it has a registry entry to fix.
+/// Everything else keeps its old answer — a relative or empty value lands on `/` — so no
+/// link that worked before this rule starts failing.
 pub async fn login(State(st): State<WebState>, jar: CookieJar, Query(q): Query<LoginQuery>) -> Result<(CookieJar, Redirect), (StatusCode, &'static str)> {
 	let st = &st.inner;
 	let return_to = match q.return_to.as_deref() {
-		Some(raw) if !raw.starts_with('/') => match st.scope_origins.is_return_target(raw) {
+		Some(raw) if has_scheme(raw) => match st.allowlist.current().await.origins.is_return_target(raw) {
 			true => raw.to_owned(),
 			false => return Err((StatusCode::BAD_REQUEST, "returnTo is not a registered landing")),
 		},
-		path => safe_return_to(path),
+		// A path, or anything else that is not a URL: the answer it always had.
+		other => safe_return_to(other),
 	};
 	// A link that names no provider predates the choice, and meant Google.
 	let provider = st
@@ -117,16 +120,16 @@ pub async fn callback(State(st): State<WebState>, Path(name): Path<String>, jar:
 	};
 	let return_to = tx.as_ref().map(|t| t.return_to.clone()).unwrap_or_else(|| "/".to_string());
 	if q.error.is_some() {
-		return fail(st, jar, &return_to, "denied");
+		return fail(st, jar, &return_to, "denied").await;
 	}
 	let (Some(code), Some(state_param), Some(tx)) = (q.code, q.state, tx) else {
-		return fail(st, jar, &return_to, "invalid");
+		return fail(st, jar, &return_to, "invalid").await;
 	};
 	let Some(provider) = st.provider(&name).filter(|p| p.name() == tx.provider) else {
-		return fail(st, jar, &return_to, "invalid");
+		return fail(st, jar, &return_to, "invalid").await;
 	};
 	if tx.state != state_param {
-		return fail(st, jar, &return_to, "invalid");
+		return fail(st, jar, &return_to, "invalid").await;
 	}
 
 	let identity = match provider.exchange_code(&code, &tx.code_verifier, &st.redirect_uri(provider.name()), &tx.nonce).await {
@@ -135,12 +138,12 @@ pub async fn callback(State(st): State<WebState>, Path(name): Path<String>, jar:
 			// The callback is outside the reporting interceptor: an incident is reported here or never.
 			evconcierge_auth::telemetry::report_unexpected(&e);
 			tracing::warn!(provider = provider.name(), error = %e, "auth callback: provider exchange failed");
-			return fail(st, jar, &return_to, "exchange");
+			return fail(st, jar, &return_to, "exchange").await;
 		}
 	};
 	let Ok(email) = Email::parse(&identity.email) else {
 		tracing::warn!(provider = provider.name(), "auth callback: provider answered an unusable email");
-		return fail(st, jar, &return_to, "exchange");
+		return fail(st, jar, &return_to, "exchange").await;
 	};
 	let provider_kind: Provider = provider.name().parse().expect("every OAuthProvider name is a domain Provider");
 	let proven = ProvenIdentity {
@@ -152,12 +155,15 @@ pub async fn callback(State(st): State<WebState>, Path(name): Path<String>, jar:
 		Ok(user) => user,
 		Err(e) => {
 			tracing::error!(error = %e, "auth callback: account resolution failed");
-			return fail(st, jar, &return_to, "session");
+			return fail(st, jar, &return_to, "session").await;
 		}
 	};
 	match open_session(st, jar, &headers, user.id()).await {
-		Ok(jar) => (clear_tx(st, jar), Redirect::to(&st.landing(&tx.return_to))),
-		Err((jar, reason)) => fail(st, jar, &return_to, reason),
+		Ok(jar) => {
+			let landing = st.landing(&tx.return_to).await;
+			(clear_tx(st, jar), Redirect::to(&landing))
+		}
+		Err((jar, reason)) => fail(st, jar, &return_to, reason).await,
 	}
 }
 
@@ -330,8 +336,8 @@ impl super::Inner {
 	/// Where a finished (or failed) OAuth trip sends the browser. Re-checked although
 	/// `login` admitted it: the transaction is in-process state, and the redirect is the
 	/// one place an unchecked value would become an open redirect.
-	fn landing(&self, return_to: &str) -> String {
-		match self.scope_origins.is_return_target(return_to) {
+	async fn landing(&self, return_to: &str) -> String {
+		match self.allowlist.current().await.origins.is_return_target(return_to) {
 			true => return_to.to_owned(),
 			false => safe_return_to(Some(return_to)),
 		}
@@ -486,6 +492,15 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
 	a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
+/// Whether `raw` starts with a URL scheme (`https:`, `javascript:` …) — i.e. names a
+/// target on some origin rather than a path on this one.
+fn has_scheme(raw: &str) -> bool {
+	raw.split_once(':').is_some_and(|(scheme, _)| {
+		let mut chars = scheme.chars();
+		chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+	})
+}
+
 /// Clear the OAuth transaction cookie.
 fn clear_tx(st: &super::Inner, jar: CookieJar) -> CookieJar {
 	jar.add(st.cookies.removal(st.cookies.oauth_tx.clone(), true))
@@ -500,8 +515,8 @@ fn clear_session(st: &super::Inner, jar: CookieJar) -> CookieJar {
 
 /// Abort the callback: clear the tx cookie and land the user back where they came
 /// from, signed out, with a machine-readable reason.
-fn fail(st: &super::Inner, jar: CookieJar, return_to: &str, reason: &str) -> (CookieJar, Redirect) {
-	let base = st.landing(return_to);
+async fn fail(st: &super::Inner, jar: CookieJar, return_to: &str, reason: &str) -> (CookieJar, Redirect) {
+	let base = st.landing(return_to).await;
 	let sep = if base.contains('?') { '&' } else { '?' };
 	(clear_tx(st, jar), Redirect::to(&format!("{base}{sep}auth_error={reason}")))
 }

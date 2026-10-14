@@ -19,8 +19,11 @@ use axum::{
 };
 use concierge::{
 	infrastructure::{db, governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
-	ports::{ScopeRepository, UserDirectoryRepository},
-	web::{self, KycDeps, origins::ScopeOrigins},
+	ports::UserDirectoryRepository,
+	web::{
+		self, KycDeps,
+		allowlist::{REFRESH_EVERY, SignInAllowlist},
+	},
 };
 use evconcierge_auth::{OAuthClientConfig, oauth::OAuthProvider};
 use serde_json::{Value, json};
@@ -84,7 +87,11 @@ async fn setup() -> Option<Fx> {
 	};
 	sign_in.providers.push(OAuthProvider::github_at(&client, &format!("{stub}/login/oauth/access_token"), &stub));
 	// The seeded registry: `invest` lands on `/cabinet`, `sa` on `/` and `/auth/login`.
-	sign_in.scope_origins = ScopeOrigins::from_scopes(&PgScopes::new(pool.clone()).scopes().await.expect("read the scope registry"));
+	sign_in.allowlist = Arc::new(
+		SignInAllowlist::live(Arc::new(PgScopes::new(pool.clone())), ORIGIN, REFRESH_EVERY)
+			.await
+			.expect("read the scope registry"),
+	);
 	let state = web::WebState::try_new(
 		common::signing_auth(users.clone()).await,
 		ORIGIN.to_string(),
@@ -287,10 +294,11 @@ async fn a_failed_trip_lands_back_on_the_scope_host_with_the_reason() {
 	assert_eq!(back.headers()[header::LOCATION], "https://sa.evinvest.ltd/?auth_error=denied");
 }
 
-/// Anything absolute that is not a scope origin plus one of THAT scope's return paths is
-/// refused before the provider is involved — `returnTo` must never be an open redirect.
+/// Anything absolute (with a scheme) that is not a scope origin plus one of THAT scope's
+/// return paths is refused before the provider is involved — `returnTo` must never be an
+/// open redirect.
 #[tokio::test]
-async fn a_return_to_outside_the_registry_is_refused() {
+async fn an_absolute_return_to_outside_the_registry_is_refused() {
 	let fx = fixture!();
 	for target in [
 		"https://evil.example/",
@@ -301,20 +309,25 @@ async fn a_return_to_outside_the_registry_is_refused() {
 		"https://invest.evinvest.ltd/cabinet#x",
 		"https://invest.evinvest.ltd.evil.example/cabinet",
 		"https://sa.evinvest.ltd/cabinet",
+		"https://evinvest.ltd/cabinet",
 		"http://invest.evinvest.ltd/cabinet",
-		"//evil.example/cabinet",
 		"javascript:alert(1)",
 	] {
 		let out = fx.login(target).await;
-		match target.starts_with('/') {
-			// A protocol-relative path keeps the old answer: it is rewritten to `/`, which
-			// is on this origin and so no redirect anywhere.
-			true => assert_eq!(out.status(), StatusCode::SEE_OTHER, "{target}"),
-			false => assert_eq!(out.status(), StatusCode::BAD_REQUEST, "{target}"),
-		}
-		assert!(
-			!out.headers().contains_key(header::SET_COOKIE) || target.starts_with('/'),
-			"{target}: no transaction is opened for a refused target"
-		);
+		assert_eq!(out.status(), StatusCode::BAD_REQUEST, "{target}");
+		assert!(!out.headers().contains_key(header::SET_COOKIE), "{target}: no transaction is opened for a refused target");
+	}
+}
+
+/// What worked before the registry keeps working: a value that is not a URL lands on `/`
+/// silently, as it always did, instead of failing the sign-in.
+#[tokio::test]
+async fn a_relative_or_empty_return_to_still_lands_on_the_root() {
+	let fx = fixture!();
+	for target in ["", "cabinet", "//evil.example/cabinet", "/\\evil.example"] {
+		let code = format!("code-{}", Uuid::new_v4().simple());
+		fx.will_answer(&code, github_id(), json!([{ "email": address("relative"), "primary": true, "verified": true }]));
+		let (landing, _) = fx.sign_in_returning(&code, target).await;
+		assert_eq!(landing, "/", "{target:?}");
 	}
 }

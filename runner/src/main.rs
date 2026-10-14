@@ -178,11 +178,15 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.sync_registry(|var| std::env::var(var).ok())
 		.await
 		.context("failed to load the relying-party registry")?;
-	// The scope registry, read once: its origins widen the sign-in routes' CORS and
-	// `Origin` check, the passkey verifier and OAuth `returnTo`, and they change only by
-	// migration — which arrives with a boot.
+	// The scope registry. Its origins widen the sign-in routes' CORS and `Origin` check,
+	// the passkey verifier, OAuth `returnTo` and the MFE bundles' CORS; the allowlist
+	// re-reads it at most `REFRESH_EVERY` apart, so closing a scope needs no restart.
 	let scope_repo: Arc<dyn concierge::ports::ScopeRepository> = Arc::new(infrastructure::scopes::PgScopes::new(pool.clone()));
-	let scope_origins = web::origins::ScopeOrigins::from_scopes(&scope_repo.scopes().await.context("failed to load the scope registry")?);
+	let allowlist = Arc::new(
+		web::allowlist::SignInAllowlist::live(scope_repo.clone(), &config.public_origin, web::allowlist::REFRESH_EVERY)
+			.await
+			.context("failed to build the sign-in allowlist")?,
+	);
 	let providers: Vec<OAuthProvider> = auth_config
 		.google
 		.iter()
@@ -367,8 +371,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			turnstile: web::Turnstile::new(config.turnstile_secret.clone(), web::SITEVERIFY.to_string()),
 			credentials: Arc::new(infrastructure::credentials::PgCredentials::new(pool.clone())),
 			mail_wake,
-			webauthn: Arc::new(web::passkey_verifier(&config.public_origin, scope_origins.origins())?),
-			scope_origins: scope_origins.clone(),
+			allowlist: allowlist.clone(),
 		},
 		web::KycDeps {
 			users: users.clone(),
@@ -385,7 +388,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	.context("failed to build the auth web state")?;
 	let web_listener = tokio::net::TcpListener::bind(config.web_bind).await.context("failed to bind the auth web listener")?;
 	tracing::info!(bind = %config.web_bind, "auth web surface listening");
-	let web_router = match mfe_assets(config.web_mfe_dir.as_deref(), scope_origins) {
+	let web_router = match mfe_assets(config.web_mfe_dir.as_deref(), allowlist) {
 		Some(assets) => web::mfe::mount(web::router(web_state), assets),
 		None => web::router(web_state),
 	};
@@ -552,12 +555,12 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 /// number behind every stored row. That is precisely the PII `0010_kyc_cases.sql` promises
 /// this database does not hold, handed over by a weak secret rather than by the schema.
 /// The bundles to serve under `/auth/mfe/*`, or `None` — logged — when there are none.
-fn mfe_assets(dir: Option<&str>, origins: web::origins::ScopeOrigins) -> Option<web::mfe::MfeAssets> {
+fn mfe_assets(dir: Option<&str>, allowlist: Arc<web::allowlist::SignInAllowlist>) -> Option<web::mfe::MfeAssets> {
 	let Some(dir) = dir else {
 		tracing::info!("WEB_MFE_DIR is unset: /auth/mfe/* is not served");
 		return None;
 	};
-	match web::mfe::MfeAssets::open(std::path::Path::new(dir), origins) {
+	match web::mfe::MfeAssets::open(std::path::Path::new(dir), allowlist) {
 		Ok(assets) => Some(assets),
 		Err(e) => {
 			tracing::error!(error = ?e, "micro-frontend bundles unavailable: /auth/mfe/* is not served");

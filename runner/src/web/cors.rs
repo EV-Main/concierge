@@ -23,19 +23,19 @@ use axum::{
 use crate::web::{WebState, origins::sign_in_route};
 
 /// How long a browser may reuse a preflight. Short: an origin dropped from the registry
-/// should stop being answered within minutes of the boot that dropped it.
+/// stops being answered within `allowlist::REFRESH_EVERY` here, and a cached preflight
+/// should not outlive that by much.
 const PREFLIGHT_MAX_AGE_SECS: &str = "600";
 
 pub(super) async fn sign_in(State(st): State<WebState>, request: Request, next: Next) -> Response {
 	let Some(route) = sign_in_route(request.uri().path()) else {
 		return next.run(request).await;
 	};
-	let allowed = request
-		.headers()
-		.get(ORIGIN)
-		.and_then(|v| v.to_str().ok())
-		.filter(|origin| st.inner.sign_in_origin(origin))
-		.and_then(|origin| HeaderValue::from_str(origin).ok());
+	let origin = request.headers().get(ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_owned);
+	let allowed = match origin {
+		Some(origin) if st.inner.sign_in_origin(&origin).await => HeaderValue::from_str(&origin).ok(),
+		_ => None,
+	};
 
 	if request.method() == Method::OPTIONS {
 		let asked = request.headers().get(ACCESS_CONTROL_REQUEST_METHOD).and_then(|v| v.to_str().ok());

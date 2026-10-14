@@ -6,6 +6,10 @@
 //! talk to the others, and nothing here names a person. A relying party's restricted token
 //! never reaches it — the layer admits that token on `GetMe` alone.
 //!
+//! It reads the same port the sign-in allowlist (`web::allowlist`) refreshes from, under
+//! the same rule for a malformed row (left out, reported), so both describe one registry;
+//! the RPC reads it on every call, the allowlist at most `REFRESH_EVERY` behind.
+//!
 //! `Result<_, Status>` is tonic's mandated handler signature; `Status` is a large type
 //! we don't control, so the large-err lint does not apply in this module.
 #![allow(clippy::result_large_err)]
@@ -91,11 +95,11 @@ impl ScopeRegistryRpc for ScopeRegistry {
 		if id == ROOT {
 			return Ok(Response::new(root()));
 		}
-		self.registered()
-			.await?
-			.into_iter()
-			.find(|scope| &scope.id == id)
-			.map(Response::new)
+		self.repo
+			.scope(id)
+			.await
+			.map_err(domain_to_status)?
+			.map(|scope| Response::new(wire(scope)))
 			.ok_or_else(|| Status::not_found("no such scope"))
 	}
 }

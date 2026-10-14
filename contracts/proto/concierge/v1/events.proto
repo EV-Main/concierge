@@ -48,6 +48,11 @@ message PullUserLifecycleResponse {
   // event returned when the rows after it were not the caller's to see, so a filtered
   // reader never re-scans them; the request's `after_position` unchanged when nothing was
   // scanned. To the unfiltered reader (the bridge token) it is the max position returned.
+  // A page that FILLS `limit` ends its scan at its last event, so then `next_position` is
+  // exactly that event's `position` — in particular `limit = 1` returning one event
+  // answers that event's position, which is what lets a consumer re-pull ONE parked event
+  // (`after_position = position - 1, limit = 1`) and know it got that one and no other.
+  // The scan may run past the last event only when the page did not fill.
   int64 next_position = 2;
 }
 
