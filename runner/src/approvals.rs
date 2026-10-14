@@ -190,7 +190,7 @@ pub fn approval_to(record: ApprovalRecord, reader: Reader) -> Approval {
 	};
 	let proposed_policy = match (&record.action, reader) {
 		(Some(rules::Action::InstallPolicy { scope, policy }), Reader::Decider | Reader::Bystander) => Some(policy_to(scope, policy.clone())),
-		(Some(rules::Action::InstallPolicy { .. } | rules::Action::GrantAdmin { .. }) | None, _) => None,
+		(Some(rules::Action::InstallPolicy { .. } | rules::Action::GrantAdmin { .. } | rules::Action::InstallPlatformPolicy { .. }) | None, _) => None,
 	};
 	let (requested_by, mut requested_by_email) = record.requested_by.map(|(_, p)| (p.auth_subject, p.email)).unwrap_or_default();
 	let mut vetoed_by = record.vetoed_by.map(|p| p.auth_subject).unwrap_or_default();
@@ -491,6 +491,45 @@ impl ApprovalService for Approvals {
 		Ok(Response::new(record))
 	}
 
+	async fn get_platform_approval_policy(&self, request: Request<cc::GetPlatformApprovalPolicyRequest>) -> Result<Response<cc::PlatformApprovalPolicy>, Status> {
+		let viewer = self.viewer(&request).await?;
+		if !viewer.owner {
+			return Err(Status::permission_denied("the platform's policy is the owners'"));
+		}
+		let (policy, roster_changed_at) = self.approvals.platform_policy().await.map_err(domain_to_status)?;
+		Ok(Response::new(cc::PlatformApprovalPolicy {
+			version: policy.version,
+			cooldown_secs: policy.cooldown_secs,
+			roster_changed_at,
+		}))
+	}
+
+	async fn propose_platform_policy_change(&self, request: Request<cc::ProposePlatformPolicyChangeRequest>) -> Result<Response<Approval>, Status> {
+		let caller = self.caller(&request).await?;
+		let viewer = self.approvals.viewer(caller).await.map_err(domain_to_status)?;
+		if !viewer.owner {
+			return Err(Status::permission_denied("the platform's policy change is opened by an owner"));
+		}
+		let req = request.into_inner();
+		let wanted = req.policy.ok_or_else(|| Status::invalid_argument("name the policy to install"))?;
+		rules::check_text("reason", &req.reason, REASON_BYTES).map_err(invalid)?;
+		let policy = rules::PlatformPolicy {
+			version: 0,
+			cooldown_secs: wanted.cooldown_secs,
+		};
+		policy.check().map_err(invalid)?;
+		let fields = vec![Field {
+			key: "cooldown_secs".into(),
+			value: FieldValue::Count(u64::from(policy.cooldown_secs)),
+		}];
+		// One live change at a time: every change of the platform's policy is about the
+		// same subject.
+		let subject_ref = format!("platform_policy:{}", derived_uuid("platform_policy"));
+		let action = rules::Action::InstallPlatformPolicy { policy };
+		let record = self.open_own(caller, rules::PLATFORM_POLICY, ROOT.to_owned(), subject_ref, fields, req.reason, action).await?;
+		Ok(Response::new(record))
+	}
+
 	async fn propose_scope_policy_change(&self, request: Request<ProposeScopePolicyChangeRequest>) -> Result<Response<Approval>, Status> {
 		let caller = self.caller(&request).await?;
 		let viewer = self.approvals.viewer(caller).await.map_err(domain_to_status)?;
@@ -532,10 +571,7 @@ impl ApprovalService for Approvals {
 		policy.check(&kinds).map_err(invalid)?;
 		// One live change per scope: the subject is the scope's policy, named by a UUID
 		// derived from the scope so every change of it collides on the live-subject index.
-		let digest = Sha256::digest(format!("scope_policy:{}", wanted.scope).as_bytes());
-		let mut bytes = [0u8; 16];
-		bytes.copy_from_slice(&digest[..16]);
-		let subject_ref = format!("scope_policy:{}", Uuid::from_bytes(bytes));
+		let subject_ref = format!("scope_policy:{}", derived_uuid(&format!("scope_policy:{}", wanted.scope)));
 		let fields = rules::policy_fields(&policy);
 		let action = rules::Action::InstallPolicy {
 			scope: wanted.scope.clone(),
@@ -577,6 +613,7 @@ impl Approvals {
 			client: String::new(),
 			exclude: Some(opener),
 			action: Some(action),
+			proven: None,
 		};
 		let record = match self.approvals.propose(new).await.map_err(domain_to_status)? {
 			Proposed::Opened(record) | Proposed::Existing(record) => record,
@@ -593,13 +630,26 @@ impl Approvals {
 #[derive(Clone)]
 pub struct ApprovalExecution {
 	callers: ServiceCallers,
+	/// `None` where this plane verifies no tokens: a proposal presenting one is refused.
+	user_tokens: Option<Arc<dyn crate::ports::UserTokenVerifier>>,
 	approvals: Arc<dyn ApprovalRepository>,
 	catalogs: Arc<dyn ScopeCatalogRepository>,
 }
 
 impl ApprovalExecution {
+	/// This plane's verifier, for the user token a proposer presents beside `requested_by`.
+	pub fn with_user_tokens(mut self, tokens: Arc<dyn crate::ports::UserTokenVerifier>) -> Self {
+		self.user_tokens = Some(tokens);
+		self
+	}
+
 	pub fn new(callers: ServiceCallers, approvals: Arc<dyn ApprovalRepository>, catalogs: Arc<dyn ScopeCatalogRepository>) -> Self {
-		Self { callers, approvals, catalogs }
+		Self {
+			callers,
+			user_tokens: None,
+			approvals,
+			catalogs,
+		}
 	}
 
 	async fn caller<T>(&self, request: &Request<T>) -> Result<ServiceCaller, Status> {
@@ -613,6 +663,29 @@ impl ApprovalExecution {
 			Some(record) if record.proposer == namespace => Ok(record),
 			_ => Err(hidden()),
 		}
+	}
+}
+
+impl ApprovalExecution {
+	/// The account the proposer proved asked for it: the subject of this plane's own access
+	/// token, presented in `x-ev-user-token` beside `requested_by` (D24(1)). No token: the
+	/// name is information and proves nothing. Whether it is `requested_by`'s, and still
+	/// speaks for an active account, is decided where the proposal is opened.
+	async fn proven_initiator(&self, token: &Option<String>, requested_by: &str) -> Result<Option<(UserId, u64)>, Status> {
+		let Some(token) = token else { return Ok(None) };
+		if requested_by.is_empty() {
+			return Err(Status::invalid_argument("a user token proves who asked: name them in requested_by"));
+		}
+		let tokens = self.user_tokens.as_ref().ok_or_else(|| Status::unauthenticated("no user token can be verified on this plane"))?;
+		let claims = tokens.verify(token).await.map_err(|err| match err {
+			evconcierge_auth::AuthError::Unavailable => Status::unavailable("user token not verifiable now"),
+			_ => Status::unauthenticated("invalid user token"),
+		})?;
+		if !claims.is_access() {
+			return Err(Status::unauthenticated("invalid user token"));
+		}
+		let user = Uuid::parse_str(&claims.sub).map_err(|_| Status::unauthenticated("invalid user token"))?;
+		Ok(Some((UserId::from_raw(user), claims.token_version)))
 	}
 }
 
@@ -631,6 +704,10 @@ impl ApprovalExecutionService for ApprovalExecution {
 			return Err(Status::failed_precondition("the scope is closed: nothing new is accepted from it"));
 		}
 		let namespace = caller.namespace().to_owned();
+		let request_token = request
+			.metadata()
+			.get(crate::scope_inbox::USER_TOKEN_HEADER)
+			.map(|v| v.to_str().map(str::to_owned).unwrap_or_default());
 		let req = request.into_inner();
 		if req.kind.split_once(':').map(|(ns, _)| ns) != Some(namespace.as_str()) {
 			return Err(Status::permission_denied(format!("a proposal is opened only by its kind's namespace; yours is `{namespace}`")));
@@ -655,6 +732,7 @@ impl ApprovalExecutionService for ApprovalExecution {
 		if !req.requested_by.is_empty() {
 			rules::check_auth_subject("requested_by", &req.requested_by).map_err(invalid)?;
 		}
+		let proven = self.proven_initiator(&request_token, &req.requested_by).await?;
 		let fields = req.fields.into_iter().map(field_from).collect::<Result<Vec<_>, _>>()?;
 		let fields = rules::check_fields(&kind, fields).map_err(invalid)?;
 		let payload_hash = hex(&Sha256::digest(rules::payload_preimage(&kind.name, &req.scope, &req.subject_ref, &fields)));
@@ -677,6 +755,7 @@ impl ApprovalExecutionService for ApprovalExecution {
 			client,
 			exclude: None,
 			action: None,
+			proven,
 		};
 		let record = match self.approvals.propose(new).await.map_err(domain_to_status)? {
 			Proposed::Opened(record) => {
@@ -758,6 +837,15 @@ impl ApprovalExecutionService for ApprovalExecution {
 		tracing::info!(approval = %id, outcome = outcome.as_str(), by = caller.publisher(), "approval outcome reported");
 		Ok(Response::new(approval_to(record, Reader::Service)))
 	}
+}
+
+/// A UUID that names one fixed subject — a scope's policy, the platform's — so every
+/// proposal about it collides on the live-subject index.
+fn derived_uuid(name: &str) -> Uuid {
+	let digest = Sha256::digest(name.as_bytes());
+	let mut bytes = [0u8; 16];
+	bytes.copy_from_slice(&digest[..16]);
+	Uuid::from_bytes(bytes)
 }
 
 fn hex(bytes: &[u8]) -> String {

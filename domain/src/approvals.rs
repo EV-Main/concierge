@@ -64,6 +64,50 @@ pub const MIN_SCOPE_TTL_SECS: u32 = 60 * 60;
 pub const OWN_NAMESPACE: &str = "concierge";
 pub const SCOPE_ADMIN_GRANT: &str = "concierge:scope_admin_grant";
 pub const SCOPE_POLICY_CHANGE: &str = "concierge:scope_policy_change";
+pub const PLATFORM_POLICY: &str = "concierge:platform_policy";
+
+/// How long platform decisions pause after the owner roster changes, until the owners set
+/// another (D24(2)): long enough for the owners who were there before to notice a seat
+/// that should not have moved, and to act on it before anyone decides with the new roster.
+pub const DEFAULT_COOLDOWN_SECS: u32 = 48 * 60 * 60;
+/// The longest pause the owners may set: two weeks. Longer would let one decision of theirs
+/// freeze every platform decision — payments included — for a quarter.
+pub const MAX_COOLDOWN_SECS: u32 = 14 * 24 * 60 * 60;
+/// The version of a platform policy nobody has changed yet.
+pub const DEFAULT_PLATFORM_POLICY_VERSION: u64 = 1;
+
+/// The platform's approval policy: its roster, quorum and delay are the owners'
+/// consilium's; what it sets is the pause after the owners change.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlatformPolicy {
+	pub version: u64,
+	pub cooldown_secs: u32,
+}
+
+impl Default for PlatformPolicy {
+	fn default() -> Self {
+		Self {
+			version: DEFAULT_PLATFORM_POLICY_VERSION,
+			cooldown_secs: DEFAULT_COOLDOWN_SECS,
+		}
+	}
+}
+
+impl PlatformPolicy {
+	pub fn check(&self) -> Result<(), String> {
+		if self.cooldown_secs > MAX_COOLDOWN_SECS {
+			return Err(format!("cooldown_secs is 0..={MAX_COOLDOWN_SECS} (fourteen days)"));
+		}
+		Ok(())
+	}
+
+	/// Whether a platform decision may open at `now`, the owners having last changed at
+	/// `roster_changed_at`; `Err` names when they may again.
+	pub fn admits(&self, roster_changed_at: i64, now: i64) -> Result<(), i64> {
+		let reopens = roster_changed_at.saturating_add(i64::from(self.cooldown_secs));
+		if now < reopens { Err(reopens) } else { Ok(()) }
+	}
+}
 /// What `void_reason` says of a decision nobody executed in time.
 pub const LAPSED: &str = "not executed within 72 hours of becoming executable";
 
@@ -218,6 +262,14 @@ pub fn builtin_kinds() -> Vec<ApprovalKind> {
 			],
 			escalations: Vec::new(),
 		},
+		ApprovalKind {
+			name: PLATFORM_POLICY.into(),
+			label: "Change the platform's approval policy".into(),
+			description: "Set how long platform decisions pause after the owner roster changes.".into(),
+			level: ApprovalLevel::Platform,
+			fields: vec![field("cooldown_secs", "Pause after the owners change, seconds", FieldType::Count)],
+			escalations: Vec::new(),
+		},
 	]
 }
 
@@ -232,6 +284,8 @@ pub enum Action {
 	GrantAdmin { user: uuid::Uuid, scope: String, granted_by: uuid::Uuid },
 	/// Install `policy` as `scope`'s next version.
 	InstallPolicy { scope: String, policy: ScopePolicy },
+	/// Install `policy` as the platform's next version.
+	InstallPlatformPolicy { policy: PlatformPolicy },
 }
 
 /// The fields a policy change shows its voters, every override with its value among them.
@@ -1232,6 +1286,22 @@ mod tests {
 		};
 		assert_ne!(with("500"), with("900"));
 		assert!(with("500").contains("threshold\tTEXT\tbank:account_transfer/per_operation=500\n"));
+	}
+
+	#[test]
+	fn the_platform_pauses_after_the_owners_change() {
+		let policy = PlatformPolicy::default();
+		assert_eq!(policy.admits(1000, 1000 + i64::from(DEFAULT_COOLDOWN_SECS) - 1), Err(1000 + i64::from(DEFAULT_COOLDOWN_SECS)));
+		assert_eq!(policy.admits(1000, 1000 + i64::from(DEFAULT_COOLDOWN_SECS)), Ok(()));
+		assert_eq!(PlatformPolicy { cooldown_secs: 0, ..policy }.admits(1000, 1000), Ok(()));
+		assert!(
+			PlatformPolicy {
+				cooldown_secs: MAX_COOLDOWN_SECS + 1,
+				..policy
+			}
+			.check()
+			.is_err()
+		);
 	}
 
 	#[test]

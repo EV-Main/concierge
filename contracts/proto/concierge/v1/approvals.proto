@@ -22,9 +22,10 @@ package concierge.v1;
 //   APPROVAL_LEVEL_PLATFORM — the platform owners (persisted `owner` seats, never
 //                             break-glass);
 //   APPROVAL_LEVEL_SCOPE    — the active holders of `<scope>:admin`.
-// Nobody is excluded from the roster of a service's proposal: a service cannot prove which
-// person asked it, so the person it names (`requested_by`) is information, not a fact the
-// quorum can rest on. The opener of a `concierge:*` proposal is proven by their session
+// Nobody is excluded from the roster of a service's proposal on a name alone: a service
+// cannot prove which person asked it, so the person it names (`requested_by`) is
+// information, not a fact the quorum can rest on — unless the service presents that
+// person's own access token, which keeps them off a PLATFORM roster (see Propose). The opener of a `concierge:*` proposal is proven by their session
 // and is kept off its roster: they do not vote on what they asked for. A FOR counts only
 // while its voter still holds the seat the roster was drawn from.
 // A passed proposal waits out its veto delay, after which the proposer PULLS it,
@@ -104,6 +105,15 @@ service ApprovalService {
   // scope is live at a time. Installed as the scope's next `version`. Compartment limits are
   // not part of it: they are the money plane's `bank:compartment_policy`.
   rpc ProposeScopePolicyChange(ProposeScopePolicyChangeRequest) returns (Approval);
+
+  // The platform's approval policy and when the owner roster last changed. Persisted
+  // owners only.
+  rpc GetPlatformApprovalPolicy(GetPlatformApprovalPolicyRequest) returns (PlatformApprovalPolicy);
+
+  // Open `concierge:platform_policy`: replace the platform's approval policy. Platform
+  // level, opened by a persisted owner, who is kept off the roster. `cooldown_secs` is
+  // 0..=1209600 (14 days; INVALID_ARGUMENT otherwise). One change is live at a time.
+  rpc ProposePlatformPolicyChange(ProposePlatformPolicyChangeRequest) returns (Approval);
 }
 
 // ApprovalExecutionService — the proposing services. Every RPC acts only on kinds of the
@@ -122,8 +132,19 @@ service ApprovalExecutionService {
   // `^[a-z][a-z0-9_]*:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` or
   // longer than 128 bytes (the same pattern banking scope/v1 enforces), a
   // USER field or `requested_by` naming no account. FAILED_PRECONDITION: the scope is
-  // not ACTIVE, or the resolved roster is too small to decide (fewer than two platform
-  // owners). PERMISSION_DENIED: a relying party naming a scope other than its own.
+  // not ACTIVE; the resolved roster is too small to decide (fewer than two platform
+  // owners, or fewer than two besides a proven initiator); or the proposal resolves to
+  // PLATFORM while the platform pauses after a change of its owners (PlatformApprovalPolicy
+  // `cooldown_secs` from `roster_changed_at`). PERMISSION_DENIED: a relying party naming a
+  // scope other than its own; a user token that is not `requested_by`'s or no longer
+  // speaks for an active account. UNAUTHENTICATED: a user token this plane does not verify.
+  //
+  // Metadata `x-ev-user-token`: optionally, `requested_by`'s own access token of this plane
+  // (`typ=access`, verified as every RPC of this plane verifies one; `requested_by`
+  // required with it). It PROVES who asked, and when the proposal resolves to PLATFORM that
+  // person is kept off its roster (D24(1)) — two other owners must remain. Without it the
+  // name is information and its holder votes like anyone. Every live PLATFORM proposal is
+  // VOID the moment the owner roster changes (`void_reason` says so).
   // RESOURCE_EXHAUSTED: the namespace already holds 200 live (OPEN, or PASSED and not
   // lapsed) proposals in this scope. ALREADY_EXISTS: a live
   // (OPEN or PASSED) proposal of the same kind, scope and subject_ref exists — one
@@ -312,8 +333,30 @@ message ApprovalFieldValue {
   }
 }
 
-// A scope's approval policy. The platform level has no policy of its own: its roster,
-// quorum and delay are the owners' consilium's.
+// The platform's approval policy. Its roster, quorum and delay are the owners'
+// consilium's; what it sets is how long platform decisions pause after the owners change.
+message PlatformApprovalPolicy {
+  // 1 until the first executed `concierge:platform_policy`; bumped by each one.
+  uint64 version = 1;
+  // After any change of the owner roster — a seat granted or taken, an owner suspended or
+  // reinstated — no PLATFORM-level proposal opens for this long (FAILED_PRECONDITION),
+  // and every live one is VOID at the change. Default 172800 (48 h).
+  uint32 cooldown_secs = 2;
+  // Unix SECONDS of the last change of the owner roster; 0 if none since this was
+  // introduced. Read-only: ignored in a proposal.
+  int64 roster_changed_at = 3;
+}
+
+message GetPlatformApprovalPolicyRequest {}
+
+message ProposePlatformPolicyChangeRequest {
+  // `version` and `roster_changed_at` are ignored.
+  PlatformApprovalPolicy policy = 1;
+  // Required.
+  string reason = 2;
+}
+
+// A scope's approval policy. The platform level has its own (PlatformApprovalPolicy).
 message ScopeApprovalPolicy {
   string scope = 1;
   // Bumped on every executed scope_policy_change; a proposal records the version it was

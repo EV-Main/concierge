@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use domain::{
 	approvals::{
 		self, Action, Decision, EXECUTION_WINDOW_SECS, Field, FieldValue, MAX_LIVE_PER_PROPOSER, MAX_TTL_SECS, Outcome, PLATFORM_DELAY_SECS, PLATFORM_MIN_ROSTER, PLATFORM_QUORUM_BPS,
-		PULL_MARGIN_SECS, ROLLING_WINDOW_SECS, ScopePolicy, Vote, Voter,
+		PULL_MARGIN_SECS, PlatformPolicy, ROLLING_WINDOW_SECS, ScopePolicy, Vote, Voter,
 	},
 	error::DomainError,
 	scope_catalog::ApprovalLevel,
@@ -466,6 +466,22 @@ impl ApprovalRepository for PgApprovals {
 			),
 			None => None,
 		};
+		// A token proves who asked only if it is that person's, still standing as it was
+		// when the token was minted.
+		if let Some((proven, token_version)) = new.proven {
+			if requested_by != Some(proven.raw()) {
+				return Err(DomainError::Forbidden("the user token is not requested_by's".into()));
+			}
+			let standing: Option<(String, i64)> = sqlx::query_as("SELECT status, token_version FROM users WHERE id = $1")
+				.bind(proven.raw())
+				.fetch_optional(&mut *tx)
+				.await
+				.map_err(repo_err)?;
+			let live = standing.is_some_and(|(status, floor)| status == "active" && u64::try_from(floor).is_ok_and(|floor| token_version >= floor));
+			if !live {
+				return Err(DomainError::Forbidden("the user token no longer speaks for an active account".into()));
+			}
+		}
 		for field in &new.fields {
 			if let FieldValue::User(subject) = &field.value
 				&& user_by_subject(&mut tx, subject).await?.is_none()
@@ -548,6 +564,20 @@ impl ApprovalRepository for PgApprovals {
 			_ => Vec::new(),
 		};
 		let resolution = approvals::resolve_level(new.kind.level, in_root, fired, admins.len());
+		if resolution.level == ApprovalLevel::Platform {
+			// FOR SHARE: a change of the owners stamps this row first, so it either waits for
+			// this open to commit and then voids it, or commits first and is seen here.
+			let changed_at: i64 = sqlx::query_scalar("SELECT changed_at FROM platform_roster FOR SHARE")
+				.fetch_one(&mut *tx)
+				.await
+				.map_err(repo_err)?;
+			let platform = current_platform_policy(&mut tx).await?;
+			if let Err(reopens) = platform.admits(changed_at, now) {
+				return Err(DomainError::Precondition(format!(
+					"the platform owners changed at {changed_at}: no platform decision opens before {reopens}"
+				)));
+			}
+		}
 		let policy_version = policy.as_ref().map_or(0, |p| p.version);
 		let (roster, quorum_bps, delay_secs, ttl_secs) = match (resolution.level, &policy) {
 			(ApprovalLevel::Scope, Some(policy)) => (admins, policy.quorum_bps, policy.delay_secs, policy.ttl_secs.min(MAX_TTL_SECS)),
@@ -560,9 +590,23 @@ impl ApprovalRepository for PgApprovals {
 				(owners, PLATFORM_QUORUM_BPS, PLATFORM_DELAY_SECS, MAX_TTL_SECS)
 			}
 		};
-		let roster: Vec<UserId> = roster.into_iter().filter(|u| Some(*u) != new.exclude).collect();
+		// A service's proven initiator leaves a platform roster only (D24(1)); a scope's
+		// admins decide their own scope as they always did.
+		let proven_out = match (resolution.level, new.proven) {
+			(ApprovalLevel::Platform, Some((initiator, _))) => Some(initiator),
+			(ApprovalLevel::Platform | ApprovalLevel::Scope, _) => None,
+		};
+		let before = roster.len();
+		let roster: Vec<UserId> = roster.into_iter().filter(|u| Some(*u) != new.exclude && Some(*u) != proven_out).collect();
 		if roster.is_empty() {
 			return Err(DomainError::Precondition("nobody but the one who asked could decide it".into()));
+		}
+		// A service's proposal keeps its floor of two deciders even with the initiator gone:
+		// one owner must not decide another's money alone.
+		if roster.len() < before && new.proposer != approvals::OWN_NAMESPACE && roster.len() < PLATFORM_MIN_ROSTER {
+			return Err(DomainError::Precondition(format!(
+				"not enough owners besides the initiator: {PLATFORM_MIN_ROSTER} others must decide it"
+			)));
 		}
 		let threshold = approvals::threshold(roster.len(), quorum_bps);
 		let mut decision = Decision::open(&roster, threshold, i64::from(delay_secs), now + i64::from(ttl_secs));
@@ -781,6 +825,12 @@ impl ApprovalRepository for PgApprovals {
 		Ok(row.map(|(subject, verified)| (id, subject, verified)))
 	}
 
+	async fn platform_policy(&self) -> Result<(PlatformPolicy, i64), DomainError> {
+		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+		let changed_at: i64 = sqlx::query_scalar("SELECT changed_at FROM platform_roster").fetch_one(&mut *conn).await.map_err(repo_err)?;
+		Ok((current_platform_policy(&mut conn).await?, changed_at))
+	}
+
 	async fn execute(&self, id: Uuid) -> Result<Option<Outcome>, DomainError> {
 		let (mut tx, mut record, now) = self.begin_locked(id).await?;
 		if record.proposer != approvals::OWN_NAMESPACE {
@@ -799,6 +849,13 @@ impl ApprovalRepository for PgApprovals {
 			Some(Action::GrantAdmin { user, scope, granted_by }) => match grant_by_approval(&mut tx, UserId::from_raw(*user), scope, UserId::from_raw(*granted_by), id, now).await? {
 				ApprovedGrant::Granted | ApprovedGrant::AlreadyHeld => None,
 				ApprovedGrant::Inapplicable(why) => Some(why.to_owned()),
+			},
+			Some(Action::InstallPlatformPolicy { policy }) => match policy.check() {
+				Err(why) => Some(why),
+				Ok(()) => {
+					install_platform_policy(&mut tx, policy, id, now).await?;
+					None
+				}
 			},
 			Some(Action::InstallPolicy { scope, policy }) => {
 				let kinds = scope_catalogs::current_kinds(&mut *tx).await?;
@@ -879,6 +936,37 @@ async fn current_policy(conn: &mut PgConnection, scope: &str) -> Result<ScopePol
 		ttl_secs: positive(ttl_secs, "ttl_secs")?,
 		thresholds: serde_json::from_value(thresholds).map_err(|e| DomainError::Repository(format!("stored policy thresholds are unreadable: {e}")))?,
 	})
+}
+
+/// The platform's policy in force: its newest installed version, else the default.
+async fn current_platform_policy(conn: &mut PgConnection) -> Result<PlatformPolicy, DomainError> {
+	let row: Option<(i64, i32)> = sqlx::query_as("SELECT version, cooldown_secs FROM platform_approval_policies ORDER BY version DESC LIMIT 1")
+		.fetch_optional(conn)
+		.await
+		.map_err(repo_err)?;
+	let Some((version, cooldown_secs)) = row else {
+		return Ok(PlatformPolicy::default());
+	};
+	Ok(PlatformPolicy {
+		version: unsigned(version, "platform policy version")?,
+		cooldown_secs: u32::try_from(cooldown_secs).map_err(|_| DomainError::Repository("platform_approval_policies.cooldown_secs is negative".into()))?,
+	})
+}
+
+/// Install `policy` as the platform's next version, on the authority of executed approval
+/// `id`.
+async fn install_platform_policy(conn: &mut PgConnection, policy: &PlatformPolicy, id: Uuid, now: i64) -> Result<(), DomainError> {
+	advisory_lock(conn, "platform_policy").await?;
+	let next = current_platform_policy(conn).await?.version + 1;
+	sqlx::query("INSERT INTO platform_approval_policies (version, cooldown_secs, approval_id, installed_at) VALUES ($1, $2, $3, $4)")
+		.bind(i64::try_from(next).map_err(|_| DomainError::Repository("platform policy version overflows".into()))?)
+		.bind(i32::try_from(policy.cooldown_secs).map_err(|_| DomainError::Repository("a cooldown overflows".into()))?)
+		.bind(id)
+		.bind(now)
+		.execute(conn)
+		.await
+		.map_err(repo_err)?;
+	Ok(())
 }
 
 /// Install `policy` as `scope`'s next version, on the authority of executed approval `id`.

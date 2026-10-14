@@ -25,7 +25,7 @@
 
 use async_trait::async_trait;
 use domain::{
-	approvals::{Action, ApprovalState, Decision, Field, Outcome, ScopePolicy, Vote as ApprovalVote},
+	approvals::{Action, ApprovalState, Decision, Field, Outcome, PlatformPolicy, ScopePolicy, Vote as ApprovalVote},
 	architecture::{Reader, Repository},
 	auth::ProvenIdentity,
 	authz::Role,
@@ -536,6 +536,26 @@ pub struct NewApproval {
 	pub exclude: Option<UserId>,
 	/// What this plane's executor does once it passes; `concierge:*` kinds only.
 	pub action: Option<Action>,
+	/// The account a service proved asked for it — the subject of the user access token it
+	/// presented, and that token's `token_version` — when it presented one. The adapter
+	/// holds it against `requested_by` and, for a platform decision, keeps them off the
+	/// roster (D24(1)).
+	pub proven: Option<(UserId, u64)>,
+}
+
+/// This plane's own token verifier as an approval sees it: whose access token a proposer
+/// presented beside `requested_by` (D24(1)). A port, so the rule can be exercised without a
+/// signing key; production mounts `evconcierge_auth::Verifier`.
+#[async_trait]
+pub trait UserTokenVerifier: Send + Sync {
+	async fn verify(&self, token: &str) -> Result<evconcierge_auth::Claims, evconcierge_auth::AuthError>;
+}
+
+#[async_trait]
+impl UserTokenVerifier for evconcierge_auth::Verifier {
+	async fn verify(&self, token: &str) -> Result<evconcierge_auth::Claims, evconcierge_auth::AuthError> {
+		evconcierge_auth::Verifier::verify(self, token).await
+	}
 }
 
 /// Whom a person-facing RPC names: by id, or by a handle resolved as
@@ -663,6 +683,9 @@ pub trait ApprovalRepository: Send + Sync {
 	/// An ACTIVE account, its `auth_subject` and whether its address is verified. A handle
 	/// naming several accounts names nobody (`Validation`).
 	async fn person(&self, who: PersonRef<'_>) -> Result<Option<(UserId, String, bool)>, DomainError>;
+
+	/// The platform's policy in force and when the owner roster last changed.
+	async fn platform_policy(&self) -> Result<(PlatformPolicy, i64), DomainError>;
 
 	/// Carry out one passed `concierge:*` proposal and record its outcome, in one
 	/// transaction. `None` when it is not (or no longer) this plane's to execute now.
