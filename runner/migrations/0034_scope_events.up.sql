@@ -36,7 +36,7 @@
 -- trigger SHARE ROW EXCLUSIVE on `tenants`; every `GetMe` reads `tenants` and migrations run
 -- ON BOOT. SET LOCAL: a session SET would outlive this migration on the pooled connection.
 --
--- REVERSIBILITY: `0033_scope_events.down.sql` drops all of it. Lossy: the stream positions
+-- REVERSIBILITY: `0034_scope_events.down.sql` drops all of it. Lossy: the stream positions
 -- relying parties hold become meaningless (a re-run starts again from 1) and every
 -- published scope catalog is lost until its publisher republishes.
 SET LOCAL lock_timeout = '3s';

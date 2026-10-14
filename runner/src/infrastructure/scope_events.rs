@@ -1,5 +1,5 @@
 //! Postgres adapter for the relying-party streams (`scope_members`, `scope_outbox`,
-//! migration 0033).
+//! migration 0034).
 //!
 //! The WRITES are free functions on an open transaction, called by the adapters whose
 //! transactions change what an event describes — a grant or revocation
@@ -74,7 +74,7 @@ struct GrantsJson {
 	permissions: Vec<String>,
 }
 
-/// `scope_snapshot()`'s shape (migration 0033).
+/// `scope_snapshot()`'s shape (migration 0034).
 #[derive(Deserialize)]
 struct ScopeJson {
 	id: String,

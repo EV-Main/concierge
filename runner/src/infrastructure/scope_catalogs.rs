@@ -1,4 +1,4 @@
-//! Postgres adapter for scope catalogs (`scope_catalogs`, migration 0033): every catalog
+//! Postgres adapter for scope catalogs (`scope_catalogs`, migration 0034): every catalog
 //! a namespace ever published, one row per version, the newest in force.
 
 use async_trait::async_trait;

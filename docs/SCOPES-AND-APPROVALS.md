@@ -172,7 +172,7 @@ is unaffected; the image sets it only once `web/` exists in this repository.
 
 ### 4.1 Visibility
 
-Implemented in `runner/` as `scope_members` (migration 0033): a row is inserted, never
+Implemented in `runner/` as `scope_members` (migration 0034): a row is inserted, never
 deleted, on the user's first relying-party session with one of the scope's clients
 (`joined_by = sign_in`) or their first grant in its namespace (`grant`), in the same
 transaction. Grants and sessions that predate the table are backfilled at boot.
