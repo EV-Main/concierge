@@ -33,6 +33,10 @@ export const AUTH_ERRORS = [
   "invalid_ticket",
   "invalid_channel",
   "unknown_topic",
+  "invalid_view",
+  "origin_not_allowed",
+  "platform_only",
+  "forbidden",
   "unavailable",
   "internal",
 ] as const;

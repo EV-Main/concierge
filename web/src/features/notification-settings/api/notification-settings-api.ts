@@ -1,6 +1,9 @@
 // Delivery preferences (concierge runner/src/web/account.rs). Platform origin only, the
-// writes CSRF-checked. A plane without the routes answers 404, which the section shows as
-// "not available yet" rather than as a failure.
+// writes CSRF-checked. The plane picks the inbox by the request's Origin, so from here it is
+// the platform's: the two channels and the built-in and money-plane topics. A scope's own
+// topics never appear here; the scope's backend serves them (ScopeInboxService). A plane
+// without the routes answers 404, which the section shows as "not available yet" rather
+// than as a failure.
 
 import type { AuthApi } from "../../../shared/api/auth-api";
 import { bool, isRecord, listOf, str } from "../../../shared/lib/guard";

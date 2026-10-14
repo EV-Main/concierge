@@ -3,7 +3,7 @@
 Three self-registering custom elements, each a single ESM file with its own React,
 rendered in the host's light DOM with the shared `@evinvest/uikit` tokens. Hosts mount
 them through [`@evinvest/mfe`](https://github.com/EV-Main/lib/tree/main/ts/mfe) /
-`@evinvest/concierge` (registry, loader, events, `apiVersion` 2).
+`@evinvest/concierge` ([`../sdk`](../sdk)) (registry, loader, events, `apiVersion` 2).
 
 | Element | Registry name | Kind |
 | --- | --- | --- |
@@ -24,13 +24,19 @@ username, notification settings, platform sign-out — is a link to
 `https://evinvest.ltd/admin/account`. On the platform origin they do it in place.
 `src/shared/config/origin.ts` (`isPlatformPage`) is that switch.
 
+Notification settings are per inbox: the plane picks it by the request's `Origin`. From
+the platform the account page shows the platform's inbox (the two delivery channels, the
+built-in and money-plane topics). A scope's own topics are not on that page and are not
+reachable from a scope host's browser either; the scope's backend reads and writes them
+through `ScopeInboxService`, and the host renders them itself.
+
 Sign-out on a scope host (the account page's Security tab, the chip in host mode) first
 fires `signout` for the host to end its own session, then navigates to
 `<EV_PUBLIC_ORIGIN>/api/auth/logout/confirm?return_to=<this page's origin + path>` so the
-platform session ends too (`src/shared/element/host-sign-out.ts`). **Depends on concierge
-serving that confirmation page** (it ends the platform session and returns to
-`return_to` after checking it against the scope allowlist); until it ships, the
-navigation lands on a 404 after the host's own sign-out. Because the navigation follows
+platform session ends too (`src/shared/element/host-sign-out.ts`). That page
+(`runner/src/web/logout.rs`) asks for one click, ends the platform session and returns to
+`return_to` once it passes the scope allowlist; it does not sign out on the GET, so a
+link elsewhere cannot sign a visitor out. Because the navigation follows
 the event at once, a host must end its session with a request that survives unload
 (`fetch(..., { keepalive: true })`, `sendBeacon`) or server-side.
 
@@ -52,8 +58,11 @@ dialog) portal into the element, so mount it outside any transformed ancestor.
 
 ## Build
 
+`package-lock.json` is committed: the image's Nix build (`webMfe` in `flake.nix`) reads
+it and refuses to build without it.
+
 ```sh
-npm install
+npm ci
 npm run typecheck && npm run lint && npm run i18n:check
 npm run build          # → dist/<name>-<hash>.js + dist/registry.json
 ```
