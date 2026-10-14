@@ -1,4 +1,4 @@
-//! `concierge_projection`: the pull engine on a fake concierge and a recording handler over
+//! `evconcierge_projection`: the pull engine on a fake concierge and a recording handler over
 //! the real SQLite store (in memory); the SQLite store's contract and migration; and
 //! `GrpcSource`'s reading of the wire, against an in-process fake of concierge's streams.
 #![cfg(feature = "sqlite")]
@@ -15,11 +15,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use concierge_projection::{
+use evconcierge_contracts::concierge::v1 as wire;
+use evconcierge_projection::{
 	Cycle, EventSource, GrpcSource, Handler, Member, Page, ParkReason, Parked, Projection, ProjectionConfig, ProjectionError, ProjectionStore, Pulled, ScopeEvent, ScopeEventBody,
 	ScopeState, SourceError, SqliteProjectionStore, StoreError, Stream, UnknownEvent, UnknownKind, UserEvent, UserEventKind, sqlite,
 };
-use evconcierge_contracts::concierge::v1 as wire;
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use tokio::time::Instant;
 

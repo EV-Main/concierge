@@ -775,21 +775,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "concierge_client"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "evconcierge_contracts",
- "getrandom 0.4.3",
- "sha2 0.11.0",
- "thiserror 2.0.18",
- "tokio",
- "tonic 0.14.6",
- "uuid",
-]
-
-[[package]]
 name = "concierge_iam"
 version = "0.1.0"
 dependencies = [
@@ -808,22 +793,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "concierge_projection"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "concierge_projection",
- "evconcierge_contracts",
- "sqlx",
- "thiserror 2.0.18",
- "tokio",
- "tonic 0.14.6",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1910,6 +1879,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "evconcierge_client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "evconcierge_contracts",
+ "getrandom 0.4.3",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic 0.14.6",
+ "uuid",
+]
+
+[[package]]
 name = "evconcierge_contracts"
 version = "0.1.0"
 dependencies = [
@@ -1919,6 +1903,22 @@ dependencies = [
  "tonic 0.14.6",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "evconcierge_projection"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "evconcierge_contracts",
+ "evconcierge_projection",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic 0.14.6",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -14,7 +14,7 @@ use super::{
 	store::{ParkReason, Parked, ProjectionStore, StoreError},
 };
 
-const TARGET: &str = "concierge_projection";
+const TARGET: &str = "evconcierge_projection";
 
 /// concierge's own ceiling on `limit` (its `MAX_LIMIT`). A larger batch would come back
 /// short every time and stop each drain after one page.

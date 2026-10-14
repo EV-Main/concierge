@@ -1,4 +1,4 @@
-//! `concierge_client` — what a relying party (a direction's backend: invest, admin, the
+//! `evconcierge_client` — what a relying party (a direction's backend: invest, admin, the
 //! Service-Arb panel) calls on concierge, the identity plane.
 //!
 //! - Sign-in is concierge's code flow with PKCE: [`PkceVerifier`] + [`random_state`] +
@@ -9,6 +9,8 @@
 //!   also where the party re-reads `permissions`, the only thing it may gate on.
 //! - [`ConciergeClient::publish_catalog`] (permissions and aliases) and
 //!   [`ConciergeClient::publish_scope_catalog`] (approval kinds and notification topics).
+//! - The direction's own inbox (`ScopeInboxService`): reads by `user_id` under the client
+//!   credential alone, writes with the user's access token as well — see [`inbox`].
 //!
 //! The client secret authenticates the server-to-server calls: in the request body for
 //! the `AuthService` ones (their wire says so), as `x-ev-client-id` + `authorization:
@@ -30,16 +32,19 @@
 //! ```
 
 mod error;
+pub mod inbox;
 mod pkce;
 
 use std::time::Duration;
 
 pub use error::ConciergeError;
 pub use evconcierge_contracts::concierge::v1 as proto;
+pub use inbox::{DEFAULT_INBOX_LIMIT, InboxQuery, MarkRead};
 pub use pkce::{Authorize, PkceVerifier, Prompt, random_state};
 use proto::{
 	CatalogAlias, ClientTokenResponse, ExchangeCodeRequest, GetMeRequest, PublishCatalogRequest, PublishScopeCatalogRequest, RefreshClientTokenRequest, UserProfile,
-	auth_service_client::AuthServiceClient, scope_catalog_service_client::ScopeCatalogServiceClient, user_directory_client::UserDirectoryClient,
+	auth_service_client::AuthServiceClient, scope_catalog_service_client::ScopeCatalogServiceClient, scope_inbox_service_client::ScopeInboxServiceClient,
+	user_directory_client::UserDirectoryClient,
 };
 use tonic::{
 	Request,
@@ -171,6 +176,7 @@ pub struct ConciergeClient {
 	auth: AuthServiceClient<Channel>,
 	directory: UserDirectoryClient<Channel>,
 	scope_catalog: ScopeCatalogServiceClient<Channel>,
+	inbox: ScopeInboxServiceClient<Channel>,
 	client_id: String,
 	client_secret: String,
 	client_id_header: AsciiMetadataValue,
@@ -202,7 +208,8 @@ impl ConciergeClient {
 		Ok(Self {
 			auth: AuthServiceClient::new(channel.clone()),
 			directory: UserDirectoryClient::new(channel.clone()),
-			scope_catalog: ScopeCatalogServiceClient::new(channel),
+			scope_catalog: ScopeCatalogServiceClient::new(channel.clone()),
+			inbox: ScopeInboxServiceClient::new(channel),
 			client_id,
 			client_secret,
 			client_id_header,

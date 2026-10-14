@@ -3,7 +3,7 @@
 // by tests/projection.rs (SQLite) and tests/pg.rs; each
 // wraps the cases in `store_contract_tests!` with its own fixture.
 
-use concierge_projection::{ParkReason, Parked, ProjectionStore, StoreError, Stream};
+use evconcierge_projection::{ParkReason, Parked, ProjectionStore, StoreError, Stream};
 
 fn parked(stream: Stream, position: i64, event_id: &str, key: &str, reason: ParkReason) -> Parked {
 	Parked {

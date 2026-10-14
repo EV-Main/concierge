@@ -1,5 +1,5 @@
 [package]
-name = "concierge_projection"
+name = "evconcierge_projection"
 version = "0.1.0"
 edition = "2024"
 description = "The pull engine a relying party keeps its projection of EV concierge's users with: cursors, dedupe, per-key ordering, parking and replay over the lifecycle and scope streams."
@@ -28,7 +28,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 # Every test target sees both adapters, whatever features the command line named.
-concierge_projection = { path = ".", features = ["pg", "sqlite"] }
+evconcierge_projection = { path = ".", features = ["pg", "sqlite"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "test-util"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 uuid = { workspace = true, features = ["v4"] }

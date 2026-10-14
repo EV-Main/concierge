@@ -1,4 +1,4 @@
-# concierge_projection — keeping a direction's users
+# evconcierge_projection — keeping a direction's users
 
 A direction (invest, admin, the Service-Arb panel) needs to know its users: who they
 are, whether they are suspended, what they may do inside its scope. concierge owns all
@@ -8,12 +8,12 @@ projection. This crate is the pull engine; the projection — your tables — is
 The contract this follows is concierge's `docs/SCOPES-AND-APPROVALS.md` §4 and the
 comments on `events.proto` / `scopes.proto`. Both live in the same repository as this
 crate, and the wire types come from `evconcierge_contracts` of the same release, so a
-version of `concierge_projection` always speaks the contract it was built against.
+version of `evconcierge_projection` always speaks the contract it was built against.
 
 ## Wiring
 
 ```rust
-use concierge_projection::{pg, GrpcSource, PgProjectionStore, Projection, ProjectionConfig};
+use evconcierge_projection::{pg, GrpcSource, PgProjectionStore, Projection, ProjectionConfig};
 
 pg::migrate(&pool).await?; // before serving, every boot; idempotent
 let projection = Projection::new(
@@ -25,7 +25,7 @@ let projection = Projection::new(
 tokio::select! { () = projection.run() => {}, () = shutdown => {} }
 ```
 
-`Cargo.toml`: `concierge_projection = { version = "…", features = ["pg"] }` (or
+`Cargo.toml`: `evconcierge_projection = { version = "…", features = ["pg"] }` (or
 `["sqlite"]`). Building needs no `protoc` on `PATH`: `evconcierge_contracts` falls back
 to a vendored one when `PROTOC` is unset.
 
@@ -38,7 +38,7 @@ page's `next_position`, never the last event's position.
 
 `migrate` creates `concierge_projection_{schema,cursor,applied,sequence,parked}` with
 its own version table, apart from your `sqlx::migrate!` history. It runs at boot, so
-**a release that bumps `concierge_projection` past a new schema step is a schema rollout**: read the
+**a release that bumps `evconcierge_projection` past a new schema step is a schema rollout**: read the
 step in the diff, and do not roll back below it (the old build refuses a newer schema
 version).
 
@@ -93,7 +93,7 @@ request still comes from the caller's token / `GetMe`, not from a row you copied
   own).
 - Anything parked holds its key: later events of the same key queue behind it, so the
   sequence guard never runs past an event still to apply. Other keys keep flowing.
-- Log lines `needs intervention` (target `concierge_projection`) mean a parked
+- Log lines `needs intervention` (target `evconcierge_projection`) mean a parked
   position no longer resolves, or a halted stream: a human looks.
 
 ## Lag

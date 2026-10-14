@@ -195,7 +195,7 @@ was scanned. To the unfiltered reader (the bridge token) that is the max positio
 returned, which is what banking stores today. A page that **fills `limit`** stops scanning at its last
 event, so its `next_position` is exactly that event's `position`; with `limit = 1` and
 one event returned, `next_position` is that event's position. The
-`concierge_projection` crate (`projection/`) relies on this to replay a parked event (§4.3) and confirm it got
+`evconcierge_projection` crate (`projection/`) relies on this to replay a parked event (§4.3) and confirm it got
 that one; the scan runs past the last event only when the page did not fill.
 
 **`UserEvents.PullUserLifecycle`**, read by a client credential: same request,
@@ -252,7 +252,7 @@ swallowed event would cost (decided):
   consumer alerts; upgrading the binary is the only thing that unblocks it. Marking it
   applied is how a freeze or a scope closure gets swallowed while money keeps moving
   under rules this plane already revoked.
-- **Directions (invest, sa, admin, via the `concierge_projection` crate): Park.** Record
+- **Directions (invest, sa, admin, via the `evconcierge_projection` crate): Park.** Record
   the event's `position` and `event_id`, advance the cursor, and replay after an
   upgrade by re-pulling with `after_position = position - 1, limit = 1`. Park the
   POSITION, not the decoded event: prost drops fields it does not know, so a stored

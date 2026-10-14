@@ -1,15 +1,19 @@
-//! `concierge_client`: the PKCE half of the code flow, the error mapping, redaction, and
+//! `evconcierge_client`: the PKCE half of the code flow, the error mapping, redaction, and
 //! the calls themselves against an in-process fake of concierge's gRPC.
 
 use std::sync::{Arc, Mutex};
 
-use concierge_client::{Authorize, ClientConfig, ClientTokens, ConciergeClient, ConciergeError, Me, PkceVerifier, Prompt, ScopeCatalog, proto, random_state};
+use evconcierge_client::{
+	Authorize, ClientConfig, ClientTokens, ConciergeClient, ConciergeError, DEFAULT_INBOX_LIMIT, InboxQuery, MarkRead, Me, PkceVerifier, Prompt, ScopeCatalog, proto, random_state,
+};
 use proto::{
-	ClientTokenResponse, ExchangeCodeRequest, GetScopeCatalogRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse,
-	PublishCatalogRequest, PublishCatalogResponse, PublishScopeCatalogRequest, PublishScopeCatalogResponse, RefreshClientTokenRequest, RefreshRequest, RevokeSessionRequest,
-	RevokeSessionResponse, TokenResponse, UserProfile,
+	ClientTokenResponse, ExchangeCodeRequest, GetScopeCatalogRequest, GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, GetUnreadCountResponse, JwksRequest, JwksResponse,
+	ListNotificationsResponse, ListScopeNotificationsRequest, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse, MarkReadResponse, MarkScopeNotificationsReadRequest,
+	NotificationSettings, PublishCatalogRequest, PublishCatalogResponse, PublishScopeCatalogRequest, PublishScopeCatalogResponse, RefreshClientTokenRequest, RefreshRequest,
+	RevokeSessionRequest, RevokeSessionResponse, SetScopeTopicSubscriptionRequest, TokenResponse, UserProfile,
 	auth_service_server::{AuthService, AuthServiceServer},
 	scope_catalog_service_server::{ScopeCatalogService, ScopeCatalogServiceServer},
+	scope_inbox_service_server::{ScopeInboxService, ScopeInboxServiceServer},
 };
 use tonic::{
 	Code, Request, Response, Status,
@@ -194,7 +198,7 @@ fn client_config_debug_should_not_print_the_client_secret() {
 }
 
 #[tokio::test]
-async fn concierge_client_debug_should_not_print_the_client_secret() {
+async fn evconcierge_client_debug_should_not_print_the_client_secret() {
 	let channel = Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
 	let client = ConciergeClient::from_channel(channel, "sa", "client-SECRET").unwrap();
 
@@ -260,6 +264,8 @@ struct FakeConcierge {
 	refuse: Arc<Mutex<bool>>,
 	exchanged: Arc<Mutex<Vec<ExchangeCodeRequest>>>,
 	scope_publishes: Arc<Mutex<Vec<ScopePublish>>>,
+	inbox_calls: Arc<Mutex<Vec<InboxCall>>>,
+	inbox_refusal: Arc<Mutex<Option<Status>>>,
 }
 
 impl FakeConcierge {
@@ -340,7 +346,8 @@ async fn serve(fake: FakeConcierge) -> ConciergeClient {
 	tokio::spawn(
 		Server::builder()
 			.add_service(AuthServiceServer::new(fake.clone()))
-			.add_service(ScopeCatalogServiceServer::new(fake))
+			.add_service(ScopeCatalogServiceServer::new(fake.clone()))
+			.add_service(ScopeInboxServiceServer::new(fake))
 			.serve_with_incoming(TcpIncoming::from(listener)),
 	);
 	ConciergeClient::connect_lazy(ClientConfig::new(format!("http://{addr}"), "sa", "client-SECRET")).unwrap()
@@ -396,7 +403,7 @@ async fn refresh_client_token_should_be_refused_when_concierge_says_unauthentica
 async fn publish_catalog_should_be_rejected_with_failed_precondition_for_an_older_version() {
 	let client = serve(FakeConcierge::default()).await;
 
-	let error = client.publish_catalog(concierge_client::Catalog::default()).await.unwrap_err();
+	let error = client.publish_catalog(evconcierge_client::Catalog::default()).await.unwrap_err();
 
 	assert!(matches!(error, ConciergeError::Rejected { code: Code::FailedPrecondition, .. }), "{error:?}");
 }
@@ -431,4 +438,293 @@ async fn a_call_to_a_concierge_nobody_listens_on_should_be_unavailable() {
 
 	assert!(matches!(error, ConciergeError::Unavailable(_)), "{error:?}");
 	assert!(error.is_transient());
+}
+
+// --- the direction's inbox ----------------------------------------------------------------
+
+const ANN: &str = "6f1c8a4e-2b0d-4c61-9b8e-0a1d2c3e4f50";
+
+/// An inbox call as the fake saw it: the RPC, `x-ev-client-id`, `authorization`,
+/// `x-ev-user-token`, and the request message's `Debug`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InboxCall {
+	rpc: &'static str,
+	client_id: Option<String>,
+	authorization: Option<String>,
+	user_token: Option<String>,
+	message: String,
+}
+
+impl FakeConcierge {
+	fn inbox_call<T: std::fmt::Debug>(&self, rpc: &'static str, request: &Request<T>) -> Result<(), Status> {
+		let header = |name: &str| request.metadata().get(name).map(|v| v.to_str().unwrap().to_owned());
+		self.inbox_calls.lock().unwrap().push(InboxCall {
+			rpc,
+			client_id: header("x-ev-client-id"),
+			authorization: header("authorization"),
+			user_token: header("x-ev-user-token"),
+			message: format!("{:?}", request.get_ref()),
+		});
+		match self.inbox_refusal.lock().unwrap().clone() {
+			Some(status) => Err(status),
+			None => Ok(()),
+		}
+	}
+
+	fn inbox_calls(&self) -> Vec<InboxCall> {
+		self.inbox_calls.lock().unwrap().clone()
+	}
+}
+
+#[async_trait::async_trait]
+impl ScopeInboxService for FakeConcierge {
+	async fn list_scope_notifications(&self, request: Request<ListScopeNotificationsRequest>) -> Result<Response<ListNotificationsResponse>, Status> {
+		self.inbox_call("list", &request)?;
+		Ok(Response::new(ListNotificationsResponse {
+			next_cursor: "c-2".into(),
+			unread_count: 3,
+			..ListNotificationsResponse::default()
+		}))
+	}
+
+	async fn get_scope_unread_count(&self, request: Request<GetScopeUnreadCountRequest>) -> Result<Response<GetUnreadCountResponse>, Status> {
+		self.inbox_call("unread", &request)?;
+		Ok(Response::new(GetUnreadCountResponse { unread_count: 7 }))
+	}
+
+	async fn mark_scope_notifications_read(&self, request: Request<MarkScopeNotificationsReadRequest>) -> Result<Response<MarkReadResponse>, Status> {
+		self.inbox_call("mark", &request)?;
+		Ok(Response::new(MarkReadResponse { marked: 2, unread_count: 1 }))
+	}
+
+	async fn get_scope_notification_settings(&self, request: Request<GetScopeNotificationSettingsRequest>) -> Result<Response<NotificationSettings>, Status> {
+		self.inbox_call("settings", &request)?;
+		Ok(Response::new(NotificationSettings {
+			email_enabled: true,
+			..NotificationSettings::default()
+		}))
+	}
+
+	async fn set_scope_topic_subscription(&self, request: Request<SetScopeTopicSubscriptionRequest>) -> Result<Response<NotificationSettings>, Status> {
+		self.inbox_call("subscribe", &request)?;
+		Ok(Response::new(NotificationSettings::default()))
+	}
+}
+
+fn ann() -> Uuid {
+	Uuid::parse_str(ANN).unwrap()
+}
+
+#[test]
+fn inbox_query_default_should_ask_for_twenty_of_every_topic() {
+	assert_eq!(
+		InboxQuery::default(),
+		InboxQuery {
+			cursor: String::new(),
+			limit: 20,
+			unread_only: false,
+			topic: String::new(),
+		}
+	);
+	assert_eq!(DEFAULT_INBOX_LIMIT, 20);
+}
+
+#[tokio::test]
+async fn list_scope_notifications_should_send_the_client_credential_the_user_and_a_limit_of_twenty_by_default() {
+	let fake = FakeConcierge::default();
+	let client = serve(fake.clone()).await;
+
+	let page = client.list_scope_notifications(ann(), InboxQuery::default()).await.unwrap();
+
+	assert_eq!(page.next_cursor, "c-2");
+	assert_eq!(
+		fake.inbox_calls(),
+		[InboxCall {
+			rpc: "list",
+			client_id: Some("sa".into()),
+			authorization: Some("Bearer client-SECRET".into()),
+			user_token: None,
+			message: format!(
+				"{:?}",
+				ListScopeNotificationsRequest {
+					user_id: ANN.into(),
+					limit: 20,
+					..ListScopeNotificationsRequest::default()
+				}
+			),
+		}]
+	);
+}
+
+#[tokio::test]
+async fn list_scope_notifications_should_send_twenty_rather_than_a_zero_limit() {
+	let fake = FakeConcierge::default();
+	let client = serve(fake.clone()).await;
+
+	client.list_scope_notifications(ann(), InboxQuery { limit: 0, ..InboxQuery::default() }).await.unwrap();
+
+	assert!(fake.inbox_calls()[0].message.contains("limit: 20,"), "{:?}", fake.inbox_calls());
+}
+
+#[tokio::test]
+async fn list_scope_notifications_should_pass_the_cursor_filter_and_an_explicit_limit_through() {
+	let fake = FakeConcierge::default();
+	let client = serve(fake.clone()).await;
+
+	client
+		.list_scope_notifications(
+			ann(),
+			InboxQuery {
+				cursor: "c-1".into(),
+				limit: 50,
+				unread_only: true,
+				topic: "sa.leads".into(),
+			},
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(
+		fake.inbox_calls()[0].message,
+		format!(
+			"{:?}",
+			ListScopeNotificationsRequest {
+				user_id: ANN.into(),
+				cursor: "c-1".into(),
+				limit: 50,
+				unread_only: true,
+				topic: "sa.leads".into(),
+			}
+		)
+	);
+}
+
+#[tokio::test]
+async fn scope_reads_should_carry_the_client_credential_and_no_user_token() {
+	let fake = FakeConcierge::default();
+	let client = serve(fake.clone()).await;
+
+	let unread = client.scope_unread_count(ann()).await.unwrap();
+	let settings = client.scope_notification_settings(ann()).await.unwrap();
+
+	assert_eq!(unread, 7);
+	assert!(settings.email_enabled);
+	let calls = fake.inbox_calls();
+	assert_eq!(calls.iter().map(|c| c.rpc).collect::<Vec<_>>(), ["unread", "settings"]);
+	for call in &calls {
+		assert_eq!(call.client_id.as_deref(), Some("sa"), "{call:?}");
+		assert_eq!(call.authorization.as_deref(), Some("Bearer client-SECRET"), "{call:?}");
+		assert_eq!(call.user_token, None, "{call:?}");
+		assert!(call.message.contains(ANN), "{call:?}");
+	}
+}
+
+#[tokio::test]
+async fn mark_scope_notifications_read_should_carry_the_raw_user_token_beside_the_client_credential() {
+	let fake = FakeConcierge::default();
+	let client = serve(fake.clone()).await;
+
+	let marked = client
+		.mark_scope_notifications_read("user-ACCESS", MarkRead::Ids(vec!["n-1".into(), "n-2".into()]))
+		.await
+		.unwrap();
+
+	assert_eq!(marked.marked, 2);
+	assert_eq!(
+		fake.inbox_calls(),
+		[InboxCall {
+			rpc: "mark",
+			client_id: Some("sa".into()),
+			authorization: Some("Bearer client-SECRET".into()),
+			user_token: Some("user-ACCESS".into()),
+			message: format!(
+				"{:?}",
+				MarkScopeNotificationsReadRequest {
+					user_id: String::new(),
+					ids: vec!["n-1".into(), "n-2".into()],
+					all: false,
+				}
+			),
+		}]
+	);
+}
+
+#[tokio::test]
+async fn mark_all_scope_notifications_read_should_send_all_and_no_ids() {
+	let fake = FakeConcierge::default();
+	let client = serve(fake.clone()).await;
+
+	client.mark_scope_notifications_read("user-ACCESS", MarkRead::All).await.unwrap();
+
+	assert_eq!(
+		fake.inbox_calls()[0].message,
+		format!(
+			"{:?}",
+			MarkScopeNotificationsReadRequest {
+				user_id: String::new(),
+				ids: vec![],
+				all: true,
+			}
+		)
+	);
+}
+
+#[tokio::test]
+async fn set_scope_topic_subscription_should_carry_the_user_token_and_the_choice() {
+	let fake = FakeConcierge::default();
+	let client = serve(fake.clone()).await;
+
+	client.set_scope_topic_subscription("user-ACCESS", "sa.leads", true, false).await.unwrap();
+
+	let call = &fake.inbox_calls()[0];
+	assert_eq!(call.user_token.as_deref(), Some("user-ACCESS"), "{call:?}");
+	assert_eq!(call.authorization.as_deref(), Some("Bearer client-SECRET"), "{call:?}");
+	assert_eq!(
+		call.message,
+		format!(
+			"{:?}",
+			SetScopeTopicSubscriptionRequest {
+				user_id: String::new(),
+				topic: "sa.leads".into(),
+				subscribed: true,
+				email_enabled: false,
+			}
+		)
+	);
+}
+
+#[tokio::test]
+async fn a_user_token_that_cannot_travel_as_a_header_should_be_a_config_error_before_any_call() {
+	let fake = FakeConcierge::default();
+	let client = serve(fake.clone()).await;
+
+	let error = client.mark_scope_notifications_read("line\nbreak", MarkRead::All).await.unwrap_err();
+
+	assert!(matches!(error, ConciergeError::Config(_)), "{error:?}");
+	assert_eq!(fake.inbox_calls(), []);
+}
+
+#[tokio::test]
+async fn an_inbox_write_for_a_non_member_should_be_rejected_with_concierge_message() {
+	let fake = FakeConcierge::default();
+	*fake.inbox_refusal.lock().unwrap() = Some(Status::failed_precondition("not a member of the scope"));
+	let client = serve(fake).await;
+
+	let error = client.set_scope_topic_subscription("user-ACCESS", "sa.leads", true, true).await.unwrap_err();
+
+	assert!(
+		matches!(&error, ConciergeError::Rejected { code: Code::FailedPrecondition, message } if message == "not a member of the scope"),
+		"{error:?}"
+	);
+}
+
+#[tokio::test]
+async fn an_inbox_read_with_a_refused_credential_should_be_refused() {
+	let fake = FakeConcierge::default();
+	*fake.inbox_refusal.lock().unwrap() = Some(Status::unauthenticated("invalid scope inbox client credential"));
+	let client = serve(fake).await;
+
+	let error = client.scope_unread_count(ann()).await.unwrap_err();
+
+	assert!(matches!(error, ConciergeError::Refused { code: Code::Unauthenticated }), "{error:?}");
 }

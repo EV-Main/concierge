@@ -55,7 +55,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
 	let current = usize::try_from(current.unwrap_or(0)).map_err(|_| StoreError::Corrupt("negative concierge_projection_schema.version".into()))?;
 	if current > STEPS.len() {
 		return Err(StoreError::Corrupt(format!(
-			"concierge_projection schema is at version {current}, newer than this build's {}; roll forward, not back",
+			"evconcierge_projection schema is at version {current}, newer than this build's {}; roll forward, not back",
 			STEPS.len()
 		)));
 	}

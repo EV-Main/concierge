@@ -50,7 +50,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), StoreError> {
 	// The tables are new and nobody else writes them, so a wait here is another replica
 	// migrating; anything longer than this is worth failing the boot over.
 	sqlx::query("SET LOCAL lock_timeout = '10s'").execute(&mut *tx).await.map_err(backend("set lock_timeout"))?;
-	sqlx::query("SELECT pg_advisory_xact_lock(hashtext('concierge_projection'))")
+	sqlx::query("SELECT pg_advisory_xact_lock(hashtext('evconcierge_projection'))")
 		.execute(&mut *tx)
 		.await
 		.map_err(backend("take the migration lock"))?;
@@ -65,7 +65,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), StoreError> {
 	let current = usize::try_from(current.unwrap_or(0)).map_err(|_| StoreError::Corrupt("negative concierge_projection_schema.version".into()))?;
 	if current > STEPS.len() {
 		return Err(StoreError::Corrupt(format!(
-			"concierge_projection schema is at version {current}, newer than this build's {}; roll forward, not back",
+			"evconcierge_projection schema is at version {current}, newer than this build's {}; roll forward, not back",
 			STEPS.len()
 		)));
 	}

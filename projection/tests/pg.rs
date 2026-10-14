@@ -1,4 +1,4 @@
-//! `concierge_projection`'s Postgres store and migration against a real server.
+//! `evconcierge_projection`'s Postgres store and migration against a real server.
 //!
 //! Needs `DATABASE_URL`, like the runner's suites. Each test works in a schema of its own
 //! (`search_path` pinned on its pool), dropped at the end: the store and the migration use
@@ -11,7 +11,7 @@
 #[path = "support/projection_store.rs"]
 mod projection_store;
 
-use concierge_projection::{PgProjectionStore, ProjectionStore, StoreError, Stream, pg};
+use evconcierge_projection::{PgProjectionStore, ProjectionStore, StoreError, Stream, pg};
 use sqlx::{
 	AssertSqlSafe, PgPool,
 	postgres::{PgConnectOptions, PgPoolOptions},

@@ -1,4 +1,4 @@
-# concierge_client — a relying party's calls into concierge
+# evconcierge_client — a relying party's calls into concierge
 
 What a direction's backend (invest, admin, the Service-Arb panel) calls on concierge,
 the EV identity plane. Server-side only: the client secret never reaches a browser.
@@ -10,9 +10,14 @@ the EV identity plane. Server-side only: the client secret never reaches a brows
   re-reads `permissions`, the only thing it may gate on.
 - **`publish_catalog`** (permissions and aliases) and **`publish_scope_catalog`**
   (approval kinds and notification topics), under the client credential.
+- **The direction's inbox** (`ScopeInboxService`): `list_scope_notifications` (an
+  `InboxQuery`, 20 per page unless told otherwise), `scope_unread_count` and
+  `scope_notification_settings` by concierge's `user_id`; `mark_scope_notifications_read`
+  and `set_scope_topic_subscription` with the access token this client holds for the
+  user, sent as `x-ev-user-token` beside the client credential.
 
 ```rust
-use concierge_client::{Authorize, ClientConfig, ConciergeClient, PkceVerifier, random_state};
+use evconcierge_client::{Authorize, ClientConfig, ConciergeClient, PkceVerifier, random_state};
 
 let concierge = ConciergeClient::connect_lazy(ClientConfig::new(grpc_addr, "sa", secret))?;
 let verifier = PkceVerifier::generate()?;
@@ -28,7 +33,7 @@ Errors are values (`ConciergeError`), one arm per reaction: `Refused` ends the s
 reason. Every call has a timeout (`ClientConfig::timeout`, 5 s by default).
 
 The wire types are concierge's own `evconcierge_contracts` of the same release,
-re-exported as `concierge_client::proto`. Building needs no `protoc` on `PATH`.
+re-exported as `evconcierge_client::proto`. Building needs no `protoc` on `PATH`.
 
 Keeping a copy of concierge's users (suspensions, grants, MEMBER_JOINED) is a different
-job: the `concierge_projection` crate.
+job: the `evconcierge_projection` crate.

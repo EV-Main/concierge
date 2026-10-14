@@ -1,4 +1,4 @@
-//! `concierge_projection` — the engine a direction (invest, admin, the Service-Arb panel)
+//! `evconcierge_projection` — the engine a direction (invest, admin, the Service-Arb panel)
 //! keeps its own copy of concierge's users with.
 //!
 //! concierge is the identity plane and never calls a direction; a direction pulls. Two
