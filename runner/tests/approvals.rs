@@ -1661,23 +1661,83 @@ async fn a_scope_admin_is_an_account_with_a_proven_address() {
 	assert!(!fx.holds_admin(&scope, subject).await);
 }
 
-/// A suspended owner keeps the role and loses the seat's say: their vote is refused and a
-/// FOR they cast before does not count.
+/// A temporary hold is one operator's brake, not a change of the owners (D24(2), owner's
+/// decision): the held owner has no say while held, and nothing is voided or paused.
 #[tokio::test]
-async fn a_suspended_owner_has_no_say() {
+async fn a_hold_on_an_owner_is_not_a_change_of_the_owners() {
 	let Some(fx) = setup().await else { return };
 	let (_lock, owners) = fx.owners(3).await;
 	let scope = fx.scope().await;
-	let subject = fx.user("subject").await;
 	fx.at(T0);
-	let opened = fx.grant_admin(owners[0], &scope, subject).await.unwrap();
+	let opened = fx.grant_admin(owners[0], &scope, fx.user("subject").await).await.unwrap();
 	fx.vote(owners[1], &opened.id, ApprovalVote::For).await.unwrap();
-	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
+	let changed = fx.platform_policy(owners[0]).await.roster_changed_at;
+
+	let action = concierge::infrastructure::users::AdminAction {
+		actor: Some(owners[2]),
+		action: "held",
+		reason: "credential stuffing".into(),
+		..Default::default()
+	};
+	fx.users.hold_user(owners[1], &action, owners[2], fx.db_now().await).await.expect("an owner holds an owner");
+	assert_eq!(state(&fx.get(owners[2], &opened.id).await), ApprovalState::Open, "a hold voids nothing");
+	assert_eq!(fx.platform_policy(owners[0]).await.roster_changed_at, changed, "and pauses nothing");
+	let other = fx.grant_admin(owners[0], &scope, fx.user("other").await).await;
+	assert!(other.is_ok(), "new platform decisions still open: {other:?}");
+	let still = fx.vote(owners[2], &opened.id, ApprovalVote::For).await.unwrap();
+	assert_ne!(state(&still), ApprovalState::Passed, "the held owner's FOR does not carry it while held");
+
+	let lift = concierge::infrastructure::users::AdminAction {
+		actor: Some(owners[2]),
+		action: "reinstated",
+		..Default::default()
+	};
+	fx.users.reinstate_outside_governance(owners[1], &lift, fx.db_now().await).await.expect("the hold is lifted");
+	assert_eq!(fx.platform_policy(owners[0]).await.roster_changed_at, changed, "lifting a hold is no change either");
+}
+
+/// An owner suspended indefinitely by the consilium's verdict, and reinstated from it, IS a
+/// change of the owners: live platform decisions are void and new ones pause.
+#[tokio::test]
+async fn a_consilium_suspension_of_an_owner_changes_the_owners() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	fx.at(T0);
+	let opened = fx.grant_admin(owners[0], &scope, fx.user("subject").await).await.unwrap();
+	let before = fx.platform_policy(owners[0]).await.roster_changed_at;
+
+	// The columns the executed suspension verdict writes (`domain::users::User::suspend`).
+	sqlx::query("UPDATE users SET status = 'disabled', suspended_by = 'governance' WHERE id = $1")
 		.bind(owners[1].raw())
 		.execute(&fx.pool)
 		.await
 		.unwrap();
-	assert_eq!(state(&fx.get(owners[2], &opened.id).await), ApprovalState::Void, "suspending an owner changes the roster");
+	assert_eq!(state(&fx.get(owners[0], &opened.id).await), ApprovalState::Void);
+	let suspended = fx.platform_policy(owners[0]).await;
+	assert!(suspended.roster_changed_at >= before, "stamped by the store's clock");
+	fx.at(suspended.roster_changed_at + i64::from(suspended.cooldown_secs) - 1);
+	assert_eq!(
+		code(fx.grant_admin(owners[0], &scope, fx.user("next").await).await),
+		Some(Code::FailedPrecondition),
+		"platform decisions pause"
+	);
+
+	sqlx::query("UPDATE users SET status = 'active', suspended_by = NULL WHERE id = $1")
+		.bind(owners[1].raw())
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	assert!(
+		fx.platform_policy(owners[0]).await.roster_changed_at >= suspended.roster_changed_at,
+		"reinstating from a verdict is a change too"
+	);
+	let changes: i64 = sqlx::query_scalar("SELECT count(*) FROM approval_events WHERE approval_id = $1::uuid AND event = 'roster_changed'")
+		.bind(&opened.id)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(changes, 1, "voided once, by the suspension");
 }
 
 /// One decision the executor cannot carry out must not stop the ones behind it.

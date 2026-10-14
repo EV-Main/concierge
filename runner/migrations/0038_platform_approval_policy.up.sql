@@ -16,9 +16,15 @@
 -- while it opens a platform decision, so a change either waits for the open to commit and
 -- then voids it, or commits first and the open sees the pause.
 --
--- What counts as a change of the roster: a row becoming or ceasing to be an `owner`, and an
--- owner's `status` moving (a suspended owner has no say, so suspending one changes who
--- decides). Time is `clock_timestamp()`, the store's clock, as everywhere in approvals.
+-- What counts as a change of the roster (the owner's decision, D24(2)): a row becoming or
+-- ceasing to be an `owner`, and an owner suspended INDEFINITELY by the consilium's verdict
+-- (`suspended_by` becoming `governance`) or reinstated from one. A temporary hold
+-- (`admin_hold`, with its deadline) and its release — by the sweep or by ReinstateUser — are
+-- NOT: a held owner simply has no vote while held (`holds_seat`, `unseated`), and a brake
+-- one operator may pull must not also void the owners' decisions and pause the platform.
+-- `coalesce` because `suspended_by` is NULL for an active account and for the rows
+-- suspended before 0015: NULL against `admin_hold` must read as "no verdict either way".
+-- Time is `clock_timestamp()`, the store's clock, as everywhere in approvals.
 --
 -- `approvals_passed` widens: a VOID by roster change may never have passed. Every row
 -- already written satisfies the narrower rule it replaces.
@@ -75,9 +81,11 @@ END
 $$;
 
 CREATE TRIGGER users_owner_roster_updated
-AFTER UPDATE OF role, status ON users
+AFTER UPDATE OF role, suspended_by ON users
 FOR EACH ROW
-WHEN ((OLD.role = 'owner') IS DISTINCT FROM (NEW.role = 'owner') OR (NEW.role = 'owner' AND OLD.status IS DISTINCT FROM NEW.status))
+WHEN ((OLD.role = 'owner') IS DISTINCT FROM (NEW.role = 'owner')
+      OR (NEW.role = 'owner'
+          AND coalesce(OLD.suspended_by = 'governance', FALSE) IS DISTINCT FROM coalesce(NEW.suspended_by = 'governance', FALSE)))
 EXECUTE FUNCTION platform_roster_changed();
 
 CREATE TRIGGER users_owner_roster_inserted

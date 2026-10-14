@@ -672,8 +672,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   the opener of this plane's own `concierge:*` proposal, proven by the session, is (D23),
   and so is a money decision's initiator whose own access token the proposer presents —
   from a PLATFORM roster, with two other owners still required (D24(1)). Any change of the
-  owner roster voids every live platform decision in its own transaction (a trigger on
-  `users`) and pauses new ones for the platform policy's cool-down (D24(2)).
+  owner roster — a seat granted or taken, an owner suspended by the consilium's verdict or
+  reinstated from one, never a temporary hold — voids every live platform decision in its
+  own transaction (a trigger on `users`) and pauses new ones for the platform policy's cool-down (D24(2)).
   What keeps one person from acting alone is the threshold over the whole roster,
   `sole_admin` escalation, the two-owner floor — and that `<ns>:admin`, the scope roster,
   is granted ONLY by an executed `concierge:scope_admin_grant` (`GrantPermission` refuses

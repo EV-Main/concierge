@@ -345,13 +345,17 @@ containment is never slower than the grant).
   initiator stays on the roster, as every admin does. Without a token the name stays
   information.
 - **The platform pauses after its owners change** (D24(2)): any change of the owner roster
-  — a seat granted or taken, an owner suspended or reinstated, on any path, written by any
-  binary — voids every live `PLATFORM` proposal in the same transaction (`void_reason` "the
+  — a seat granted or taken, an owner suspended indefinitely by the consilium's verdict
+  (`suspended_by = governance`) or reinstated from one, on any path, written by any binary —
+  voids every live `PLATFORM` proposal in the same transaction (`void_reason` "the
   platform owners changed while it was live", history event `roster_changed`) and stamps
   `roster_changed_at`; for the platform policy's `cooldown_secs` after it (default 48 h,
   0..=14 days, changed only by `concierge:platform_policy`) no `PLATFORM` proposal opens
   (`FAILED_PRECONDITION`) — a service's escalated one, a money one and this plane's own
-  alike. A scope's own decisions do not pause.
+  alike. A scope's own decisions do not pause. A temporary HOLD on an owner (`admin_hold`)
+  and its release, by the sweep or by `ReinstateUser`, are not a change (owner's decision):
+  the held owner simply has no vote while held, and one operator's brake must not also void
+  the owners' decisions and pause the platform.
 - **A vote is the seat's** (decided): a vote counts only while its voter still holds the
   seat the roster was drawn from — for an owner, the persisted `owner` role AND an active
   account, so a suspended owner has no say. Removing an admin after their FOR takes it
@@ -571,9 +575,11 @@ in `domain::approvals`.
   amount in another currency, sends the proposal to the owners; only an unset FLAG stays
   down.
 - **The roster change is a trigger** on `users` (migration 0038,
-  `platform_roster_changed`): the seat moves on many paths — admission, removal,
-  resignation, genesis, a hold, a suspension, a reinstatement, the hold sweep — and from
-  the previous binary during a rollout; the row is the one place all of them pass. It
+  `platform_roster_changed`, on `role` and `suspended_by`): the seat moves on many paths —
+  admission, removal, resignation, genesis, a suspension verdict, a reinstatement from one
+  — and from the previous binary during a rollout; the row is the one place all of them
+  pass. A hold only moves `status` and `suspended_by = admin_hold`, which the trigger
+  ignores. It
   stamps `platform_roster` first, which `propose` holds `FOR SHARE` while it opens a
   platform decision, so an open and a change never miss each other.
 - **One daily budget per scope** (D24(4)) is the money plane's to count: everything that

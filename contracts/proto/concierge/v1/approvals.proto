@@ -338,9 +338,11 @@ message ApprovalFieldValue {
 message PlatformApprovalPolicy {
   // 1 until the first executed `concierge:platform_policy`; bumped by each one.
   uint64 version = 1;
-  // After any change of the owner roster — a seat granted or taken, an owner suspended or
-  // reinstated — no PLATFORM-level proposal opens for this long (FAILED_PRECONDITION),
-  // and every live one is VOID at the change. Default 172800 (48 h).
+  // After any change of the owner roster — a seat granted or taken, an owner suspended
+  // indefinitely by the consilium's verdict or reinstated from one — no PLATFORM-level
+  // proposal opens for this long (FAILED_PRECONDITION), and every live one is VOID at the
+  // change. A temporary hold on an owner and its release are not a change: the held owner
+  // has no vote while held. Default 172800 (48 h).
   uint32 cooldown_secs = 2;
   // Unix SECONDS of the last change of the owner roster; 0 if none since this was
   // introduced. Read-only: ignored in a proposal.
