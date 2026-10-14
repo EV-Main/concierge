@@ -134,8 +134,9 @@ service ApprovalExecutionService {
   // USER field or `requested_by` naming no account. FAILED_PRECONDITION: the scope is
   // not ACTIVE; the resolved roster is too small to decide (fewer than two platform
   // ACTIVE owners, or fewer than two ACTIVE owners besides a proven initiator — this one
-  // carries the code word `not_enough_owners_besides_initiator`; do NOT retry it without the
-  // token, which would put the initiator back on the roster); a spent proof ("this proof was
+  // carries the code word `not_enough_owners_besides_initiator`, to be matched as a
+  // SUBSTRING of the message (it follows a `precondition failed:` prefix); do NOT retry it
+  // without the token, which would put the initiator back on the roster); a spent proof ("this proof was
   // already spent"); or the proposal resolves to
   // PLATFORM while the platform pauses after a change of its owners (PlatformApprovalPolicy
   // `cooldown_secs` from `roster_changed_at`). PERMISSION_DENIED: a relying party naming a
@@ -152,8 +153,12 @@ service ApprovalExecutionService {
   // (D24(1)) — two other ACTIVE owners must remain — the proposal says
   // `requested_by_proven`, and they find a notice in their inbox (topic
   // `account:money-movement`) that a decision was opened in their name, so that a request
-  // they did not make meets their veto. Without a token the name is information and its
-  // holder votes like anyone. Every live PLATFORM proposal is
+  // they did not make meets their veto — only if they were on that roster: a proven account
+  // that is no owner has no vote to lose and no veto to cast, and is not told. Without a
+  // token the name is information and its holder votes like anyone. A RETRY under the same
+  // `dedupe_key` with a token is checked as the first call was (PERMISSION_DENIED if it is
+  // not `requested_by`'s) and spends nothing; mint a fresh token for it — one older than 120
+  // seconds is UNAUTHENTICATED here too. A retry without a token answers as before. Every live PLATFORM proposal is
   // VOID the moment the owner roster changes (`void_reason` says so).
   // RESOURCE_EXHAUSTED: the namespace already holds 200 live (OPEN, or PASSED and not
   // lapsed) proposals in this scope. ALREADY_EXISTS: a live

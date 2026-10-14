@@ -344,9 +344,12 @@ containment is never slower than the grant).
   already spent"). What that proves is honest and narrow: the service held that person's
   fresh token, so it could act with their session at that moment — not that they read the
   proposal. When the proposal resolves to `PLATFORM` that person is kept off the roster,
-  the proposal says `requested_by_proven`, and they get an inbox notice (topic
-  `account:money-movement`, no link, no code) that a decision was opened in their name — if
-  they did not ask for it, their veto stops it. Two OTHER ACTIVE owners must remain
+  the proposal says `requested_by_proven`, and — if they were on that roster, i.e. an
+  owner — they get an inbox notice (topic `account:money-movement`, no link, no code) that a
+  decision was opened in their name: if they did not ask for it, their veto stops it. A
+  proven account that is no owner has no vote and no veto there, and is not told. A retry
+  under the same `dedupe_key` with a token is checked as the first call was and spends
+  nothing; a proposer mints a fresh token for each retry. Two OTHER ACTIVE owners must remain
   (`FAILED_PRECONDITION`, code word `not_enough_owners_besides_initiator`; a proposer must
   not retry it without the token): one owner must not decide another's money alone, so
   0036's floor of two for a service's proposal is not relaxed, and a held owner, who has no

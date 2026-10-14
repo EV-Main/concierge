@@ -2042,3 +2042,74 @@ async fn the_owners_set_the_platform_cooldown() {
 	let after = fx.platform_policy(owners[0]).await;
 	assert_eq!((after.version, after.cooldown_secs), (before.version + 1, 7200));
 }
+
+/// Only someone taken OFF a platform roster is told a decision was opened in their name:
+/// a proven scope admin was never on it and has no veto to cast (live run of #141).
+#[tokio::test]
+async fn only_an_owner_taken_off_the_roster_is_told() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, _owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let admin = fx.admins(&scope, 2).await[0];
+	let kind = fx.bank_platform_kind(&scope).await;
+	fx.at(T0);
+	let token = fx.tokens.mint(admin, T0);
+	let opened = fx.payment(&kind, &scope, Some(admin), Some(&token)).await.expect("a proven admin asks");
+	assert!(opened.requested_by_proven);
+	assert_eq!(opened.voters.len(), 3, "an admin was never on the owners' roster");
+	let notices: i64 = sqlx::query_scalar(
+		"SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id \
+		 WHERE s.user_id = $1 AND n.kind = 'approval_opened_in_your_name'",
+	)
+	.bind(admin.raw())
+	.fetch_one(&fx.pool)
+	.await
+	.unwrap();
+	assert_eq!(notices, 0, "nothing to veto, nothing to tell");
+}
+
+/// A retry under the same `dedupe_key` that carries a token is held to what the first call
+/// was: the token must be the named person's, or the answer is the same refusal.
+#[tokio::test]
+async fn a_retry_with_a_token_is_checked_as_the_first_call_was() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let kind = fx.bank_platform_kind(&scope).await;
+	fx.at(T0);
+	let request = |token: Option<String>| {
+		let request = as_bridge(ProposeRequest {
+			kind: kind.clone(),
+			scope: scope.id.clone(),
+			subject_ref: "payment:4f0c1a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b".into(),
+			requested_by: String::new(),
+			reason: "Monthly rebalance".into(),
+			fields: vec![amount("10", "USDT")],
+			dedupe_key: format!("retry-{}", scope.id),
+		});
+		(request, token)
+	};
+	let asker = fx.auth_subject(owners[0]).await;
+	let send = |token: Option<String>| {
+		let (mut request, token) = request(token);
+		request.get_mut().requested_by = asker.clone();
+		let request = match token {
+			Some(token) => with_user_token(request, &token),
+			None => request,
+		};
+		fx.services.propose(request)
+	};
+	let first = send(Some(fx.tokens.mint(owners[0], T0))).await.expect("the first call").into_inner();
+	let again = send(Some(fx.tokens.mint(owners[0], T0)))
+		.await
+		.expect("a retry with a fresh token of the same person")
+		.into_inner();
+	assert_eq!(again.id, first.id);
+	assert_eq!(send(None).await.expect("a retry without a token").into_inner().id, first.id);
+	assert_eq!(
+		code(send(Some(fx.tokens.mint(owners[1], T0))).await),
+		Some(Code::PermissionDenied),
+		"someone else's token is refused on a retry as on the first call"
+	);
+	assert_eq!(code(send(Some(fx.tokens.mint(owners[0], T0 - 121))).await), Some(Code::Unauthenticated), "and a stale one");
+}

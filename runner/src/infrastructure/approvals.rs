@@ -338,6 +338,24 @@ async fn user_by_subject(conn: &mut PgConnection, subject: &str) -> Result<Optio
 /// The SQLSTATE the store's pause raises (migration 0038, `approvals_platform_pause`).
 const PAUSE_SQLSTATE: &str = "EVA01";
 
+/// A token proves who asked only if it is the named person's (`requested_by`, resolved),
+/// still standing as it was when the token was minted.
+async fn check_proof(conn: &mut PgConnection, proven: &ProvenInitiator, requested_by: Option<Uuid>) -> Result<(), DomainError> {
+	if requested_by != Some(proven.user.raw()) {
+		return Err(DomainError::Forbidden("the user token is not requested_by's".into()));
+	}
+	let standing: Option<(String, i64)> = sqlx::query_as("SELECT status, token_version FROM users WHERE id = $1")
+		.bind(proven.user.raw())
+		.fetch_optional(conn)
+		.await
+		.map_err(repo_err)?;
+	let live = standing.is_some_and(|(status, floor)| status == "active" && u64::try_from(floor).is_ok_and(|floor| proven.token_version >= floor));
+	if !live {
+		return Err(DomainError::Forbidden("the user token no longer speaks for an active account".into()));
+	}
+	Ok(())
+}
+
 /// Spend a proof: one token proves one request. Spent in the transaction that opens the
 /// proposal, so a refused open spends nothing and a committed one can never be repeated
 /// under another `dedupe_key`.
@@ -467,6 +485,12 @@ impl ApprovalRepository for PgApprovals {
 			.map_err(repo_err)?;
 		if let Some(id) = existing {
 			let stored = load(&mut tx, id, false, now).await?.ok_or_else(|| not_found(id))?;
+			// A retry with a token answers as the first call would have: a token that is not
+			// the named person's is refused here too, rather than waved through because the
+			// proposal exists. Nothing is spent — the first call spent its own proof.
+			if let Some(proven) = &new.proven {
+				check_proof(&mut tx, proven, stored.requested_by.as_ref().map(|(user, _)| user.raw())).await?;
+			}
 			let same = stored.kind == new.kind.name
 				&& stored.scope == new.scope
 				&& stored.subject_ref == new.subject_ref
@@ -524,21 +548,8 @@ impl ApprovalRepository for PgApprovals {
 			),
 			None => None,
 		};
-		// A token proves who asked only if it is that person's, still standing as it was
-		// when the token was minted.
-		if let Some(ProvenInitiator { user: proven, token_version, .. }) = new.proven {
-			if requested_by != Some(proven.raw()) {
-				return Err(DomainError::Forbidden("the user token is not requested_by's".into()));
-			}
-			let standing: Option<(String, i64)> = sqlx::query_as("SELECT status, token_version FROM users WHERE id = $1")
-				.bind(proven.raw())
-				.fetch_optional(&mut *tx)
-				.await
-				.map_err(repo_err)?;
-			let live = standing.is_some_and(|(status, floor)| status == "active" && u64::try_from(floor).is_ok_and(|floor| token_version >= floor));
-			if !live {
-				return Err(DomainError::Forbidden("the user token no longer speaks for an active account".into()));
-			}
+		if let Some(proven) = &new.proven {
+			check_proof(&mut tx, proven, requested_by).await?;
 		}
 		for field in &new.fields {
 			if let FieldValue::User(subject) = &field.value
@@ -655,6 +666,10 @@ impl ApprovalRepository for PgApprovals {
 			(ApprovalLevel::Platform | ApprovalLevel::Scope, _) => None,
 		};
 		let before = roster.len();
+		// Told only if taken OFF a roster they were on: a proven admin of a scope is no owner,
+		// has no vote on a platform decision and no veto to cast, so a notice inviting one
+		// would point at a door that is shut.
+		let initiator_removed = proven_out.is_some_and(|initiator| roster.contains(&initiator));
 		let roster: Vec<UserId> = roster.into_iter().filter(|u| Some(*u) != new.exclude && Some(*u) != proven_out).collect();
 		// The floors count who can DECIDE: an owner on hold is on the roster with no say.
 		let deciders = match resolution.level {
@@ -729,7 +744,7 @@ impl ApprovalRepository for PgApprovals {
 			.map_err(repo_err)?;
 		if let Some(proven) = &new.proven {
 			spend_proof(&mut tx, proven, new.id, now).await?;
-			if proven_out.is_some() {
+			if initiator_removed {
 				tell_initiator(&mut tx, proven.user, new.id, &new.scope, now).await?;
 			}
 		}
