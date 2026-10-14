@@ -434,6 +434,8 @@ message ProposeScopePolicyChangeRequest {
 
 message ProposeRequest {
   string kind = 1;
+  // The scope whose roster decides: the one the subject lives in, and for a move out of a
+  // scope (`bank:scope_transfer`) the SOURCE scope.
   string scope = 2;
   string subject_ref = 3;
   // The person who asked for it, by `auth_subject`; empty when the proposer acts on its

@@ -118,8 +118,9 @@ They widen CORS for a **closed list** of sign-in routes and nothing else:
 | ---------------------- | -------------------- |
 | `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/email/verify/*`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user}`, never a token) | everything acting on an open session: `/auth/password/set`, `/auth/passkey/register`, `/auth/passkey/remove`, sessions, username, logout, `/kyc/*` |
 
-A credential POST on the left accepts an `Origin` that is `PUBLIC_ORIGIN` or one of an
-`ACTIVE` scope's origins. An OAuth `returnTo` must be one of these origins plus a path
+A route on the left accepts an `Origin` that is `PUBLIC_ORIGIN` or an origin of a scope
+that is `ACTIVE` or `FROZEN` — a frozen scope's clients still sign people in — and never
+one of a `CLOSED` scope. An OAuth `returnTo` must be one of these origins plus a path
 from the scope's `return_paths`, matched exactly.
 
 ---
@@ -215,7 +216,8 @@ So a direction that needs money moved does not hold an approval: it asks banking
 (banking's `RequestPayout`/`RequestTransfer`), banking stores the request whole, opens
 the `bank:*` proposal with every money field, executes it from `PullApproved` — one
 decision, one execution, unique by approval id on banking's side — and reports the
-outcome. The direction follows it by `subject_ref` on banking's money stream.
+outcome. Banking opens these proposals with `subject_ref = pending_operation:<operation_id>`,
+and the direction follows the operation by that `subject_ref` on banking's money stream.
 
 Kinds are published whole with `ScopeCatalogService.PublishScopeCatalog` (versioned like
 `PublishCatalog`); `concierge:*` kinds are this plane's own, built in at version 0. A
@@ -270,16 +272,17 @@ threshold. A `USER` field carries an `auth_subject`.
 | Kind | Level | Escalations (default) | Fields |
 | ---- | ----- | --------------------- | ------ |
 | `bank:payment` — from a scope account off the platform (L1) only | PLATFORM | — | tier, source, destination (TEXT), amount |
-| `bank:scope_transfer` — between two scopes | PLATFORM, always | — | from_account, to_account (TEXT), amount |
+| `bank:scope_transfer` — between two scopes; opened in the SOURCE scope | PLATFORM, always | — | from_account, to_account (TEXT), amount |
 | `bank:account_transfer` — between accounts of one scope | SCOPE | `per_operation` AMOUNT_ABOVE 1000 USDT; `daily` ROLLING_24H_AMOUNT_ABOVE 5000 USDT | from_account, to_account (TEXT), amount |
-| `bank:scope_payout` — discretionary payout from a scope account to users | SCOPE | `per_operation` AMOUNT_ABOVE 1000 USDT on `total`; `distribution` FLAG_SET | from_account (TEXT), total (AMOUNT), recipients (COUNT), recipient (USER, only when there is one line), lines_digest (TEXT), distribution (FLAG) |
+| `bank:scope_payout` — discretionary payout from a scope account to users | SCOPE | `per_operation` AMOUNT_ABOVE 1000 USDT on `total`; `daily` ROLLING_24H_AMOUNT_ABOVE 5000 USDT on `total`; `distribution` FLAG_SET | from_account (TEXT), total (AMOUNT), recipients (COUNT), recipient (USER, only when there is one line), lines_digest (TEXT), distribution (FLAG) |
 | `bank:seed_capital` | PLATFORM | — | to_account (TEXT), amount |
 | `bank:treasury_surplus` | PLATFORM | — | amount, destination (TEXT) |
 | `bank:compartment_policy` — a scope's compartment limits, default mandates, automatic ceilings | PLATFORM | — | banking's to define |
 
-`lines_digest` is SHA-256, lowercase hex, over the payout's lines as canonical
-`<auth_subject>|<amount>` strings, sorted and joined by `\n`, each amount in this
-plane's canonical decimal; banking computes it over the payout it stored. A
+`lines_digest` is SHA-256, lowercase hex, over the UTF-8 bytes of the payout's lines,
+each `<auth_subject>|<amount>` with the amount in this plane's canonical decimal, sorted
+bytewise and joined by `\n` with no trailing `\n` — the same definition as banking's,
+which computes it over the payout it stored. A
 distribution to every holder of an allocation is a `bank:scope_payout` with
 `distribution` set, which always escalates — there is no separate dividend kind.
 
@@ -403,3 +406,9 @@ position scanned (§4.2); `Scope.state` (§3).
 2. A direction receives `kyc_level` on the lifecycle stream and in `ScopeMember` (D5),
    although `GetMe` withholds it from relying parties today.
 3. Topic labels are one language; the frontends carry five locales.
+
+**Known limitation until `typ=service` tokens:** a namespace is the unit of
+`ApprovalExecutionService`, so several clients of one namespace are indistinguishable
+there — any of them may withdraw, pull or report on a proposal another opened.
+`requested_by_client` records which one opened it, for the audit trail, and authorises
+nothing.

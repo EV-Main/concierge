@@ -84,13 +84,14 @@ message Scope {
   // wildcard, never `null`. Compared byte for byte; the answer's
   // `Access-Control-Allow-Origin` is exactly the matched origin, with `Vary: Origin`.
   //
-  // They widen CORS on a CLOSED list of sign-in routes only — `/auth/code/request`,
-  // `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`,
-  // `/auth/email/verify/*`, `/auth/passkey/signin/*` and `GET /auth/session`, which
-  // answers them `{authenticated, user}` and never a token. Everything that acts on an
-  // open session (`/auth/password/set`, `/auth/passkey/register|remove`, sessions,
-  // username, logout, `/kyc/*`) accepts PUBLIC_ORIGIN alone. An OAuth `returnTo` must be
-  // one of these origins plus a path from `return_paths`.
+  // While the scope is ACTIVE or FROZEN (never once CLOSED) they widen CORS on a fixed
+  // list of sign-in routes only — `/auth/code/request`, `/auth/code/verify`,
+  // `/auth/password/signin`, `/auth/password/signup`, `/auth/email/verify/*`,
+  // `/auth/passkey/signin/*` and `GET /auth/session`, which answers them
+  // `{authenticated, user}` and never a token. Everything that acts on an open session
+  // (`/auth/password/set`, `/auth/passkey/register|remove`, sessions, username, logout,
+  // `/kyc/*`) accepts PUBLIC_ORIGIN alone. An OAuth `returnTo` must be one of these
+  // origins plus a path from `return_paths`.
   repeated string origins = 5;
   // The relying-party clients signing people in for this scope. A scope may have none
   // (`main` is first-party) or several.
