@@ -129,8 +129,8 @@ message GetUnreadCountResponse {
 }
 
 message MarkReadRequest {
-  // Notification ids to mark read, at most 500 (else INVALID_ARGUMENT). Ignored when
-  // `all` is set.
+  // Notification ids to mark read, at most 500 (else INVALID_ARGUMENT, also when `all`
+  // is set); not read when `all` is set.
   repeated string ids = 1;
   // Mark every unread notification read.
   bool all = 2;

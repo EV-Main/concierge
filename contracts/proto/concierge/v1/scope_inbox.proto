@@ -63,7 +63,7 @@ message GetScopeUnreadCountRequest {
 
 message MarkScopeNotificationsReadRequest {
   string user_id = 1;
-  // Ignored when `all` is set.
+  // At most 500 (else INVALID_ARGUMENT, also when `all` is set); not read when `all` is set.
   repeated string ids = 2;
   // Every unread notification of this inbox.
   bool all = 3;
