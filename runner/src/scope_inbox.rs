@@ -8,9 +8,13 @@
 //!
 //! The namespace is the calling client's scope's, never a request field and never an
 //! observed scope's: observing a scope's stream is not reading its users' mail. The user is
-//! named by the request because a client credential names no user; what keeps that from
-//! being a key to anyone's inbox is that the user must be an active member of the client's
-//! own scope and only that scope's topics are ever reached.
+//! named by the request on a READ because a client credential names no user; what keeps
+//! that from being a key to anyone's inbox is that the user must be an active member of
+//! the client's own scope and only that scope's topics are ever reached — the scope reads
+//! back what its own services emitted. A WRITE needs the user's own say: following a topic
+//! turns on mail to their address, so the client must also present the access token it
+//! was issued for that user ([`USER_TOKEN_HEADER`]), and the user is taken from it. A
+//! leaked client secret alone then reads a scope's own notifications and changes nothing.
 //!
 //! `Result<_, Status>` is tonic's mandated handler signature; `Status` is a large type
 //! we don't control, so the large-err lint does not apply in this module.
@@ -19,6 +23,7 @@
 use std::sync::Arc;
 
 use domain::users::UserId;
+use evconcierge_auth::{AuthError, Authenticate};
 use evconcierge_contracts::concierge::v1::{
 	GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, GetUnreadCountResponse, ListNotificationsRequest, ListNotificationsResponse, ListScopeNotificationsRequest,
 	MarkReadResponse, MarkScopeNotificationsReadRequest, NotificationSettings, SetScopeTopicSubscriptionRequest, scope_inbox_service_server::ScopeInboxService,
@@ -29,17 +34,26 @@ use uuid::Uuid;
 use crate::{
 	notification::{InboxView, inbox_mark_read, inbox_page, inbox_unread, settings_of, subscriber_of, topic_offered},
 	ports::{NotificationRepository, UserDirectoryRepository},
-	service_caller::{ServiceCaller, ServiceCallers},
+	relying_party::ClientTokenAuthenticator,
+	service_caller::{ClientCaller, ServiceCaller, ServiceCallers},
 	support::domain_to_status,
 };
 
 const SEAM: &str = "scope inbox";
+
+/// The metadata carrying the user's access token, as the client received it for that user
+/// (raw, no `Bearer`): `authorization` already carries the client's secret.
+pub const USER_TOKEN_HEADER: &str = "x-ev-user-token";
 
 #[derive(Clone)]
 pub struct ScopeInbox {
 	callers: ServiceCallers,
 	notifications: Arc<dyn NotificationRepository>,
 	users: Arc<dyn UserDirectoryRepository>,
+	/// The verifier that admits a client's user tokens to `GetMe`: their signature, `typ`,
+	/// a client audience and a live session. `None` where no client is configured — every
+	/// write is then refused.
+	user_tokens: Option<ClientTokenAuthenticator>,
 }
 
 /// Whose inbox, through which scope. `member` is `None` for anyone the scope may not show
@@ -50,11 +64,16 @@ struct Reader {
 }
 
 impl ScopeInbox {
-	pub fn new(callers: ServiceCallers, notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>) -> Self {
-		Self { callers, notifications, users }
+	pub fn new(callers: ServiceCallers, notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, user_tokens: Option<ClientTokenAuthenticator>) -> Self {
+		Self {
+			callers,
+			notifications,
+			users,
+			user_tokens,
+		}
 	}
 
-	async fn reader<T>(&self, request: &Request<T>, user_id: &str) -> Result<Reader, Status> {
+	async fn client<T>(&self, request: &Request<T>) -> Result<ClientCaller, Status> {
 		let client = match self.callers.authenticate(request, SEAM).await? {
 			ServiceCaller::Client(client) => client,
 			ServiceCaller::Bridge => return Err(Status::permission_denied("the money plane's topics are in the platform inbox, not a scope's")),
@@ -62,6 +81,11 @@ impl ScopeInbox {
 		if client.scope_closed {
 			return Err(Status::failed_precondition("the scope is closed"));
 		}
+		Ok(client)
+	}
+
+	async fn reader<T>(&self, request: &Request<T>, user_id: &str) -> Result<Reader, Status> {
+		let client = self.client(request).await?;
 		let user = Uuid::parse_str(user_id).map_err(|_| Status::invalid_argument("user_id must be a concierge user id"))?;
 		let member = self.notifications.is_active_scope_member(&client.scope, user).await.map_err(domain_to_status)?;
 		Ok(Reader {
@@ -70,8 +94,35 @@ impl ScopeInbox {
 		})
 	}
 
-	fn member_only(reader: &Reader) -> Result<Uuid, Status> {
-		reader.member.ok_or_else(|| Status::failed_precondition("not an active member of this scope"))
+	/// The inbox a write goes to and whose it is: the user the token was issued for, by THIS
+	/// client. `user_id`, when the request sets it, must name the same user — a mismatch is
+	/// a backend acting for someone the token does not speak for.
+	async fn writer<T>(&self, request: &Request<T>, user_id: &str) -> Result<(InboxView, Uuid), Status> {
+		let client = self.client(request).await?;
+		let Some(tokens) = &self.user_tokens else {
+			return Err(Status::unauthenticated("no user token can be verified on this plane"));
+		};
+		let token = request
+			.metadata()
+			.get(USER_TOKEN_HEADER)
+			.and_then(|v| v.to_str().ok())
+			.filter(|t| !t.is_empty())
+			.ok_or_else(|| Status::unauthenticated(format!("a write needs the user's access token in {USER_TOKEN_HEADER}")))?;
+		let claims = tokens.authenticate(token.to_owned()).await.map_err(|err| match err {
+			AuthError::Unavailable => Status::unavailable("user token not verifiable now"),
+			_ => Status::unauthenticated("invalid user token"),
+		})?;
+		if claims.aud != client.audience {
+			return Err(Status::permission_denied("the user token was issued to another client"));
+		}
+		let user = Uuid::parse_str(&claims.sub).map_err(|_| Status::unauthenticated("invalid user token"))?;
+		if !user_id.is_empty() && Uuid::parse_str(user_id).ok() != Some(user) {
+			return Err(Status::permission_denied("user_id is not the user the token was issued for"));
+		}
+		if !self.notifications.is_active_scope_member(&client.scope, user).await.map_err(domain_to_status)? {
+			return Err(Status::failed_precondition("not an active member of this scope"));
+		}
+		Ok((InboxView::Scope { namespace: client.namespace }, user))
 	}
 
 	async fn settings(&self, view: &InboxView, user: Uuid) -> Result<NotificationSettings, Status> {
@@ -122,13 +173,12 @@ impl ScopeInboxService for ScopeInbox {
 	}
 
 	async fn mark_scope_notifications_read(&self, request: Request<MarkScopeNotificationsReadRequest>) -> Result<Response<MarkReadResponse>, Status> {
-		let reader = self.reader(&request, &request.get_ref().user_id).await?;
-		let user = Self::member_only(&reader)?;
+		let (view, user) = self.writer(&request, &request.get_ref().user_id).await?;
 		let req = request.get_ref();
 		let Some(sub) = self.notifications.subscriber_of_user(user).await.map_err(domain_to_status)? else {
 			return Ok(Response::new(MarkReadResponse::default()));
 		};
-		Ok(Response::new(inbox_mark_read(self.notifications.as_ref(), sub.id, &reader.view, &req.ids, req.all).await?))
+		Ok(Response::new(inbox_mark_read(self.notifications.as_ref(), sub.id, &view, &req.ids, req.all).await?))
 	}
 
 	async fn get_scope_notification_settings(&self, request: Request<GetScopeNotificationSettingsRequest>) -> Result<Response<NotificationSettings>, Status> {
@@ -142,10 +192,9 @@ impl ScopeInboxService for ScopeInbox {
 	}
 
 	async fn set_scope_topic_subscription(&self, request: Request<SetScopeTopicSubscriptionRequest>) -> Result<Response<NotificationSettings>, Status> {
-		let reader = self.reader(&request, &request.get_ref().user_id).await?;
-		let user = Self::member_only(&reader)?;
+		let (view, user) = self.writer(&request, &request.get_ref().user_id).await?;
 		let req = request.get_ref();
-		if !topic_offered(self.notifications.as_ref(), &reader.view, &req.topic).await.map_err(domain_to_status)? {
+		if !topic_offered(self.notifications.as_ref(), &view, &req.topic).await.map_err(domain_to_status)? {
 			return Err(Status::invalid_argument("unknown topic"));
 		}
 		let account = self
@@ -159,6 +208,6 @@ impl ScopeInboxService for ScopeInbox {
 			.set_topic_subscription(sub.id, &req.topic, req.subscribed, req.email_enabled)
 			.await
 			.map_err(domain_to_status)?;
-		Ok(Response::new(self.settings(&reader.view, user).await?))
+		Ok(Response::new(self.settings(&view, user).await?))
 	}
 }

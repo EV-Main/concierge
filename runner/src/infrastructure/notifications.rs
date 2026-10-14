@@ -39,7 +39,9 @@ impl PgNotifications {
 }
 
 /// [`InboxTopics`] as the four binds of `inbox_topics_sql`. `split_part` rather than
-/// `LIKE ns || ':%'`: a namespace may hold `_`, which `LIKE` reads as a wildcard.
+/// `LIKE ns || ':%'`: a namespace may hold `_`, which `LIKE` reads as a wildcard. The
+/// `strpos` guard matches `InboxView::shows`: a key with no `:` has no namespace, where
+/// `split_part` alone would call the whole key one.
 fn inbox_topics(within: &InboxTopics) -> (bool, &[String], &[String], &[String]) {
 	match within {
 		InboxTopics::Every => (true, &[], &[], &[]),
@@ -50,7 +52,7 @@ fn inbox_topics(within: &InboxTopics) -> (bool, &[String], &[String], &[String])
 /// The predicate over `topic` for binds `$n`…`$n+3` in [`inbox_topics`]'s order.
 fn inbox_topics_sql(n: usize) -> String {
 	format!(
-		"(${n} OR ((topic = ANY(${k}) OR split_part(topic, ':', 1) = ANY(${ns})) AND NOT topic = ANY(${ex})))",
+		"(${n} OR ((topic = ANY(${k}) OR (strpos(topic, ':') > 0 AND split_part(topic, ':', 1) = ANY(${ns}))) AND NOT topic = ANY(${ex})))",
 		k = n + 1,
 		ns = n + 2,
 		ex = n + 3
@@ -351,7 +353,7 @@ impl NotificationRepository for PgNotifications {
 			        COALESCE(EXTRACT(EPOCH FROM read_at)::BIGINT, 0) AS read_at \
 			 FROM notifications \
 			 WHERE subscriber_id = $1 \
-			   AND ($2::UUID IS NULL OR (created_at, id) < ROW((SELECT created_at FROM notifications WHERE id = $2), $2)) \
+			   AND ($2::UUID IS NULL OR (created_at, id) < ROW((SELECT created_at FROM notifications WHERE id = $2 AND subscriber_id = $1), $2)) \
 			   AND (NOT $3 OR read_at IS NULL) \
 			   AND ($4::TEXT IS NULL OR topic = $4) \
 			   AND {} \

@@ -13,9 +13,8 @@ mod common;
 use axum::http::{Method, StatusCode};
 use common::web::{Browser, ORIGIN, Surface, address, surface};
 use concierge::{
-	authz::BreakGlass,
 	infrastructure::{notifications::PgNotifications, scope_catalogs::PgScopeCatalogs, users::PgUsers},
-	notification::{INBOX_VIEW_HEADER, Notifications, RateLimiter, TOPICS},
+	notification::{INBOX_VIEW_HEADER, MAX_MARK_IDS, Notifications, RateLimiter, TOPICS},
 	ports::{NotificationRepository, ScopeCatalogRepository, UserDirectoryRepository},
 };
 use domain::scope_catalog::{NotificationTopic, ScopeCatalog};
@@ -281,8 +280,10 @@ async fn the_summary_needs_the_permission_and_the_public_origin() {
 	assert!(shown.iter().any(|s| s == TOPICS[0].key), "the built-ins too");
 	assert_eq!(on_scope_host, StatusCode::FORBIDDEN, "the summary is never served to a scope's host");
 
-	let (status, _) = settings_from(&fx, ORIGIN, "?all=yes", &mut browser).await;
-	assert_eq!(status, StatusCode::BAD_REQUEST);
+	for query in ["?all=yes", "?all=1&all=1"] {
+		let answer = settings_from(&fx, ORIGIN, query, &mut browser).await;
+		assert_eq!(answer, (StatusCode::BAD_REQUEST, json!({ "error": "invalid_view" })), "{query}");
+	}
 }
 
 fn as_user(id: Uuid) -> Claims {
@@ -319,12 +320,7 @@ async fn a_user_token_on_grpc_reads_the_platform_inbox() {
 	let bank = bank_topic(&pool).await;
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let repo = Arc::new(PgNotifications::new(pool.clone()));
-	let service = Notifications::new(
-		repo.clone(),
-		users.clone(),
-		Arc::new(RateLimiter::new(std::time::Duration::from_secs(60), 10)),
-		Arc::new(BreakGlass::new(Vec::new())),
-	);
+	let service = Notifications::new(repo.clone(), users.clone(), Arc::new(RateLimiter::new(std::time::Duration::from_secs(60), 10)));
 	let user = users.resolve(common::google("grpc", true), 0).await.unwrap();
 	let id = user.id().raw();
 	join(&pool, &a_scope, id).await;
@@ -384,6 +380,15 @@ async fn a_user_token_on_grpc_reads_the_platform_inbox() {
 
 	let denied = service.list_notifications(grpc(id, ListNotificationsRequest::default(), true)).await.unwrap_err();
 	assert_eq!(denied.code(), Code::PermissionDenied, "an investor has no summary");
+	// The one subject break-glass could elevate is one with no persisted seat at all.
+	let seatless = service.list_notifications(grpc(Uuid::new_v4(), ListNotificationsRequest::default(), true)).await.unwrap_err();
+	assert_eq!(seatless.code(), Code::PermissionDenied, "the summary reads the persisted seat only");
+
+	let too_many = MarkReadRequest {
+		ids: (0..=MAX_MARK_IDS).map(|_| Uuid::new_v4().to_string()).collect(),
+		all: false,
+	};
+	assert_eq!(service.mark_read(grpc(id, too_many, false)).await.unwrap_err().code(), Code::InvalidArgument);
 
 	let mut roster_lock = PgConnection::connect(&url).await.unwrap();
 	sqlx::query("SELECT pg_advisory_lock($1)").bind(ROSTER_LOCK).execute(&mut roster_lock).await.unwrap();

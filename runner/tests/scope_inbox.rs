@@ -2,36 +2,56 @@
 //! inbox with its client credential, and only its own namespace, only for its members.
 //!
 //! Every test makes its own scopes (tenant, client, secret, catalog) and its own users, so
-//! the suite runs beside the others on a shared database.
+//! the suite runs beside the others on a shared database. A write needs the user's own
+//! access token for the calling client, minted here through the real code exchange and
+//! verified by the real relying-party verifier against this suite's JWKS server.
 
-use std::sync::Arc;
+use std::{net::TcpListener, sync::Arc, time::Duration};
 
 mod common;
 
 use concierge::{
-	infrastructure::{db, notifications::PgNotifications, relying_parties::PgRelyingParties, scope_catalogs::PgScopeCatalogs, users::PgUsers},
-	notification::TOPICS,
+	infrastructure::{db, grants::PgGrants, notifications::PgNotifications, relying_parties::PgRelyingParties, scope_catalogs::PgScopeCatalogs, users::PgUsers},
+	notification::{MAX_MARK_IDS, TOPICS},
 	ports::{NotificationRepository, RelyingPartyRepository, ScopeCatalogRepository, UserDirectoryRepository},
-	scope_inbox::ScopeInbox,
+	relying_party::{Admission, ClientTokenAuthenticator, RelyingParties, Requester, s256_challenge},
+	scope_inbox::{ScopeInbox, USER_TOKEN_HEADER},
 	service_caller::ServiceCallers,
 };
-use domain::scope_catalog::{NotificationTopic, ScopeCatalog};
+use domain::{
+	scope_catalog::{NotificationTopic, ScopeCatalog},
+	users::UserId,
+};
+use evconcierge_auth::{AuthConfig, AuthService, SigningConfig, TokenType, Verifier, VerifierConfig, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
-	GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, ListScopeNotificationsRequest, MarkScopeNotificationsReadRequest, SetScopeTopicSubscriptionRequest,
+	ExchangeCodeRequest, GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, ListScopeNotificationsRequest, MarkScopeNotificationsReadRequest, SetScopeTopicSubscriptionRequest,
+	auth_service_server::{AuthService as AuthRpc, AuthServiceServer},
 	scope_inbox_service_server::ScopeInboxService,
 };
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tonic::{Code, Request, metadata::MetadataValue};
+use tonic::{
+	Code, Request,
+	metadata::MetadataValue,
+	transport::{Channel, Server},
+};
 use uuid::Uuid;
 
 const BRIDGE_TOKEN: &str = "test-bridge-token";
+// The same throwaway Ed25519 keypair `relying_party.rs` and the auth crate's tests sign with.
+const TEST_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIKolOSMXwE+tafZkX+jkKYJbmJ066f4E12wAwTIkKps6\n-----END PRIVATE KEY-----\n";
+const TEST_JWK_X: &str = "Z6BCmq9-_wo9d7co5CDW84Wn0sAC3BA0XWK2AOstpV4";
+const ISSUER: &str = "https://auth.concierge.test";
 
 struct Fx {
 	pool: PgPool,
-	inbox: ScopeInbox,
+	callers: ServiceCallers,
 	notifications: Arc<PgNotifications>,
 	users: Arc<PgUsers>,
+	rp: Arc<RelyingParties>,
+	auth: AuthService,
+	/// Where this suite's `AuthService` serves the JWKS the verifier reads.
+	jwks: String,
 }
 
 struct Scope {
@@ -39,6 +59,27 @@ struct Scope {
 	client: String,
 	secret: String,
 	topic: String,
+	redirect: String,
+}
+
+fn auth_config() -> AuthConfig {
+	AuthConfig {
+		issuer: ISSUER.into(),
+		client_audience: "concierge".into(),
+		service_audience: "concierge-services".into(),
+		access_ttl_secs: 3600,
+		refresh_ttl_secs: 3600,
+		max_session_secs: 7_776_000,
+		idle_timeout_secs: 0,
+		service_ttl_secs: 300,
+		signing: Some(SigningConfig {
+			signing_key_pem: TEST_PEM.into(),
+			kid: "test-kid".into(),
+			jwks_json: format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","x":"{TEST_JWK_X}","kid":"test-kid","alg":"EdDSA","use":"sig"}}]}}"#),
+		}),
+		google: None,
+		github: None,
+	}
 }
 
 async fn setup() -> Option<Fx> {
@@ -48,11 +89,36 @@ async fn setup() -> Option<Fx> {
 	let callers = ServiceCallers::new(Some(BRIDGE_TOKEN.into()), Arc::new(PgRelyingParties::new(pool.clone())));
 	let notifications = Arc::new(PgNotifications::new(pool.clone()));
 	let users = Arc::new(PgUsers::new(pool.clone()));
+	let rp = Arc::new(RelyingParties::new(
+		Arc::new(PgRelyingParties::new(pool.clone())),
+		users.clone(),
+		Arc::new(PgGrants::new(pool.clone())),
+		Default::default(),
+	));
+	let (provisioner, _rx) = provisioner_channel();
+	let auth = AuthService::try_new(auth_config(), provisioner).await.expect("auth service").with_client_grants(rp.clone());
+
+	let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+	let jwks = format!("http://{addr}");
+	let serving = auth.clone();
+	// Detached on purpose: it serves the JWKS for the life of the test's runtime and is
+	// dropped with it.
+	drop(tokio::spawn(async move { Server::builder().add_service(AuthServiceServer::new(serving)).serve(addr).await }));
+	for attempt in 0.. {
+		if Channel::from_shared(jwks.clone()).unwrap().connect().await.is_ok() {
+			break;
+		}
+		assert!(attempt < 50, "the JWKS server never became reachable");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
 	Some(Fx {
-		inbox: ScopeInbox::new(callers, notifications.clone(), users.clone()),
+		pool,
+		callers,
 		notifications,
 		users,
-		pool,
+		rp,
+		auth,
+		jwks,
 	})
 }
 
@@ -61,6 +127,63 @@ fn now() -> i64 {
 }
 
 impl Fx {
+	/// The service as `main` mounts it, verifying the user tokens of `clients`.
+	fn inbox(&self, clients: &[&Scope]) -> ScopeInbox {
+		let verifier = Verifier::try_new(VerifierConfig {
+			issuer: ISSUER.into(),
+			audiences: clients.iter().map(|s| s.client.clone()).collect(),
+			allowed_types: vec![TokenType::Access],
+			jwks_grpc_endpoint: self.jwks.clone(),
+		})
+		.unwrap();
+		ScopeInbox::new(
+			self.callers.clone(),
+			self.notifications.clone(),
+			self.users.clone(),
+			Some(ClientTokenAuthenticator::new(verifier, self.rp.clone())),
+		)
+	}
+
+	/// `user`'s access token for `scope`'s client, through the real code exchange. Signing in
+	/// also makes the user a member of the scope, as it does in production.
+	async fn token(&self, scope: &Scope, user: Uuid) -> String {
+		let client = self.rp.resolve(&scope.client, &scope.redirect).await.unwrap().expect("the client resolves");
+		let Admission::Admitted { token_version } = self.rp.admit(UserId::from_raw(user)).await.unwrap() else {
+			panic!("the user is admitted");
+		};
+		let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+		let code = self
+			.rp
+			.issue_code(
+				&client,
+				&scope.redirect,
+				&s256_challenge(&verifier),
+				UserId::from_raw(user),
+				token_version,
+				Requester {
+					upstream_family: &format!("fam-{}", Uuid::new_v4()),
+					client_ip: "203.0.113.7",
+					user_agent: "itest",
+				},
+			)
+			.await
+			.unwrap();
+		AuthRpc::exchange_code(
+			&self.auth,
+			Request::new(ExchangeCodeRequest {
+				client_id: scope.client.clone(),
+				client_secret: scope.secret.clone(),
+				code,
+				redirect_uri: scope.redirect.clone(),
+				code_verifier: verifier,
+			}),
+		)
+		.await
+		.expect("the code redeems")
+		.into_inner()
+		.access_token
+	}
+
 	/// A scope with one client, its secret and one published topic. `observers` name the
 	/// clients that may read its stream.
 	async fn scope(&self, observers: &[&Scope]) -> Scope {
@@ -70,6 +193,7 @@ impl Fx {
 			client: format!("xc_{tag}"),
 			secret: format!("{tag}{tag}{tag}"),
 			topic: format!("x_{tag}:news"),
+			redirect: format!("https://{tag}.test/cb"),
 		};
 		let observers: Vec<String> = observers.iter().map(|s| s.client.clone()).collect();
 		sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, observers) VALUES ($1, $1, FALSE, 0, $2)")
@@ -80,7 +204,7 @@ impl Fx {
 			.expect("register the scope");
 		sqlx::query("INSERT INTO rp_clients (client_id, audience, redirect_uris, created_at, tenant_id) VALUES ($1, $1, $2, 0, $3)")
 			.bind(&scope.client)
-			.bind(vec![format!("https://{tag}.test/cb")])
+			.bind(vec![scope.redirect.clone()])
 			.bind(&scope.id)
 			.execute(&self.pool)
 			.await
@@ -112,12 +236,14 @@ impl Fx {
 	}
 
 	async fn join(&self, scope: &Scope, user: Uuid) {
-		sqlx::query("INSERT INTO scope_members (scope, user_id, joined_at, joined_by, lifecycle_sequence, sequence, permissions) VALUES ($1, $2, 0, 'grant', 0, 1, '{}')")
-			.bind(&scope.id)
-			.bind(user)
-			.execute(&self.pool)
-			.await
-			.expect("make the user a member");
+		sqlx::query(
+			"INSERT INTO scope_members (scope, user_id, joined_at, joined_by, lifecycle_sequence, sequence, permissions) VALUES ($1, $2, 0, 'grant', 0, 1, '{}') ON CONFLICT DO NOTHING",
+		)
+		.bind(&scope.id)
+		.bind(user)
+		.execute(&self.pool)
+		.await
+		.expect("make the user a member");
 	}
 
 	/// An inbox entry on `topic`, written as a consent trace is: regardless of follows.
@@ -152,6 +278,30 @@ fn as_client<T>(body: T, scope: &Scope) -> Request<T> {
 	with_client(body, &scope.client, &scope.secret)
 }
 
+/// `scope`'s client writing for the user `token` was issued for.
+fn on_behalf<T>(body: T, scope: &Scope, token: &str) -> Request<T> {
+	let mut request = as_client(body, scope);
+	request.metadata_mut().insert(USER_TOKEN_HEADER, MetadataValue::try_from(token).unwrap());
+	request
+}
+
+fn follow(user: &str, topic: &str) -> SetScopeTopicSubscriptionRequest {
+	SetScopeTopicSubscriptionRequest {
+		user_id: user.to_owned(),
+		topic: topic.to_owned(),
+		subscribed: true,
+		email_enabled: true,
+	}
+}
+
+fn mark_all(user: &str) -> MarkScopeNotificationsReadRequest {
+	MarkScopeNotificationsReadRequest {
+		user_id: user.to_owned(),
+		ids: Vec::new(),
+		all: true,
+	}
+}
+
 fn list(user: Uuid) -> ListScopeNotificationsRequest {
 	ListScopeNotificationsRequest {
 		user_id: user.to_string(),
@@ -164,8 +314,9 @@ async fn a_member_reads_only_the_scope_namespace_in_pages() {
 	let Some(fx) = setup().await else { return };
 	let mine = fx.scope(&[]).await;
 	let other = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&mine, &other]);
 	let (user, email) = fx.user("member").await;
-	fx.join(&mine, user).await;
+	let token = fx.token(&mine, user).await;
 	fx.join(&other, user).await;
 	for _ in 0..25 {
 		fx.note(user, &email, &mine.topic).await;
@@ -174,13 +325,12 @@ async fn a_member_reads_only_the_scope_namespace_in_pages() {
 	fx.note(user, &email, TOPICS[2].key).await;
 	fx.note(user, &email, "bank:anything").await;
 
-	let page = fx.inbox.list_scope_notifications(as_client(list(user), &mine)).await.unwrap().into_inner();
+	let page = inbox.list_scope_notifications(as_client(list(user), &mine)).await.unwrap().into_inner();
 	assert_eq!(page.notifications.len(), 20, "limit 0 is a real page, not one row");
 	assert!(page.notifications.iter().all(|n| n.topic == mine.topic), "only this scope's namespace");
 	assert!(!page.next_cursor.is_empty());
 	assert_eq!(page.unread_count, 25);
-	let rest = fx
-		.inbox
+	let rest = inbox
 		.list_scope_notifications(as_client(
 			ListScopeNotificationsRequest {
 				user_id: user.to_string(),
@@ -195,16 +345,14 @@ async fn a_member_reads_only_the_scope_namespace_in_pages() {
 		.into_inner();
 	assert_eq!((rest.notifications.len(), rest.next_cursor.as_str()), (5, ""));
 
-	let unread = fx
-		.inbox
+	let unread = inbox
 		.get_scope_unread_count(as_client(GetScopeUnreadCountRequest { user_id: user.to_string() }, &mine))
 		.await
 		.unwrap()
 		.into_inner();
 	assert_eq!(unread.unread_count, 25);
 
-	let settings = fx
-		.inbox
+	let settings = inbox
 		.get_scope_notification_settings(as_client(GetScopeNotificationSettingsRequest { user_id: user.to_string() }, &mine))
 		.await
 		.unwrap()
@@ -212,32 +360,12 @@ async fn a_member_reads_only_the_scope_namespace_in_pages() {
 	assert_eq!(settings.topics.iter().map(|t| t.topic.as_str()).collect::<Vec<_>>(), vec![mine.topic.as_str()]);
 	assert_eq!(settings.email, email, "a member's own address, which the scope's stream already carries");
 
-	let followed = fx
-		.inbox
-		.set_scope_topic_subscription(as_client(
-			SetScopeTopicSubscriptionRequest {
-				user_id: user.to_string(),
-				topic: mine.topic.clone(),
-				subscribed: true,
-				email_enabled: false,
-			},
-			&mine,
-		))
-		.await
-		.unwrap()
-		.into_inner();
-	assert!(followed.topics.iter().any(|t| t.topic == mine.topic && t.subscribed && !t.email_enabled));
+	// The token names the user; `user_id` may be left out of a write.
+	let followed = inbox.set_scope_topic_subscription(on_behalf(follow("", &mine.topic), &mine, &token)).await.unwrap().into_inner();
+	assert!(followed.topics.iter().any(|t| t.topic == mine.topic && t.subscribed && t.email_enabled));
 
-	let all = fx
-		.inbox
-		.mark_scope_notifications_read(as_client(
-			MarkScopeNotificationsReadRequest {
-				user_id: user.to_string(),
-				ids: Vec::new(),
-				all: true,
-			},
-			&mine,
-		))
+	let all = inbox
+		.mark_scope_notifications_read(on_behalf(mark_all(&user.to_string()), &mine, &token))
 		.await
 		.unwrap()
 		.into_inner();
@@ -246,9 +374,10 @@ async fn a_member_reads_only_the_scope_namespace_in_pages() {
 }
 
 #[tokio::test]
-async fn a_non_member_reads_nothing_and_writes_nothing() {
+async fn a_non_member_reads_nothing() {
 	let Some(fx) = setup().await else { return };
 	let scope = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&scope]);
 	let (user, email) = fx.user("outsider").await;
 	fx.note(user, &email, &scope.topic).await;
 
@@ -257,84 +386,120 @@ async fn a_non_member_reads_nothing_and_writes_nothing() {
 	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(disabled).execute(&fx.pool).await.unwrap();
 
 	for id in [user, disabled, Uuid::new_v4()] {
-		let page = fx.inbox.list_scope_notifications(as_client(list(id), &scope)).await.unwrap().into_inner();
+		let page = inbox.list_scope_notifications(as_client(list(id), &scope)).await.unwrap().into_inner();
 		assert!(page.notifications.is_empty() && page.unread_count == 0, "{id}");
-		let unread = fx
-			.inbox
+		let unread = inbox
 			.get_scope_unread_count(as_client(GetScopeUnreadCountRequest { user_id: id.to_string() }, &scope))
 			.await
 			.unwrap()
 			.into_inner();
 		assert_eq!(unread.unread_count, 0);
-		let settings = fx
-			.inbox
+		let settings = inbox
 			.get_scope_notification_settings(as_client(GetScopeNotificationSettingsRequest { user_id: id.to_string() }, &scope))
 			.await
 			.unwrap()
 			.into_inner();
 		assert_eq!(settings, Default::default(), "not even whose address the id is: {id}");
-
-		let mark = fx
-			.inbox
-			.mark_scope_notifications_read(as_client(
-				MarkScopeNotificationsReadRequest {
-					user_id: id.to_string(),
-					ids: Vec::new(),
-					all: true,
-				},
-				&scope,
-			))
-			.await
-			.unwrap_err();
-		assert_eq!(mark.code(), Code::FailedPrecondition);
-		let follow = fx
-			.inbox
-			.set_scope_topic_subscription(as_client(
-				SetScopeTopicSubscriptionRequest {
-					user_id: id.to_string(),
-					topic: scope.topic.clone(),
-					subscribed: true,
-					email_enabled: true,
-				},
-				&scope,
-			))
-			.await
-			.unwrap_err();
-		assert_eq!(follow.code(), Code::FailedPrecondition);
 	}
-	assert_eq!(fx.unread_rows(user).await, 1);
+}
+
+/// A client secret alone writes nothing: following a topic turns on mail to someone's
+/// address, so the user's own token for THIS client is what names them.
+#[tokio::test]
+async fn a_write_needs_the_user_s_token_for_this_client() {
+	let Some(fx) = setup().await else { return };
+	let mine = fx.scope(&[]).await;
+	let other = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&mine, &other]);
+	let (user, email) = fx.user("writer").await;
+	let token = fx.token(&mine, user).await;
+	let theirs = fx.token(&other, user).await;
+	let (someone, _) = fx.user("someone").await;
+	fx.token(&mine, someone).await;
+	fx.note(user, &email, &mine.topic).await;
+	let me = user.to_string();
+
+	let bare = inbox.set_scope_topic_subscription(as_client(follow(&me, &mine.topic), &mine)).await.unwrap_err();
+	assert_eq!(bare.code(), Code::Unauthenticated, "no token, no write");
+	let bare = inbox.mark_scope_notifications_read(as_client(mark_all(&me), &mine)).await.unwrap_err();
+	assert_eq!(bare.code(), Code::Unauthenticated);
+
+	let forged = inbox.set_scope_topic_subscription(on_behalf(follow(&me, &mine.topic), &mine, "not.a.token")).await.unwrap_err();
+	assert_eq!(forged.code(), Code::Unauthenticated);
+
+	let foreign = inbox.set_scope_topic_subscription(on_behalf(follow(&me, &mine.topic), &mine, &theirs)).await.unwrap_err();
+	assert_eq!(foreign.code(), Code::PermissionDenied, "a token issued to another client");
+	let foreign = inbox.mark_scope_notifications_read(on_behalf(mark_all(&me), &mine, &theirs)).await.unwrap_err();
+	assert_eq!(foreign.code(), Code::PermissionDenied);
+
+	let other_user = inbox
+		.set_scope_topic_subscription(on_behalf(follow(&someone.to_string(), &mine.topic), &mine, &token))
+		.await
+		.unwrap_err();
+	assert_eq!(other_user.code(), Code::PermissionDenied, "user_id names someone the token does not speak for");
+	let other_user = inbox.mark_scope_notifications_read(on_behalf(mark_all(&someone.to_string()), &mine, &token)).await.unwrap_err();
+	assert_eq!(other_user.code(), Code::PermissionDenied);
+	assert_eq!(fx.unread_rows(user).await, 1, "nothing was marked by a refused write");
+
+	let too_many = MarkScopeNotificationsReadRequest {
+		user_id: me.clone(),
+		ids: (0..=MAX_MARK_IDS).map(|_| Uuid::new_v4().to_string()).collect(),
+		all: false,
+	};
+	assert_eq!(
+		inbox.mark_scope_notifications_read(on_behalf(too_many, &mine, &token)).await.unwrap_err().code(),
+		Code::InvalidArgument
+	);
+	let at_most = MarkScopeNotificationsReadRequest {
+		user_id: me.clone(),
+		ids: (0..MAX_MARK_IDS).map(|_| Uuid::new_v4().to_string()).collect(),
+		all: false,
+	};
+	assert_eq!(inbox.mark_scope_notifications_read(on_behalf(at_most, &mine, &token)).await.unwrap().into_inner().marked, 0);
+
+	inbox
+		.set_scope_topic_subscription(on_behalf(follow(&me, &mine.topic), &mine, &token))
+		.await
+		.expect("the user's own token writes");
+	assert_eq!(inbox.mark_scope_notifications_read(on_behalf(mark_all(&me), &mine, &token)).await.unwrap().into_inner().marked, 1);
+
+	// A token that still verifies, for an account suspended since: not a member any more.
+	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(user).execute(&fx.pool).await.unwrap();
+	let held = inbox.set_scope_topic_subscription(on_behalf(follow(&me, &mine.topic), &mine, &token)).await.unwrap_err();
+	assert_eq!(held.code(), Code::FailedPrecondition);
 }
 
 #[tokio::test]
 async fn only_the_scope_s_own_client_opens_it() {
 	let Some(fx) = setup().await else { return };
 	let scope = fx.scope(&[]).await;
+	let closed = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&scope, &closed]);
 	let (user, _) = fx.user("creds").await;
 	fx.join(&scope, user).await;
 
-	let wrong = fx.inbox.list_scope_notifications(with_client(list(user), &scope.client, "not-the-secret")).await.unwrap_err();
+	let wrong = inbox.list_scope_notifications(with_client(list(user), &scope.client, "not-the-secret")).await.unwrap_err();
 	assert_eq!(wrong.code(), Code::Unauthenticated);
-	let unknown = fx.inbox.list_scope_notifications(with_client(list(user), "nobody_here", &scope.secret)).await.unwrap_err();
+	let unknown = inbox.list_scope_notifications(with_client(list(user), "nobody_here", &scope.secret)).await.unwrap_err();
 	assert_eq!(unknown.code(), Code::Unauthenticated);
-	let anonymous = fx.inbox.list_scope_notifications(Request::new(list(user))).await.unwrap_err();
+	let anonymous = inbox.list_scope_notifications(Request::new(list(user))).await.unwrap_err();
 	assert_eq!(anonymous.code(), Code::Unauthenticated);
 
 	let mut bridge = Request::new(list(user));
 	bridge.metadata_mut().insert("authorization", MetadataValue::try_from(format!("Bearer {BRIDGE_TOKEN}")).unwrap());
-	assert_eq!(fx.inbox.list_scope_notifications(bridge).await.unwrap_err().code(), Code::PermissionDenied);
+	assert_eq!(inbox.list_scope_notifications(bridge).await.unwrap_err().code(), Code::PermissionDenied);
 
 	sqlx::query("UPDATE rp_clients SET disabled_at = 0 WHERE client_id = $1")
 		.bind(&scope.client)
 		.execute(&fx.pool)
 		.await
 		.unwrap();
-	let disabled = fx.inbox.list_scope_notifications(as_client(list(user), &scope)).await.unwrap_err();
+	let disabled = inbox.list_scope_notifications(as_client(list(user), &scope)).await.unwrap_err();
 	assert_eq!(disabled.code(), Code::Unauthenticated);
 
-	let closed = fx.scope(&[]).await;
 	fx.join(&closed, user).await;
 	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1").bind(&closed.id).execute(&fx.pool).await.unwrap();
-	let refused = fx.inbox.list_scope_notifications(as_client(list(user), &closed)).await.unwrap_err();
+	let refused = inbox.list_scope_notifications(as_client(list(user), &closed)).await.unwrap_err();
 	assert_eq!(refused.code(), Code::FailedPrecondition);
 }
 
@@ -345,15 +510,15 @@ async fn a_client_never_reaches_another_scope_s_inbox_even_as_its_observer() {
 	let Some(fx) = setup().await else { return };
 	let a = fx.scope(&[]).await;
 	let b = fx.scope(&[&a]).await;
+	let inbox = fx.inbox(&[&a, &b]);
 	let (user, email) = fx.user("both").await;
-	fx.join(&a, user).await;
+	let token = fx.token(&a, user).await;
 	fx.join(&b, user).await;
 	let of_b = fx.note(user, &email, &b.topic).await;
 
-	let page = fx.inbox.list_scope_notifications(as_client(list(user), &a)).await.unwrap().into_inner();
+	let page = inbox.list_scope_notifications(as_client(list(user), &a)).await.unwrap().into_inner();
 	assert!(page.notifications.is_empty(), "{:?}", page.notifications);
-	let filter = fx
-		.inbox
+	let filter = inbox
 		.list_scope_notifications(as_client(
 			ListScopeNotificationsRequest {
 				user_id: user.to_string(),
@@ -366,15 +531,15 @@ async fn a_client_never_reaches_another_scope_s_inbox_even_as_its_observer() {
 		.unwrap_err();
 	assert_eq!(filter.code(), Code::InvalidArgument);
 
-	let marked = fx
-		.inbox
-		.mark_scope_notifications_read(as_client(
+	let marked = inbox
+		.mark_scope_notifications_read(on_behalf(
 			MarkScopeNotificationsReadRequest {
 				user_id: user.to_string(),
 				ids: vec![of_b.to_string()],
 				all: false,
 			},
 			&a,
+			&token,
 		))
 		.await
 		.unwrap()
@@ -382,21 +547,9 @@ async fn a_client_never_reaches_another_scope_s_inbox_even_as_its_observer() {
 	assert_eq!(marked.marked, 0, "another inbox's id is not marked");
 	assert_eq!(fx.unread_rows(user).await, 1);
 
-	let follow = fx
-		.inbox
-		.set_scope_topic_subscription(as_client(
-			SetScopeTopicSubscriptionRequest {
-				user_id: user.to_string(),
-				topic: b.topic.clone(),
-				subscribed: true,
-				email_enabled: true,
-			},
-			&a,
-		))
-		.await
-		.unwrap_err();
-	assert_eq!(follow.code(), Code::InvalidArgument);
+	let follow_b = inbox.set_scope_topic_subscription(on_behalf(follow(&user.to_string(), &b.topic), &a, &token)).await.unwrap_err();
+	assert_eq!(follow_b.code(), Code::InvalidArgument);
 
-	let own = fx.inbox.list_scope_notifications(as_client(list(user), &b)).await.unwrap().into_inner();
+	let own = inbox.list_scope_notifications(as_client(list(user), &b)).await.unwrap().into_inner();
 	assert_eq!(own.notifications.iter().map(|n| n.id.clone()).collect::<Vec<_>>(), vec![of_b.to_string()]);
 }

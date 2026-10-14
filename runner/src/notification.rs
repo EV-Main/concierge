@@ -48,7 +48,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
-	authz::{BreakGlass, require_permission},
+	authz::caller_gate,
 	infrastructure::notifications::SubscriberRow,
 	ports::{InboxTopics, NotificationRepository, UserDirectoryRepository},
 	service_caller::BANK_NAMESPACE,
@@ -258,29 +258,28 @@ pub struct Notifications {
 	notifications: Arc<dyn NotificationRepository>,
 	users: Arc<dyn UserDirectoryRepository>,
 	limiter: Arc<RateLimiter>,
-	break_glass: Arc<BreakGlass>,
 }
 
 impl Notifications {
-	pub fn new(notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, limiter: Arc<RateLimiter>, break_glass: Arc<BreakGlass>) -> Self {
-		Self {
-			notifications,
-			users,
-			limiter,
-			break_glass,
-		}
+	pub fn new(notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, limiter: Arc<RateLimiter>) -> Self {
+		Self { notifications, users, limiter }
 	}
 
 	/// A user's token reads the platform inbox: a scope's own surface signs its users in
 	/// with its own client, whose token this service never admits, so a session token here
 	/// is always someone on `PUBLIC_ORIGIN`. The summary is asked for by
-	/// [`INBOX_VIEW_HEADER`] and needs `concierge:notifications:read_all`.
+	/// [`INBOX_VIEW_HEADER`] and needs `concierge:notifications:read_all` on the PERSISTED
+	/// seat, as on the web: break-glass elevation opens the console, not everyone's mail.
 	async fn view<T>(&self, request: &Request<T>) -> Result<InboxView, Status> {
 		match request.metadata().get(INBOX_VIEW_HEADER).map(|v| v.to_str()) {
 			None => Ok(InboxView::Platform),
 			Some(Ok("all")) => {
-				require_permission(self.users.as_ref(), &self.break_glass, request, NotificationPermission::ReadAll).await?;
-				Ok(InboxView::All)
+				let gate = caller_gate(self.users.as_ref(), request).await?;
+				if gate.record.is_some_and(|r| r.role.may(NotificationPermission::ReadAll)) {
+					Ok(InboxView::All)
+				} else {
+					Err(Status::permission_denied("insufficient role"))
+				}
 			}
 			Some(_) => Err(Status::invalid_argument(format!("{INBOX_VIEW_HEADER} is `all` or absent"))),
 		}
@@ -456,8 +455,14 @@ pub(crate) async fn inbox_unread(notifications: &dyn NotificationRepository, sub
 	Ok(notifications.unread_count(sub.id, &view.topics()).await.map_err(domain_to_status)? as u32)
 }
 
+/// The most ids one mark-read names: bounds the `ANY($ids)` a caller can hand Postgres.
+pub const MAX_MARK_IDS: usize = 500;
+
 /// Marks `ids` (or everything unread with `all`) within `view` only.
 pub(crate) async fn inbox_mark_read(notifications: &dyn NotificationRepository, subscriber_id: Uuid, view: &InboxView, ids: &[String], all: bool) -> Result<MarkReadResponse, Status> {
+	if ids.len() > MAX_MARK_IDS {
+		return Err(Status::invalid_argument(format!("at most {MAX_MARK_IDS} ids per call")));
+	}
 	let ids = ids
 		.iter()
 		.map(|raw| Uuid::parse_str(raw).map_err(|_| Status::invalid_argument("notification id must be a UUID")))
@@ -528,36 +533,36 @@ impl NotificationService for Notifications {
 	}
 
 	async fn list_notifications(&self, request: Request<ListNotificationsRequest>) -> Result<Response<ListNotificationsResponse>, Status> {
-		let sub = self.caller(&request).await?;
 		let view = self.view(&request).await?;
+		let sub = self.caller(&request).await?;
 		let req = request.get_ref();
 
 		Ok(Response::new(inbox_page(self.notifications.as_ref(), &sub, &view, req).await?))
 	}
 
 	async fn get_unread_count(&self, request: Request<GetUnreadCountRequest>) -> Result<Response<GetUnreadCountResponse>, Status> {
-		let sub = self.caller(&request).await?;
 		let view = self.view(&request).await?;
+		let sub = self.caller(&request).await?;
 		let unread_count = inbox_unread(self.notifications.as_ref(), &sub, &view).await?;
 		Ok(Response::new(GetUnreadCountResponse { unread_count }))
 	}
 
 	async fn mark_read(&self, request: Request<MarkReadRequest>) -> Result<Response<MarkReadResponse>, Status> {
-		let sub = self.caller(&request).await?;
 		let view = self.view(&request).await?;
+		let sub = self.caller(&request).await?;
 		let req = request.get_ref();
 		Ok(Response::new(inbox_mark_read(self.notifications.as_ref(), sub.id, &view, &req.ids, req.all).await?))
 	}
 
 	async fn get_notification_settings(&self, request: Request<GetNotificationSettingsRequest>) -> Result<Response<NotificationSettings>, Status> {
-		let sub = self.caller(&request).await?;
 		let view = self.view(&request).await?;
+		let sub = self.caller(&request).await?;
 		Ok(Response::new(self.settings_snapshot(&view, &sub).await?))
 	}
 
 	async fn set_channel_enabled(&self, request: Request<SetChannelEnabledRequest>) -> Result<Response<NotificationSettings>, Status> {
-		let sub = self.caller(&request).await?;
 		let view = self.view(&request).await?;
+		let sub = self.caller(&request).await?;
 		let req = request.get_ref();
 
 		// Both channels off is explicitly allowed — "stop contacting me" is a supported
@@ -576,8 +581,8 @@ impl NotificationService for Notifications {
 	}
 
 	async fn set_topic_subscription(&self, request: Request<SetTopicSubscriptionRequest>) -> Result<Response<NotificationSettings>, Status> {
-		let sub = self.caller(&request).await?;
 		let view = self.view(&request).await?;
+		let sub = self.caller(&request).await?;
 		let req = request.get_ref();
 		if !topic_offered(self.notifications.as_ref(), &view, &req.topic).await.map_err(domain_to_status)? {
 			return Err(Status::invalid_argument("unknown topic"));

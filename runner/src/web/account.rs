@@ -87,21 +87,20 @@ pub async fn me(State(st): State<WebState>, jar: CookieJar) -> Read {
 	read_answer(st, jar, caller, answer).await
 }
 
-/// `?all=1` asks for the summary inbox.
-#[derive(Deserialize)]
-pub struct ViewQuery {
-	all: Option<String>,
-}
+/// `?all=1` asks for the summary inbox. Taken as raw pairs rather than a struct so a
+/// repeated `all` is this route's JSON refusal, not the extractor's plain-text 400.
+type ViewQuery = Vec<(String, String)>;
 
 /// The inbox a request on the notification routes is answered from. The summary is served
 /// on `PUBLIC_ORIGIN` only, to a PERSISTED seat holding the permission: break-glass
 /// elevation opens the console, not everyone's notifications.
 async fn inbox_view(st: &super::Inner, headers: &HeaderMap, query: &ViewQuery, user: &User) -> Result<InboxView, Refusal> {
 	let forbidden = || Refusal::new(StatusCode::FORBIDDEN, "forbidden");
-	let summary = match query.all.as_deref() {
-		None | Some("0" | "false") => false,
-		Some("1" | "true") => true,
-		Some(_) => return Err(Refusal::new(StatusCode::BAD_REQUEST, "invalid_view")),
+	let mut all = query.iter().filter(|(key, _)| key == "all").map(|(_, value)| value.as_str());
+	let summary = match (all.next(), all.next()) {
+		(None | Some("0" | "false"), None) => false,
+		(Some("1" | "true"), None) => true,
+		_ => return Err(Refusal::new(StatusCode::BAD_REQUEST, "invalid_view")),
 	};
 	let not_allowed = || Refusal::new(StatusCode::FORBIDDEN, "origin_not_allowed");
 	let origin = headers.get(header::ORIGIN).map(|v| v.to_str().map_err(|_| not_allowed())).transpose()?;

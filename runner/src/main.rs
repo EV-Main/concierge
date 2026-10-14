@@ -254,12 +254,20 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		client_verifier_config.audiences.iter().all(|aud| !verifier_config_audiences.contains(aud)),
 		"a relying party's audience collides with this plane's own — its tokens would open every RPC"
 	);
-	let auth = if client_verifier_config.audiences.is_empty() {
-		grpc_auth_layer(verifier)
+	// The same authenticator checks the user token a scope's backend presents to write in
+	// that user's scope inbox (`scope_inbox`).
+	let client_tokens = if client_verifier_config.audiences.is_empty() {
+		None
 	} else {
 		let client_verifier = Verifier::try_new(client_verifier_config).context("failed to build the relying-party token verifier")?;
-		let get_me = format!("/{}/GetMe", <UserDirectoryServer<directory::Directory> as NamedService>::NAME);
-		grpc_auth_layer(verifier).with_restricted(ClientTokenAuthenticator::new(client_verifier, relying_parties.clone()), [get_me])
+		Some(ClientTokenAuthenticator::new(client_verifier, relying_parties.clone()))
+	};
+	let auth = match &client_tokens {
+		None => grpc_auth_layer(verifier),
+		Some(client_tokens) => {
+			let get_me = format!("/{}/GetMe", <UserDirectoryServer<directory::Directory> as NamedService>::NAME);
+			grpc_auth_layer(verifier).with_restricted(client_tokens.clone(), [get_me])
+		}
 	};
 
 	// The cross-plane bridge producer: the one-way identity→money seam the banking
@@ -297,7 +305,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	let notification_repo: Arc<dyn concierge::ports::NotificationRepository> = pg_notifications.clone();
 	let dispatch_repo: Arc<dyn concierge::ports::NotificationDispatchRepository> = pg_notifications;
 	// A direction's own inbox, read by its backend with its client credential (D21).
-	let scope_inbox = concierge::scope_inbox::ScopeInbox::new(service_callers, notification_repo.clone(), users.clone());
+	let scope_inbox = concierge::scope_inbox::ScopeInbox::new(service_callers, notification_repo.clone(), users.clone(), client_tokens);
 
 	// The ownership consilium. The broadcast channel is only an immediacy optimisation
 	// for the live feed — each stream ALSO re-reads the revision from Postgres on an
@@ -501,13 +509,8 @@ async fn run(config: config::AppConfig) -> Result<()> {
 				governance_revisions,
 			))))
 			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), grants, break_glass.clone()).with_grant_write_limiter(grant_write_limiter))))
-			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass.clone(), platform_repo))))
-			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(
-				notification_repo,
-				users,
-				subscribe_limiter,
-				break_glass,
-			))))
+			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass, platform_repo))))
+			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 			.add_service(auth.layer(ScopeRegistryServer::new(concierge::scopes::ScopeRegistry::new(scope_repo))))
 			.serve_with_shutdown(config.bind, await_signal())

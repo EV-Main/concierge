@@ -669,9 +669,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `ScopeInboxService` (outside the user auth layer, `BIND` and the TLS listener) with its
   client credential and the user's concierge id: the client's own scope's namespace only
   (never an observed scope's), active members only — anyone else reads empty and writes
-  `FAILED_PRECONDITION`. So the client credential opens `ScopeEvents`, `UserEvents`,
-  `ScopeCatalogService` and `ScopeInboxService`, while a client's USER token still opens
-  `GetMe` alone. `docs/SCOPES-AND-APPROVALS.md` §6.
+  `FAILED_PRECONDITION`. A WRITE also needs the user's access token issued to that client
+  (`x-ev-user-token`, `aud` = its audience, live session) and takes the user from it:
+  following a topic turns on mail, and a client secret alone must not do that to anyone.
+  So the client credential opens `ScopeEvents`, `UserEvents`, `ScopeCatalogService` and
+  `ScopeInboxService`, while a client's USER token is admitted by the auth layer on `GetMe`
+  alone and is otherwise only that second proof on a scope-inbox write. The gRPC summary
+  reads the persisted seat; break-glass does not open it. `docs/SCOPES-AND-APPROVALS.md` §6.
 - **This plane is the identity provider of first-party clients on OTHER origins, and a
   client's token opens exactly one RPC.** A relying party (`relying_party`, registry
   `rp_clients` from `0025`; the Service-Arb panel `sa` (0025) and the invest cabinet `invest` (0031) are seeded) runs authorization code +

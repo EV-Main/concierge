@@ -19,11 +19,18 @@ import "concierge/v1/notification.proto";
 // field: an observer of a scope does not get that scope's inbox. Only that namespace's
 // catalog topics are offered, followed, filtered on, listed, counted and marked.
 //
-// USER. `user_id` is the concierge user id — the `sub` of the client's own access token
-// for that user, and `ScopeEvent.user_id`. The user must be an active MEMBER of the scope
-// (`ScopeEvent` MEMBER_JOINED); for anyone else — an unknown id, an account the scope
-// never saw, a disabled account, alike — the reads answer empty and the writes
-// FAILED_PRECONDITION, so the service tells a client nothing its stream did not.
+// USER. On a READ, `user_id` is the concierge user id — the `sub` of the client's own
+// access token for that user, and `ScopeEvent.user_id`. A WRITE (MarkScopeNotificationsRead,
+// SetScopeTopicSubscription) needs the user's say, because following a topic turns on mail
+// to their address: the metadata `x-ev-user-token` carries the access token THIS client was
+// issued for the user (raw, no `Bearer`), checked as GetMe checks it (signature,
+// `typ=access`, a live session) and with `aud` = this client's audience. The user is taken
+// from its `sub`; `user_id` may be empty, and when set must be that user. No or a bad token
+// is UNAUTHENTICATED; another client's token or a different `user_id` is PERMISSION_DENIED.
+// The user must be an active MEMBER of the scope (`ScopeEvent` MEMBER_JOINED); for anyone
+// else — an unknown id, an account the scope never saw, a disabled account, alike — the
+// reads answer empty and the writes FAILED_PRECONDITION, so the service tells a client
+// nothing its stream did not.
 //
 // The master channel switches (in-app, email) are the account's across every inbox and
 // are not set from here: NotificationService.SetChannelEnabled on PUBLIC_ORIGIN.
@@ -32,7 +39,7 @@ service ScopeInboxService {
   rpc ListScopeNotifications(ListScopeNotificationsRequest) returns (ListNotificationsResponse);
   rpc GetScopeUnreadCount(GetScopeUnreadCountRequest) returns (GetUnreadCountResponse);
   // Marks only notifications of this inbox: an id of another inbox is not marked and not
-  // reported (`marked` counts what was flipped).
+  // reported (`marked` counts what was flipped). At most 500 ids, else INVALID_ARGUMENT.
   rpc MarkScopeNotificationsRead(MarkScopeNotificationsReadRequest) returns (MarkReadResponse);
   // The settings snapshot with this inbox's topics only.
   rpc GetScopeNotificationSettings(GetScopeNotificationSettingsRequest) returns (NotificationSettings);

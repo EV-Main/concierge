@@ -478,11 +478,19 @@ console, not everyone's notifications. The summary is metadata on gRPC and not a
 field because banking builds these request messages with struct literals (§1).
 
 **How a direction reaches its own inbox (decided 2026-10-14).** Its frontend talks to its
-own backend, and the backend calls `ScopeInboxService` with the client credential, naming
-the user by the concierge id it knows from its own session (its access token's `sub`,
-`ScopeEvent.user_id`). Neither credentialed CORS on the account routes nor the client's
-user token on `NotificationService`: the account routes stay off the scope hosts' CORS
-list (§3.1), and a client's user token still opens `GetMe` alone.
+own backend, and the backend calls `ScopeInboxService` with the client credential. A READ
+names the user by the concierge id it knows from its own session (its access token's
+`sub`, `ScopeEvent.user_id`): the inbox holds only what the scope's own services emitted.
+A WRITE — mark-read, following a topic — also carries the user's access token issued to
+THIS client (metadata `x-ev-user-token`), checked as `GetMe` checks it plus `aud` = the
+calling client's audience, and the user is taken from its `sub`: following a topic turns
+on mail to the user's address, and a client secret alone (or a leaked one) must not be
+able to do that to anyone. No or a bad token is `UNAUTHENTICATED`; another client's token,
+or a `user_id` that is not the token's user, `PERMISSION_DENIED`. Neither credentialed
+CORS on the account routes nor the client's user token on `NotificationService`: the
+account routes stay off the scope hosts' CORS list (§3.1), and a client's user token is
+admitted by the auth layer on `GetMe` alone — here it is a second proof beside the
+client's secret, never a credential on its own.
 
 - The namespace is the calling client's scope's, never a request field. An observer of a
   scope (§3) gets its stream, never its inbox.
@@ -497,7 +505,10 @@ list (§3.1), and a client's user token still opens `GetMe` alone.
   platform inbox's).
 - The master channel switches are not offered: they act on every inbox, so they stay on
   `PUBLIC_ORIGIN` (`NotificationService.SetChannelEnabled`, the account MFE).
-- Pages are explicit: `limit` 0 means 20, at most 100, `next_cursor` empty on the last.
+- Pages are explicit: `limit` 0 means 20, at most 100, `next_cursor` empty on the last. A
+  mark-read names at most 500 ids, here and on `NotificationService.MarkRead`.
+- The gRPC summary (`x-ev-inbox-view: all`) reads the PERSISTED seat, as the web does:
+  break-glass elevation (`OWNER_SUBJECTS`) does not open it.
 
 As implemented: a scope catalog's topics are offered in the inbox of their scope (gRPC and
 `/auth/notifications/settings`), may be followed and filtered on there, and disappear from

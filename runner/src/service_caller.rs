@@ -41,6 +41,8 @@ pub enum ServiceCaller {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientCaller {
 	pub client_id: String,
+	/// The `aud` of the access tokens it is issued for its users.
+	pub audience: String,
 	pub scope: String,
 	pub namespace: String,
 	/// Its scope is CLOSED: the history stays readable on every stream, nothing new is
@@ -112,6 +114,7 @@ impl ServiceCallers {
 		}
 		Ok(ServiceCaller::Client(ClientCaller {
 			client_id: client.client_id,
+			audience: client.audience,
 			scope: client.scope,
 			namespace: client.namespace,
 			scope_closed: client.scope_closed,
