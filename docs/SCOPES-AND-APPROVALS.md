@@ -333,9 +333,15 @@ containment is never slower than the grant).
   opener is proven by their session and is kept off the roster (D23): nobody votes on
   what they asked for. A `PLATFORM` proposal is refused at open (`FAILED_PRECONDITION`)
   with fewer than two owners, or when the opener is the only one left to decide.
-- **A vote is the seat's** (decided): a FOR counts towards the threshold only while its
-  voter still holds the seat the roster was drawn from, so removing an admin after their
-  FOR takes it back, and the proposal needs another vote to pass.
+- **A vote is the seat's** (decided): a vote counts only while its voter still holds the
+  seat the roster was drawn from — for an owner, the persisted `owner` role AND an active
+  account, so a suspended owner has no say. Removing an admin after their FOR takes it
+  back and the proposal needs another vote to pass; and when the seated voters who have
+  not voted AGAINST are fewer than the threshold, the proposal is `REJECTED`. `voters` on
+  `Approval` still shows every vote as cast: whether one counts is decided from the seats
+  at each vote, not stored on it. A proposal that already PASSED is not reopened when its
+  voters lose their seats: inside the delay any owner (or remaining roster member) vetoes
+  it (§5.6).
 - **Escalation to `PLATFORM`** happens at open and is frozen with the roster
   (`Approval.escalated_by` says why):
   - any declared escalation test fires against the scope's threshold (or the kind's
@@ -394,8 +400,8 @@ executor loop once passed (D23).
 
 | Kind | Level | Opened by | Fields | Executed as |
 | ---- | ----- | --------- | ------ | ----------- |
-| `concierge:scope_admin_grant` | PLATFORM | a seat holding `iam:tenants:grant` | account (USER) | a grant of `<namespace>:admin`, `granted_by` the opener; VOID if the account or scope is no longer active |
-| `concierge:scope_policy_change` | PLATFORM | such a seat, or an admin of the scope | quorum_bps, delay_secs, ttl_secs, thresholds (COUNT; the overrides themselves are stored with the proposal) | the scope's next policy `version`, checked again against the catalogs then in force; VOID if it no longer fits |
+| `concierge:scope_admin_grant` | PLATFORM | a seat holding `iam:tenants:grant`, for an account with a VERIFIED address | account (USER) | a grant of `<namespace>:admin`, `granted_by` the opener; VOID if the account is no longer active or verified, or the scope no longer active |
+| `concierge:scope_policy_change` | PLATFORM | such a seat, or an admin of the scope | quorum_bps, delay_secs, ttl_secs, thresholds (COUNT), and one `threshold` TEXT field per override, `<kind>/<parameter>=<value>` — the values are in `payload_hash`; the whole policy is also `Approval.proposed_policy` | the scope's next policy `version`, checked again against the catalogs then in force; VOID if it no longer fits |
 
 Assigning an operator in a scope is still a delegated `GrantPermission` by a
 `<scope>:admin`, with no approval.
@@ -476,7 +482,12 @@ happens over a session, not from a mailbox.
 the behaviour `SetRole` has for `admin`; the alias is granted only by an executed
 `concierge:scope_admin_grant`. No catalog may delegate `<namespace>:admin`
 (`Catalog::check`): a seat able to hand out the alias could fill a scope's roster with
-accounts it controls and pass its quorum with no owner asked. **Removing a scope admin is immediate, with no
+accounts it controls and pass its quorum with no owner asked. The account must have a
+VERIFIED address, checked at open and again at execution: the seat is reached by the
+approvals' mail, and an unproven address hands it to whoever holds the mailbox.
+Removing an admin takes back their votes on OPEN proposals at once (§5.2); a proposal they
+already carried to PASSED is stopped only by a veto inside its delay — any owner may cast
+it. **Removing a scope admin is immediate, with no
 approval** (`RevokePermission` by a seat holding `iam:tenants:grant`): containing a
 rogue admin must never be the slower path, the rule this plane already keeps for
 `Role::Admin`.
@@ -518,6 +529,9 @@ in `domain::approvals`.
   `PERMISSION_DENIED` on a vote and a veto, and a FOR they cast before is not counted,
   while the threshold stays what it was: removing an admin is the containment step and
   must bite at once (§5.6), and shrinking the roster would let a removal lower the bar.
+- **A scope may only tighten** (decided, until this plane keeps its own floor on the known
+  money kinds, D24): a policy's threshold is never above the kind's own
+  `default_threshold`.
 - **Policy**: a scope with no installed policy is on the default (`version` 1, 5001 bps,
   3600 s, 72 h, no overrides); an executed `concierge:scope_policy_change` installs the next
   version (`scope_approval_policies`, every version kept). A scope's delay is never under

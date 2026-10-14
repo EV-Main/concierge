@@ -55,6 +55,8 @@ pub const PULL_MARGIN_SECS: i64 = 60 * 60;
 /// A scope's veto window is never shorter: an hour is the least an owner gets to see a
 /// scope decision and stop it (decided).
 pub const MIN_SCOPE_DELAY_SECS: u32 = 60 * 60;
+/// Threshold overrides one policy may carry, each a field of its proposal.
+pub const MAX_THRESHOLDS: usize = 64;
 /// The shortest lifetime a scope policy may give an open proposal.
 pub const MIN_SCOPE_TTL_SECS: u32 = 60 * 60;
 
@@ -127,6 +129,9 @@ impl ScopePolicy {
 		if !(MIN_SCOPE_TTL_SECS..=MAX_TTL_SECS).contains(&self.ttl_secs) {
 			return Err(format!("ttl_secs is {MIN_SCOPE_TTL_SECS}..={MAX_TTL_SECS}"));
 		}
+		if self.thresholds.len() > MAX_THRESHOLDS {
+			return Err(format!("a policy overrides at most {MAX_THRESHOLDS} thresholds"));
+		}
 		for (i, t) in self.thresholds.iter().enumerate() {
 			if self.thresholds[..i].iter().any(|o| o.kind == t.kind && o.parameter == t.parameter) {
 				return Err(format!("threshold `{}`/`{}` is given twice", t.kind, t.parameter));
@@ -144,6 +149,23 @@ impl ScopePolicy {
 			};
 			if !shaped {
 				return Err(format!("threshold `{}`/`{}` is not a value its test takes", t.kind, t.parameter));
+			}
+			// Until this plane holds its own floor on the known money kinds, a scope may only
+			// make a kind's escalation stricter than the kind publishes it (decided): a looser
+			// one would let the scope keep for itself what its publisher sends to the owners.
+			let looser = match escalation.test {
+				EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => amount_above(&t.value, &escalation.default_threshold),
+				EscalationTest::AbsBpsAbove => match (t.value.parse::<u64>(), escalation.default_threshold.parse::<u64>()) {
+					(Ok(value), Ok(default)) => value > default,
+					_ => true,
+				},
+				EscalationTest::FlagSet => true,
+			};
+			if looser {
+				return Err(format!(
+					"threshold `{}`/`{}` is above the kind's own `{}`: a scope may only tighten it",
+					t.kind, t.parameter, escalation.default_threshold
+				));
 			}
 		}
 		Ok(())
@@ -163,6 +185,7 @@ pub fn builtin_kinds() -> Vec<ApprovalKind> {
 		label: label.into(),
 		field_type,
 		required: true,
+		repeated: false,
 	};
 	vec![
 		ApprovalKind {
@@ -183,6 +206,15 @@ pub fn builtin_kinds() -> Vec<ApprovalKind> {
 				field("delay_secs", "Veto delay, seconds", FieldType::Count),
 				field("ttl_secs", "Lifetime, seconds", FieldType::Count),
 				field("thresholds", "Threshold overrides", FieldType::Count),
+				// One per override, `<kind>/<parameter>=<value>`: the values the owners
+				// approve are fields, so `payload_hash` is taken over them.
+				FieldSpec {
+					key: "threshold".into(),
+					label: "Threshold override".into(),
+					field_type: FieldType::Text,
+					required: false,
+					repeated: true,
+				},
 			],
 			escalations: Vec::new(),
 		},
@@ -202,19 +234,23 @@ pub enum Action {
 	InstallPolicy { scope: String, policy: ScopePolicy },
 }
 
-/// The fields a policy change shows its voters; the overrides themselves travel in the
-/// [`Action`].
+/// The fields a policy change shows its voters, every override with its value among them.
 pub fn policy_fields(policy: &ScopePolicy) -> Vec<Field> {
 	let count = |key: &str, value: u64| Field {
 		key: key.into(),
 		value: FieldValue::Count(value),
 	};
-	vec![
+	let mut fields = vec![
 		count("quorum_bps", u64::from(policy.quorum_bps)),
 		count("delay_secs", u64::from(policy.delay_secs)),
 		count("ttl_secs", u64::from(policy.ttl_secs)),
 		count("thresholds", u64::try_from(policy.thresholds.len()).unwrap_or(u64::MAX)),
-	]
+	];
+	fields.extend(policy.thresholds.iter().map(|t| Field {
+		key: "threshold".into(),
+		value: FieldValue::Text(format!("{}/{}={}", t.kind, t.parameter, t.value)),
+	}));
+	fields
 }
 
 /// Money as the proposer spells it. The spelling is canonical (checked at open), because
@@ -312,7 +348,7 @@ pub fn check_fields(kind: &ApprovalKind, fields: Vec<Field>) -> Result<Vec<Field
 		let Some(spec) = kind.fields.iter().find(|s| s.key == field.key) else {
 			return Err(format!("field `{}` is not declared by `{}`", field.key, kind.name));
 		};
-		if fields[..i].iter().any(|f| f.key == field.key) {
+		if !spec.repeated && fields[..i].iter().any(|f| f.key == field.key) {
 			return Err(format!("field `{}` is given twice", field.key));
 		}
 		if spec.field_type != field.value.field_type() {
@@ -815,15 +851,18 @@ impl Decision {
 		self.voters[index].vote = vote;
 		self.voters[index].voted_at = now;
 		self.transition(ApprovalEvent::Voted);
-		let fors = self.voters.iter().filter(|x| x.vote == Vote::For && !unseated.contains(&x.user_id)).count();
-		let againsts = self.voters.iter().filter(|x| x.vote == Vote::Against).count();
+		let seated = || self.voters.iter().filter(|x| !unseated.contains(&x.user_id));
+		let fors = seated().filter(|x| x.vote == Vote::For).count();
+		// What could still carry it: seated FORs and seated votes not cast yet. Neither
+		// vote of someone who lost the seat counts, either way.
+		let reachable = seated().filter(|x| x.vote != Vote::Against).count();
 		let threshold = usize::try_from(self.threshold).unwrap_or(usize::MAX);
 		if fors >= threshold {
 			self.state = ApprovalState::Passed;
 			self.passed_at = Some(now);
 			self.executable_at = Some(now.saturating_add(self.delay_secs));
 			self.transition(ApprovalEvent::Passed);
-		} else if againsts > self.voters.len().saturating_sub(threshold) {
+		} else if reachable < threshold {
 			self.close(ApprovalState::Rejected, ApprovalEvent::Rejected, now);
 		}
 		Ok(())
@@ -912,18 +951,21 @@ mod tests {
 					label: "To".into(),
 					field_type: FieldType::Text,
 					required: true,
+					repeated: false,
 				},
 				FieldSpec {
 					key: "amount".into(),
 					label: "Amount".into(),
 					field_type: FieldType::Amount,
 					required: true,
+					repeated: false,
 				},
 				FieldSpec {
 					key: "distribution".into(),
 					label: "To every holder".into(),
 					field_type: FieldType::Flag,
 					required: false,
+					repeated: false,
 				},
 			],
 			escalations: vec![
@@ -1161,6 +1203,38 @@ mod tests {
 	}
 
 	#[test]
+	fn a_vote_that_can_no_longer_be_won_is_lost() {
+		let roster = [uid(), uid(), uid()];
+		let mut d = Decision::open(&roster, 2, 0, 1000);
+		d.vote(roster[0], Vote::For, 1, &[]).unwrap();
+		d.vote(roster[1], Vote::Against, 2, &[roster[0]]).unwrap();
+		assert_eq!(d.state, ApprovalState::Rejected, "one seated vote left of the two needed");
+		let mut d = Decision::open(&roster, 2, 0, 1000);
+		d.vote(roster[0], Vote::Against, 1, &[]).unwrap();
+		d.vote(roster[1], Vote::For, 2, &[roster[0]]).unwrap();
+		assert_eq!(d.state, ApprovalState::Open, "the unseated AGAINST counts no more than a FOR would");
+	}
+
+	#[test]
+	fn a_policy_change_carries_its_values_into_the_hash() {
+		let with = |value: &str| {
+			let policy = ScopePolicy {
+				thresholds: vec![Threshold {
+					kind: "bank:account_transfer".into(),
+					parameter: "per_operation".into(),
+					value: value.into(),
+				}],
+				..ScopePolicy::default()
+			};
+			let kind = builtin_kinds().into_iter().find(|k| k.name == SCOPE_POLICY_CHANGE).unwrap();
+			let fields = check_fields(&kind, policy_fields(&policy)).unwrap();
+			payload_preimage(&kind.name, "sa", "scope_policy:4f0c1a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b", &fields)
+		};
+		assert_ne!(with("500"), with("900"));
+		assert!(with("500").contains("threshold\tTEXT\tbank:account_transfer/per_operation=500\n"));
+	}
+
+	#[test]
 	fn pulling_stops_before_the_lapse() {
 		let roster = [uid(), uid()];
 		let mut d = Decision::open(&roster, 2, 100, 1000);
@@ -1212,6 +1286,16 @@ mod tests {
 			assert!(bad.check(&kinds).is_err(), "{bad:?}");
 		}
 		assert!(ok.check(&[]).is_err(), "a kind withdrawn since");
+		let looser = ScopePolicy {
+			thresholds: vec![threshold("per_operation", "1000.5")],
+			..ok.clone()
+		};
+		assert!(looser.check(&kinds).is_err(), "above the kind's own 1000");
+		let equal = ScopePolicy {
+			thresholds: vec![threshold("per_operation", "1000")],
+			..ok.clone()
+		};
+		assert_eq!(equal.check(&kinds), Ok(()));
 	}
 
 	#[test]

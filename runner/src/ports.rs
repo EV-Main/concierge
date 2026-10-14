@@ -660,9 +660,9 @@ pub trait ApprovalRepository: Send + Sync {
 	/// The policy scope `scope` is measured against; `None` for an unknown scope.
 	async fn policy(&self, scope: &str) -> Result<Option<ScopePolicy>, DomainError>;
 
-	/// An ACTIVE account and its `auth_subject`. A handle naming several accounts names
-	/// nobody (`Validation`).
-	async fn person(&self, who: PersonRef<'_>) -> Result<Option<(UserId, String)>, DomainError>;
+	/// An ACTIVE account, its `auth_subject` and whether its address is verified. A handle
+	/// naming several accounts names nobody (`Validation`).
+	async fn person(&self, who: PersonRef<'_>) -> Result<Option<(UserId, String, bool)>, DomainError>;
 
 	/// Carry out one passed `concierge:*` proposal and record its outcome, in one
 	/// transaction. `None` when it is not (or no longer) this plane's to execute now.

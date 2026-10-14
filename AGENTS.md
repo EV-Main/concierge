@@ -673,7 +673,10 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   What keeps one person from acting alone is the threshold over the whole roster,
   `sole_admin` escalation, the two-owner floor — and that `<ns>:admin`, the scope roster,
   is granted ONLY by an executed `concierge:scope_admin_grant` (`GrantPermission` refuses
-  it to everyone) and never delegated. A FOR counts only while its voter holds the seat;
+  it to everyone), never delegated, and only to an account with a verified address. A vote
+  counts only while its voter holds the seat (a suspended owner holds none), and a proposal
+  the seated voters can no longer carry is rejected; a scope's policy only tightens a kind's
+  thresholds;
   any owner vetoes any proposal inside its delay; a scope's delay is never under an hour.
   Expiry, executability and the 72 h lapse to `void` are time predicates and nothing sweeps
   for them; every transition writes its `approval_events` row in the same transaction.

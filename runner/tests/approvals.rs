@@ -1187,8 +1187,10 @@ async fn a_namespace_holds_a_bounded_number_of_live_proposals() {
 
 impl Fx {
 	/// One pass of the executor of this plane's own kinds, as the background loop runs it.
-	async fn execute(&self) -> usize {
-		concierge::approvals::execute_due(self.repo.as_ref()).await.expect("an executor pass")
+	/// The pass is global — it takes on every due `concierge:*` decision in the database,
+	/// other suites' too — so a test asserts on its own proposals, never on the count.
+	async fn execute(&self) {
+		concierge::approvals::execute_due(self.repo.as_ref()).await.expect("an executor pass");
 	}
 
 	async fn get(&self, who: UserId, id: &str) -> Approval {
@@ -1326,14 +1328,21 @@ async fn the_owners_grant_a_scope_admin_and_the_opener_does_not_vote() {
 	fx.vote(owners[1], &opened.id, ApprovalVote::For).await.unwrap();
 	let passed = fx.vote(owners[2], &opened.id, ApprovalVote::For).await.unwrap();
 	assert_eq!(state(&passed), ApprovalState::Passed);
-	assert_eq!(fx.execute().await, 0, "nothing is executed inside the owners' veto window");
+	fx.execute().await;
 	assert!(!fx.holds_admin(&scope, subject).await);
 
 	fx.at(T0 + 24 * HOUR);
-	assert_eq!(fx.execute().await, 1);
-	assert_eq!(fx.execute().await, 0, "one decision, one execution");
+	fx.execute().await;
+	fx.execute().await;
 	assert_eq!(state(&fx.get(owners[1], &opened.id).await), ApprovalState::Executed);
 	assert!(fx.holds_admin(&scope, subject).await);
+	let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM grants WHERE user_id = $1 AND target = $2 || ':admin'")
+		.bind(subject.raw())
+		.bind(&scope.id)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(grants, 1, "one decision, one execution");
 	let granted_by: Uuid = sqlx::query_scalar("SELECT granted_by FROM grants WHERE user_id = $1 AND target = $2 || ':admin' AND revoked_at IS NULL")
 		.bind(subject.raw())
 		.bind(&scope.id)
@@ -1428,7 +1437,7 @@ async fn a_scope_policy_is_changed_by_the_owners_and_then_measures_its_proposals
 	fx.vote(owners[0], &opened.id, ApprovalVote::For).await.unwrap();
 	fx.vote(owners[1], &opened.id, ApprovalVote::For).await.unwrap();
 	fx.at(T0 + 24 * HOUR);
-	assert_eq!(fx.execute().await, 1);
+	fx.execute().await;
 	assert_eq!(state(&fx.get(owners[0], &opened.id).await), ApprovalState::Executed);
 
 	let stored = fx
@@ -1473,7 +1482,7 @@ async fn a_policy_is_checked_again_when_it_is_executed() {
 		.await
 		.expect("the scope withdraws its kinds");
 	fx.at(T0 + 24 * HOUR);
-	assert_eq!(fx.execute().await, 1);
+	fx.execute().await;
 	let read = fx.get(owners[0], &opened.id).await;
 	assert_eq!(state(&read), ApprovalState::Void);
 	assert!(read.void_reason.contains("per_operation"), "{}", read.void_reason);
@@ -1554,4 +1563,142 @@ async fn the_live_cap_counts_one_scope() {
 	}
 	assert_eq!(code(fx.services.propose(request(&busy)).await), Some(Code::ResourceExhausted));
 	fx.services.propose(request(&quiet)).await.expect("another scope has its own cap");
+}
+
+// ---------------------------------------------------------------------------------
+// Review of #140: what the owners see of a policy, verified subjects, suspended owners,
+// a resilient executor, a vote that can no longer be won.
+// ---------------------------------------------------------------------------------
+
+/// The owners approve the thresholds themselves, not a count of them: the proposed policy
+/// is on the proposal, and its values are in the fields `payload_hash` is taken over.
+#[tokio::test]
+async fn the_owners_read_the_policy_they_are_asked_to_install() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(2).await;
+	let scope = fx.scope().await;
+	let admins = fx.admins(&scope, 2).await;
+	fx.at(T0);
+	let opened = fx.change_policy(admins[0], policy(&scope, 7200, vec![per_operation(&scope, "500")])).await.unwrap();
+	let read = fx.get(owners[0], &opened.id).await;
+	let proposed = read.proposed_policy.expect("the policy is on the proposal");
+	assert_eq!((proposed.scope.as_str(), proposed.quorum_bps, proposed.delay_secs), (scope.id.as_str(), 10_000, 7200));
+	assert_eq!(proposed.thresholds.len(), 1);
+	assert_eq!(proposed.thresholds[0].value, "500");
+	let threshold = read.fields.iter().find(|f| f.key == "threshold").expect("each override is a field");
+	assert_eq!(threshold.value, Some(Value::Text(format!("{}/per_operation=500", scope.kind("transfer")))));
+}
+
+/// Until this plane holds its own floor on the known money kinds, a scope's policy may only
+/// make its escalations stricter than the kind's own defaults (decided).
+#[tokio::test]
+async fn a_policy_only_tightens_the_kinds_thresholds() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope().await;
+	let admins = fx.admins(&scope, 2).await;
+	fx.at(T0);
+	assert_eq!(
+		code(fx.change_policy(admins[0], policy(&scope, 7200, vec![per_operation(&scope, "1000.5")])).await),
+		Some(Code::InvalidArgument),
+		"1000 is the kind's own default"
+	);
+}
+
+#[tokio::test]
+async fn a_scope_admin_is_an_account_with_a_proven_address() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let unproven = fx.users.resolve(common::google("unproven", false), 0).await.unwrap().id();
+	fx.at(T0);
+	assert_eq!(code(fx.grant_admin(owners[0], &scope, unproven).await), Some(Code::FailedPrecondition));
+
+	let subject = fx.user("subject").await;
+	let opened = fx.grant_admin(owners[0], &scope, subject).await.unwrap();
+	fx.vote(owners[1], &opened.id, ApprovalVote::For).await.unwrap();
+	fx.vote(owners[2], &opened.id, ApprovalVote::For).await.unwrap();
+	sqlx::query("UPDATE users SET email_verified = FALSE WHERE id = $1")
+		.bind(subject.raw())
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	fx.at(T0 + 24 * HOUR);
+	fx.execute().await;
+	let read = fx.get(owners[1], &opened.id).await;
+	assert_eq!(state(&read), ApprovalState::Void);
+	assert!(read.void_reason.contains("not verified"), "{}", read.void_reason);
+	assert!(!fx.holds_admin(&scope, subject).await);
+}
+
+/// A suspended owner keeps the role and loses the seat's say: their vote is refused and a
+/// FOR they cast before does not count.
+#[tokio::test]
+async fn a_suspended_owner_has_no_say() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let subject = fx.user("subject").await;
+	fx.at(T0);
+	let opened = fx.grant_admin(owners[0], &scope, subject).await.unwrap();
+	fx.vote(owners[1], &opened.id, ApprovalVote::For).await.unwrap();
+	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
+		.bind(owners[1].raw())
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	let one = fx.vote(owners[2], &opened.id, ApprovalVote::For).await.unwrap();
+	assert_eq!(state(&one), ApprovalState::Rejected, "the suspended owner's FOR is gone, so two of two can no longer be reached");
+}
+
+/// One decision the executor cannot carry out must not stop the ones behind it.
+#[tokio::test]
+async fn the_executor_carries_on_past_a_failing_decision() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(2).await;
+	let broken_scope = fx.scope().await;
+	let scope = fx.scope().await;
+	let admins = fx.admins(&broken_scope, 2).await;
+	fx.at(T0);
+	let broken = fx.change_policy(admins[0], policy(&broken_scope, 7200, vec![])).await.unwrap();
+	let subject = fx.user("subject").await;
+	fx.at(T0 + 1);
+	let fine = fx.grant_admin(owners[0], &scope, subject).await.unwrap();
+	fx.vote(owners[0], &broken.id, ApprovalVote::For).await.unwrap();
+	fx.vote(owners[1], &broken.id, ApprovalVote::For).await.unwrap();
+	fx.vote(owners[1], &fine.id, ApprovalVote::For).await.unwrap();
+	// A row already naming the decision makes its install fail on `approval_id`'s
+	// uniqueness: a failure of the store, not a refusal of the decision.
+	sqlx::query(
+		"INSERT INTO scope_approval_policies (scope, version, quorum_bps, delay_secs, ttl_secs, thresholds, approval_id, installed_at) \
+		 VALUES ($1, 2, 5001, 3600, 3600, '[]', $2::uuid, 0)",
+	)
+	.bind(&broken_scope.id)
+	.bind(&broken.id)
+	.execute(&fx.pool)
+	.await
+	.unwrap();
+	fx.at(T0 + 25 * HOUR);
+	fx.execute().await;
+	assert_eq!(state(&fx.get(owners[0], &fine.id).await), ApprovalState::Executed);
+	assert_eq!(state(&fx.get(owners[0], &broken.id).await), ApprovalState::Passed, "left for the next pass");
+}
+
+/// A vote that can no longer be won is lost: a FOR of someone who lost the seat is not
+/// one of the votes that could still carry it.
+#[tokio::test]
+async fn a_vote_that_can_no_longer_be_won_is_rejected() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope().await;
+	let admins = fx.admins(&scope, 3).await;
+	fx.at(T0);
+	let opened = fx.propose(&scope, transfer(&scope, "10")).await;
+	fx.vote(admins[0], &opened.id, ApprovalVote::For).await.unwrap();
+	sqlx::query("UPDATE grants SET revoked_at = 1, revoked_by = granted_by WHERE user_id = $1 AND revoked_at IS NULL")
+		.bind(admins[0].raw())
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	let against = fx.vote(admins[1], &opened.id, ApprovalVote::Against).await.unwrap();
+	assert_eq!(state(&against), ApprovalState::Rejected, "one seated voter is left and two are needed");
+	assert_eq!(code(fx.vote(admins[2], &opened.id, ApprovalVote::For).await), Some(Code::FailedPrecondition));
 }

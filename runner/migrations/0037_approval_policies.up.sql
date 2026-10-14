@@ -29,6 +29,13 @@ SET LOCAL lock_timeout = '3s';
 ALTER TABLE approvals ADD COLUMN action JSONB;
 ALTER TABLE approvals ADD CONSTRAINT approvals_action_is_ours CHECK (action IS NULL OR proposer = 'concierge');
 ALTER TABLE approvals ADD CONSTRAINT approvals_scope_delay CHECK (level = 'platform' OR delay_secs >= 3600);
+-- The opener of a `concierge:*` proposal is kept off its roster (D23), so with two owners
+-- one of them opening leaves a roster of one: still two people, the one who asked and the
+-- one who decides. 0036's floor of two on the ROSTER stays for every service's proposal,
+-- whose roster nobody is taken off.
+ALTER TABLE approvals DROP CONSTRAINT approvals_platform_roster;
+ALTER TABLE approvals ADD CONSTRAINT approvals_platform_roster
+    CHECK (level = 'scope' OR roster_size >= 2 OR (proposer = 'concierge' AND roster_size >= 1));
 
 CREATE TABLE scope_approval_policies (
     scope        TEXT NOT NULL REFERENCES tenants (id),

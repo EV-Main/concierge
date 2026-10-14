@@ -311,7 +311,7 @@ async fn scope_admins(conn: &mut PgConnection, namespace: &str) -> Result<Vec<Us
 /// one is the containment step and must bite at once (§5.6).
 async fn holds_seat(conn: &mut PgConnection, record: &ApprovalRecord, user: UserId) -> Result<bool, DomainError> {
 	let query = match record.level {
-		ApprovalLevel::Platform => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND role = 'owner')").bind(user.raw()),
+		ApprovalLevel::Platform => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND role = 'owner' AND status = 'active')").bind(user.raw()),
 		ApprovalLevel::Scope => sqlx::query_scalar(
 			"SELECT EXISTS (SELECT 1 FROM grants g JOIN tenants t ON t.namespace = g.namespace JOIN users u ON u.id = g.user_id \
 			 WHERE t.id = $2 AND g.user_id = $1 AND g.target = t.namespace || ':admin' AND g.revoked_at IS NULL AND u.status = 'active')",
@@ -763,7 +763,7 @@ impl ApprovalRepository for PgApprovals {
 		current_policy(&mut conn, scope).await.map(Some)
 	}
 
-	async fn person(&self, who: PersonRef<'_>) -> Result<Option<(UserId, String)>, DomainError> {
+	async fn person(&self, who: PersonRef<'_>) -> Result<Option<(UserId, String, bool)>, DomainError> {
 		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
 		let id = match who {
 			PersonRef::Id(id) => id,
@@ -773,12 +773,12 @@ impl ApprovalRepository for PgApprovals {
 				Named::Several => return Err(DomainError::Validation("this handle names more than one account; name it by user_id".into())),
 			},
 		};
-		let subject: Option<String> = sqlx::query_scalar("SELECT auth_subject FROM users WHERE id = $1 AND status = 'active'")
+		let row: Option<(String, bool)> = sqlx::query_as("SELECT auth_subject, email_verified FROM users WHERE id = $1 AND status = 'active'")
 			.bind(id.raw())
 			.fetch_optional(&mut *conn)
 			.await
 			.map_err(repo_err)?;
-		Ok(subject.map(|subject| (id, subject)))
+		Ok(row.map(|(subject, verified)| (id, subject, verified)))
 	}
 
 	async fn execute(&self, id: Uuid) -> Result<Option<Outcome>, DomainError> {
@@ -844,7 +844,9 @@ fn clip(text: &str, max: usize) -> String {
 async fn unseated(conn: &mut PgConnection, record: &ApprovalRecord) -> Result<Vec<UserId>, DomainError> {
 	let query = match record.level {
 		ApprovalLevel::Platform =>
-			sqlx::query_scalar("SELECT v.user_id FROM approval_voters v JOIN users u ON u.id = v.user_id WHERE v.approval_id = $1 AND u.role <> 'owner'").bind(record.id),
+		// A suspended owner keeps the role and has no say while suspended.
+			sqlx::query_scalar("SELECT v.user_id FROM approval_voters v JOIN users u ON u.id = v.user_id WHERE v.approval_id = $1 AND (u.role <> 'owner' OR u.status <> 'active')")
+				.bind(record.id),
 		ApprovalLevel::Scope => sqlx::query_scalar(
 			"SELECT v.user_id FROM approval_voters v WHERE v.approval_id = $1 AND NOT EXISTS ( \
 			   SELECT 1 FROM grants g JOIN tenants t ON t.namespace = g.namespace JOIN users u ON u.id = g.user_id \

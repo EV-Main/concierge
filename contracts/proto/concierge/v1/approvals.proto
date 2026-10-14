@@ -81,11 +81,12 @@ service ApprovalService {
   rpc CancelApproval(CancelApprovalRequest) returns (Approval);
 
   // Open `concierge:scope_admin_grant`: grant `<scope>:admin`. Always platform level.
-  // A seat holding `iam:tenants:grant` may open one, for an ACTIVE account other than its
-  // own that does not hold the alias yet (FAILED_PRECONDITION if it does), in an ACTIVE
+  // A seat holding `iam:tenants:grant` may open one, for an ACTIVE account with a VERIFIED
+  // address, other than its own, that does not hold the alias yet (FAILED_PRECONDITION
+  // otherwise), in an ACTIVE
   // scope other than `main` (INVALID_ARGUMENT). The opener is kept off the roster. Once
   // passed, this plane's executor grants it, `granted_by` the opener, or voids it if the
-  // account or the scope is no longer active. UserDirectory.GrantPermission refuses a
+  // account is no longer active or verified, or the scope no longer active. UserDirectory.GrantPermission refuses a
   // `<scope>:admin` target to every caller and names this RPC, and no catalog may delegate it.
   // Taking the grant away needs no approval and stays RevokePermission, one act:
   // containing a rogue admin must never be the slower path.
@@ -98,7 +99,8 @@ service ApprovalService {
   // again when the executor installs it, against the catalogs then in force (a policy that
   // no longer fits is VOID): quorum 5001..=10000 bps, delay 3600..=259200 s (an owner always
   // has an hour to stop a scope's decision), lifetime 3600..=259200 s, each threshold an
-  // escalation of a scope-level kind in force, spelled as its test takes it. One change per
+  // escalation of a scope-level kind in force, spelled as its test takes it and NOT above
+  // the kind's own `default_threshold` (a scope only tightens), at most 64. One change per
   // scope is live at a time. Installed as the scope's next `version`. Compartment limits are
   // not part of it: they are the money plane's `bank:compartment_policy`.
   rpc ProposeScopePolicyChange(ProposeScopePolicyChangeRequest) returns (Approval);
@@ -212,7 +214,9 @@ enum ApprovalState {
   APPROVAL_STATE_EXECUTED = 3;
   // The proposer tried and failed. Terminal: a retry is a new proposal.
   APPROVAL_STATE_EXECUTION_FAILED = 4;
-  // Enough votes AGAINST that the threshold can no longer be reached.
+  // The threshold can no longer be reached: the voters still holding their seat who have
+  // not voted AGAINST are fewer than it. A vote of someone who lost the seat counts neither
+  // way.
   APPROVAL_STATE_REJECTED = 5;
   APPROVAL_STATE_VETOED = 6;
   APPROVAL_STATE_EXPIRED = 7;
@@ -402,6 +406,10 @@ message Approval {
   // 0 until it passes. PullApproved serves it until an hour before this, so whatever a
   // proposer pulls it still has that hour to report.
   int64 execute_by = 29;
+  // Under `concierge:scope_policy_change`: the policy the deciders are asked to install,
+  // whole — every threshold override with its value, which the fields carry too, so
+  // `payload_hash` is taken over them. Absent on every other kind, and to a service.
+  ScopeApprovalPolicy proposed_policy = 30;
 }
 
 message ListApprovalKindsRequest {}

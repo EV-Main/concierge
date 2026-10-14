@@ -493,6 +493,16 @@ pub(crate) async fn grant_by_approval(conn: &mut PgConnection, user: UserId, sco
 	if !standing_in(&locked, user).is_some_and(|s| s.status == UserStatus::Active) {
 		return Ok(ApprovedGrant::Inapplicable("the account is no longer active"));
 	}
+	// A seat on a scope's roster is a mailbox the approvals reach; an address nobody proved
+	// hands that seat to whoever holds it. Re-read here: it can move after the owners voted.
+	let verified: bool = sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+		.bind(user.raw())
+		.fetch_one(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	if !verified {
+		return Ok(ApprovedGrant::Inapplicable("the account's address is not verified"));
+	}
 	if standing_in(&locked, granted_by).is_none() {
 		return Ok(ApprovedGrant::Inapplicable("the account that asked for it is gone"));
 	}

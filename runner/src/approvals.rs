@@ -183,6 +183,15 @@ pub fn approval_to(record: ApprovalRecord, reader: Reader) -> Approval {
 	let now = record.as_of;
 	let state = decision.effective_state(now);
 	let decided_at = decision.effective_decided_at(now).unwrap_or(0);
+	// A lapse projected before anything wrote it says why, as the written one will.
+	let void_reason = match (state, decision.state) {
+		(ApprovalState::Void, ApprovalState::Passed) => rules::LAPSED.to_owned(),
+		_ => decision.void_reason.clone(),
+	};
+	let proposed_policy = match (&record.action, reader) {
+		(Some(rules::Action::InstallPolicy { scope, policy }), Reader::Decider | Reader::Bystander) => Some(policy_to(scope, policy.clone())),
+		(Some(rules::Action::InstallPolicy { .. } | rules::Action::GrantAdmin { .. }) | None, _) => None,
+	};
 	let (requested_by, mut requested_by_email) = record.requested_by.map(|(_, p)| (p.auth_subject, p.email)).unwrap_or_default();
 	let mut vetoed_by = record.vetoed_by.map(|p| p.auth_subject).unwrap_or_default();
 	let mut voters: Vec<cc::ApprovalVoter> = decision
@@ -231,13 +240,14 @@ pub fn approval_to(record: ApprovalRecord, reader: Reader) -> Approval {
 		decided_at,
 		vetoed_by,
 		veto_reason: decision.veto_reason.clone(),
-		void_reason: decision.void_reason.clone(),
+		void_reason,
 		outcome: outcome_to(decision.outcome) as i32,
 		outcome_detail: decision.outcome_detail.clone(),
 		proposer: record.proposer,
 		version: decision.version,
 		requested_by_client: record.requested_by_client,
 		execute_by: decision.execute_by().unwrap_or(0),
+		proposed_policy,
 	}
 }
 
@@ -450,12 +460,17 @@ impl ApprovalService for Approvals {
 			Some(propose_scope_admin_grant_request::Subject::Account(handle)) => PersonRef::Handle(handle),
 			None => return Err(Status::invalid_argument("name the account by user_id or account")),
 		};
-		let (subject, subject_ref_name) = self
+		let (subject, subject_ref_name, verified) = self
 			.approvals
 			.person(named)
 			.await
 			.map_err(domain_to_status)?
 			.ok_or_else(|| Status::not_found("no active account by that name"))?;
+		// A scope admin is reached by the approvals' mail; an unproven address hands the
+		// seat to whoever holds that mailbox.
+		if !verified {
+			return Err(Status::failed_precondition("the account's address is not verified"));
+		}
 		// The grant names its opener as `granted_by`, and nobody grants to themselves
 		// (`grants_not_to_self`).
 		if subject == caller {
@@ -541,7 +556,7 @@ impl Approvals {
 			.find(|k| k.name == kind)
 			.ok_or_else(|| Status::internal("a built-in kind is missing"))?;
 		let fields = rules::check_fields(&kind, fields).map_err(invalid)?;
-		let (_, opener_subject) = self
+		let (_, opener_subject, _) = self
 			.approvals
 			.person(PersonRef::Id(opener))
 			.await
@@ -647,6 +662,7 @@ impl ApprovalExecutionService for ApprovalExecution {
 			ServiceCaller::Bridge => String::new(),
 			ServiceCaller::Client(client) => client.client_id.clone(),
 		};
+		let scope = req.scope.clone();
 		let new = NewApproval {
 			id: Uuid::new_v4(),
 			kind,
@@ -670,9 +686,10 @@ impl ApprovalExecutionService for ApprovalExecution {
 			Proposed::Existing(record) => record,
 			Proposed::Saturated => {
 				return Err(Status::resource_exhausted(format!(
-					"`{}` already holds {} live proposals; withdraw or wait for some before opening more",
+					"`{}` already holds {} live proposals in scope `{}`; withdraw or wait for some before opening more",
 					caller.namespace(),
-					rules::MAX_LIVE_PER_PROPOSER
+					rules::MAX_LIVE_PER_PROPOSER,
+					scope
 				)));
 			}
 		};
@@ -755,9 +772,15 @@ const EXECUTOR_BATCH: i64 = 100;
 pub async fn execute_due(approvals: &dyn ApprovalRepository) -> Result<usize, domain::error::DomainError> {
 	let mut closed = 0;
 	for due in approvals.pull(rules::OWN_NAMESPACE, EXECUTOR_BATCH).await? {
-		if let Some(outcome) = approvals.execute(due.id).await? {
-			tracing::info!(approval = %due.id, kind = %due.kind, scope = %due.scope, outcome = outcome.as_str(), "approval executed by this plane");
-			closed += 1;
+		// One decision the store cannot carry out must not hold up the ones behind it; it
+		// stays passed and is tried again next pass, until it lapses.
+		match approvals.execute(due.id).await {
+			Ok(Some(outcome)) => {
+				tracing::info!(approval = %due.id, kind = %due.kind, scope = %due.scope, outcome = outcome.as_str(), "approval executed by this plane");
+				closed += 1;
+			}
+			Ok(None) => {}
+			Err(err) => tracing::error!(approval = %due.id, kind = %due.kind, scope = %due.scope, %err, "executing an approval failed; it is retried next pass"),
 		}
 	}
 	Ok(closed)
