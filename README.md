@@ -24,6 +24,7 @@ contracts/auth crates.
 | [`auth/`](auth) | `evconcierge_auth` — the `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation) + the stateless token-verification flow (imported by downstream repos) | Rust · tonic · JWKS |
 | [`contracts/`](contracts) | `evconcierge_contracts` — gRPC wire contracts (`proto/concierge/v1/` → tonic stubs) | Rust · tonic-build · proto3 |
 | [`domain/`](domain) | shared identity types (pure, wasm-safe) over `ev::architecture` | Rust |
+| [`sdk/`](sdk) | `@evinvest/concierge` on npm — host wrappers for the concierge microfrontends (sign-in dialog, account chip and page, session reader, platform sign-out) over `@evinvest/mfe` | TypeScript · React |
 
 `directory`, `platform`, `bridge` and `notification` are live; `log` is a deferred stub.
 
