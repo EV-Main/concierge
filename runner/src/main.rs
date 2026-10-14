@@ -38,6 +38,8 @@ use evconcierge_contracts::concierge::v1::{
 	notification_service_server::NotificationServiceServer,
 	owner_removal_approval_service_server::OwnerRemovalApprovalServiceServer,
 	platform_service_server::PlatformServiceServer,
+	scope_catalog_service_server::ScopeCatalogServiceServer,
+	scope_events_server::ScopeEventsServer,
 	scope_registry_server::ScopeRegistryServer,
 	user_directory_server::UserDirectoryServer,
 	user_events_server::UserEventsServer,
@@ -265,6 +267,16 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// a user access token.
 	let bridge = bridge::Bridge::new(pool.clone(), Some(config.bridge_service_token.clone()));
 
+	// The relying-party streams and the scope catalog: service seams like the bridge,
+	// outside the user auth layer, opened by the bridge token or a client's own secret
+	// (`service_caller`).
+	let service_callers = concierge::service_caller::ServiceCallers::new(
+		Some(config.bridge_service_token.clone()),
+		Arc::new(infrastructure::relying_parties::PgRelyingParties::new(pool.clone())),
+	);
+	let scope_events = concierge::scope_events::ScopeEvents::new(service_callers.clone(), Arc::new(infrastructure::scope_events::PgScopeEvents::new(pool.clone())));
+	let scope_catalogs = concierge::scope_catalog::ScopeCatalogs::new(service_callers, Arc::new(infrastructure::scope_catalogs::PgScopeCatalogs::new(pool.clone())));
+
 	// The TLS listener for the same seam (banking#199, phase 2). Validated and READ here,
 	// before anything is served: a half-configured listener or an unreadable PEM is a
 	// boot refusal, never a listener quietly not started. Production without it is a
@@ -425,13 +437,16 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		config.public_origin.clone(),
 	);
 
-	// The TLS listener serves ONLY what banking dials through `CONCIERGE_BRIDGE_ADDR`:
-	// the lifecycle pull and the mail push. No gRPC-Web, no `accept_http1` — nothing a
-	// browser reaches — and the same shared token checks inside the handlers, so TLS
+	// The TLS listener serves ONLY the service seams: the lifecycle pull and the mail push
+	// banking dials through `CONCIERGE_BRIDGE_ADDR`, and the scope stream and catalog
+	// (`docs/SCOPES-AND-APPROVALS.md` §1). No gRPC-Web, no `accept_http1` — nothing a
+	// browser reaches — and the credential checks stay inside the handlers, so TLS
 	// is added proof, not a replacement. Unconfigured ⇒ resolves at once and lets the
 	// `try_join!` below wait on the other two.
 	let tls_bridge = bridge.clone();
 	let tls_mail_relay = mail_relay.clone();
+	let tls_scope_events = scope_events.clone();
+	let tls_scope_catalogs = scope_catalogs.clone();
 	let bridge_tls_server = async {
 		let Some(listener) = bridge_tls else {
 			return Ok(());
@@ -447,6 +462,8 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.layer(TraceLayer::new_for_grpc())
 			.add_service(UserEventsServer::new(tls_bridge))
 			.add_service(MailRelayServiceServer::new(tls_mail_relay))
+			.add_service(ScopeEventsServer::new(tls_scope_events))
+			.add_service(ScopeCatalogServiceServer::new(tls_scope_catalogs))
 			.serve_with_shutdown(listener.bind, await_signal())
 			.await
 			.context("concierge bridge TLS server error")
@@ -459,6 +476,8 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(HealthServiceServer::new(Health))
 			.add_service(AuthServiceServer::new(auth_service))
 			.add_service(UserEventsServer::new(bridge))
+			.add_service(ScopeEventsServer::new(scope_events))
+			.add_service(ScopeCatalogServiceServer::new(scope_catalogs))
 			// Both governance seams are mounted OUTSIDE the user auth layer, for the two
 			// different reasons the layer exists to distinguish: the approval surface is
 			// reached by a person holding an emailed token who may not be signed in, and

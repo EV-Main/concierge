@@ -17,6 +17,10 @@
 //! - [`relying_parties`] — the registry of first-party clients on other origins, their
 //!   one-time authorization codes and their refresh families (all secrets as digests).
 //! - [`scopes`] — the scope registry: tenants seen as directions, with their clients.
+//! - [`scope_events`] — the relying-party streams: who each scope can see, and the
+//!   scope events written in the transactions that change what they describe.
+//! - [`scope_catalogs`] — the approval kinds and notification topics each namespace
+//!   publishes, every version kept.
 //! - [`credentials`] — what this plane checks itself: emailed one-time codes and
 //!   passwords.
 //! - [`email`] — the SMTP transport seam and the rendered messages that cross it.
@@ -30,5 +34,7 @@ pub mod kyc;
 pub mod notifications;
 pub mod platform;
 pub mod relying_parties;
+pub mod scope_catalogs;
+pub mod scope_events;
 pub mod scopes;
 pub mod users;
