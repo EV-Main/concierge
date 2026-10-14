@@ -442,6 +442,48 @@ async fn refresh_after_a_suspension_is_denied_and_ends_the_session() {
 	fx.refresh(&tokens.refresh_token).await.expect_err("revoked for good");
 }
 
+impl Fx {
+	async fn set_scope_state(&self, state: &str) {
+		sqlx::query("UPDATE tenants SET state = $2 WHERE id = $1")
+			.bind(&self.client.namespace)
+			.bind(state)
+			.execute(&self.pool)
+			.await
+			.expect("set the scope state");
+	}
+}
+
+/// A FROZEN scope's client keeps working (a direction has to learn it was frozen); a
+/// CLOSED one's is refused like a disabled client, and its session ends at the refresh.
+#[tokio::test]
+async fn a_closed_scope_ends_its_clients_and_a_frozen_one_does_not() {
+	let fx = fixture!();
+	let (_, tokens) = fx.signed_in().await;
+
+	fx.set_scope_state("frozen").await;
+	assert!(!fx.record().await.scope_closed, "a frozen scope still resolves its client");
+	let tokens = fx.refresh(&tokens.refresh_token).await.expect("a frozen scope's client still refreshes");
+	let user = fx.user().await;
+	let (code, verifier) = fx.code_for(user).await;
+	fx.exchange(&code, &verifier).await.expect("and still redeems a code");
+	let (pending, pending_verifier) = fx.code_for(user).await;
+
+	fx.set_scope_state("closed").await;
+	assert!(
+		fx.rp.resolve(&fx.client.id, &fx.client.redirect_uri).await.unwrap().is_none(),
+		"/auth/authorize answers with a page, as for a disabled client"
+	);
+	assert!(!fx.session_live(&tokens).await, "an outstanding access token stops opening GetMe at once");
+	let status = fx.exchange(&pending, &pending_verifier).await.expect_err("no code redeems");
+	assert_eq!(status.code(), Code::Unauthenticated);
+	let status = fx.refresh(&tokens.refresh_token).await.expect_err("no refresh");
+	assert_eq!(status.code(), Code::Unauthenticated);
+	assert_eq!(fx.revoked_reason(fx.session_of(&tokens).await).await.as_deref(), Some("scope_closed"));
+
+	fx.set_scope_state("active").await;
+	fx.refresh(&tokens.refresh_token).await.expect_err("a session the closure ended stays ended");
+}
+
 #[tokio::test]
 async fn refresh_after_revoke_all_is_refused() {
 	let fx = fixture!();

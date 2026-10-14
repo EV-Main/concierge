@@ -37,8 +37,9 @@
 -- alias that replaces it, so FALSE would leave a lone owner unable to reach it.
 --
 -- `lock_timeout`: ALTER TABLE takes ACCESS EXCLUSIVE on `tenants`, which every `GetMe`
--- reads, and the triggers take SHARE ROW EXCLUSIVE on `rp_clients`; migrations run ON
--- BOOT. SET LOCAL, not SET: sqlx runs this on a connection borrowed from the service's
+-- reads, the triggers take SHARE ROW EXCLUSIVE on `rp_clients`, and re-adding the
+-- revocation-reason CHECK holds ACCESS EXCLUSIVE on `rp_sessions` while it scans the
+-- table (one row per client sign-in, small); migrations run ON BOOT. SET LOCAL, not SET: sqlx runs this on a connection borrowed from the service's
 -- pool, and a session SET would outlive it.
 --
 -- REVERSIBILITY: `0031_scopes.down.sql`. Lossy for `invest` only: its client, the codes
@@ -101,6 +102,12 @@ VALUES ('invest', 'invest', TRUE, extract(epoch FROM now())::BIGINT, 'EV Invest'
 
 INSERT INTO rp_clients (client_id, audience, redirect_uris, tenant_id, created_at)
 VALUES ('invest', 'invest', ARRAY['https://invest.evinvest.ltd/cabinet/auth/callback'], 'invest', extract(epoch FROM now())::BIGINT);
+
+-- A closed scope's clients are refused like disabled ones, and a session of theirs is
+-- ended at its next refresh under its own reason, so the record says why.
+ALTER TABLE rp_sessions DROP CONSTRAINT rp_sessions_revoked_reason;
+ALTER TABLE rp_sessions ADD CONSTRAINT rp_sessions_revoked_reason
+    CHECK (revoked_reason IN ('refresh_reuse', 'code_replay', 'access_denied', 'tokens_revoked', 'upstream_revoked', 'scope_closed'));
 
 -- Created after the seeds, so every scope starts at version 1.
 CREATE FUNCTION tenants_bump_version() RETURNS TRIGGER

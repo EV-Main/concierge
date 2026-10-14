@@ -44,6 +44,7 @@ struct ClientRow {
 	secret_hash: Option<Vec<u8>>,
 	disabled_at: Option<i64>,
 	namespace: String,
+	scope_closed: bool,
 }
 
 impl TryFrom<ClientRow> for ClientRecord {
@@ -57,6 +58,7 @@ impl TryFrom<ClientRow> for ClientRecord {
 			secret_hash: row.secret_hash,
 			disabled: row.disabled_at.is_some(),
 			namespace: row.namespace,
+			scope_closed: row.scope_closed,
 		})
 	}
 }
@@ -88,7 +90,7 @@ struct SessionDbRow {
 impl RelyingPartyRepository for PgRelyingParties {
 	async fn client(&self, client_id: &str) -> Result<Option<ClientRecord>, DomainError> {
 		sqlx::query_as::<_, ClientRow>(
-			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace \
+			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace, t.state = 'closed' AS scope_closed \
 			 FROM rp_clients c JOIN tenants t ON t.id = c.tenant_id WHERE c.client_id = $1",
 		)
 		.bind(client_id)
@@ -101,7 +103,7 @@ impl RelyingPartyRepository for PgRelyingParties {
 
 	async fn clients(&self) -> Result<Vec<ClientRecord>, DomainError> {
 		sqlx::query_as::<_, ClientRow>(
-			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace \
+			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace, t.state = 'closed' AS scope_closed \
 			 FROM rp_clients c JOIN tenants t ON t.id = c.tenant_id ORDER BY c.client_id",
 		)
 		.fetch_all(&self.pool)
@@ -336,8 +338,8 @@ impl RelyingPartyRepository for PgRelyingParties {
 
 	async fn session_live(&self, id: Uuid, audience: &str, now: i64) -> Result<bool, DomainError> {
 		let live: Option<bool> = sqlx::query_scalar(
-			"SELECT s.revoked_at IS NULL AND s.expires_at > $3 AND c.disabled_at IS NULL
-			 FROM rp_sessions s JOIN rp_clients c USING (client_id)
+			"SELECT s.revoked_at IS NULL AND s.expires_at > $3 AND c.disabled_at IS NULL AND t.state <> 'closed'
+			 FROM rp_sessions s JOIN rp_clients c USING (client_id) JOIN tenants t ON t.id = c.tenant_id
 			 WHERE s.id = $1 AND c.audience = $2",
 		)
 		.bind(id)

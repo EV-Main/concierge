@@ -7,6 +7,12 @@ DROP FUNCTION rp_clients_bump_scope_version();
 DROP TRIGGER tenants_bump_version ON tenants;
 DROP FUNCTION tenants_bump_version();
 
+-- The older vocabulary has no word for it; `access_denied` is the nearest that it does.
+UPDATE rp_sessions SET revoked_reason = 'access_denied' WHERE revoked_reason = 'scope_closed';
+ALTER TABLE rp_sessions DROP CONSTRAINT rp_sessions_revoked_reason;
+ALTER TABLE rp_sessions ADD CONSTRAINT rp_sessions_revoked_reason
+    CHECK (revoked_reason IN ('refresh_reuse', 'code_replay', 'access_denied', 'tokens_revoked', 'upstream_revoked'));
+
 DELETE FROM rp_sessions WHERE client_id IN (SELECT client_id FROM rp_clients WHERE tenant_id = 'invest');
 DELETE FROM rp_codes WHERE client_id IN (SELECT client_id FROM rp_clients WHERE tenant_id = 'invest');
 DELETE FROM catalogs WHERE tenant_id = 'invest';

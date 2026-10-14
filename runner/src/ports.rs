@@ -258,6 +258,10 @@ pub struct ClientRecord {
 	pub disabled: bool,
 	/// The tenant namespace whose catalog it publishes and whose permissions its tokens read.
 	pub namespace: String,
+	/// Its scope is CLOSED: the client signs nobody in and its sessions end at their next
+	/// refresh, as if disabled. A FROZEN scope's client keeps working — a direction has to
+	/// learn it was frozen.
+	pub scope_closed: bool,
 }
 
 /// A one-time authorization code to store (`rp_codes`). Only its digest is persisted.
@@ -342,6 +346,8 @@ pub enum SessionRevocation {
 	TokensRevoked,
 	/// The `evinvest.ltd` session it was authorized by ended — single logout.
 	UpstreamRevoked,
+	/// The client's scope was closed.
+	ScopeClosed,
 }
 
 impl SessionRevocation {
@@ -351,6 +357,7 @@ impl SessionRevocation {
 			Self::AccessDenied => "access_denied",
 			Self::TokensRevoked => "tokens_revoked",
 			Self::UpstreamRevoked => "upstream_revoked",
+			Self::ScopeClosed => "scope_closed",
 		}
 	}
 }
