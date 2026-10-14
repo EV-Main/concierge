@@ -16,6 +16,7 @@
 //! modules) minus everything banking: the money-plane pair is the cabinet's own
 //! concern, minted zone-side from the verified access token.
 
+mod account;
 pub mod allowlist;
 mod authorize;
 mod cors;
@@ -27,6 +28,7 @@ mod passkey;
 mod routes;
 mod session;
 mod sign_in;
+mod signup;
 mod single_flight;
 mod turnstile;
 
@@ -204,6 +206,8 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/code/verify", post(sign_in::verify_code))
 		.route("/auth/password/signup", post(sign_in::sign_up))
 		.route("/auth/password/signin", post(sign_in::sign_in))
+		.route("/auth/password/signup/confirm", post(signup::confirm))
+		.route("/auth/password/signup/resend", post(signup::resend))
 		.route("/auth/passkey/signin/options", post(passkey::signin_options))
 		.route("/auth/passkey/signin/verify", post(passkey::signin_verify))
 		.layer(cors::layer(allowlist.clone(), Method::POST));
@@ -222,6 +226,11 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/password/set", post(sign_in::set_password))
 		.route("/auth/username", post(sign_in::set_username))
 		.route("/auth/methods", get(sign_in::methods))
+		// The account MFE: `PUBLIC_ORIGIN` only, CSRF on every mutation (`web::account`).
+		.route("/auth/me", get(account::me))
+		.route("/auth/notifications/settings", get(account::notification_settings))
+		.route("/auth/notifications/settings/channel", post(account::set_channel))
+		.route("/auth/notifications/settings/topic", post(account::set_topic))
 		.route("/auth/passkey/register/options", post(passkey::register_options))
 		.route("/auth/passkey/register/verify", post(passkey::register_verify))
 		.route("/auth/passkey/remove", post(passkey::remove))

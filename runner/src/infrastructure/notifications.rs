@@ -139,6 +139,17 @@ impl NotificationRepository for PgNotifications {
 		upsert_subscriber(&mut conn, user_id, email, email_verified).await
 	}
 
+	async fn subscriber_of_user(&self, user_id: Uuid) -> Result<Option<SubscriberRow>, DomainError> {
+		sqlx::query_as::<_, SubscriberRow>(
+			"SELECT id, user_id, email, email_verified, in_app_enabled, email_enabled, (confirmed_at IS NOT NULL) AS confirmed, unsubscribe_token \
+			 FROM notification_subscribers WHERE user_id = $1",
+		)
+		.bind(user_id)
+		.fetch_optional(&self.pool)
+		.await
+		.map_err(repo_err)
+	}
+
 	async fn subscriptions(&self, subscriber_id: Uuid) -> Result<Vec<SubscriptionRow>, DomainError> {
 		sqlx::query_as::<_, SubscriptionRow>("SELECT topic, email_enabled FROM notification_subscriptions WHERE subscriber_id = $1 ORDER BY topic ASC")
 			.bind(subscriber_id)

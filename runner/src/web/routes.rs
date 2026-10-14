@@ -244,7 +244,7 @@ pub async fn logout(State(st): State<WebState>, jar: CookieJar, headers: HeaderM
 }
 
 /// Drop a session and revoke its refresh family upstream.
-async fn close(st: &super::Inner, id: &str) -> color_eyre::Result<()> {
+pub(super) async fn close(st: &super::Inner, id: &str) -> color_eyre::Result<()> {
 	if let Some(refresh) = st.sessions.forget(id).await? {
 		// The session is already gone locally; an upstream blip must not keep it signed in here.
 		let _ = AuthRpc::logout(
@@ -435,6 +435,13 @@ pub(super) struct SessionStoreDown;
 /// browser out from under itself.
 pub(super) struct Caller {
 	pub(super) id: UserId,
+	/// The seat as the directory resolves it NOW, break-glass included — the same
+	/// reading `/auth/session` reports.
+	pub(super) role: String,
+	pub(super) role_is_break_glass: bool,
+	/// The `token_version` the session's access token was minted under — the half of
+	/// `authz::caller_gate`'s check the live summary cannot supply.
+	pub(super) minted_token_version: Option<u64>,
 	access_token: String,
 	remaining_secs: i64,
 }
@@ -473,10 +480,23 @@ pub(super) async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<O
 	Ok(fresh.and_then(|f| {
 		Uuid::parse_str(&f.user.user_id).map(UserId::from_raw).ok().map(|id| Caller {
 			id,
+			role: f.user.role,
+			role_is_break_glass: f.user.role_is_break_glass,
+			minted_token_version: minted_token_version(&f.access_token),
 			access_token: f.access_token,
 			remaining_secs: f.remaining_secs,
 		})
 	}))
+}
+
+/// Read as the gRPC verifier reads it — into [`evconcierge_auth::Claims`], an absent claim
+/// being 0 — but without a signature check, which is sound only because of where the
+/// token comes from: the server-side session store, never the browser. `None` for a
+/// token that does not parse, which the caller refuses.
+fn minted_token_version(token: &str) -> Option<u64> {
+	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+	let payload = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
+	serde_json::from_slice::<evconcierge_auth::Claims>(&payload).ok().map(|claims| claims.token_version)
 }
 
 /// Constant-time string equality.
@@ -516,7 +536,7 @@ fn clear_tx(st: &super::Inner, jar: CookieJar) -> CookieJar {
 }
 
 /// Clear the session + csrf + access cookies (sign-out / dead session).
-fn clear_session(st: &super::Inner, jar: CookieJar) -> CookieJar {
+pub(super) fn clear_session(st: &super::Inner, jar: CookieJar) -> CookieJar {
 	jar.add(st.cookies.removal(st.cookies.session.clone(), true))
 		.add(st.cookies.removal(st.cookies.csrf.clone(), false))
 		.add(st.cookies.removal(st.cookies.access.clone(), true))

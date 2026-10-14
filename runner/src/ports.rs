@@ -1119,6 +1119,10 @@ pub trait NotificationRepository: Send + Sync {
 	/// with the directory's copy of the address.
 	async fn subscriber_for_user(&self, user_id: Uuid, email: &str, email_verified: bool) -> Result<SubscriberRow, DomainError>;
 
+	/// The user's subscriber row if one exists, written nowhere: a read that must not
+	/// create state.
+	async fn subscriber_of_user(&self, user_id: Uuid) -> Result<Option<SubscriberRow>, DomainError>;
+
 	async fn subscriptions(&self, subscriber_id: Uuid) -> Result<Vec<SubscriptionRow>, DomainError>;
 
 	/// Flip one or both master channel switches. `None` leaves a channel untouched.
@@ -1320,6 +1324,9 @@ pub trait OwnerGenesisRepository: Send + Sync {
 
 /// How long an emailed code works.
 pub const CODE_TTL_SECS: i64 = 600;
+/// A sign-up ticket outlives its code: a mail that is late, or a code that expired while
+/// the tab sat open, is recovered by a resend under the same ticket.
+pub const SIGNUP_TICKET_TTL_SECS: i64 = 24 * 60 * 60;
 /// Wrong guesses a code survives before it burns (`email_codes_attempts`).
 pub const CODE_MAX_ATTEMPTS: i32 = 5;
 /// Codes one address may be sent per [`CODE_SEND_WINDOW_SECS`], counted in the table so
@@ -1400,6 +1407,17 @@ pub enum VerifyRefusal {
 	Taken,
 }
 
+/// Why a sign-up confirmation was refused.
+#[derive(Debug)]
+pub enum SignUpConfirmRefusal {
+	/// Unknown, spent, expired, or outlived by a new password or a revoke-all. One
+	/// variant for all of them: the caller answers each the way it answers a wrong code.
+	Ticket,
+	/// The account is disabled. Decided before anything is written.
+	Disabled,
+	Verify(VerifyRefusal),
+}
+
 /// Emailed codes (and, beside them, passwords): the credentials this plane checks itself
 /// rather than trusting a provider for. Every method is one transaction, and a wrong guess
 /// is counted in it BEFORE the comparison, so an attempt that errors still counts.
@@ -1446,4 +1464,18 @@ pub trait CredentialRepository: Send + Sync {
 	/// session alone cannot plant a password that outlives its revocation. Spending the
 	/// code verifies the address, as [`Self::verify_email`] does.
 	async fn set_password(&self, user: UserId, code: &str, phc: String, now: i64) -> Result<Result<(), VerifyRefusal>, DomainError>;
+
+	/// Store a sign-up ticket (its digest) for `user`, bound to their current
+	/// `token_version` and password, alive for [`SIGNUP_TICKET_TTL_SECS`].
+	async fn issue_signup_ticket(&self, user: UserId, ticket_hash: &[u8], now: i64) -> Result<(), DomainError>;
+
+	/// Spend a sign-up ticket and the verification code beside it: the account's address
+	/// is verified exactly as [`Self::verify_email`] does it — the password stays, nothing
+	/// is taken over. A wrong code is counted against the code and leaves the ticket.
+	async fn confirm_signup(&self, ticket_hash: &[u8], code: &str, now: i64) -> Result<Result<User, SignUpConfirmRefusal>, DomainError>;
+
+	/// Mail a fresh verification code to the account a live sign-up ticket speaks for,
+	/// under the same throttle as every code. `None` when the ticket speaks for nobody —
+	/// unknown, spent, expired, outlived, or its account disabled — and nothing is mailed.
+	async fn resend_signup_code(&self, ticket_hash: &[u8], now: i64) -> Result<Option<CodeIssue>, DomainError>;
 }

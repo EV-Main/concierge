@@ -32,7 +32,10 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use domain::users::Email;
+use domain::{
+	error::DomainError,
+	users::{Email, User},
+};
 use evconcierge_auth::{Claims, claims_of};
 use evconcierge_contracts::concierge::v1::{
 	Channel, ConfirmSubscriptionRequest, ConfirmSubscriptionResponse, EmitRequest, EmitResponse, GetNotificationSettingsRequest, GetUnreadCountRequest, GetUnreadCountResponse,
@@ -172,10 +175,7 @@ impl Notifications {
 		let gate = crate::authz::caller_gate(self.users.as_ref(), request).await?;
 		let id = gate.id.ok_or_else(|| Status::unauthenticated("caller is not a user"))?;
 		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user not found"))?;
-		self.notifications
-			.subscriber_for_user(id.raw(), user.email().as_str(), user.email_verified())
-			.await
-			.map_err(domain_to_status)
+		subscriber_of(self.notifications.as_ref(), &user).await.map_err(domain_to_status)
 	}
 
 	/// Assert a `typ=service` token. A user token must never reach the emit path or
@@ -189,28 +189,69 @@ impl Notifications {
 	}
 
 	async fn settings_snapshot(&self, sub: &SubscriberRow) -> Result<NotificationSettings, Status> {
-		let held = self.notifications.subscriptions(sub.id).await.map_err(domain_to_status)?;
-		let topics = TOPICS
-			.iter()
-			.map(|t| {
-				let row = held.iter().find(|s| s.topic == t.key);
-				TopicSubscription {
-					topic: t.key.to_owned(),
-					label: t.label.to_owned(),
-					description: t.description.to_owned(),
-					subscribed: row.is_some(),
-					email_enabled: row.map(|r| r.email_enabled).unwrap_or(true),
-				}
-			})
-			.collect();
-		Ok(NotificationSettings {
-			in_app_enabled: sub.in_app_enabled,
-			email_enabled: sub.email_enabled,
-			email: sub.email.clone(),
-			email_verified: sub.email_verified,
-			topics,
-		})
+		settings_of(self.notifications.as_ref(), &sub.email, sub.email_verified, Some(sub))
+			.await
+			.map_err(domain_to_status)
 	}
+}
+
+/// The user's subscriber row, created on first touch and kept in step with the
+/// directory's address. For writes: a read that must create nothing asks
+/// `NotificationRepository::subscriber_of_user` and hands [`settings_of`] what it found.
+pub async fn subscriber_of(notifications: &dyn NotificationRepository, user: &User) -> Result<SubscriberRow, DomainError> {
+	notifications.subscriber_for_user(user.id().raw(), user.email().as_str(), user.email_verified()).await
+}
+
+/// The settings screen's whole snapshot: both master switches and every catalogue topic
+/// with the caller's choice on it. One builder for the RPC and the web surface, so the two
+/// can never render the same subscriber differently. With no subscriber row yet it is the
+/// state the first write would create: both channels on (the columns' defaults), no topic
+/// followed — answered without creating anything. `email` is the address to show, which a
+/// read takes from the directory rather than a row it does not refresh.
+pub async fn settings_of(notifications: &dyn NotificationRepository, email: &str, email_verified: bool, sub: Option<&SubscriberRow>) -> Result<NotificationSettings, DomainError> {
+	let held = match sub {
+		Some(sub) => notifications.subscriptions(sub.id).await?,
+		None => Vec::new(),
+	};
+	let topics = TOPICS
+		.iter()
+		.map(|t| {
+			let row = held.iter().find(|s| s.topic == t.key);
+			TopicSubscription {
+				topic: t.key.to_owned(),
+				label: t.label.to_owned(),
+				description: t.description.to_owned(),
+				subscribed: row.is_some(),
+				email_enabled: row.map(|r| r.email_enabled).unwrap_or(true),
+			}
+		})
+		.collect();
+	Ok(NotificationSettings {
+		in_app_enabled: sub.is_none_or(|s| s.in_app_enabled),
+		email_enabled: sub.is_none_or(|s| s.email_enabled),
+		email: email.to_owned(),
+		email_verified,
+		topics,
+	})
+}
+
+/// The web surface's JSON for a [`NotificationSettings`], field for field with the
+/// message: the one place the two shapes are mapped, so adding a field to one without
+/// the other is a single diff.
+pub fn settings_json(settings: &NotificationSettings) -> serde_json::Value {
+	serde_json::json!({
+		"in_app_enabled": settings.in_app_enabled,
+		"email_enabled": settings.email_enabled,
+		"email": settings.email,
+		"email_verified": settings.email_verified,
+		"topics": settings.topics.iter().map(|t| serde_json::json!({
+			"topic": t.topic,
+			"label": t.label,
+			"description": t.description,
+			"subscribed": t.subscribed,
+			"email_enabled": t.email_enabled,
+		})).collect::<Vec<_>>(),
+	})
 }
 
 #[tonic::async_trait]

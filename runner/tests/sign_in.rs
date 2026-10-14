@@ -11,6 +11,7 @@ use axum::{
 	body::Body,
 	http::{Request, StatusCode, header},
 };
+use common::web::{Browser, address};
 use concierge::{
 	dispatch::{DispatcherConfig, drain_once},
 	infrastructure::{
@@ -78,33 +79,6 @@ macro_rules! fixture {
 	};
 }
 
-/// A browser: the cookies the plane set, and the CSRF token it may read.
-#[derive(Default)]
-struct Browser {
-	cookies: Vec<(String, String)>,
-}
-
-impl Browser {
-	fn header(&self) -> String {
-		self.cookies.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; ")
-	}
-
-	fn get(&self, name: &str) -> Option<&str> {
-		self.cookies.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
-	}
-
-	fn absorb(&mut self, headers: &axum::http::HeaderMap) {
-		for raw in headers.get_all(header::SET_COOKIE) {
-			let pair = raw.to_str().unwrap().split(';').next().unwrap();
-			let (name, value) = pair.split_once('=').unwrap();
-			self.cookies.retain(|(k, _)| k != name);
-			if !value.is_empty() {
-				self.cookies.push((name.to_owned(), value.to_owned()));
-			}
-		}
-	}
-}
-
 struct Answer {
 	status: StatusCode,
 	body: Value,
@@ -166,10 +140,6 @@ impl Fx {
 		let response = self.router.clone().oneshot(request).await.unwrap();
 		serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
 	}
-}
-
-fn address(tag: &str) -> String {
-	format!("{tag}-{}@example.com", Uuid::new_v4().simple())
 }
 
 fn wrong(code: &str) -> String {
@@ -372,7 +342,7 @@ async fn a_password_account_works_unverified_and_verifies_later() {
 	let email = address("later");
 	let mut browser = Browser::default();
 	let answer = fx.sign_up(&email, PASSWORD, false, &mut browser).await;
-	assert_eq!((answer.status, answer.body), (StatusCode::OK, json!({ "ok": true, "verification": "skipped" })));
+	assert_eq!((answer.status, answer.body), (StatusCode::OK, json!({ "ok": true, "verification": "skipped", "ticket": null })));
 	assert_eq!(fx.session(&browser).await["user"]["emailVerified"], false, "signed in, unverified");
 
 	let code = fx.verification_code(&mut browser).await;
@@ -387,7 +357,8 @@ async fn ticking_verify_mails_a_code_at_sign_up() {
 	let fx = fixture!();
 	let email = address("now");
 	let answer = fx.sign_up(&email, PASSWORD, true, &mut Browser::default()).await;
-	assert_eq!(answer.body, json!({ "ok": true, "verification": "sent" }));
+	assert_eq!((answer.body["ok"].clone(), answer.body["verification"].clone()), (json!(true), json!("sent")));
+	assert!(answer.body["ticket"].is_string(), "the code goes out with its sign-up ticket");
 	assert_eq!(fx.queued_codes(&email).await, 1);
 }
 

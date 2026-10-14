@@ -50,6 +50,10 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1-rustls-tls"] }
 proc-macro2 = "1"
 prost = "0.14"
+# `evconcierge_contracts`' build script hands tonic a protoc of its own choosing.
+prost-build = "0.14"
+# A protoc for a crates.io consumer of `evconcierge_contracts`, who has none on PATH.
+protoc-bin-vendored = "3"
 quote = "1"
 # rustls-only Redis for the issuing-side refresh-token state, matching the rustls
 # stance (no native-tls). No-op until `REDIS_URL` is set (in-process fallback).

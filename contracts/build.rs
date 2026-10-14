@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 /// Compile every `proto/<pkg>/v1/*.proto` into Rust with tonic — BOTH client and
 /// server stubs. The runner includes the servers; other service repos that depend
-/// on this crate (by git) include the clients. Each package's generated module is
+/// on this crate (by git, or from crates.io) include the clients. Each package's generated module is
 /// pulled into `src/lib.rs` via `tonic::include_proto!("<pkg>.v1")`.
 ///
 /// `concierge.v1` is the whole user/identity + platform plane surface: auth,
@@ -25,7 +25,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 	protos.sort();
 
-	tonic_prost_build::configure().build_server(true).build_client(true).compile_protos(&protos, &[proto_root])?;
+	// The dev shell and the image build name their protoc in `PROTOC`; a crates.io consumer
+	// usually has none, and builds with the vendored one rather than failing.
+	println!("cargo:rerun-if-env-changed=PROTOC");
+	let mut config = prost_build::Config::new();
+	if std::env::var_os("PROTOC").is_none() {
+		config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
+	}
+	tonic_prost_build::configure()
+		.build_server(true)
+		.build_client(true)
+		.compile_with_config(config, &protos, &[proto_root])?;
 
 	Ok(())
 }

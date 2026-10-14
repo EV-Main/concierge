@@ -81,7 +81,7 @@ fn email(raw: &str) -> Result<Email, Refusal> {
 	Email::parse(raw).map_err(|_| Refusal(StatusCode::BAD_REQUEST, "invalid_email"))
 }
 
-fn code_refusal(refusal: CodeRefusal) -> Refusal {
+pub(super) fn code_refusal(refusal: CodeRefusal) -> Refusal {
 	match refusal {
 		CodeRefusal::Missing | CodeRefusal::Wrong => Refusal(StatusCode::BAD_REQUEST, "invalid_code"),
 		CodeRefusal::Expired => Refusal(StatusCode::BAD_REQUEST, "code_expired"),
@@ -89,7 +89,7 @@ fn code_refusal(refusal: CodeRefusal) -> Refusal {
 	}
 }
 
-async fn sent(st: &super::Inner, issue: CodeIssue) -> Result<Json<Value>, Refusal> {
+pub(super) async fn sent(st: &super::Inner, issue: CodeIssue) -> Result<Json<Value>, Refusal> {
 	match issue {
 		CodeIssue::Sent => {
 			st.mail_wake.notify_one();
@@ -286,8 +286,26 @@ pub async fn sign_up(State(st): State<WebState>, jar: CookieJar, headers: Header
 			}
 		},
 	};
+	// The ticket goes with the code: it is what lets this browser confirm the address
+	// from a scope's host, where it cannot read the CSRF cookie (`signup::confirm`).
+	// A ticket that could not be stored is SAID, not only logged: the account exists and
+	// is signed in, so failing the request would hide an account the user just made;
+	// `ticket: null` with `ticket_error` tells the dialog to confirm on evinvest.ltd.
+	// Whenever a code was ASKED for, sent or not: a throttled or failed send is exactly
+	// what `signup::resend` recovers, and it needs the ticket to do it.
+	let (ticket, ticket_error) = match body.verify {
+		true => match super::signup::ticket_for(st, user.id()).await {
+			Some(ticket) => (Some(ticket), None),
+			None => (None, Some("ticket_unavailable")),
+		},
+		false => (None, None),
+	};
 	let (jar, _) = signed_in_as(st, jar, &headers, user.id()).await?;
-	Ok((jar, Json(json!({ "ok": true, "verification": verification }))))
+	let mut answer = json!({ "ok": true, "verification": verification, "ticket": ticket });
+	if let Some(error) = ticket_error {
+		answer["ticket_error"] = json!(error);
+	}
+	Ok((jar, Json(answer)))
 }
 
 #[derive(Deserialize)]

@@ -6,6 +6,8 @@
 //! compiles the other half unused — hence the blanket allowance.
 #![allow(dead_code)]
 
+pub mod web;
+
 /// The environment marker that says "this database is disposable".
 pub const TEST_DB_MARKER: &str = "CONCIERGE_TEST_DB";
 
