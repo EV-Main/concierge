@@ -25,13 +25,14 @@
 
 use async_trait::async_trait;
 use domain::{
+	approvals::{ApprovalState, Decision, Field, Outcome, ScopePolicy, Vote as ApprovalVote},
 	architecture::{Reader, Repository},
 	auth::ProvenIdentity,
 	authz::Role,
 	error::DomainError,
 	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
 	iam::{Catalog, Target},
-	scope_catalog::{NotificationTopic, ScopeCatalog},
+	scope_catalog::{ApprovalKind, ApprovalLevel, NotificationTopic, ScopeCatalog},
 	users::{Email, ProfileFields, User, UserId, Username},
 };
 use uuid::Uuid;
@@ -502,6 +503,132 @@ pub trait ScopeCatalogRepository: Send + Sync {
 
 	/// The catalog in force for `namespace`; `None` before its first publication.
 	async fn current(&self, namespace: &str) -> Result<Option<ScopeCatalog>, DomainError>;
+
+	/// The catalog in force for every namespace that has published one, by namespace.
+	async fn all_current(&self) -> Result<Vec<(String, ScopeCatalog)>, DomainError>;
+}
+
+/// A proposal as `ApprovalExecutionService.Propose` opens it. The kind is the spec in
+/// force when the proposer asked; level, roster and threshold are resolved by the adapter
+/// inside the opening transaction, from that spec and the registry as it stands there.
+#[derive(Clone, Debug)]
+pub struct NewApproval {
+	pub id: Uuid,
+	pub kind: ApprovalKind,
+	pub proposer: String,
+	pub scope: String,
+	pub subject_ref: String,
+	/// Checked against `kind` and in its display order.
+	pub fields: Vec<Field>,
+	pub payload_hash: String,
+	/// An `auth_subject`, resolved to an account by the adapter.
+	pub requested_by: Option<String>,
+	pub reason: String,
+	pub dedupe_key: String,
+	/// The opening client; empty for the bridge token.
+	pub client: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum Proposed {
+	Opened(ApprovalRecord),
+	/// The same `dedupe_key` with the same content: the proposal already open under it.
+	Existing(ApprovalRecord),
+}
+
+/// An account as a reader of a proposal sees it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalPerson {
+	pub auth_subject: String,
+	pub email: String,
+}
+
+/// One proposal. `decision` holds the STORED state: a reader projects it through
+/// `Decision::effective_state`, so an overdue open proposal reads as expired.
+#[derive(Clone, Debug)]
+pub struct ApprovalRecord {
+	pub id: Uuid,
+	pub kind: String,
+	pub proposer: String,
+	pub scope: String,
+	pub level: ApprovalLevel,
+	pub escalated_by: Vec<String>,
+	pub subject_ref: String,
+	pub fields: Vec<Field>,
+	pub payload_hash: String,
+	pub requested_by: Option<(UserId, ApprovalPerson)>,
+	pub reason: String,
+	/// Aligned with `decision.voters`.
+	pub voters: Vec<ApprovalPerson>,
+	pub vetoed_by: Option<ApprovalPerson>,
+	pub policy_version: u64,
+	pub created_at: i64,
+	pub requested_by_client: String,
+	pub decision: Decision,
+}
+
+/// What a signed-in person may see (§5, `ListApprovals`): everything as a persisted
+/// owner, their scopes' proposals as a scope admin, and anything that names them.
+#[derive(Clone, Debug)]
+pub struct ApprovalViewer {
+	pub user: UserId,
+	pub owner: bool,
+	/// Scope ids whose `<namespace>:admin` they actively hold.
+	pub admin_of: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ApprovalFilter {
+	pub scope: Option<String>,
+	pub state: Option<ApprovalState>,
+	pub awaiting_my_vote: bool,
+	pub limit: i64,
+	/// `(created_at, id)` of the last row of the previous page.
+	pub before: Option<(i64, Uuid)>,
+}
+
+/// Who moved a proposal, for its history.
+#[derive(Clone, Copy, Debug)]
+pub enum ApprovalActor<'a> {
+	Person(UserId),
+	/// A client id, or `bridge`.
+	Service(&'a str),
+}
+
+/// Approvals (`approvals`, migration 0036). Every write is one transaction holding the
+/// proposal row `FOR UPDATE`, and writes the lazy expiry it finds due even when the act
+/// it was asked for is then refused.
+#[async_trait]
+pub trait ApprovalRepository: Send + Sync {
+	/// Open a proposal: resolve its level, freeze the roster, refuse a second live one
+	/// about the same subject, answer an idempotent repeat with the stored proposal.
+	async fn propose(&self, new: NewApproval, now: i64) -> Result<Proposed, DomainError>;
+
+	async fn viewer(&self, user: UserId) -> Result<ApprovalViewer, DomainError>;
+
+	async fn find(&self, id: Uuid) -> Result<Option<ApprovalRecord>, DomainError>;
+
+	/// Newest first, under `viewer`'s visibility.
+	async fn list(&self, viewer: &ApprovalViewer, filter: &ApprovalFilter, now: i64) -> Result<Vec<ApprovalRecord>, DomainError>;
+
+	/// A roster member's vote; refused when they no longer hold the seat the roster was
+	/// drawn from.
+	async fn vote(&self, id: Uuid, voter: UserId, vote: ApprovalVote, now: i64) -> Result<ApprovalRecord, DomainError>;
+
+	async fn veto(&self, id: Uuid, by: UserId, reason: &str, now: i64) -> Result<ApprovalRecord, DomainError>;
+
+	/// `proposer`'s own proposal only; any other is `NotFound`.
+	async fn withdraw(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, reason: &str, now: i64) -> Result<ApprovalRecord, DomainError>;
+
+	/// `proposer`'s passed proposals past their delay, oldest `executable_at` first.
+	async fn pull(&self, proposer: &str, limit: i64, now: i64) -> Result<Vec<ApprovalRecord>, DomainError>;
+
+	/// `proposer`'s own proposal only; any other is `NotFound`. A repeated outcome
+	/// writes nothing.
+	async fn report(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, outcome: Outcome, detail: &str, now: i64) -> Result<ApprovalRecord, DomainError>;
+
+	/// The policy scope `scope` is measured against; `None` for an unknown scope.
+	async fn policy(&self, scope: &str) -> Result<Option<ScopePolicy>, DomainError>;
 }
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
