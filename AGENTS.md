@@ -682,13 +682,14 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `sole_admin` escalation, the two-owner floor — and that `<ns>:admin`, the scope roster,
   is granted ONLY by an executed `concierge:scope_admin_grant` (`GrantPermission` refuses
   it to everyone), never delegated, and only to an account with a verified address. A vote
-  counts only while its voter holds the seat (a suspended owner holds none), and a proposal
-  the seated voters can no longer carry is rejected; a scope's policy only tightens a kind's
-  thresholds;
+  counts only while its voter holds the seat (a suspended owner holds none); a proposal is
+  rejected only by seated AGAINSTs beyond what the roster can spare — one that can no longer
+  pass for want of seats waits out its lifetime; a scope's policy only tightens a kind's
+  thresholds, and binds by test and field, not by name;
   any owner vetoes any proposal inside its delay; a scope's delay is never under an hour.
   The known money kinds are held to one table in `domain::floors` (platform level, or caps
   on their scope escalations) at publication AND at every proposal, whatever the catalog
-  says.
+  says; it is an allow-list for `bank` and `invest` — a kind it does not name is the owners'.
   Expiry, executability and the 72 h lapse to `void` are time predicates and nothing sweeps
   for them; every transition writes its `approval_events` row in the same transaction.
 - **Two loops act on their own: the hold sweep and the approval executor.** Everything

@@ -334,7 +334,10 @@ containment is never slower than the grant).
   opener is proven by their session and is kept off the roster (D23), and so is the
   account a `scope_admin_grant` would seat, when an owner: nobody votes on
   what they asked for, or on their own seat. A `PLATFORM` proposal is refused at open (`FAILED_PRECONDITION`)
-  with fewer than two owners, or when the opener is the only one left to decide.
+  with fewer than two owners, or when nobody besides the one who asked and the one it would
+  seat is left to decide. ⚠️ For the owner's attention, kept as decided: with three owners,
+  one opening a grant for another leaves a roster of one, so that grant is decided by a
+  single owner.
 - **A proven initiator of a money decision does not decide it** (D24(1)): a proposer may
   present, in metadata `x-ev-user-token`, an access token of this plane that `requested_by`
   holds (banking forwards the owner's). Verified as every RPC here verifies one, its `sub`
@@ -406,22 +409,38 @@ containment is never slower than the grant).
 ### 5.3 Kinds
 
 **The floor this plane keeps** (D24, decided by the session; `domain::floors`, one
-table): whatever a publisher's catalog says, `bank:payment`, `bank:scope_transfer`,
-`bank:seed_capital`, `bank:treasury_surplus`, `bank:compartment_policy` and
-`invest:holder_grant` are decided by the platform owners; `bank:account_transfer` escalates
-above 1000 USDT on `amount` and above 5000 USDT a day; `bank:scope_payout` above 1000 USDT
-on `total`, 5000 USDT a day, and above one `recipients` (COUNT — a distribution to more
-than one holder); `invest:valuation_override` above 10 % (`deviation`, 1000 bps);
-`invest:fee_policy` when `raises_ceiling` is set. It binds twice: a publication of such a
-kind at scope level, without the field the floor tests, or with an escalation of that test
-and field above the cap or in another currency is refused; and a proposal is measured
-against the stricter of the table and the catalog in force, the table's own escalations
-(`floor_per_operation`, `floor_daily`, `floor_recipients`, `floor_deviation`,
-`floor_ceiling` in `escalated_by`) added where the catalog has none — so a catalog stored
-before the table, or published wrong, cannot keep from the owners what the table sends
-them. A scope policy may only tighten a threshold from the stricter of the two. A catalog
-is republished whole, so one stored kind that breaks the floor blocks the namespace's
-next publication until that kind is fixed.
+table). Whatever a publisher's catalog says:
+
+- `bank:payment`, `bank:scope_transfer`, `bank:seed_capital`, `bank:treasury_surplus`,
+  `bank:compartment_policy` and `invest:holder_grant` are decided by the platform owners.
+  So is any kind of the `bank` and `invest` namespaces the table does not name — an
+  allow-list: a money kind added to a catalog before it is added here goes to the owners. A
+  kind of those namespaces that moves no money is named in the table as unbounded.
+- `bank:account_transfer` escalates above 1000 USDT on `amount` and above 5000 USDT a day.
+- `bank:scope_payout` escalates above 1000 USDT on `total`, above 5000 USDT a day, above one
+  `recipients` (COUNT), above one recipient a day (`ROLLING_24H_COUNT_ABOVE` — a payout
+  split into single-recipient ones is still one distribution), when `distribution` (FLAG,
+  a dividend to every holder) is set, and when `recipients` is 0.
+- `invest:valuation_override` escalates above 10 % (`deviation`, 1000 bps);
+  `invest:fee_policy` when `raises_ceiling` is set.
+
+It binds twice. A publication of such a kind at scope level without a field the floor
+tests, or with an escalation of that test and field above the cap or in another currency,
+is refused; at the platform level it is stricter and accepted as it is. A proposal is
+measured against the kind as `ListApprovalKinds` shows it: the catalog's escalations
+capped at the table's, and the table's own beside them, always, under names this plane
+reserves (`floor_*`, which no publisher may use) — so a catalog stored before the table,
+or published wrong, cannot keep from the owners what the table sends them.
+`GetScopeCatalog` still answers the publisher what it published.
+
+A scope policy may only tighten, from the stricter of the table and the catalog. Its
+threshold binds by what it tests, not by name: it holds every escalation of the same test,
+field and currency as the one it names, and an executed policy change anchors a threshold
+on a catalog escalation onto the floor's parameter of the same test. A publisher's next
+catalog — dropping, renaming or loosening its own escalation — therefore never loosens a
+scope's stored tightening (review of #142). A catalog is republished whole, so one stored
+kind that breaks the floor blocks the namespace's next publication until that kind is
+fixed.
 
 `bank:*` — final; banking is the only proposer and executor of each.
 
@@ -578,8 +597,9 @@ in `domain::approvals`.
   as a service would and carries each out with its outcome in ONE transaction, so a grant
   or an installed policy never exists without the executed decision behind it. If it stops,
   passed decisions lapse to `VOID` unexecuted after 72 hours — nothing is done that was not
-  decided. A pass with a failed execution doubles the pause before the next one, up to 15
-  minutes, so a store that refuses every write is not asked again every 30 s.
+  decided. A decision whose execution fails waits out its own backoff — doubled per
+  failure, up to 15 minutes — while every other due decision is executed every 30 s: one
+  poisoned decision does not hold the healthy ones back (review of #142).
 - **The scope roster** is the ACTIVE accounts holding an unrevoked grant of exactly
   `<namespace>:admin`. A seat that holds every permission of a namespace without a row
   (`granting_seats_hold_all`) is not on it: what it may do on the scope's surface is not a
