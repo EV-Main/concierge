@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	// The dev shell and the image build name their protoc in `PROTOC`; a crates.io consumer
 	// usually has none, and builds with the vendored one rather than failing.
+	println!("cargo:rerun-if-env-changed=PROTOC");
 	let mut config = prost_build::Config::new();
 	if std::env::var_os("PROTOC").is_none() {
 		config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
