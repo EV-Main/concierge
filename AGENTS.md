@@ -88,8 +88,8 @@ retired in favour of `HoldUser` plus `GovernanceService.OpenUserSuspension`.
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
 | `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `governance` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
 | `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Redis-backed refresh rotation with reuse detection · `Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party `ExchangeCode`/`RefreshClientToken` over the runner's `ClientGrants` port, plus `open_session` for the web surface's sign-ins) reading accounts from the directory over an in-process `Provisioner` channel, the closed `oauth::OAuthProvider` set (Google, GitHub — code + PKCE), **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
-| gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
-| Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams; also which consumer-built messages and services must never grow. Implemented so far: the registry (`tenants`, migration 0031; `ScopeRegistry`, `scopes` module), sign-in from a scope's hosts (`web::origins`, `web::cors`, the live allowlist `web::allowlist`) and the MFE bundles under `/auth/mfe/*` (`web::mfe`, `WEB_MFE_DIR`); the rest is contract only | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
+| gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-prost-build` (protoc from `PROTOC`, else the vendored one). `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
+| Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams; also which consumer-built messages and services must never grow. Implemented so far: the registry (`tenants`, migration 0031; `ScopeRegistry`, `scopes` module), sign-in from a scope's hosts (`web::origins`, `web::cors`, the live allowlist `web::allowlist`) and the MFE bundles under `/auth/mfe/*` (`web::mfe`, `WEB_MFE_DIR`), and the sign-up ticket that confirms an address from a scope's host (`web::signup`, migration 0032); the rest is contract only | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
 | `concierge_iam` (+ `_derive`) — permission scopes: `#[derive(Permission)]` enums, `alias!`, the concrete `PermissionSet` a service asks `may` of, `Pattern` containment, the `Catalog` a tenant publishes. I/O-free, wasm-safe, published to crates.io so consumers need no protoc | [`iam/`](./iam) |
 | **Design** — operator (admin) surface over this plane | [§ Design](#design) |
@@ -151,9 +151,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   those rows to banking over `UserEvents.PullUserLifecycle` (read-only; shared bridge
   token; mounted outside the user auth layer). The **platform** module is the
   operator console's platform/cabinet config surface (maintenance mode, announcement
-  banner, feature flags) behind the shared RBAC gate (`authz`). `notification` and
-  `log` stay DEFERRED stubs (`tonic::Status::unimplemented`); their application
-  layers are placeholders to grow into. Health returns `"ok"`.
+  banner, feature flags) behind the shared RBAC gate (`authz`). `log` stays a
+  DEFERRED stub (`tonic::Status::unimplemented`); its application layer is a
+  placeholder to grow into. Health returns `"ok"`.
 - **Every sign-in method lands in ONE rule, and a proven mailbox is the link.** The web
   surface signs in by Google or GitHub (`/auth/login?provider=`, `/callback/auth/{provider}`),
   by an emailed code (`/auth/code/{request,verify}`) or by a password
@@ -173,7 +173,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   provisions by `auth_subject`, so 0029's `users_mirror_google_subject` trigger mirrors its
   inserts into `user_identities` and refuses one whose sub this binary already linked; it is
   dropped once no older binary runs. The credential POSTs carry no session to double-submit
-  against, so they check `Origin` against `PUBLIC_ORIGIN` (login CSRF), and the ones that
+  against, so they check `Origin` against `PUBLIC_ORIGIN` or an origin of a scope that still
+  signs people in (login CSRF; `web::allowlist`, `docs/SCOPES-AND-APPROVALS.md` §3.1), and the ones that
   cost a mail or test a password check a Cloudflare Turnstile token server-side
   (`TURNSTILE_SECRET`, required in every environment — development runs Cloudflare's
   always-pass test secret, and there is no arm that skips the check). Codes are six digits,
@@ -205,7 +206,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   the username. A PASSKEY (WebAuthn, `web::passkey`, `passkey_credentials`) is registered by a
   signed-in account and signs in without an account named first: it must be discoverable
   (`residentKey: required`), its user handle is the account id, the relying party is
-  `PUBLIC_ORIGIN`'s host and that origin the only one accepted. A credential this plane
+  `PUBLIC_ORIGIN`'s host, and the origins accepted are that one plus the registered scope
+  origins under it — exact origins, never any subdomain. A credential this plane
   checks itself, like the password — not a provider subject and not a `user_identities`
   row. Its ceremony state lives in process between the two requests, as the OAuth
   transaction's does.
@@ -543,7 +545,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   permission is `<namespace>:<resource…>:<action>` (`concierge_iam`), an alias a named set
   of them. What a SEAT means is code (`domain::authz`, `SEAT_*` over `concierge:*`, `iam:*`,
   `bank:*`) and who holds one is still only governance's to say; nothing compares seats by
-  rank. A TENANT (`tenants`, migration 0026) owns one namespace, and its relying party
+  rank. A TENANT (`tenants`, migration 0026) owns one namespace (seen as a direction it is a
+  SCOPE — migration 0031, `docs/SCOPES-AND-APPROVALS.md` §3), and its relying party
   publishes the catalog over it (`AuthService.PublishCatalog`, client secret, everything
   inside the namespace, at most 1024 permissions and 128 aliases of at most 128 characters —
   every `GetMe` loads it). `version` is the unix seconds of the client's build COMMIT, never
@@ -615,7 +618,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   target, and for an ungrantable address its category — never the address).
 - **This plane is the identity provider of first-party clients on OTHER origins, and a
   client's token opens exactly one RPC.** A relying party (`relying_party`, registry
-  `rp_clients` from `0025`; the Service-Arb panel `sa` is seeded) runs authorization code +
+  `rp_clients` from `0025`; the Service-Arb panel `sa` (0025) and the invest cabinet `invest` (0031) are seeded) runs authorization code +
   PKCE S256: `GET /auth/authorize` (publicly `/api/auth/authorize`, under the conductor's
   existing `/api/auth/*` rewrite) → `AuthService.ExchangeCode` / `RefreshClientToken`,
   called by the client's backend with its secret. `/auth/authorize` settles the client and
@@ -630,7 +633,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `CODE_TTL_SECS` (60), is bound to client, redirect_uri, PKCE challenge, user and
   `token_version`, and is BURNED on its first presentation, matching or not; a second
   presentation marks it replayed and revokes every session it opened. Every client signs
-  in any ACTIVE account — part of a client's surface is open to everyone, and what a user
+  in any ACTIVE account — unless its scope is CLOSED: such a client is refused like a
+  disabled one, `GetMe` stops honouring its tokens at once and its sessions end at the
+  next refresh (`scope_closed`) — part of a client's surface is open to everyone, and what a user
   may do there is `GetMe.permissions`, which the client gates on. The account is re-read at
   authorize, at the exchange and on EVERY refresh, and a refusal on refresh revokes the
   session. Every client is a tenant (`rp_clients.tenant_id`). Client refresh families live in
@@ -722,7 +727,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   re-exports it as `domain::architecture`, and stays wasm-safe — so the
   wasm-unsafe `evconcierge_auth` must never be a dependency of `domain`.
 - `evconcierge_contracts` (vendoring `proto/`) is the single dependency other
-  service repos import by git — it gives them the gRPC stubs and, via
+  service repos import by git or from crates.io (it vendors protoc, so a consumer needs none) — it gives them the gRPC stubs and, via
   `evconcierge_auth`, the standard token-verification flow.
 - This is the **identity/platform** plane — no TigerBeetle, no money ledger, no
   money-operation authorization. Those belong to the `banking` repo.

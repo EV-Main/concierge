@@ -1,5 +1,5 @@
 //! The relying-party flow: this plane as the identity provider of first-party clients on
-//! other origins (the Service-Arb panel on `sa.evinvest.ltd`).
+//! other origins (`rp_clients`: the Service-Arb panel `sa`, the invest cabinet `invest`).
 //!
 //! ```text
 //! browser → evinvest.ltd/api/auth/authorize?client_id&redirect_uri&state&code_challenge  (web::authorize)
@@ -10,8 +10,8 @@
 //! client backend → UserDirectory.GetMe with that JWT — the ONE RPC it opens
 //! ```
 //!
-//! Every client signs in any ACTIVE account; what the user may do there is their tenant
-//! permissions, which GetMe hands the client fresh on every call — its own copy is never
+//! Every client of a scope that is not CLOSED signs in any ACTIVE account; what the user
+//! may do there is their tenant permissions, which GetMe hands the client fresh on every call — its own copy is never
 //! trusted. The account is re-read at authorize, again at the exchange (a code does not
 //! outlive a suspension, even inside its 60s), and again on every refresh.
 //!
@@ -208,8 +208,8 @@ impl RelyingParties {
 		Ok(audiences)
 	}
 
-	/// The client, when `client_id` names an enabled one of a scope that is not closed, and `redirect_uri` is one of its
-	/// URIs byte for byte. `None` is the ONLY answer for anything else, so the caller has
+	/// The client, when `client_id` names an enabled one of a scope that is not closed and
+	/// `redirect_uri` is one of its URIs byte for byte. `None` is the ONLY answer for anything else, so the caller has
 	/// no way to redirect to an address nobody registered.
 	pub async fn resolve(&self, client_id: &str, redirect_uri: &str) -> Result<Option<ClientRecord>, DomainError> {
 		let Some(client) = self.repo.client(client_id).await? else {
@@ -262,7 +262,8 @@ impl RelyingParties {
 		self.repo.session_live(session_id, audience, now_secs()).await
 	}
 
-	/// The client, when it exists, is enabled and `secret` is its secret.
+	/// The client, when it exists, is enabled, its scope is not closed and `secret` is its
+	/// secret.
 	async fn authenticate_client(&self, client_id: &str, secret: &str) -> Result<ClientRecord, ClientGrantError> {
 		let client = self.authenticate_client_of_any_scope(client_id, secret).await?;
 		if client.scope_closed {

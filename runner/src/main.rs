@@ -162,7 +162,8 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	tokio::spawn(directory::run_provisioner(provision_rx, users.clone(), break_glass.clone()));
 
 	// Relying parties: first-party clients on other origins signing users in through this
-	// plane (`relying_party`). The registry is data (migration 0025 seeds `sa`); each
+	// plane (`relying_party`). The registry is data (migrations 0025 and 0031 seed `sa` and
+	// `invest`); each
 	// client's secret comes from `RP_CLIENT_SECRET_<ID>` and is written to the registry as
 	// a digest here, so a rotation is an env change and a restart. Dev-only loopback
 	// redirect targets come from `RP_DEV_REDIRECT_URIS`, refused in production.

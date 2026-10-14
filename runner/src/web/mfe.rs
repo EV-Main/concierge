@@ -1,6 +1,7 @@
-//! The platform's micro-frontend bundles (`web/dist`), served under `/auth/mfe/*` from
-//! the directory `WEB_MFE_DIR` names (`docs/SCOPES-AND-APPROVALS.md` §3.1, the plan's
-//! §4.1/§4.3: hosts load them by manifest and allow this origin in their CSP).
+//! The platform's micro-frontend bundles (`web/dist`), served under `/auth/mfe/*` —
+//! publicly `/api/auth/mfe/*` — from the directory `WEB_MFE_DIR` names
+//! (`docs/SCOPES-AND-APPROVALS.md` §3.1). Hosts find the current bundles through the
+//! manifest, [`MANIFEST`].
 //!
 //! The serving itself — conditional requests (ETag, Last-Modified, 304), ranges, the
 //! content type — is tower-http's `ServeDir`. What is decided here is what it may be

@@ -3,10 +3,13 @@
 Status: **partly implemented.** The wire is in `contracts/proto/concierge/v1/scopes.proto`,
 `approvals.proto` and the comments on `events.proto`. Implemented in `runner/`: the
 registry (§3: `tenants` columns from migration 0031, `ScopeRegistry` mounted inside the
-user auth layer) and sign-in from a scope's hosts (§3.1: CORS and the `Origin` check on
-the closed route list, the passkey verifier's origins, OAuth `returnTo`). Every other
-service below is not mounted yet and answers `UNIMPLEMENTED`. Banking, the `lib`
-projections, invest and admin build against this document.
+user auth layer; a CLOSED scope's clients are refused), sign-in from a scope's hosts
+(§3.1: CORS and the `Origin` check on the closed route list, the passkey verifier's
+origins, OAuth `returnTo`, the sign-up ticket of migration 0032) and the micro-frontend
+bundles under `/auth/mfe/*` (§3.1). Every other service below is not mounted yet and
+answers `UNIMPLEMENTED`; nothing emits `ScopeEvents`, and `PullUserLifecycle` still admits
+the bridge token alone (§1). Banking, the `lib` projections, invest and admin build
+against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it
@@ -16,14 +19,14 @@ says so and why.
 
 ## 1. Surface
 
-| Service | File | Caller | Where it is mounted |
-| ------- | ---- | ------ | ------------------- |
-| `ScopeRegistry` | scopes.proto | first-party session, `typ=service` token | inside the user auth layer |
-| `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, like `UserEvents` |
-| `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener |
-| `ApprovalService` | approvals.proto | first-party session | inside the user auth layer |
-| `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener |
-| `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and now** a relying party's client credential | as today |
+| Service | File | Caller | Where it is mounted | Today |
+| ------- | ---- | ------ | ------------------- | ----- |
+| `ScopeRegistry` | scopes.proto | first-party session, `typ=service` token | inside the user auth layer | served (`runner/src/scopes.rs`) |
+| `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, like `UserEvents` | contract, `UNIMPLEMENTED` |
+| `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | contract, `UNIMPLEMENTED` |
+| `ApprovalService` | approvals.proto | first-party session | inside the user auth layer | contract, `UNIMPLEMENTED` |
+| `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | contract, `UNIMPLEMENTED` |
+| `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and** a relying party's client credential | as today | bridge token only; the client credential is contract |
 
 A relying party's restricted access token still opens exactly one RPC,
 `UserDirectory.GetMe`. Votes are cast over a first-party session on `evinvest.ltd`,
@@ -95,7 +98,8 @@ a resource (D2): an admin of a scope holds the `<scope>:admin` alias, which dele
   plane refuses new debits of its accounts; its clients still sign people in and its
   streams are still read) or `CLOSED` (terminal: its clients sign nobody in, nothing new
   opens, history stays readable).
-- **`clients`**: a scope may have several relying-party clients (today one, `sa`).
+- **`clients`**: a scope may have several relying-party clients (today one each: client
+  `sa` in scope `sa`, client `invest` in scope `invest`, migrations 0025 and 0031).
 - **`observers`**: client ids that may also READ this scope's events and its users'
   lifecycle. invest runs allocations of other scopes (the `service_arb` allocation lives
   in `sa`) and checks `sa:admin` to authorise `sa`'s admins there, so `sa` names
@@ -103,7 +107,9 @@ a resource (D2): an admin of a scope holds the `<scope>:admin` alias, which dele
   accounts a service may open, debit or read there is banking's own configuration of
   service grants, and nothing on this plane widens it.
 - **Registry writes** are migrations and configuration, as `rp_clients` is today; there
-  is no write RPC. Every change bumps `version` and emits `SCOPE_CHANGED`.
+  is no write RPC. Every change bumps `version` (migration 0031's triggers, a client's
+  audience, `disabled_at` or scope included); `SCOPE_CHANGED` is to carry it once
+  `ScopeEvents` is served.
 
 ### 3.1 `origins`: sign-in from a scope's hosts
 
@@ -120,7 +126,7 @@ They widen CORS for a **closed list** of sign-in routes and nothing else:
 
 | Accepts a scope origin | `PUBLIC_ORIGIN` only |
 | ---------------------- | -------------------- |
-| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`, `/auth/password/signup/resend`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user}`, never a token) | everything acting on an open session: `/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register`, `/auth/passkey/remove`, sessions, username, logout, `/kyc/*` |
+| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`, `/auth/password/signup/resend`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user, permissions}`, never a token) | everything acting on an open session or reading the account: `/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register/*`, `/auth/passkey/remove`, `/auth/sessions`, `/auth/username`, `/auth/methods`, `/auth/me`, `/auth/notifications/settings*`, `/auth/logout`, `/kyc/*` |
 
 A route on the left accepts an `Origin` that is `PUBLIC_ORIGIN` or an origin of a scope
 that is `ACTIVE` or `FROZEN` — a frozen scope's clients still sign people in — and never
@@ -129,11 +135,28 @@ scope host cannot read, so email verification is not offered there. A password s
 started on a scope host is confirmed instead by `/auth/password/signup/confirm` with the
 ticket the sign-up answered (migration 0032; the ticket lives a day, and
 `/auth/password/signup/resend` mails a new code under it): the address is verified and the
-password kept, where a code SIGN-IN on that mailbox would take the unverified account over. The allowlist is re-read from the registry at most
-30 s apart (`web::allowlist`), so closing a scope or removing an origin takes effect
-without a restart. An absolute OAuth `returnTo` must be one of these origins plus a path
-from the scope's `return_paths`, matched exactly, or `/auth/login` answers 400; a
-relative or empty one lands on `/` as it always did.
+password kept, where a code SIGN-IN on that mailbox would take the unverified account
+over. The sign-up hands a ticket out only when it was asked to mail a code (`verify`);
+if the ticket cannot be stored the answer says `ticket: null` with
+`ticket_error: "ticket_unavailable"` and the address is confirmed on `evinvest.ltd`
+instead. A ticket that is unknown, spent, expired or outlived by a revoke-all or a new
+password answers `/confirm` as a wrong code does, and `/resend` with `{ok: true}` and no
+mail.
+
+The allowlist is re-read from the registry at most 30 s apart (`web::allowlist`), so
+closing a scope or removing an origin takes effect without a restart. An absolute OAuth
+`returnTo` must be one of these origins plus a path from the scope's `return_paths`,
+matched exactly, or `/auth/login` answers 400; a relative or empty one lands on `/` as it
+always did.
+
+**Micro-frontend bundles.** `GET /auth/mfe/*` — publicly
+`https://evinvest.ltd/api/auth/mfe/*`, under the conductor's `/api/auth/*` rewrite — serves
+the directory `WEB_MFE_DIR` names; the manifest hosts read is `registry.json`. It is
+public and read-only: a scope origin gets `Access-Control-Allow-Origin` (no credentials)
+and `Vary: Origin`, files only (no index, no listing, no dotfile, nothing resolving
+outside the directory), esbuild-hashed names cached for a year and everything else for
+five minutes. With `WEB_MFE_DIR` unset or unreadable the route is not mounted and sign-in
+is unaffected; the image sets it only once `web/` exists in this repository.
 
 ---
 

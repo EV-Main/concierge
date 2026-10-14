@@ -21,7 +21,8 @@ import "concierge/v1/approvals.proto";
 //                         permissions: approval kinds and notification topics.
 //   ScopeEvents         — the per-scope event stream relying parties project from.
 // The last two are called by services and authenticate by service credential (the doc's
-// "Service callers"), outside the user auth layer like UserEvents.
+// "Service callers"), outside the user auth layer like UserEvents. Only ScopeRegistry is
+// served today; the other two are contract and answer UNIMPLEMENTED.
 //
 // The registry has no write RPC: scopes, their origins and their clients are written by
 // migration and configuration, as `rp_clients` is today.
@@ -81,20 +82,23 @@ message Scope {
   // The https origins of the scope's hosts (`https://invest.evinvest.ltd`), exactly as a
   // browser sends `Origin`: `https` only; the host ends in `.evinvest.ltd` (the bare
   // `evinvest.ltd` is PUBLIC_ORIGIN, never a scope's); port 1-65535 and only when
-  // non-default; no path, no trailing slash, no
-  // wildcard, never `null`. Compared byte for byte; the answer's
-  // `Access-Control-Allow-Origin` is exactly the matched origin, with `Vary: Origin`.
+  // non-default; no path, no trailing slash, no wildcard, never `null`. Compared byte for
+  // byte; the answer's `Access-Control-Allow-Origin` is exactly the matched origin, with
+  // `Vary: Origin`.
   //
   // While the scope is ACTIVE or FROZEN (never once CLOSED) they widen CORS on a fixed
   // list of sign-in routes only — `/auth/code/request`, `/auth/code/verify`,
   // `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`,
-  // `/auth/password/signup/resend`, `/auth/passkey/signin/*` and `GET /auth/session`, which answers them
-  // `{authenticated, user}` and never a token. Everything that acts on an open session
-  // (`/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register|remove`,
-  // sessions, username, logout, `/kyc/*`) accepts PUBLIC_ORIGIN alone; a scope host
-  // confirms a password sign-up with the ticket that sign-up handed it. The registry is re-read at most 30 s apart, so a CLOSED scope or a removed
-  // origin stops being answered within that. An absolute OAuth `returnTo` must be one of
-  // these origins plus a path from `return_paths`, or `/auth/login` answers 400.
+  // `/auth/password/signup/resend`, `/auth/passkey/signin/*` and `GET /auth/session`, which
+  // answers them `{authenticated, user, permissions}` and never a token — and on the
+  // public, credential-less `GET /auth/mfe/*`. Everything that acts on an open session or
+  // reads the account (`/auth/email/verify/*`, `/auth/password/set`,
+  // `/auth/passkey/register|remove`, sessions, username, methods, `/auth/me`,
+  // `/auth/notifications/settings*`, logout, `/kyc/*`) accepts PUBLIC_ORIGIN alone; a scope
+  // host confirms a password sign-up with the ticket that sign-up handed it. The registry
+  // is re-read at most 30 s apart, so a CLOSED scope or a removed origin stops being
+  // answered within that. An absolute OAuth `returnTo` must be one of these origins plus a
+  // path from `return_paths`, or `/auth/login` answers 400.
   repeated string origins = 5;
   // The relying-party clients signing people in for this scope. A scope may have none
   // (`main` is first-party) or several.
