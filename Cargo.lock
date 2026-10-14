@@ -775,6 +775,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "concierge_client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "evconcierge_contracts",
+ "getrandom 0.4.3",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic 0.14.6",
+ "uuid",
+]
+
+[[package]]
 name = "concierge_iam"
 version = "0.1.0"
 dependencies = [
@@ -793,6 +808,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "concierge_projection"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "concierge_projection",
+ "evconcierge_contracts",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic 0.14.6",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2977,6 +3008,7 @@ version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
