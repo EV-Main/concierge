@@ -17,8 +17,11 @@
 //! concern, minted zone-side from the verified access token.
 
 mod authorize;
+mod cors;
 mod kyc;
+pub mod mfe;
 mod oauth;
+pub mod origins;
 mod passkey;
 mod routes;
 mod session;
@@ -30,7 +33,7 @@ mod turnstile;
 use std::sync::Arc;
 
 use axum::{
-	Router,
+	Router, middleware,
 	routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
@@ -40,6 +43,7 @@ use evconcierge_auth::{AuthService, oauth::OAuthProvider};
 /// enforces. A test that hard-coded the number would keep passing after someone raised
 /// it, and the number is what stands between one account and the vendor balance.
 pub use kyc::START_MAX_PER_WINDOW;
+pub use passkey::verifier as passkey_verifier;
 pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
 use tokio::sync::Notify;
@@ -52,7 +56,7 @@ use webauthn_rs::{
 use crate::{
 	ports::{CredentialRepository, GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
 	relying_party::RelyingParties,
-	web::{oauth::OAuthTxStore, passkey::Ceremonies, single_flight::KeyedLocks},
+	web::{oauth::OAuthTxStore, origins::ScopeOrigins, passkey::Ceremonies, single_flight::KeyedLocks},
 };
 
 /// Cookie names + shared attributes. `__Host-` prefixed when secure (production);
@@ -129,6 +133,7 @@ impl WebState {
 				credentials: sign_in.credentials,
 				mail_wake: sign_in.mail_wake,
 				webauthn: sign_in.webauthn,
+				scope_origins: sign_in.scope_origins,
 				passkey_registrations: Ceremonies::default(),
 				passkey_sign_ins: Ceremonies::default(),
 				public_origin: public_origin.trim_end_matches('/').to_string(),
@@ -154,8 +159,11 @@ pub struct SignInDeps {
 	pub credentials: Arc<dyn CredentialRepository>,
 	/// The mail dispatcher's wake-up: a queued code leaves now rather than on the next tick.
 	pub mail_wake: Arc<Notify>,
-	/// The WebAuthn verifier, pinned to `PUBLIC_ORIGIN` and its host as the relying party.
+	/// The WebAuthn verifier: its relying party is `PUBLIC_ORIGIN`'s host, and it accepts
+	/// that origin and the scope origins under it.
 	pub webauthn: Arc<Webauthn>,
+	/// The scope hosts the sign-in routes answer besides `PUBLIC_ORIGIN`.
+	pub scope_origins: ScopeOrigins,
 }
 
 /// What the identity-verification routes need, gathered so the composition root hands
@@ -217,8 +225,19 @@ pub fn router(state: WebState) -> Router {
 		// facts of THIS plane, and the cabinet needs them even while Didit is down.
 		.route("/kyc/status", get(kyc::status))
 		.route("/kyc/callback/didit", post(kyc::callback))
+		.layer(middleware::from_fn_with_state(state.clone(), cors::sign_in))
 		.with_state(state)
 }
+impl Inner {
+	/// Whether a sign-in route may be called from `origin`: this plane's own, or a host of
+	/// a scope that still signs people in. Only the routes in `origins::SIGN_IN_ROUTES`
+	/// may ask; everything acting on an open session compares against `PUBLIC_ORIGIN`
+	/// alone.
+	fn sign_in_origin(&self, origin: &str) -> bool {
+		origin == self.public_origin || self.scope_origins.admits(origin)
+	}
+}
+
 /// An opaque identifier: `n` bytes of CSPRNG entropy, base64url-encoded (no padding).
 fn random_token(n: usize) -> String {
 	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -246,6 +265,7 @@ struct Inner {
 	credentials: Arc<dyn CredentialRepository>,
 	mail_wake: Arc<Notify>,
 	webauthn: Arc<Webauthn>,
+	scope_origins: ScopeOrigins,
 	passkey_registrations: Ceremonies<(UserId, PasskeyRegistration)>,
 	passkey_sign_ins: Ceremonies<DiscoverableAuthentication>,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).

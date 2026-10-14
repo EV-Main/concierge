@@ -1,9 +1,12 @@
 # Scopes, approvals and the relying-party event streams — contract
 
-Status: **contract only.** The wire is in `contracts/proto/concierge/v1/scopes.proto`,
-`approvals.proto` and the comments on `events.proto`; nothing here is implemented in
-`runner/` yet, no service below is mounted, and calling one answers `UNIMPLEMENTED`.
-Banking, the `lib` projections, invest and admin build against this document.
+Status: **partly implemented.** The wire is in `contracts/proto/concierge/v1/scopes.proto`,
+`approvals.proto` and the comments on `events.proto`. Implemented in `runner/`: the
+registry (§3: `tenants` columns from migration 0031, `ScopeRegistry` mounted inside the
+user auth layer) and sign-in from a scope's hosts (§3.1: CORS and the `Origin` check on
+the closed route list, the passkey verifier's origins, OAuth `returnTo`). Every other
+service below is not mounted yet and answers `UNIMPLEMENTED`. Banking, the `lib`
+projections, invest and admin build against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it

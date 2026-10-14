@@ -123,6 +123,7 @@ pub fn sign_in_with_turnstile(pool: &sqlx::PgPool, turnstile: &str) -> concierge
 		credentials: std::sync::Arc::new(concierge::infrastructure::credentials::PgCredentials::new(pool.clone())),
 		mail_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
 		webauthn: std::sync::Arc::new(webauthn_for(WEBAUTHN_ORIGIN)),
+		scope_origins: concierge::web::origins::ScopeOrigins::none(),
 	}
 }
 

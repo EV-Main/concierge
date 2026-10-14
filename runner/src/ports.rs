@@ -396,6 +396,36 @@ pub trait RelyingPartyRepository: Send + Sync {
 	async fn session_live(&self, id: Uuid, audience: &str, now: i64) -> Result<bool, DomainError>;
 }
 
+/// A registered scope (`tenants`, migration 0031). `main` is implicit and never one.
+#[derive(Clone, Debug)]
+pub struct ScopeRecord {
+	pub id: String,
+	pub namespace: String,
+	pub parent: String,
+	pub display_name: String,
+	pub origins: Vec<String>,
+	pub return_paths: Vec<String>,
+	pub observers: Vec<String>,
+	pub clients: Vec<ScopeClientRecord>,
+	pub created_at: i64,
+	pub version: u64,
+	pub state: domain::scopes::ScopeState,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScopeClientRecord {
+	pub client_id: String,
+	pub audience: String,
+	pub disabled: bool,
+}
+
+/// The scope registry. Read-only: scopes are written by migration and configuration.
+#[async_trait]
+pub trait ScopeRepository: Send + Sync {
+	/// Every registered scope with its clients, by id.
+	async fn scopes(&self) -> Result<Vec<ScopeRecord>, DomainError>;
+}
+
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
 #[async_trait]
 pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggregate = User> {

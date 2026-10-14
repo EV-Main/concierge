@@ -38,6 +38,7 @@ use evconcierge_contracts::concierge::v1::{
 	notification_service_server::NotificationServiceServer,
 	owner_removal_approval_service_server::OwnerRemovalApprovalServiceServer,
 	platform_service_server::PlatformServiceServer,
+	scope_registry_server::ScopeRegistryServer,
 	user_directory_server::UserDirectoryServer,
 	user_events_server::UserEventsServer,
 };
@@ -177,6 +178,11 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.sync_registry(|var| std::env::var(var).ok())
 		.await
 		.context("failed to load the relying-party registry")?;
+	// The scope registry, read once: its origins widen the sign-in routes' CORS and
+	// `Origin` check, the passkey verifier and OAuth `returnTo`, and they change only by
+	// migration — which arrives with a boot.
+	let scope_repo: Arc<dyn concierge::ports::ScopeRepository> = Arc::new(infrastructure::scopes::PgScopes::new(pool.clone()));
+	let scope_origins = web::origins::ScopeOrigins::from_scopes(&scope_repo.scopes().await.context("failed to load the scope registry")?);
 	let providers: Vec<OAuthProvider> = auth_config
 		.google
 		.iter()
@@ -361,7 +367,8 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			turnstile: web::Turnstile::new(config.turnstile_secret.clone(), web::SITEVERIFY.to_string()),
 			credentials: Arc::new(infrastructure::credentials::PgCredentials::new(pool.clone())),
 			mail_wake,
-			webauthn: Arc::new(relying_party_webauthn(&config.public_origin)?),
+			webauthn: Arc::new(web::passkey_verifier(&config.public_origin, scope_origins.origins())?),
+			scope_origins: scope_origins.clone(),
 		},
 		web::KycDeps {
 			users: users.clone(),
@@ -378,8 +385,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	.context("failed to build the auth web state")?;
 	let web_listener = tokio::net::TcpListener::bind(config.web_bind).await.context("failed to bind the auth web listener")?;
 	tracing::info!(bind = %config.web_bind, "auth web surface listening");
+	let web_router = match mfe_assets(config.web_mfe_dir.as_deref(), scope_origins) {
+		Some(assets) => web::mfe::mount(web::router(web_state), assets),
+		None => web::router(web_state),
+	};
 	let web_server = async {
-		axum::serve(web_listener, web::router(web_state))
+		axum::serve(web_listener, web_router)
 			.with_graceful_shutdown(await_signal())
 			.await
 			.context("concierge auth web server error")
@@ -454,6 +465,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass, platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
+			.add_service(auth.layer(ScopeRegistryServer::new(concierge::scopes::ScopeRegistry::new(scope_repo))))
 			.serve_with_shutdown(config.bind, await_signal())
 			.await
 			.context("concierge gRPC server error")
@@ -539,14 +551,19 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 /// account is one) can brute-force a hand-typed key offline and then recover the document
 /// number behind every stored row. That is precisely the PII `0010_kyc_cases.sql` promises
 /// this database does not hold, handed over by a weak secret rather than by the schema.
-/// The passkey verifier: the relying party is the public origin's host, and that origin is
-/// the only one an assertion may come from.
-fn relying_party_webauthn(public_origin: &str) -> Result<webauthn_rs::Webauthn> {
-	let origin = webauthn_rs::prelude::Url::parse(public_origin).context("PUBLIC_ORIGIN is not a URL")?;
-	let host = origin.host_str().ok_or_else(|| color_eyre::eyre::eyre!("PUBLIC_ORIGIN has no host"))?.to_owned();
-	webauthn_rs::WebauthnBuilder::new(&host, &origin)
-		.and_then(|builder| builder.rp_name("EV Investment").build())
-		.context("the passkey verifier refused PUBLIC_ORIGIN")
+/// The bundles to serve under `/auth/mfe/*`, or `None` — logged — when there are none.
+fn mfe_assets(dir: Option<&str>, origins: web::origins::ScopeOrigins) -> Option<web::mfe::MfeAssets> {
+	let Some(dir) = dir else {
+		tracing::info!("WEB_MFE_DIR is unset: /auth/mfe/* is not served");
+		return None;
+	};
+	match web::mfe::MfeAssets::open(std::path::Path::new(dir), origins) {
+		Ok(assets) => Some(assets),
+		Err(e) => {
+			tracing::error!(error = ?e, "micro-frontend bundles unavailable: /auth/mfe/* is not served");
+			None
+		}
+	}
 }
 
 const MIN_IDENTITY_PEPPER_LEN: usize = 32;

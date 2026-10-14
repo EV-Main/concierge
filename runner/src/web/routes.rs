@@ -80,13 +80,24 @@ impl SessionInfo {
 
 /// `GET /auth/login?provider=&returnTo=` — mint PKCE/state/nonce, stash the
 /// transaction server-side, and redirect the browser to the provider's consent screen.
+///
+/// `returnTo` is a path on this origin, or — for a sign-in started on a scope's host — that
+/// host's origin plus one of its scope's `return_paths`, byte for byte. Any other absolute
+/// target is refused first, before even the provider is looked up, rather than quietly
+/// rewritten: a host that sent it has a registry entry to fix.
 pub async fn login(State(st): State<WebState>, jar: CookieJar, Query(q): Query<LoginQuery>) -> Result<(CookieJar, Redirect), (StatusCode, &'static str)> {
 	let st = &st.inner;
+	let return_to = match q.return_to.as_deref() {
+		Some(raw) if !raw.starts_with('/') => match st.scope_origins.is_return_target(raw) {
+			true => raw.to_owned(),
+			false => return Err((StatusCode::BAD_REQUEST, "returnTo is not a registered landing")),
+		},
+		path => safe_return_to(path),
+	};
 	// A link that names no provider predates the choice, and meant Google.
 	let provider = st
 		.provider(q.provider.as_deref().unwrap_or("google"))
 		.ok_or((StatusCode::SERVICE_UNAVAILABLE, "sign-in method not configured"))?;
-	let return_to = safe_return_to(q.return_to.as_deref());
 	let ch = Challenge::new();
 	let tx_id = st.oauth.put(provider.name(), ch.state.clone(), ch.nonce.clone(), ch.code_verifier.clone(), return_to).await;
 	let url = provider.authorize_url(&st.redirect_uri(provider.name()), &ch.state, &ch.nonce, &ch.code_challenge);
@@ -145,7 +156,7 @@ pub async fn callback(State(st): State<WebState>, Path(name): Path<String>, jar:
 		}
 	};
 	match open_session(st, jar, &headers, user.id()).await {
-		Ok(jar) => (clear_tx(st, jar), Redirect::to(&safe_return_to(Some(&tx.return_to)))),
+		Ok(jar) => (clear_tx(st, jar), Redirect::to(&st.landing(&tx.return_to))),
 		Err((jar, reason)) => fail(st, jar, &return_to, reason),
 	}
 }
@@ -315,6 +326,16 @@ impl super::Inner {
 	fn provider(&self, name: &str) -> Option<&OAuthProvider> {
 		self.providers.iter().find(|p| p.name() == name)
 	}
+
+	/// Where a finished (or failed) OAuth trip sends the browser. Re-checked although
+	/// `login` admitted it: the transaction is in-process state, and the redirect is the
+	/// one place an unchecked value would become an open redirect.
+	fn landing(&self, return_to: &str) -> String {
+		match self.scope_origins.is_return_target(return_to) {
+			true => return_to.to_owned(),
+			false => safe_return_to(Some(return_to)),
+		}
+	}
 }
 
 /// A session-store failure is a 500, never an auth verdict: the session may well
@@ -480,7 +501,7 @@ fn clear_session(st: &super::Inner, jar: CookieJar) -> CookieJar {
 /// Abort the callback: clear the tx cookie and land the user back where they came
 /// from, signed out, with a machine-readable reason.
 fn fail(st: &super::Inner, jar: CookieJar, return_to: &str, reason: &str) -> (CookieJar, Redirect) {
-	let base = safe_return_to(Some(return_to));
+	let base = st.landing(return_to);
 	let sep = if base.contains('?') { '&' } else { '?' };
 	(clear_tx(st, jar), Redirect::to(&format!("{base}{sep}auth_error={reason}")))
 }

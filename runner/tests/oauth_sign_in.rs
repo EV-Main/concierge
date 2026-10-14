@@ -18,9 +18,9 @@ use axum::{
 	routing::{get, post},
 };
 use concierge::{
-	infrastructure::{db, governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, users::PgUsers},
-	ports::UserDirectoryRepository,
-	web::{self, KycDeps},
+	infrastructure::{db, governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
+	ports::{ScopeRepository, UserDirectoryRepository},
+	web::{self, KycDeps, origins::ScopeOrigins},
 };
 use evconcierge_auth::{OAuthClientConfig, oauth::OAuthProvider};
 use serde_json::{Value, json};
@@ -83,6 +83,8 @@ async fn setup() -> Option<Fx> {
 		client_secret: "gh-secret".into(),
 	};
 	sign_in.providers.push(OAuthProvider::github_at(&client, &format!("{stub}/login/oauth/access_token"), &stub));
+	// The seeded registry: `invest` lands on `/cabinet`, `sa` on `/` and `/auth/login`.
+	sign_in.scope_origins = ScopeOrigins::from_scopes(&PgScopes::new(pool.clone()).scopes().await.expect("read the scope registry"));
 	let state = web::WebState::try_new(
 		common::signing_auth(users.clone()).await,
 		ORIGIN.to_string(),
@@ -136,12 +138,23 @@ impl Fx {
 	/// Run the redirect out and the callback in. Returns where the browser lands and the
 	/// cookies it holds afterwards.
 	async fn sign_in(&self, code: &str) -> (String, HashMap<String, String>) {
-		let out = self
-			.router
+		self.sign_in_returning(code, "/cabinet").await
+	}
+
+	async fn login(&self, return_to: &str) -> axum::response::Response {
+		let query = form_urlencoded::Serializer::new(String::new())
+			.append_pair("provider", "github")
+			.append_pair("returnTo", return_to)
+			.finish();
+		self.router
 			.clone()
-			.oneshot(Request::get("/auth/login?provider=github&returnTo=/cabinet").body(Body::empty()).unwrap())
+			.oneshot(Request::get(format!("/auth/login?{query}")).body(Body::empty()).unwrap())
 			.await
-			.unwrap();
+			.unwrap()
+	}
+
+	async fn sign_in_returning(&self, code: &str, return_to: &str) -> (String, HashMap<String, String>) {
+		let out = self.login(return_to).await;
 		assert_eq!(out.status(), StatusCode::SEE_OTHER);
 		let location = out.headers()[header::LOCATION].to_str().unwrap().to_owned();
 		assert!(location.starts_with("https://github.com/login/oauth/authorize?"), "{location}");
@@ -237,4 +250,71 @@ async fn a_refused_code_lands_back_signed_out() {
 	let (landed, jar) = fx.sign_in("never-issued").await;
 	assert_eq!(landed, "/cabinet?auth_error=exchange");
 	assert!(!jar.contains_key("ev_session"));
+}
+
+#[tokio::test]
+async fn a_sign_in_started_on_a_scope_host_lands_back_on_it() {
+	let fx = fixture!();
+	let code = format!("code-{}", Uuid::new_v4().simple());
+	fx.will_answer(&code, github_id(), json!([{ "email": address("scope"), "primary": true, "verified": true }]));
+
+	let (landing, cookies) = fx.sign_in_returning(&code, "https://invest.evinvest.ltd/cabinet").await;
+
+	assert_eq!(landing, "https://invest.evinvest.ltd/cabinet");
+	assert!(cookies.contains_key("ev_session"), "the session is opened on this origin whatever the landing");
+}
+
+#[tokio::test]
+async fn a_failed_trip_lands_back_on_the_scope_host_with_the_reason() {
+	let fx = fixture!();
+	let out = fx.login("https://sa.evinvest.ltd/").await;
+	assert_eq!(out.status(), StatusCode::SEE_OTHER);
+	let state = url_param(out.headers()[header::LOCATION].to_str().unwrap(), "state");
+	let tx = cookies(out.headers())["ev_oauth_tx"].clone();
+
+	let back = fx
+		.router
+		.clone()
+		.oneshot(
+			Request::get(format!("/callback/auth/github?error=access_denied&state={state}"))
+				.header(header::COOKIE, format!("ev_oauth_tx={tx}"))
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(back.headers()[header::LOCATION], "https://sa.evinvest.ltd/?auth_error=denied");
+}
+
+/// Anything absolute that is not a scope origin plus one of THAT scope's return paths is
+/// refused before the provider is involved — `returnTo` must never be an open redirect.
+#[tokio::test]
+async fn a_return_to_outside_the_registry_is_refused() {
+	let fx = fixture!();
+	for target in [
+		"https://evil.example/",
+		"https://invest.evinvest.ltd",
+		"https://invest.evinvest.ltd/",
+		"https://invest.evinvest.ltd/cabinet/",
+		"https://invest.evinvest.ltd/cabinet?next=https://evil.example",
+		"https://invest.evinvest.ltd/cabinet#x",
+		"https://invest.evinvest.ltd.evil.example/cabinet",
+		"https://sa.evinvest.ltd/cabinet",
+		"http://invest.evinvest.ltd/cabinet",
+		"//evil.example/cabinet",
+		"javascript:alert(1)",
+	] {
+		let out = fx.login(target).await;
+		match target.starts_with('/') {
+			// A protocol-relative path keeps the old answer: it is rewritten to `/`, which
+			// is on this origin and so no redirect anywhere.
+			true => assert_eq!(out.status(), StatusCode::SEE_OTHER, "{target}"),
+			false => assert_eq!(out.status(), StatusCode::BAD_REQUEST, "{target}"),
+		}
+		assert!(
+			!out.headers().contains_key(header::SET_COOKIE) || target.starts_with('/'),
+			"{target}: no transaction is opened for a refused target"
+		);
+	}
 }
