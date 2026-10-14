@@ -7,10 +7,11 @@ user auth layer; a CLOSED scope's clients are refused), sign-in from a scope's h
 (§3.1: CORS and the `Origin` check on the closed route list, the passkey verifier's
 origins, OAuth `returnTo`, the sign-up ticket of migration 0032), the micro-frontend
 bundles under `/auth/mfe/*` (§3.1), the relying-party streams (§4: `ScopeEvents` and
-`UserEvents` read by a client credential, migration 0034) and the scope catalog's storage
-(`ScopeCatalogService`, §5.1, §6 — kinds are stored, nothing is proposed or executed yet).
-The approval services are not mounted yet and answer `UNIMPLEMENTED`. Banking, the `lib`
-projections, invest and admin build against this document.
+`UserEvents` read by a client credential, migration 0034), the scope catalog's storage
+(`ScopeCatalogService`, §5.1, §6) and the approvals of the kinds a namespace publishes
+(§5.7: `ApprovalExecutionService` whole, `ApprovalService` but for the `concierge:*` kinds;
+migration 0036). Not yet: the `concierge:*` kinds, stored scope policies and the approval
+mail (§5.7). Banking, the `lib` projections, invest and admin build against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it
@@ -23,12 +24,12 @@ says so and why.
 | Service | File | Caller | Where it is mounted | Today |
 | ------- | ---- | ------ | ------------------- | ----- |
 | `ScopeRegistry` | scopes.proto | first-party session, `typ=service` token | inside the user auth layer | served (`runner/src/scopes.rs`) |
-| `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, like `UserEvents` | contract, `UNIMPLEMENTED` |
-| `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | contract, `UNIMPLEMENTED` |
+| `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_catalog.rs`) |
+| `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_events.rs`) |
 | `ScopeInboxService` | scope_inbox.proto | a relying party's client credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_inbox.rs`, §6) |
-| `ApprovalService` | approvals.proto | first-party session | inside the user auth layer | contract, `UNIMPLEMENTED` |
-| `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | contract, `UNIMPLEMENTED` |
-| `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and** a relying party's client credential | as today | bridge token only; the client credential is contract |
+| `ApprovalService` | approvals.proto | first-party session | inside the user auth layer | served (`runner/src/approvals.rs`) but `CancelApproval`, `ProposeScopeAdminGrant`, `ProposeScopePolicyChange`, which answer `UNIMPLEMENTED` (§5.7) |
+| `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/approvals.rs`) |
+| `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and** a relying party's client credential | as today | served for both |
 
 A relying party's restricted access token still opens exactly one RPC,
 `UserDirectory.GetMe`. Votes are cast over a first-party session on `evinvest.ltd`,
@@ -448,6 +449,48 @@ behaviour `SetRole` has for `admin`. **Removing a scope admin is immediate, with
 approval** (`RevokePermission` by a seat holding `iam:tenants:grant`): containing a
 rogue admin must never be the slower path, the rule this plane already keeps for
 `Role::Admin`.
+
+### 5.7 As implemented
+
+`runner/src/approvals.rs` (both services), `infrastructure::approvals` (migration 0036:
+`approvals`, the frozen roster `approval_voters`, the history `approval_events`), the rules
+in `domain::approvals`.
+
+- **Opening** resolves everything inside one transaction: the kind is the one in the
+  proposer's catalog in force; the scope must be registered and `ACTIVE` (`main` always
+  is); `requested_by` and every `USER` field must name an account; the escalation tests,
+  `sole_admin` and the roster are decided and frozen there. Opens are serialised per
+  (kind, scope) by a transaction-scoped advisory lock, which is what makes the rolling
+  window hold for a batch opened at once — without it eight simultaneous 1 000 USDT
+  proposals each see an empty window. `dedupe_key` is **required** (1-128 bytes): an
+  executor that cannot repeat a `Propose` safely cannot be idempotent either.
+- **The scope roster** is the ACTIVE accounts holding an unrevoked grant of exactly
+  `<namespace>:admin`. A seat that holds every permission of a namespace without a row
+  (`granting_seats_hold_all`) is not on it: what it may do on the scope's surface is not a
+  say in the scope's decisions. **The platform roster** is every persisted `owner`, as the
+  consilia count it.
+- **A frozen roster keeps its size, not its votes.** A member who lost the seat it was
+  drawn from after open (an `owner` seat, the `<namespace>:admin` grant) is refused
+  `PERMISSION_DENIED` on a vote and a veto, while the threshold stays what it was: removing
+  an admin is the containment step and must bite at once (§5.6), and shrinking the roster
+  would let a removal lower the bar.
+- **Policy**: no scope has a stored one yet; every scope is measured against the default
+  (`version` 1, 5001 bps, 3600 s, 72 h, no overrides) until `concierge:scope_policy_change`
+  exists to change it. `GetScopeApprovalPolicy` answers that default to the scope's admins
+  and the owners, and `INVALID_ARGUMENT` for `main`.
+- **Visibility** of one proposal to a person: a persisted owner, an admin of its scope,
+  the account it names as `requested_by`, or a member of its roster. Anything else, and
+  an unknown id, is one `NOT_FOUND` — on the execution side too, for a proposal of another
+  namespace.
+- **History**: one `approval_events` row per transition in the transaction that made it —
+  the actor is the person, else the client id or `bridge`; a lazy expiry names nobody. A
+  write that finds an open proposal past its deadline commits the expiry even when the act
+  is then refused.
+- **Not yet**: `ListApprovalKinds` lists the published kinds only, the `concierge:*` kinds
+  (`scope_admin_grant`, `scope_policy_change`, `CancelApproval`) and their executor, the
+  stored scope policy, `GrantPermission`'s refusal of a `<scope>:admin` target (§5.6), and
+  the mail of §5.5. Until the mail exists a roster member learns of a proposal by
+  `ListApprovals { awaiting_my_vote }`.
 
 ---
 
