@@ -189,28 +189,35 @@ impl Notifications {
 	}
 
 	async fn settings_snapshot(&self, sub: &SubscriberRow) -> Result<NotificationSettings, Status> {
-		let held = self.notifications.subscriptions(sub.id).await.map_err(domain_to_status)?;
-		let topics = TOPICS
-			.iter()
-			.map(|t| {
-				let row = held.iter().find(|s| s.topic == t.key);
-				TopicSubscription {
-					topic: t.key.to_owned(),
-					label: t.label.to_owned(),
-					description: t.description.to_owned(),
-					subscribed: row.is_some(),
-					email_enabled: row.map(|r| r.email_enabled).unwrap_or(true),
-				}
-			})
-			.collect();
-		Ok(NotificationSettings {
-			in_app_enabled: sub.in_app_enabled,
-			email_enabled: sub.email_enabled,
-			email: sub.email.clone(),
-			email_verified: sub.email_verified,
-			topics,
-		})
+		settings_of(self.notifications.as_ref(), sub).await.map_err(domain_to_status)
 	}
+}
+
+/// The settings screen's whole snapshot: both master switches and every catalogue topic
+/// with the caller's choice on it. One builder for the RPC and the web surface, so the two
+/// can never render the same subscriber differently.
+pub async fn settings_of(notifications: &dyn NotificationRepository, sub: &SubscriberRow) -> Result<NotificationSettings, domain::error::DomainError> {
+	let held = notifications.subscriptions(sub.id).await?;
+	let topics = TOPICS
+		.iter()
+		.map(|t| {
+			let row = held.iter().find(|s| s.topic == t.key);
+			TopicSubscription {
+				topic: t.key.to_owned(),
+				label: t.label.to_owned(),
+				description: t.description.to_owned(),
+				subscribed: row.is_some(),
+				email_enabled: row.map(|r| r.email_enabled).unwrap_or(true),
+			}
+		})
+		.collect();
+	Ok(NotificationSettings {
+		in_app_enabled: sub.in_app_enabled,
+		email_enabled: sub.email_enabled,
+		email: sub.email.clone(),
+		email_verified: sub.email_verified,
+		topics,
+	})
 }
 
 #[tonic::async_trait]

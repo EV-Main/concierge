@@ -435,6 +435,10 @@ pub(super) struct SessionStoreDown;
 /// browser out from under itself.
 pub(super) struct Caller {
 	pub(super) id: UserId,
+	/// The seat as the directory resolves it NOW, break-glass included — the same
+	/// reading `/auth/session` reports.
+	pub(super) role: String,
+	pub(super) role_is_break_glass: bool,
 	access_token: String,
 	remaining_secs: i64,
 }
@@ -473,6 +477,8 @@ pub(super) async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<O
 	Ok(fresh.and_then(|f| {
 		Uuid::parse_str(&f.user.user_id).map(UserId::from_raw).ok().map(|id| Caller {
 			id,
+			role: f.user.role,
+			role_is_break_glass: f.user.role_is_break_glass,
 			access_token: f.access_token,
 			remaining_secs: f.remaining_secs,
 		})
