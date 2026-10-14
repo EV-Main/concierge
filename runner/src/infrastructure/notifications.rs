@@ -26,7 +26,7 @@ use domain::error::DomainError;
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
-use crate::ports::{GovernanceMailQueued, NotificationDispatchRepository, NotificationRepository};
+use crate::ports::{GovernanceMailQueued, InboxTopics, NotificationDispatchRepository, NotificationRepository};
 
 pub struct PgNotifications {
 	pool: PgPool,
@@ -36,6 +36,25 @@ impl PgNotifications {
 	pub fn new(pool: PgPool) -> Self {
 		Self { pool }
 	}
+}
+
+/// [`InboxTopics`] as the four binds of `inbox_topics_sql`. `split_part` rather than
+/// `LIKE ns || ':%'`: a namespace may hold `_`, which `LIKE` reads as a wildcard.
+fn inbox_topics(within: &InboxTopics) -> (bool, &[String], &[String], &[String]) {
+	match within {
+		InboxTopics::Every => (true, &[], &[], &[]),
+		InboxTopics::Within { keys, namespaces, except } => (false, keys, namespaces, except),
+	}
+}
+
+/// The predicate over `topic` for binds `$n`…`$n+3` in [`inbox_topics`]'s order.
+fn inbox_topics_sql(n: usize) -> String {
+	format!(
+		"(${n} OR ((topic = ANY(${k}) OR split_part(topic, ':', 1) = ANY(${ns})) AND NOT topic = ANY(${ex})))",
+		k = n + 1,
+		ns = n + 2,
+		ex = n + 3
+	)
 }
 
 /// A subscriber — signed-in (`user_id` set) or account-less (`user_id` NULL).
@@ -314,7 +333,7 @@ impl NotificationRepository for PgNotifications {
 		Ok(inserted.is_some())
 	}
 
-	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>) -> Result<Vec<NotificationRow>, DomainError> {
+	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>, within: &InboxTopics) -> Result<Vec<NotificationRow>, DomainError> {
 		// Keyset pagination on (created_at, id): the cursor row's own key is resolved in a
 		// subquery, so the caller never has to encode or trust a composite cursor.
 		//
@@ -325,7 +344,8 @@ impl NotificationRepository for PgNotifications {
 		// disagree, and rows repeat across pages whenever several notifications land in the
 		// same second, which a fan-out makes routine.
 		// `inbox_paginates_by_keyset_and_marks_read` reproduces it and pins the fix.
-		sqlx::query_as::<_, NotificationRow>(
+		let (every, keys, namespaces, except) = inbox_topics(within);
+		sqlx::query_as::<_, NotificationRow>(sqlx::AssertSqlSafe(format!(
 			"SELECT id, topic, kind, title, body, link, occurred_at, \
 			        EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at, \
 			        COALESCE(EXTRACT(EPOCH FROM read_at)::BIGINT, 0) AS read_at \
@@ -334,43 +354,70 @@ impl NotificationRepository for PgNotifications {
 			   AND ($2::UUID IS NULL OR (created_at, id) < ROW((SELECT created_at FROM notifications WHERE id = $2), $2)) \
 			   AND (NOT $3 OR read_at IS NULL) \
 			   AND ($4::TEXT IS NULL OR topic = $4) \
+			   AND {} \
 			 ORDER BY notifications.created_at DESC, notifications.id DESC LIMIT $5",
-		)
+			inbox_topics_sql(6)
+		)))
 		.bind(subscriber_id)
 		.bind(cursor)
 		.bind(unread_only)
 		.bind(topic)
 		.bind(limit)
+		.bind(every)
+		.bind(keys)
+		.bind(namespaces)
+		.bind(except)
 		.fetch_all(&self.pool)
 		.await
 		.map_err(repo_err)
 	}
 
-	async fn unread_count(&self, subscriber_id: Uuid) -> Result<i64, DomainError> {
-		let row = sqlx::query("SELECT count(*) AS n FROM notifications WHERE subscriber_id = $1 AND read_at IS NULL")
-			.bind(subscriber_id)
-			.fetch_one(&self.pool)
-			.await
-			.map_err(repo_err)?;
+	async fn unread_count(&self, subscriber_id: Uuid, within: &InboxTopics) -> Result<i64, DomainError> {
+		let (every, keys, namespaces, except) = inbox_topics(within);
+		let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+			"SELECT count(*) AS n FROM notifications WHERE subscriber_id = $1 AND read_at IS NULL AND {}",
+			inbox_topics_sql(2)
+		)))
+		.bind(subscriber_id)
+		.bind(every)
+		.bind(keys)
+		.bind(namespaces)
+		.bind(except)
+		.fetch_one(&self.pool)
+		.await
+		.map_err(repo_err)?;
 		row.try_get::<i64, _>("n").map_err(repo_err)
 	}
 
-	async fn mark_read(&self, subscriber_id: Uuid, ids: &[Uuid], all: bool) -> Result<u64, DomainError> {
-		let result = if all {
-			sqlx::query("UPDATE notifications SET read_at = now() WHERE subscriber_id = $1 AND read_at IS NULL")
-				.bind(subscriber_id)
-				.execute(&self.pool)
-				.await
-		} else {
-			// Scoped by subscriber_id as well as id: an id from another subscriber's
-			// inbox must not be markable, even though ids are unguessable UUIDs.
-			sqlx::query("UPDATE notifications SET read_at = now() WHERE subscriber_id = $1 AND id = ANY($2) AND read_at IS NULL")
-				.bind(subscriber_id)
-				.bind(ids)
-				.execute(&self.pool)
-				.await
-		};
+	async fn mark_read(&self, subscriber_id: Uuid, ids: &[Uuid], all: bool, within: &InboxTopics) -> Result<u64, DomainError> {
+		let (every, keys, namespaces, except) = inbox_topics(within);
+		// Scoped by subscriber_id as well as id: an id from another subscriber's inbox must
+		// not be markable, even though ids are unguessable UUIDs. And by `within`, so
+		// "mark all read" in one inbox leaves another's unread.
+		let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+			"UPDATE notifications SET read_at = now() \
+			 WHERE subscriber_id = $1 AND ($2 OR id = ANY($3)) AND read_at IS NULL AND {}",
+			inbox_topics_sql(4)
+		)))
+		.bind(subscriber_id)
+		.bind(all)
+		.bind(ids)
+		.bind(every)
+		.bind(keys)
+		.bind(namespaces)
+		.bind(except)
+		.execute(&self.pool)
+		.await;
 		Ok(result.map_err(repo_err)?.rows_affected())
+	}
+
+	async fn is_scope_member(&self, scope: &str, user_id: Uuid) -> Result<bool, DomainError> {
+		sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM scope_members WHERE scope = $1 AND user_id = $2)")
+			.bind(scope)
+			.bind(user_id)
+			.fetch_one(&self.pool)
+			.await
+			.map_err(repo_err)
 	}
 
 	async fn subscribe_anonymous(&self, email: &str, topic: &str, throttle_secs: i64) -> Result<Option<(Uuid, String)>, DomainError> {

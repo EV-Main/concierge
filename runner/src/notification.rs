@@ -33,6 +33,7 @@ use std::{
 };
 
 use domain::{
+	authz::Notifications as NotificationPermission,
 	error::DomainError,
 	users::{Email, User},
 };
@@ -47,8 +48,10 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
+	authz::{BreakGlass, require_permission},
 	infrastructure::notifications::SubscriberRow,
-	ports::{NotificationRepository, UserDirectoryRepository},
+	ports::{InboxTopics, NotificationRepository, UserDirectoryRepository},
+	service_caller::BANK_NAMESPACE,
 	support::domain_to_status,
 };
 
@@ -95,6 +98,90 @@ pub async fn topic_known(notifications: &dyn NotificationRepository, key: &str) 
 		return Ok(true);
 	}
 	Ok(notifications.scope_topics().await?.iter().any(|t| t.topic == key))
+}
+
+/// The gRPC metadata that asks for the summary inbox (value `all`). Metadata and not a
+/// request field: banking builds these request messages with struct literals, so a new
+/// field would break its build at the next pin bump (`docs/SCOPES-AND-APPROVALS.md` §1).
+pub const INBOX_VIEW_HEADER: &str = "x-ev-inbox-view";
+
+/// Which inbox a read or a write goes through (D21). The server decides it — from the
+/// `Origin` on the web surface, from the credential on gRPC — never from what a request
+/// asks for, so a scope's page cannot read another direction's notifications.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InboxView {
+	/// `PUBLIC_ORIGIN`: this plane's built-in topics and the money plane's (`bank:`), which
+	/// every account has.
+	Platform,
+	/// A scope's host, for a member of the scope: its catalog's topics and nothing else.
+	Scope { namespace: String },
+	/// A scope's host, for an account the scope has never seen: nothing to show. Not a
+	/// refusal — the account is in good standing, it just has nothing there.
+	Outsider,
+	/// Every namespace: `PUBLIC_ORIGIN` only, behind `concierge:notifications:read_all`.
+	All,
+}
+
+impl InboxView {
+	/// The inbox of `scope` (namespace `namespace`) as `user_id` sees it.
+	pub async fn of_scope(notifications: &dyn NotificationRepository, scope: &str, namespace: &str, user_id: Uuid) -> Result<Self, DomainError> {
+		Ok(if notifications.is_scope_member(scope, user_id).await? {
+			Self::Scope { namespace: namespace.to_owned() }
+		} else {
+			Self::Outsider
+		})
+	}
+
+	/// A built-in key never belongs to a scope even when the scope's namespace shares its
+	/// prefix: the catalog check refuses to let a scope publish one, and this keeps a stray
+	/// row from showing up there either.
+	pub fn shows(&self, key: &str) -> bool {
+		let built_in = topic(key).is_some();
+		let namespace = key.split_once(':').map(|(ns, _)| ns);
+		match self {
+			Self::Platform => built_in || namespace == Some(BANK_NAMESPACE),
+			Self::Scope { namespace: ours } => !built_in && namespace == Some(ours.as_str()),
+			Self::Outsider => false,
+			Self::All => true,
+		}
+	}
+
+	/// [`Self::shows`] as the inbox queries take it.
+	pub fn topics(&self) -> InboxTopics {
+		let built_ins = || TOPICS.iter().map(|t| t.key.to_owned()).collect();
+		match self {
+			Self::Platform => InboxTopics::Within {
+				keys: built_ins(),
+				namespaces: vec![BANK_NAMESPACE.to_owned()],
+				except: Vec::new(),
+			},
+			Self::Scope { namespace } => InboxTopics::Within {
+				keys: Vec::new(),
+				namespaces: vec![namespace.clone()],
+				except: built_ins(),
+			},
+			Self::Outsider => InboxTopics::Within {
+				keys: Vec::new(),
+				namespaces: Vec::new(),
+				except: Vec::new(),
+			},
+			Self::All => InboxTopics::Every,
+		}
+	}
+
+	/// The master channel switches are the account's, across every inbox at once, so they
+	/// are changed only where every inbox the account has a say in is in view.
+	pub fn sets_channels(&self) -> bool {
+		match self {
+			Self::Platform | Self::All => true,
+			Self::Scope { .. } | Self::Outsider => false,
+		}
+	}
+}
+
+/// [`topic_known`] within one inbox: what that inbox offers to follow and to filter on.
+pub async fn topic_offered(notifications: &dyn NotificationRepository, view: &InboxView, key: &str) -> Result<bool, DomainError> {
+	Ok(view.shows(key) && topic_known(notifications, key).await?)
 }
 
 /// Fixed-window request counter keyed by caller-supplied identity (an IP).
@@ -171,11 +258,32 @@ pub struct Notifications {
 	notifications: Arc<dyn NotificationRepository>,
 	users: Arc<dyn UserDirectoryRepository>,
 	limiter: Arc<RateLimiter>,
+	break_glass: Arc<BreakGlass>,
 }
 
 impl Notifications {
-	pub fn new(notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, limiter: Arc<RateLimiter>) -> Self {
-		Self { notifications, users, limiter }
+	pub fn new(notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, limiter: Arc<RateLimiter>, break_glass: Arc<BreakGlass>) -> Self {
+		Self {
+			notifications,
+			users,
+			limiter,
+			break_glass,
+		}
+	}
+
+	/// A user's token reads the platform inbox: a scope's own surface signs its users in
+	/// with its own client, whose token this service never admits, so a session token here
+	/// is always someone on `PUBLIC_ORIGIN`. The summary is asked for by
+	/// [`INBOX_VIEW_HEADER`] and needs `concierge:notifications:read_all`.
+	async fn view<T>(&self, request: &Request<T>) -> Result<InboxView, Status> {
+		match request.metadata().get(INBOX_VIEW_HEADER).map(|v| v.to_str()) {
+			None => Ok(InboxView::Platform),
+			Some(Ok("all")) => {
+				require_permission(self.users.as_ref(), &self.break_glass, request, NotificationPermission::ReadAll).await?;
+				Ok(InboxView::All)
+			}
+			Some(_) => Err(Status::invalid_argument(format!("{INBOX_VIEW_HEADER} is `all` or absent"))),
+		}
 	}
 
 	/// Resolve the caller's own subscriber row, enforcing the live persisted record.
@@ -198,8 +306,8 @@ impl Notifications {
 		Ok(())
 	}
 
-	async fn settings_snapshot(&self, sub: &SubscriberRow) -> Result<NotificationSettings, Status> {
-		settings_of(self.notifications.as_ref(), &sub.email, sub.email_verified, Some(sub))
+	async fn settings_snapshot(&self, view: &InboxView, sub: &SubscriberRow) -> Result<NotificationSettings, Status> {
+		settings_of(self.notifications.as_ref(), view, &sub.email, sub.email_verified, Some(sub))
 			.await
 			.map_err(domain_to_status)
 	}
@@ -212,13 +320,19 @@ pub async fn subscriber_of(notifications: &dyn NotificationRepository, user: &Us
 	notifications.subscriber_for_user(user.id().raw(), user.email().as_str(), user.email_verified()).await
 }
 
-/// The settings screen's whole snapshot: both master switches and every catalogue topic
-/// with the caller's choice on it. One builder for the RPC and the web surface, so the two
-/// can never render the same subscriber differently. With no subscriber row yet it is the
-/// state the first write would create: both channels on (the columns' defaults), no topic
-/// followed — answered without creating anything. `email` is the address to show, which a
-/// read takes from the directory rather than a row it does not refresh.
-pub async fn settings_of(notifications: &dyn NotificationRepository, email: &str, email_verified: bool, sub: Option<&SubscriberRow>) -> Result<NotificationSettings, DomainError> {
+/// The settings screen's whole snapshot: both master switches and every topic `view`
+/// offers, with the caller's choice on it. One builder for the RPC and the web surface, so
+/// the two can never render the same subscriber differently. With no subscriber row yet it
+/// is the state the first write would create: both channels on (the columns' defaults), no
+/// topic followed — answered without creating anything. `email` is the address to show,
+/// which a read takes from the directory rather than a row it does not refresh.
+pub async fn settings_of(
+	notifications: &dyn NotificationRepository,
+	view: &InboxView,
+	email: &str,
+	email_verified: bool,
+	sub: Option<&SubscriberRow>,
+) -> Result<NotificationSettings, DomainError> {
 	let held = match sub {
 		Some(sub) => notifications.subscriptions(sub.id).await?,
 		None => Vec::new(),
@@ -227,7 +341,8 @@ pub async fn settings_of(notifications: &dyn NotificationRepository, email: &str
 	let catalogue = TOPICS
 		.iter()
 		.map(|t| (t.key, t.label, t.description))
-		.chain(scoped.iter().map(|t| (t.topic.as_str(), t.label.as_str(), t.description.as_str())));
+		.chain(scoped.iter().map(|t| (t.topic.as_str(), t.label.as_str(), t.description.as_str())))
+		.filter(|(key, _, _)| view.shows(key));
 	// `default_subscribed` is not applied here: an unsubscribe deletes the row, so "never
 	// touched" cannot be told from "switched off", and showing a topic followed that the
 	// subscriber turned off would be the worse mistake.
@@ -329,6 +444,7 @@ impl NotificationService for Notifications {
 
 	async fn list_notifications(&self, request: Request<ListNotificationsRequest>) -> Result<Response<ListNotificationsResponse>, Status> {
 		let sub = self.caller(&request).await?;
+		let view = self.view(&request).await?;
 		let req = request.get_ref();
 
 		// Switching the in-app channel off hides the inbox rather than deleting it:
@@ -347,14 +463,15 @@ impl NotificationService for Notifications {
 		};
 		let topic_filter = match req.topic.as_str() {
 			"" => None,
-			t if topic_known(self.notifications.as_ref(), t).await.map_err(domain_to_status)? => Some(t),
+			t if topic_offered(self.notifications.as_ref(), &view, t).await.map_err(domain_to_status)? => Some(t),
 			_ => return Err(Status::invalid_argument("unknown topic")),
 		};
+		let within = view.topics();
 
 		// One extra row tells us whether a further page exists, with no second query.
 		let mut rows = self
 			.notifications
-			.list(sub.id, cursor, i64::from(limit) + 1, req.unread_only, topic_filter)
+			.list(sub.id, cursor, i64::from(limit) + 1, req.unread_only, topic_filter, &within)
 			.await
 			.map_err(domain_to_status)?;
 		let next_cursor = if rows.len() > limit as usize {
@@ -364,7 +481,7 @@ impl NotificationService for Notifications {
 			String::new()
 		};
 
-		let unread_count = self.notifications.unread_count(sub.id).await.map_err(domain_to_status)? as u32;
+		let unread_count = self.notifications.unread_count(sub.id, &within).await.map_err(domain_to_status)? as u32;
 		Ok(Response::new(ListNotificationsResponse {
 			notifications: rows
 				.into_iter()
@@ -387,8 +504,9 @@ impl NotificationService for Notifications {
 
 	async fn get_unread_count(&self, request: Request<GetUnreadCountRequest>) -> Result<Response<GetUnreadCountResponse>, Status> {
 		let sub = self.caller(&request).await?;
+		let view = self.view(&request).await?;
 		let unread_count = if sub.in_app_enabled {
-			self.notifications.unread_count(sub.id).await.map_err(domain_to_status)? as u32
+			self.notifications.unread_count(sub.id, &view.topics()).await.map_err(domain_to_status)? as u32
 		} else {
 			0
 		};
@@ -397,6 +515,7 @@ impl NotificationService for Notifications {
 
 	async fn mark_read(&self, request: Request<MarkReadRequest>) -> Result<Response<MarkReadResponse>, Status> {
 		let sub = self.caller(&request).await?;
+		let within = self.view(&request).await?.topics();
 		let req = request.get_ref();
 
 		let ids = req
@@ -408,18 +527,20 @@ impl NotificationService for Notifications {
 			return Err(Status::invalid_argument("provide notification ids or set all"));
 		}
 
-		let marked = self.notifications.mark_read(sub.id, &ids, req.all).await.map_err(domain_to_status)? as u32;
-		let unread_count = self.notifications.unread_count(sub.id).await.map_err(domain_to_status)? as u32;
+		let marked = self.notifications.mark_read(sub.id, &ids, req.all, &within).await.map_err(domain_to_status)? as u32;
+		let unread_count = self.notifications.unread_count(sub.id, &within).await.map_err(domain_to_status)? as u32;
 		Ok(Response::new(MarkReadResponse { marked, unread_count }))
 	}
 
 	async fn get_notification_settings(&self, request: Request<GetNotificationSettingsRequest>) -> Result<Response<NotificationSettings>, Status> {
 		let sub = self.caller(&request).await?;
-		Ok(Response::new(self.settings_snapshot(&sub).await?))
+		let view = self.view(&request).await?;
+		Ok(Response::new(self.settings_snapshot(&view, &sub).await?))
 	}
 
 	async fn set_channel_enabled(&self, request: Request<SetChannelEnabledRequest>) -> Result<Response<NotificationSettings>, Status> {
 		let sub = self.caller(&request).await?;
+		let view = self.view(&request).await?;
 		let req = request.get_ref();
 
 		// Both channels off is explicitly allowed — "stop contacting me" is a supported
@@ -434,20 +555,21 @@ impl NotificationService for Notifications {
 		// Re-read rather than patch the local copy, so the snapshot the caller renders
 		// from is what the database actually holds.
 		let sub = self.caller(&request).await?;
-		Ok(Response::new(self.settings_snapshot(&sub).await?))
+		Ok(Response::new(self.settings_snapshot(&view, &sub).await?))
 	}
 
 	async fn set_topic_subscription(&self, request: Request<SetTopicSubscriptionRequest>) -> Result<Response<NotificationSettings>, Status> {
 		let sub = self.caller(&request).await?;
+		let view = self.view(&request).await?;
 		let req = request.get_ref();
-		if !topic_known(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)? {
+		if !topic_offered(self.notifications.as_ref(), &view, &req.topic).await.map_err(domain_to_status)? {
 			return Err(Status::invalid_argument("unknown topic"));
 		}
 		self.notifications
 			.set_topic_subscription(sub.id, &req.topic, req.subscribed, req.email_enabled)
 			.await
 			.map_err(domain_to_status)?;
-		Ok(Response::new(self.settings_snapshot(&sub).await?))
+		Ok(Response::new(self.settings_snapshot(&view, &sub).await?))
 	}
 
 	async fn subscribe_anonymous(&self, request: Request<SubscribeAnonymousRequest>) -> Result<Response<SubscribeAnonymousResponse>, Status> {
@@ -527,6 +649,24 @@ mod tests {
 			assert_eq!(TOPICS.iter().filter(|o| o.key == t.key).count(), 1, "duplicate topic key {}", t.key);
 		}
 		assert!(topic("fund:does-not-exist").is_none(), "the catalogue is closed — unknown topics are rejected, not created");
+	}
+
+	#[test]
+	fn each_inbox_shows_its_own_namespace() {
+		let scope = InboxView::Scope { namespace: "invest".into() };
+		for (key, platform, invest) in [
+			("account:verification", true, false),
+			("bank:payments", true, false),
+			("invest:fund:quy-nhon", false, true),
+			("sa:leads:new", false, false),
+			("bankish:x", false, false),
+		] {
+			assert_eq!(InboxView::Platform.shows(key), platform, "{key}");
+			assert_eq!(scope.shows(key), invest, "{key}");
+			assert!(InboxView::All.shows(key) && !InboxView::Outsider.shows(key), "{key}");
+		}
+		let account = InboxView::Scope { namespace: "account".into() };
+		assert!(!account.shows("account:verification"), "a built-in never lands in a scope sharing its prefix");
 	}
 
 	#[test]

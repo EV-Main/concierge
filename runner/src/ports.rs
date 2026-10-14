@@ -1173,6 +1173,15 @@ pub trait PlatformConfigRepository: Send + Sync {
 	async fn upsert_flag(&self, key: &str, description: &str, enabled: bool, rollout: i32) -> Result<(), DomainError>;
 }
 
+/// The topics one inbox read covers, as `notification::InboxView` resolves them. A topic
+/// counts when it is one of `keys` or its namespace — the part before the first `:` — is
+/// one of `namespaces`, and it is none of `except`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InboxTopics {
+	Every,
+	Within { keys: Vec<String>, namespaces: Vec<String>, except: Vec<String> },
+}
+
 /// Port for the notification plane's read/write surface: subscribers, their
 /// per-topic subscriptions, and the in-app inbox. Plain control-plane state rather
 /// than a domain aggregate, so — like [`PlatformConfigRepository`] — no kernel markers.
@@ -1230,12 +1239,17 @@ pub trait NotificationRepository: Send + Sync {
 	) -> Result<bool, DomainError>;
 
 	/// One page of the inbox, newest first. `cursor` is the last id of the previous page.
-	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>) -> Result<Vec<NotificationRow>, DomainError>;
+	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>, within: &InboxTopics) -> Result<Vec<NotificationRow>, DomainError>;
 
-	async fn unread_count(&self, subscriber_id: Uuid) -> Result<i64, DomainError>;
+	async fn unread_count(&self, subscriber_id: Uuid, within: &InboxTopics) -> Result<i64, DomainError>;
 
-	/// Mark specific ids, or every unread one. Returns the number actually flipped.
-	async fn mark_read(&self, subscriber_id: Uuid, ids: &[Uuid], all: bool) -> Result<u64, DomainError>;
+	/// Mark specific ids, or every unread one, among `within`. Returns the number actually
+	/// flipped.
+	async fn mark_read(&self, subscriber_id: Uuid, ids: &[Uuid], all: bool, within: &InboxTopics) -> Result<u64, DomainError>;
+
+	/// Whether `user_id` is visible to `scope` (`scope_members`): the one who may see the
+	/// scope's inbox.
+	async fn is_scope_member(&self, scope: &str, user_id: Uuid) -> Result<bool, DomainError>;
 
 	/// Account-less subscribe (double opt-in). Returns the confirmation token ONLY
 	/// when a confirmation mail was actually queued — already-confirmed addresses and

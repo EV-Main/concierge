@@ -454,9 +454,37 @@ payment-consent trace, security notices) stay this plane's own. Today's
 `fund:quy-nhon` and `account:money-movement` move to `invest:` and `bank:`; carrying the
 existing subscriptions across is the implementation's migration.
 
-As implemented: a scope catalog's topics are offered in the notification settings (gRPC and
-`/auth/notifications/settings`), may be followed and filtered on, and disappear from the
-offer when a later catalog withdraws them. Not yet: `Emit` refuses a scope topic, because a
+**Each direction has its own inbox (D21).** Which one a request reads is decided by the
+server from where the request came from, never by a request field
+(`notification::InboxView`):
+
+| Asked through | Inbox | Topics offered, inbox rows shown |
+| ------------- | ----- | -------------------------------- |
+| web, `Origin` = `PUBLIC_ORIGIN` or absent (a same-origin GET sends none) | platform | this plane's built-in topics and `bank:*`, for everyone |
+| web, `Origin` = an origin of a scope that still signs in (§3.1) | that scope's | its catalog's topics only, and only for a MEMBER of the scope (`scope_members`, §4.1); anyone else gets an empty list, not a refusal |
+| web, any other `Origin` | — | `403 {"error":"origin_not_allowed"}` |
+| gRPC `NotificationService` with a user's access token | platform | as above |
+| web `?all=1` on `PUBLIC_ORIGIN` / gRPC metadata `x-ev-inbox-view: all` | summary | every namespace; needs `concierge:notifications:read_all` (seats `admin` and `owner`), else `403 {"error":"forbidden"}` / `PERMISSION_DENIED`; on a scope's host always `403` |
+
+The rule covers the settings read, following a topic (a topic outside the inbox is
+`unknown_topic` / `INVALID_ARGUMENT`, exactly like one that does not exist), the inbox
+list, its topic filter, the unread count and mark-read (`all` marks only that inbox). The
+two master channel switches are the account's across every inbox, so they are set only
+where the platform inbox is in view: from a scope's host `403 {"error":"platform_only"}`.
+On the web the summary is decided from the PERSISTED seat; break-glass elevation opens the
+console, not everyone's notifications. The summary is metadata on gRPC and not a request
+field because banking builds these request messages with struct literals (§1).
+
+What the scope inbox does not have yet: a transport. The account routes stay off the
+scope hosts' CORS list (§3.1), so a browser on a scope's host cannot read the answer, and
+the mutations carry the CSRF double-submit whose cookie a scope host cannot read; and a
+relying party's client credential names no user, while its users' tokens open only
+`GetMe`. Choosing between credentialed CORS for these routes and a client-token path on
+`NotificationService` is open (§7).
+
+As implemented: a scope catalog's topics are offered in the inbox of their scope (gRPC and
+`/auth/notifications/settings`), may be followed and filtered on there, and disappear from
+the offer when a later catalog withdraws them. Not yet: `Emit` refuses a scope topic, because a
 `typ=service` token names no namespace to hold "only its own topics" against;
 `default_subscribed` is stored but not applied (an unsubscribe deletes the subscription
 row, so "never touched" cannot be told from "switched off"); `SubscribeAnonymous` takes
@@ -484,6 +512,9 @@ position scanned (§4.2); `Scope.state` (§3).
 2. A direction receives `kyc_level` on the lifecycle stream and in `ScopeMember` (D5),
    although `GetMe` withholds it from relying parties today.
 3. Topic labels are one language; the frontends carry five locales.
+4. How a scope's host reaches its own inbox (§6): credentialed CORS on the notification
+   routes plus a CSRF scheme a scope host can satisfy, or a relying-party token admitted
+   on `NotificationService` (today a client's token opens only `GetMe`).
 
 **Known limitation until `typ=service` tokens:** a namespace is the unit of
 `ApprovalExecutionService`, so several clients of one namespace are indistinguishable

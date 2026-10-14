@@ -1,7 +1,10 @@
 //! The account MFE's routes: who the signed-in account is, and its notification settings.
 //!
-//! `PUBLIC_ORIGIN` only — none of them is on a scope host's CORS list, and every mutation
-//! carries the CSRF double-submit. The reads take none (a double-submit check on a GET can
+//! None of them is on a scope host's CORS list, and every mutation carries the CSRF
+//! double-submit. The notification routes still read the `Origin` to decide WHICH inbox
+//! they answer for (D21, [`InboxView`]): `PUBLIC_ORIGIN` (or none — a same-origin GET
+//! sends none) is the platform's, a scope's host is that scope's, and anything else is
+//! refused. The reads take none (a double-submit check on a GET can
 //! only ever be wrong) but rotate the session as `/auth/session` does, so every answer
 //! after the session was read — a refusal included — carries the refreshed access cookie;
 //! the reads also go out under `Cache-Control: no-store` and `Vary: Cookie`.
@@ -16,16 +19,19 @@
 
 use axum::{
 	Json,
-	extract::State,
+	extract::{Query, State},
 	http::{HeaderMap, HeaderName, StatusCode, header},
 };
 use axum_extra::extract::cookie::CookieJar;
-use domain::users::Username;
+use domain::{
+	authz::Notifications as NotificationPermission,
+	users::{User, Username},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-	notification::{settings_json, settings_of, subscriber_of, topic_known},
+	notification::{InboxView, settings_json, settings_of, subscriber_of, topic_offered},
 	web::{
 		WebState,
 		routes::{Caller, session_user},
@@ -81,19 +87,58 @@ pub async fn me(State(st): State<WebState>, jar: CookieJar) -> Read {
 	read_answer(st, jar, caller, answer).await
 }
 
+/// `?all=1` asks for the summary inbox.
+#[derive(Deserialize)]
+pub struct ViewQuery {
+	all: Option<String>,
+}
+
+/// The inbox a request on the notification routes is answered from. The summary is served
+/// on `PUBLIC_ORIGIN` only, to a PERSISTED seat holding the permission: break-glass
+/// elevation opens the console, not everyone's notifications.
+async fn inbox_view(st: &super::Inner, headers: &HeaderMap, query: &ViewQuery, user: &User) -> Result<InboxView, Refusal> {
+	let forbidden = || Refusal::new(StatusCode::FORBIDDEN, "forbidden");
+	let summary = match query.all.as_deref() {
+		None | Some("0" | "false") => false,
+		Some("1" | "true") => true,
+		Some(_) => return Err(Refusal::new(StatusCode::BAD_REQUEST, "invalid_view")),
+	};
+	let not_allowed = || Refusal::new(StatusCode::FORBIDDEN, "origin_not_allowed");
+	let origin = headers.get(header::ORIGIN).map(|v| v.to_str().map_err(|_| not_allowed())).transpose()?;
+	let scope = match origin {
+		None => None,
+		Some(origin) if origin == st.public_origin => None,
+		Some(origin) => {
+			let allowlist = st.allowlist.current();
+			let (id, namespace) = allowlist.origins.scope_of(origin).ok_or_else(not_allowed)?;
+			Some((id.to_owned(), namespace.to_owned()))
+		}
+	};
+	match (scope, summary) {
+		(Some(_), true) => Err(forbidden()),
+		(Some((id, namespace)), false) => InboxView::of_scope(st.notifications.as_ref(), &id, &namespace, user.id().raw())
+			.await
+			.map_err(|e| internal("notification settings: scope membership not read", e)),
+		(None, true) if user.role().may(NotificationPermission::ReadAll) => Ok(InboxView::All),
+		(None, true) => Err(forbidden()),
+		(None, false) => Ok(InboxView::Platform),
+	}
+}
+
 /// `GET /auth/notifications/settings` — written nowhere: an account that never touched
 /// its settings reads the defaults its first change would create.
-pub async fn notification_settings(State(st): State<WebState>, jar: CookieJar) -> Read {
+pub async fn notification_settings(State(st): State<WebState>, Query(query): Query<ViewQuery>, jar: CookieJar, headers: HeaderMap) -> Read {
 	let st = &st.inner;
 	let caller = reader(st, &jar).await?;
 	let answer = async {
 		let user = gate(st, &caller).await?;
+		let view = inbox_view(st, &headers, &query, &user).await?;
 		let sub = st
 			.notifications
 			.subscriber_of_user(user.id().raw())
 			.await
 			.map_err(|e| internal("notification settings: subscriber not read", e))?;
-		let settings = settings_of(st.notifications.as_ref(), user.email().as_str(), user.email_verified(), sub.as_ref())
+		let settings = settings_of(st.notifications.as_ref(), &view, user.email().as_str(), user.email_verified(), sub.as_ref())
 			.await
 			.map_err(|e| internal("notification settings: not read", e))?;
 		Ok::<_, Denied>(Json(settings_json(&settings)))
@@ -109,11 +154,16 @@ pub struct ChannelChange {
 }
 
 /// `POST /auth/notifications/settings/channel` — answers the whole snapshot. Both channels
-/// off is allowed: "stop contacting me" is a supported state.
-pub async fn set_channel(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<ChannelChange>) -> Answered {
+/// off is allowed: "stop contacting me" is a supported state. Not from a scope's host: a
+/// switch there would silence every other inbox too.
+pub async fn set_channel(State(st): State<WebState>, Query(query): Query<ViewQuery>, jar: CookieJar, headers: HeaderMap, Json(body): Json<ChannelChange>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed_in(st, &jar, &headers).await?;
 	let answer = async {
+		let view = inbox_view(st, &headers, &query, &user).await?;
+		if !view.sets_channels() {
+			return Err(Refusal::new(StatusCode::FORBIDDEN, "platform_only"));
+		}
 		let (in_app, email) = match body.channel.as_str() {
 			"in_app" => (Some(body.enabled), None),
 			"email" => (None, Some(body.enabled)),
@@ -129,7 +179,7 @@ pub async fn set_channel(State(st): State<WebState>, jar: CookieJar, headers: He
 		// The one column this request wrote, set on the row in hand rather than re-read.
 		sub.in_app_enabled = in_app.unwrap_or(sub.in_app_enabled);
 		sub.email_enabled = email.unwrap_or(sub.email_enabled);
-		let settings = settings_of(st.notifications.as_ref(), &sub.email, sub.email_verified, Some(&sub))
+		let settings = settings_of(st.notifications.as_ref(), &view, &sub.email, sub.email_verified, Some(&sub))
 			.await
 			.map_err(|e| internal("notification settings: not read", e))?;
 		Ok(Json(settings_json(&settings)))
@@ -145,13 +195,14 @@ pub struct TopicChange {
 	email_enabled: bool,
 }
 
-/// `POST /auth/notifications/settings/topic` — a built-in topic or one a scope's catalog in
-/// force publishes; answers the whole snapshot.
-pub async fn set_topic(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<TopicChange>) -> Answered {
+/// `POST /auth/notifications/settings/topic` — a topic the request's inbox offers; answers
+/// that inbox's whole snapshot. A topic of another inbox is as unknown as a made-up one.
+pub async fn set_topic(State(st): State<WebState>, Query(query): Query<ViewQuery>, jar: CookieJar, headers: HeaderMap, Json(body): Json<TopicChange>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed_in(st, &jar, &headers).await?;
 	let answer = async {
-		if !topic_known(st.notifications.as_ref(), &body.topic)
+		let view = inbox_view(st, &headers, &query, &user).await?;
+		if !topic_offered(st.notifications.as_ref(), &view, &body.topic)
 			.await
 			.map_err(|e| internal("notification settings: topics not read", e))?
 		{
@@ -164,7 +215,7 @@ pub async fn set_topic(State(st): State<WebState>, jar: CookieJar, headers: Head
 			.set_topic_subscription(sub.id, &body.topic, body.subscribed, body.email_enabled)
 			.await
 			.map_err(|e| internal("notification settings: topic not set", e))?;
-		let settings = settings_of(st.notifications.as_ref(), &sub.email, sub.email_verified, Some(&sub))
+		let settings = settings_of(st.notifications.as_ref(), &view, &sub.email, sub.email_verified, Some(&sub))
 			.await
 			.map_err(|e| internal("notification settings: not read", e))?;
 		Ok(Json(settings_json(&settings)))
