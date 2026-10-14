@@ -204,7 +204,9 @@ impl ConciergeClient {
 		let client_id = client_id.into();
 		let client_secret = client_secret.into();
 		let client_id_header = MetadataValue::try_from(client_id.as_str()).map_err(|_| ConciergeError::Config("the client id is not a valid header value".into()))?;
-		let bearer_header = MetadataValue::try_from(format!("Bearer {client_secret}")).map_err(|_| ConciergeError::Config("the client secret is not a valid header value".into()))?;
+		let mut bearer_header = MetadataValue::try_from(format!("Bearer {client_secret}")).map_err(|_| ConciergeError::Config("the client secret is not a valid header value".into()))?;
+		// Keeps the secret out of any Debug print of the request's metadata.
+		bearer_header.set_sensitive(true);
 		Ok(Self {
 			auth: AuthServiceClient::new(channel.clone()),
 			directory: UserDirectoryClient::new(channel.clone()),

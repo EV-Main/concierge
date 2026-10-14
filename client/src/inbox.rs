@@ -124,7 +124,8 @@ impl ConciergeClient {
 	/// The client credential plus the user's token. `user_id` stays empty: concierge takes
 	/// the user from the token, and a mismatch would only be a way to fail.
 	fn as_user<T>(&self, user_access_token: &str, message: T) -> Result<Request<T>, ConciergeError> {
-		let token = MetadataValue::try_from(user_access_token).map_err(|_| ConciergeError::Config("the user access token is not a valid header value".into()))?;
+		let mut token = MetadataValue::try_from(user_access_token).map_err(|_| ConciergeError::Config("the user access token is not a valid header value".into()))?;
+		token.set_sensitive(true);
 		let mut request = self.with_credential(message);
 		request.metadata_mut().insert(USER_TOKEN_HEADER, token);
 		Ok(request)

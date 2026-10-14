@@ -6,7 +6,9 @@ use tonic::{Code, Status};
 #[derive(Debug, thiserror::Error)]
 pub enum ConciergeError {
 	/// UNAUTHENTICATED or PERMISSION_DENIED: a wrong client secret, a code already
-	/// redeemed, a revoked refresh family, an access token that expired. Ends the session.
+	/// redeemed, a revoked refresh family, an access token that expired. Ends the session —
+	/// except on a scope inbox write, where PERMISSION_DENIED also means the user token was
+	/// issued to another client or names another user: a bug in the caller, not a sign-out.
 	#[error("concierge refused the call: {code:?}")]
 	Refused { code: Code },
 	/// INVALID_ARGUMENT or FAILED_PRECONDITION: concierge read the request and said no on
