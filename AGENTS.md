@@ -86,10 +86,10 @@ retired in favour of `HoldUser` plus `GovernanceService.OpenUserSuspension`.
 | ----- | ------ |
 | Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
-| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `governance` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
+| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **approvals** (the consilium generalised to every scope), **log**. `directory` + `bridge` + `governance` + `platform` + `notification` + `approvals` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
 | `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Redis-backed refresh rotation with reuse detection · `Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party `ExchangeCode`/`RefreshClientToken` over the runner's `ClientGrants` port, plus `open_session` for the web surface's sign-ins) reading accounts from the directory over an in-process `Provisioner` channel, the closed `oauth::OAuthProvider` set (Google, GitHub — code + PKCE), **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-prost-build` (protoc from `PROTOC`, else the vendored one). `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
-| Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams; also which consumer-built messages and services must never grow. Implemented so far: the registry (`tenants`, migration 0031; `ScopeRegistry`, `scopes` module), sign-in from a scope's hosts (`web::origins`, `web::cors`, the live allowlist `web::allowlist`), the MFE bundles under `/auth/mfe/*` (`web::mfe`, `WEB_MFE_DIR`), the sign-up ticket that confirms an address from a scope's host (`web::signup`, migration 0032), the relying-party streams (`ScopeEvents`, `UserEvents` by client credential; `scope_events`, `service_caller`, migration 0034) the stored scope catalog (`ScopeCatalogService`, `scope_catalog`) and each direction's own inbox (`notification::InboxView`; `ScopeInboxService`, `scope_inbox`, §6); approvals are contract only | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
+| Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams; also which consumer-built messages and services must never grow. Implemented so far: the registry (`tenants`, migration 0031; `ScopeRegistry`, `scopes` module), sign-in from a scope's hosts (`web::origins`, `web::cors`, the live allowlist `web::allowlist`), the MFE bundles under `/auth/mfe/*` (`web::mfe`, `WEB_MFE_DIR`), the sign-up ticket that confirms an address from a scope's host (`web::signup`, migration 0032), the relying-party streams (`ScopeEvents`, `UserEvents` by client credential; `scope_events`, `service_caller`, migration 0034) the stored scope catalog (`ScopeCatalogService`, `scope_catalog`) each direction's own inbox (`notification::InboxView`; `ScopeInboxService`, `scope_inbox`, §6) and approvals of the published kinds (`ApprovalService`, `ApprovalExecutionService`; `approvals`, migration 0036, §5.7 — the `concierge:*` kinds and the approval mail are not yet) | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
 | `web/` — the plane's microfrontends (`mfe-concierge-sign-in`, `-account`, `-account-chip`): React + `@evinvest/uikit` custom elements built to `web/dist/` with `registry.json`, served under `/auth/mfe/*`; which actions work on a scope host and which link to the platform | [`web/README.md`](./web/README.md) |
 | `concierge_iam` (+ `_derive`) — permission scopes: `#[derive(Permission)]` enums, `alias!`, the concrete `PermissionSet` a service asks `may` of, `Pattern` containment, the `Catalog` a tenant publishes. I/O-free, wasm-safe, published to crates.io so consumers need no protoc | [`iam/`](./iam) |
@@ -659,6 +659,23 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   bridge token publishes `bank`), versioned like `PublishCatalog`, and executes nothing;
   a scope's topics are offered only in that scope's inbox, while `Emit` still refuses
   them: a `typ=service` token names no namespace to check against.
+- **An approval is decided by a roster frozen at open and executed only by the namespace
+  that proposed it** (`approvals`, `docs/SCOPES-AND-APPROVALS.md` §5). A kind's namespace
+  alone proposes, pulls and reports on it, a relying party in its own scope only (the
+  bridge in any); another namespace's proposal answers exactly as an unknown id, and a
+  service never reads the deciders' emails or subjects. The level, the escalations and the
+  roster are decided in the opening transaction, opens are serialised per proposer
+  namespace by an advisory lock (the rolling 24h limit sums LIVE proposals and executions
+  of the last day; a namespace holds at most 200 live), and every instant is the
+  database's `now()`, never a replica's. Nobody is excluded from the roster
+  (`requested_by` is what a service says, not a proof); what keeps one person from acting
+  alone is the threshold over the whole roster, `sole_admin` escalation, the two-owner
+  floor — and that `<ns>:admin`, the scope roster, is granted only by a persisted owner and
+  never delegated (`GrantPermission`, `Catalog::check`). A member who lost the seat after
+  open keeps their place and loses the vote; any owner vetoes any proposal inside its
+  delay. Expiry, executability and the 72 h lapse to `void` are time predicates and
+  nothing sweeps; every transition writes its `approval_events` row in the same
+  transaction.
 - **Each direction has its own inbox, and the server picks it (D21).** The notification
   routes (`/auth/notifications/settings*`) resolve `notification::InboxView` from the
   `Origin`: `PUBLIC_ORIGIN` or none → the platform inbox (built-in topics and `bank:*`), a

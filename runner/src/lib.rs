@@ -30,6 +30,8 @@
 //!   scope_events    — `ScopeEvents`, the per-scope stream relying parties project from
 //!   scope_catalog   — `ScopeCatalogService`: approval kinds and notification topics per namespace
 //!   service_caller  — who calls a service-credential RPC: the bridge token or a client secret
+//!   approvals       — `ApprovalService` (people) and `ApprovalExecutionService` (proposers):
+//!                     the consilium generalised to every scope
 //!   web             — the site-level auth HTTP surface (login/callback/session cookies)
 //!   notification    — the notification plane: subscribers, the in-app inbox, queued email
 //!   dispatch        — the background loops: draining the outbound email queue, and the
@@ -37,6 +39,7 @@
 //!                     write, or the money plane never learns the account is unfrozen)
 //!   log             — DEFERRED stub (no platform audit surface yet)
 
+pub mod approvals;
 pub mod authz;
 pub mod bridge;
 pub mod bridge_tls;

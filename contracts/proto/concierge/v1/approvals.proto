@@ -25,8 +25,10 @@ package concierge.v1;
 // Nobody is excluded from the roster: a service cannot prove which person asked it, so
 // the person it names (`requested_by`) is information, not a fact the quorum can rest on.
 // A passed proposal waits out its veto delay, after which the proposer PULLS it,
-// executes it idempotently — one decision, one execution — and reports the outcome. This
-// plane never calls a proposer: the arrow stays the one the bridge has.
+// executes it idempotently — one decision, one execution — and reports the outcome, within
+// 72 hours of `executable_at`; a decision nobody executed by then lapses to VOID. Every
+// instant is this plane's database clock. This plane never calls a proposer: the arrow
+// stays the one the bridge has.
 //
 // Two services, two kinds of caller:
 //   ApprovalService          — people, over a first-party session (inside the user auth
@@ -34,7 +36,8 @@ package concierge.v1;
 //   ApprovalExecutionService — the executing services, by service credential (outside
 //                              the user auth layer, like UserEvents). See the doc's
 //                              "Service callers".
-// Neither is served yet: both are contract and answer UNIMPLEMENTED.
+// Both are served, except the `concierge:*` kinds (CancelApproval, ProposeScopeAdminGrant,
+// ProposeScopePolicyChange), which answer UNIMPLEMENTED until this plane executes them.
 
 // ApprovalService — the human side: read, vote, veto, cancel, and open the kinds this
 // plane executes itself.
@@ -62,8 +65,10 @@ service ApprovalService {
   rpc VoteApproval(VoteApprovalRequest) returns (Approval);
 
   // Stop a proposal outright while it is OPEN, or PASSED and still inside its delay.
-  // Any roster member. A reason is required: it is what everyone else reads when their
-  // decision is overruled by one person.
+  // Any roster member who still holds the seat the roster was drawn from, and any platform
+  // owner on any proposal, scope-level ones included: containment is never slower than the
+  // grant. A reason is required: it is what everyone else reads when their decision is
+  // overruled by one person.
   rpc VetoApproval(VetoApprovalRequest) returns (Approval);
 
   // Withdraw a `concierge:*` proposal the caller opened over this service — the only
@@ -74,6 +79,9 @@ service ApprovalService {
   // Open `concierge:scope_admin_grant`: grant `<scope>:admin`. Always platform level.
   // A seat holding `iam:tenants:grant` may open one. While this kind exists,
   // UserDirectory.GrantPermission refuses a `<scope>:admin` target and names this RPC.
+  // Until it is served, GrantPermission grants `<scope>:admin` to a persisted platform
+  // owner's call only (PERMISSION_DENIED to any other seat; break-glass is no owner), and
+  // no catalog may delegate it.
   // Taking the grant away needs no approval and stays RevokePermission, one act:
   // containing a rogue admin must never be the slower path.
   rpc ProposeScopeAdminGrant(ProposeScopeAdminGrantRequest) returns (Approval);
@@ -88,7 +96,10 @@ service ApprovalService {
 
 // ApprovalExecutionService — the proposing services. Every RPC acts only on kinds of the
 // caller's own namespace; anything else is PERMISSION_DENIED (for a proposal id, the
-// same NOT_FOUND as an unknown one).
+// same NOT_FOUND as an unknown one). A relying party proposes in its own scope only; the
+// bridge token (`bank`) in any. What this service answers never names the deciders:
+// `voters[].auth_subject`, `voters[].email`, `requested_by_email` and `vetoed_by` are empty,
+// the votes and their times are carried.
 service ApprovalExecutionService {
   // Open a proposal. The level is resolved HERE, from the kind, the fields and the
   // scope's policy, and frozen with the roster; the caller cannot ask for one.
@@ -100,7 +111,9 @@ service ApprovalExecutionService {
   // longer than 128 bytes (the same pattern banking scope/v1 enforces), a
   // USER field or `requested_by` naming no account. FAILED_PRECONDITION: the scope is
   // not ACTIVE, or the resolved roster is too small to decide (fewer than two platform
-  // owners). ALREADY_EXISTS: a live
+  // owners). PERMISSION_DENIED: a relying party naming a scope other than its own.
+  // RESOURCE_EXHAUSTED: the namespace already holds 200 live (OPEN, or PASSED and not
+  // lapsed) proposals. ALREADY_EXISTS: a live
   // (OPEN or PASSED) proposal of the same kind, scope and subject_ref exists — one
   // subject is decided once at a time.
   //
@@ -116,7 +129,9 @@ service ApprovalExecutionService {
   rpc GetProposal(GetProposalRequest) returns (Approval);
 
   // Proposals of the caller's namespace that are PASSED with `executable_at` behind the
-  // clock and no outcome reported, oldest `executable_at` first. A pull claims nothing:
+  // clock, less than 72 hours behind it, and no outcome reported, oldest `executable_at`
+  // first. The proposer must not START executing a decision past `executable_at` + 72h:
+  // it has lapsed, and a report on it is refused. A pull claims nothing:
   // a proposal is served again on every pull until its outcome is reported, so the
   // proposer must be idempotent per proposal id — one decision is one execution, unique
   // by `id` on its side — and must check `payload_hash` against the operation it stored
@@ -125,7 +140,8 @@ service ApprovalExecutionService {
 
   // Close a pulled proposal of the caller's namespace. Repeating the same outcome is a
   // no-op; a different one is FAILED_PRECONDITION. Reporting on a proposal that is not
-  // executable: FAILED_PRECONDITION.
+  // executable: FAILED_PRECONDITION — including one past its execution window, which the
+  // report finds lapsed and records as VOID.
   rpc ReportOutcome(ReportOutcomeRequest) returns (Approval);
 }
 
@@ -163,8 +179,9 @@ enum EscalationTest {
   ESCALATION_TEST_UNSPECIFIED = 0;
   // An AMOUNT field above the threshold. A currency other than the parameter's escalates.
   ESCALATION_TEST_AMOUNT_ABOVE = 1;
-  // The AMOUNT field plus every live or executed scope-level proposal of the same kind
-  // and scope opened in the trailing 24 hours, above the threshold.
+  // The AMOUNT field plus, of the same kind and scope at scope level, every LIVE proposal
+  // (OPEN, or PASSED and not lapsed) however long ago it was opened and every one EXECUTED
+  // in the trailing 24 hours, above the threshold.
   ESCALATION_TEST_ROLLING_24H_AMOUNT_ABOVE = 2;
   // A BPS field whose absolute value is above the threshold.
   ESCALATION_TEST_ABS_BPS_ABOVE = 3;
@@ -177,8 +194,9 @@ enum ApprovalState {
   // Collecting votes until `expires_at`.
   APPROVAL_STATE_OPEN = 1;
   // The threshold was met. Vetoable until `executable_at`; from then on the proposer
-  // pulls it. "Executable" is this state with the clock past `executable_at`, not a
-  // state of its own, so no sweep has to run for a proposal to become pullable.
+  // pulls it, for 72 hours. "Executable" is this state with the clock past
+  // `executable_at`, not a state of its own, so no sweep has to run for a proposal to
+  // become pullable — or to lapse.
   APPROVAL_STATE_PASSED = 2;
   // The proposer reported it carried the decision out.
   APPROVAL_STATE_EXECUTED = 3;
@@ -191,7 +209,8 @@ enum ApprovalState {
   // Withdrawn by the proposer, or by whoever opened a `concierge:*` proposal.
   APPROVAL_STATE_CANCELLED = 8;
   // Passed, but could not be applied: the subject had moved by the time it executed,
-  // or the proposer reported OUTCOME_VOID.
+  // the proposer reported OUTCOME_VOID, or nobody executed it within 72 hours of
+  // `executable_at` (it lapsed; `void_reason` says so and `outcome` stays UNSPECIFIED).
   APPROVAL_STATE_VOID = 9;
 }
 
@@ -244,7 +263,8 @@ message ApprovalFieldSpec {
 message ApprovalEscalation {
   // `[a-z][a-z0-9_]{0,31}`, unique within the kind; the key ApprovalThreshold names.
   string parameter = 1;
-  // The field tested; its type must match `test`.
+  // The field tested; its type must match `test`, and it must be `required`: a test over
+  // a field the proposer may leave out is one it may switch off.
   string field_key = 2;
   EscalationTest test = 3;
   // Decimal string: an amount for the AMOUNT tests, an integer of bps for ABS_BPS_ABOVE,
@@ -255,7 +275,7 @@ message ApprovalEscalation {
 }
 
 // Money as the proposing service spells it, never a float. `value` is a CANONICAL
-// non-negative decimal — `0|[1-9][0-9]*`, then optionally `.` and at most 18 digits not
+// non-negative decimal — `0|[1-9][0-9]{0,29}`, then optionally `.` and at most 18 digits not
 // ending in `0` (`1200.5`, never `1200.50` or `01200.5`) — and anything else is
 // INVALID_ARGUMENT, because `payload_hash` is taken over the spelling. `currency` is
 // `[A-Z][A-Z0-9]{1,15}` (`USDT`; a unit code for units).
@@ -338,7 +358,9 @@ message Approval {
   string requested_by_email = 11;
   // The requester's words. Required; same rules as a TEXT field, at most 500 bytes.
   string reason = 12;
-  // The whole frozen roster, with their votes.
+  // The whole frozen roster, with their votes. A person who reads it only as the one it
+  // names in `requested_by` gets no `email`; a service gets neither `email` nor
+  // `auth_subject` (see ApprovalExecutionService).
   repeated ApprovalVoter voters = 13;
   uint32 threshold = 14;
   // ScopeApprovalPolicy.version the proposal was measured against at open, escalated or

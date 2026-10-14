@@ -7,10 +7,11 @@ user auth layer; a CLOSED scope's clients are refused), sign-in from a scope's h
 (§3.1: CORS and the `Origin` check on the closed route list, the passkey verifier's
 origins, OAuth `returnTo`, the sign-up ticket of migration 0032), the micro-frontend
 bundles under `/auth/mfe/*` (§3.1), the relying-party streams (§4: `ScopeEvents` and
-`UserEvents` read by a client credential, migration 0034) and the scope catalog's storage
-(`ScopeCatalogService`, §5.1, §6 — kinds are stored, nothing is proposed or executed yet).
-The approval services are not mounted yet and answer `UNIMPLEMENTED`. Banking, the `lib`
-projections, invest and admin build against this document.
+`UserEvents` read by a client credential, migration 0034), the scope catalog's storage
+(`ScopeCatalogService`, §5.1, §6) and the approvals of the kinds a namespace publishes
+(§5.7: `ApprovalExecutionService` whole, `ApprovalService` but for the `concierge:*` kinds;
+migration 0036). Not yet: the `concierge:*` kinds, stored scope policies and the approval
+mail (§5.7). Banking, the `lib` projections, invest and admin build against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it
@@ -23,12 +24,12 @@ says so and why.
 | Service | File | Caller | Where it is mounted | Today |
 | ------- | ---- | ------ | ------------------- | ----- |
 | `ScopeRegistry` | scopes.proto | first-party session, `typ=service` token | inside the user auth layer | served (`runner/src/scopes.rs`) |
-| `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, like `UserEvents` | contract, `UNIMPLEMENTED` |
-| `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | contract, `UNIMPLEMENTED` |
+| `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_catalog.rs`) |
+| `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_events.rs`) |
 | `ScopeInboxService` | scope_inbox.proto | a relying party's client credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_inbox.rs`, §6) |
-| `ApprovalService` | approvals.proto | first-party session | inside the user auth layer | contract, `UNIMPLEMENTED` |
-| `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | contract, `UNIMPLEMENTED` |
-| `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and** a relying party's client credential | as today | bridge token only; the client credential is contract |
+| `ApprovalService` | approvals.proto | first-party session | inside the user auth layer | served (`runner/src/approvals.rs`) but `CancelApproval`, `ProposeScopeAdminGrant`, `ProposeScopePolicyChange`, which answer `UNIMPLEMENTED` (§5.7) |
+| `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/approvals.rs`) |
+| `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and** a relying party's client credential | as today | served for both |
 
 A relying party's restricted access token still opens exactly one RPC,
 `UserDirectory.GetMe`. Votes are cast over a first-party session on `evinvest.ltd`,
@@ -297,8 +298,11 @@ and the direction follows the operation by that `subject_ref` on banking's money
 
 Kinds are published whole with `ScopeCatalogService.PublishScopeCatalog` (versioned like
 `PublishCatalog`); `concierge:*` kinds are this plane's own, built in at version 0. A
-proposer may open proposals of its kinds in any registered `ACTIVE` scope — invest
-proposes `invest:valuation_override` in `sa` because the allocation is there.
+relying party opens proposals of its kinds in its OWN scope only; the bridge token
+(`bank`) in any registered `ACTIVE` scope, because the money plane holds every scope's
+accounts (decided at review, 2026-10-14). ⚠️ This departs from the earlier wording, under
+which invest would propose `invest:valuation_override` in `sa` because the allocation is
+there: as decided, that proposal is refused until the rule is revisited.
 
 `Approval.proposer` is the kind's namespace; `Approval.requested_by_client` is the
 client whose credential opened it, for the audit trail only.
@@ -307,14 +311,19 @@ A kind declares (`ApprovalKindSpec`): a label and description in plain text; its
 **level** before escalation; its **fields**, each with a type from a closed set
 (`TEXT`, `AMOUNT`, `BPS`, `FLAG`, `USER`, `TIMESTAMP`, `COUNT`) that this plane knows
 how to render; and its **escalations**, each naming a field, a test and a default
-threshold. A `USER` field carries an `auth_subject`.
+threshold. A `USER` field carries an `auth_subject`. An escalation must test a REQUIRED
+field: a test over a field the proposer may leave out is one it may switch off.
 
 ### 5.2 Who decides
 
 | Level | Roster | Threshold | Delay (veto window) | Lifetime |
 | ----- | ------ | --------- | ------------------- | -------- |
 | `PLATFORM` | persisted `owner` seats (break-glass seats nobody) | more than half of the roster | 24 h, veto by any roster member | 72 h |
-| `SCOPE` | active holders of `<scope>:admin` | the scope policy's `quorum_bps`, default more than half of the roster | the policy's `delay_secs`, default 1 h, veto by any roster member | the policy's `ttl_secs`, default and ceiling 72 h |
+| `SCOPE` | active holders of `<scope>:admin` | the scope policy's `quorum_bps`, default more than half of the roster | the policy's `delay_secs`, default 1 h, veto by any roster member or any platform owner | the policy's `ttl_secs`, default and ceiling 72 h |
+
+At either level a passed decision is executable for 72 hours after its delay and then
+lapses to `VOID`; any persisted owner may veto ANY proposal inside its delay (decided:
+containment is never slower than the grant).
 
 - **Quorum is over the whole roster frozen at open:**
   `threshold = max(1, ceil(roster × quorum_bps / 10000))`, platform at 5001 bps. Nobody
@@ -329,11 +338,15 @@ threshold. A `USER` field carries an `auth_subject`.
   - **`sole_admin`**: the scope has fewer than two admins, so one person would decide;
   - a proposal in scope `main` is always `PLATFORM`.
 - **Tests:** `AMOUNT_ABOVE` (an amount in another currency than the parameter's escalates
-  — fail safe); `ROLLING_24H_AMOUNT_ABOVE` — the amount plus every **live or executed**
-  scope-level proposal of the same kind and scope opened in the trailing 24 h (decided:
-  counting only executed ones would let proposals opened together each pass under the
-  window and then execute together above it; a proposal that ends rejected, vetoed,
-  expired, cancelled or void stops counting); `ABS_BPS_ABOVE`; `FLAG_SET`.
+  — fail safe); `ROLLING_24H_AMOUNT_ABOVE` — the amount plus, among scope-level proposals
+  of the same kind and scope, every **live** one (open, or passed and not lapsed) however
+  long ago it was opened, and every one **executed** in the trailing 24 h, counted from
+  its execution (decided: counting only executed ones would let proposals opened together
+  each pass under the window and then execute together above it; counting from the
+  opening instant would let a proposal kept open a day drop out while still able to pass,
+  and an execution count from when it was asked rather than when the money moved; a
+  proposal that ends rejected, vetoed, expired, cancelled or void stops counting);
+  `ABS_BPS_ABOVE`; `FLAG_SET`.
 - **The scope policy** (`ScopeApprovalPolicy`: quorum, delay, lifetime, threshold
   overrides) is changed only by `concierge:scope_policy_change`, which is always
   `PLATFORM`: a scope able to lower its own thresholds would decide for itself what
@@ -404,13 +417,17 @@ OPEN ──(threshold met)──▶ PASSED ──(executable_at passes; proposer
   free-form markup anywhere: the mail is rendered here from the kind's labels and the
   typed values (`USER` resolved from its `auth_subject` to the account's email here,
   `BPS` to a percentage here).
-- **Veto** by any roster member, and **withdrawal** by the proposer
+- **Veto** by any roster member who still holds the seat, or by any persisted owner on any
+  proposal, and **withdrawal** by the proposer
   (`WithdrawProposal`) — or, for a `concierge:*` proposal, by the person who opened it
   over a session (`CancelApproval`) — are possible while `OPEN` and while `PASSED`
   before `executable_at`. After that the proposer owns the proposal and only
   `ReportOutcome` moves it.
 - **Pull** (`PullApproved`) serves `PASSED` proposals of the caller's namespace whose
-  `executable_at` is behind the clock and that have no outcome, oldest first. A pull
+  `executable_at` is behind the clock by less than 72 hours and that have no outcome,
+  oldest first. Past that window the decision lapses to `VOID` (`void_reason` says so, no
+  outcome), and a report on it is refused: a proposer must not start executing past
+  `executable_at` + 72 h. A pull
   claims nothing: the same proposal is served on every pull until its outcome is
   reported, so the proposer is idempotent per proposal id. Executable is a time
   predicate over `PASSED`, not a state, so nothing has to sweep for a proposal to become
@@ -430,6 +447,12 @@ OPEN ──(threshold met)──▶ PASSED ──(executable_at passes; proposer
   tab or a newline, so the encoding is unambiguous.
 - **ReportOutcome**: `EXECUTED`, `FAILED` (terminal; a retry is a new proposal) or
   `VOID` (no longer applies; nothing attempted). Repeating the same outcome is a no-op.
+- **What a service reads**: the state, the fields and the votes — never who the deciders
+  are. `ApprovalExecutionService` answers with `voters[].auth_subject`, `voters[].email`,
+  `requested_by_email` and `vetoed_by` empty; a person who sees a proposal only as its
+  `requested_by` reads no voter's email.
+- **Bounds**: a namespace holds at most 200 live proposals (`RESOURCE_EXHAUSTED` past
+  that); an amount has at most 30 whole digits.
 
 ### 5.5 Mail
 
@@ -444,10 +467,64 @@ happens over a session, not from a mailbox.
 
 While `concierge:scope_admin_grant` exists, `UserDirectory.GrantPermission` refuses a
 `<scope>:admin` target and names `ApprovalService.ProposeScopeAdminGrant` — the
-behaviour `SetRole` has for `admin`. **Removing a scope admin is immediate, with no
+behaviour `SetRole` has for `admin`. Until it is served, `GrantPermission` grants a
+`<scope>:admin` target only on a persisted platform owner's call — any other seat holding
+`iam:tenants:grant`, break-glass included, is `PERMISSION_DENIED` — and no catalog may
+delegate `<namespace>:admin` (`Catalog::check`): one `admin` seat able to hand out the alias
+could fill a scope's roster with accounts it controls and pass its quorum with no owner
+asked. **Removing a scope admin is immediate, with no
 approval** (`RevokePermission` by a seat holding `iam:tenants:grant`): containing a
 rogue admin must never be the slower path, the rule this plane already keeps for
 `Role::Admin`.
+
+### 5.7 As implemented
+
+`runner/src/approvals.rs` (both services), `infrastructure::approvals` (migration 0036:
+`approvals`, the frozen roster `approval_voters`, the history `approval_events`), the rules
+in `domain::approvals`.
+
+- **Opening** resolves everything inside one transaction: the kind is the one in the
+  proposer's catalog in force; the scope must be registered and `ACTIVE` (`main` always
+  is); `requested_by` and every `USER` field must name an account; the escalation tests,
+  `sole_admin` and the roster are decided and frozen there. Opens are serialised per
+  proposer namespace by a transaction-scoped advisory lock, which is what makes the rolling
+  window and the live cap hold for a batch opened at once — without it eight simultaneous
+  1 000 USDT proposals each see an empty window. Locks follow the plane's order: the owner
+  roster (`users FOR SHARE`) before `tenants`. `dedupe_key` is **required** (1-128 bytes):
+  an executor that cannot repeat a `Propose` safely cannot be idempotent either.
+- **Time** is the database's (`now()` of the writing transaction), never a replica's
+  clock: a delay, an expiry and a lapse are compared on one clock however many replicas
+  write.
+- **The scope roster** is the ACTIVE accounts holding an unrevoked grant of exactly
+  `<namespace>:admin`. A seat that holds every permission of a namespace without a row
+  (`granting_seats_hold_all`) is not on it: what it may do on the scope's surface is not a
+  say in the scope's decisions. **The platform roster** is every persisted `owner`, as the
+  consilia count it.
+- **A frozen roster keeps its size, not its votes.** A member who lost the seat it was
+  drawn from after open (an `owner` seat, the `<namespace>:admin` grant) is refused
+  `PERMISSION_DENIED` on a vote and a veto, while the threshold stays what it was: removing
+  an admin is the containment step and must bite at once (§5.6), and shrinking the roster
+  would let a removal lower the bar.
+- **Policy**: no scope has a stored one yet; every scope is measured against the default
+  (`version` 1, 5001 bps, 3600 s, 72 h, no overrides) until `concierge:scope_policy_change`
+  exists to change it. `GetScopeApprovalPolicy` answers that default to the scope's admins
+  and the owners, and `INVALID_ARGUMENT` for `main`.
+- **Visibility** of one proposal to a person: a persisted owner, an admin of its scope,
+  the account it names as `requested_by`, or a member of its roster. Anything else, and
+  an unknown id, is one `NOT_FOUND` — on the execution side too, for a proposal of another
+  namespace.
+- **History**: one `approval_events` row per transition in the transaction that made it —
+  the actor is the person, else the client id or `bridge`; a lazy expiry or lapse
+  (`lapsed`) names nobody and is dated at its deadline. A write that finds a proposal past
+  its deadline commits the expiry or lapse even when the act is then refused.
+- **`awaiting_my_vote`** asks only for votes the vote RPC would accept: a member who lost
+  the seat is not listed as awaited.
+- **Not yet**: `ListApprovalKinds` lists the published kinds only, the `concierge:*` kinds
+  (`scope_admin_grant`, `scope_policy_change`, `CancelApproval`) and their executor, the
+  stored scope policy, `GrantPermission`'s outright refusal of a `<scope>:admin` target
+  naming the RPC (§5.6; owners only until then), and the mail of §5.5. A catalog already
+  stored that delegates `<namespace>:admin` is not re-checked; the next publication is. Until the mail exists a roster member learns of a proposal by
+  `ListApprovals { awaiting_my_vote }`.
 
 ---
 

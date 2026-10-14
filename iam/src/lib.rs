@@ -123,6 +123,9 @@ pub struct Catalog {
 	pub delegations: BTreeMap<String, BTreeSet<String>>,
 }
 
+/// The alias whose holders are a scope's approval roster.
+pub const ADMIN_ALIAS: &str = "admin";
+
 impl Catalog {
 	/// Every permission is concrete and in `namespace`, every alias is `<namespace>:<name>`
 	/// and names only permissions of this catalog, everything is within the size bounds,
@@ -154,6 +157,11 @@ impl Catalog {
 			}
 			if let Some(stray) = delegates.iter().find(|d| !self.aliases.contains_key(*d) || self.delegations.contains_key(*d)) {
 				return Err(format!("alias `{name}` delegates `{stray}`, which is no alias of this catalog or delegates itself"));
+			}
+			// `<namespace>:admin` seats its holder on the scope's approval roster; a holder
+			// who could hand it on could fill that roster without the platform owners.
+			if delegates.contains(&format!("{namespace}:{ADMIN_ALIAS}")) {
+				return Err(format!("alias `{name}` delegates `{namespace}:{ADMIN_ALIAS}`, which only the platform owners grant"));
 			}
 		}
 		Ok(())
@@ -323,6 +331,14 @@ mod tests {
 		] {
 			assert!(bad.check("sa").is_err(), "{bad:?}");
 		}
+	}
+
+	#[test]
+	fn nobody_delegates_the_admin_alias() {
+		let p = &["sa:work:leads:read"][..];
+		let aliases: &[(&str, &[&str])] = &[("sa:admin", p), ("sa:lead", p)];
+		let handed_on = delegating(p, aliases, &[("sa:lead", &["sa:admin"])]);
+		assert!(handed_on.check("sa").is_err(), "the admin alias is the scope's approval roster");
 	}
 
 	#[test]

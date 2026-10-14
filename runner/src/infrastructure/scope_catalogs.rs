@@ -91,4 +91,12 @@ impl ScopeCatalogRepository for PgScopeCatalogs {
 			.map(parse)
 			.transpose()
 	}
+
+	async fn all_current(&self) -> Result<Vec<(String, ScopeCatalog)>, DomainError> {
+		let rows: Vec<(String, serde_json::Value)> = sqlx::query_as("SELECT DISTINCT ON (namespace) namespace, catalog FROM scope_catalogs ORDER BY namespace, version DESC")
+			.fetch_all(&self.pool)
+			.await
+			.map_err(repo_err)?;
+		rows.into_iter().map(|(namespace, catalog)| Ok((namespace, parse(catalog)?))).collect()
+	}
 }
