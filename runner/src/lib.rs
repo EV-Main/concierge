@@ -26,6 +26,10 @@
 //!   relying_party   — this plane as the IdP of first-party clients on other origins:
 //!                     the registry, one-time codes and client refresh families behind
 //!                     `/auth/authorize` and `AuthService.ExchangeCode`
+//!   scopes          — the scope registry's read service (`ScopeRegistry`)
+//!   scope_events    — `ScopeEvents`, the per-scope stream relying parties project from
+//!   scope_catalog   — `ScopeCatalogService`: approval kinds and notification topics per namespace
+//!   service_caller  — who calls a service-credential RPC: the bridge token or a client secret
 //!   web             — the site-level auth HTTP surface (login/callback/session cookies)
 //!   notification    — the notification plane: subscribers, the in-app inbox, queued email
 //!   dispatch        — the background loops: draining the outbound email queue, and the
@@ -47,5 +51,10 @@ pub mod notification;
 pub mod platform;
 pub mod ports;
 pub mod relying_party;
+pub mod scope_catalog;
+pub mod scope_events;
+pub mod scope_inbox;
+pub mod scopes;
+pub mod service_caller;
 pub mod support;
 pub mod web;

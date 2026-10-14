@@ -6,6 +6,8 @@
 //! compiles the other half unused — hence the blanket allowance.
 #![allow(dead_code)]
 
+pub mod web;
+
 /// The environment marker that says "this database is disposable".
 pub const TEST_DB_MARKER: &str = "CONCIERGE_TEST_DB";
 
@@ -122,7 +124,9 @@ pub fn sign_in_with_turnstile(pool: &sqlx::PgPool, turnstile: &str) -> concierge
 		turnstile: concierge::web::Turnstile::new("test-secret".into(), turnstile.into()),
 		credentials: std::sync::Arc::new(concierge::infrastructure::credentials::PgCredentials::new(pool.clone())),
 		mail_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
-		webauthn: std::sync::Arc::new(webauthn_for(WEBAUTHN_ORIGIN)),
+		allowlist: std::sync::Arc::new(
+			concierge::web::allowlist::SignInAllowlist::fixed(WEBAUTHN_ORIGIN, concierge::web::origins::ScopeOrigins::none()).expect("a test origin is a relying party"),
+		),
 	}
 }
 
@@ -157,11 +161,16 @@ pub async fn signing_auth(users: std::sync::Arc<dyn concierge::ports::UserDirect
 	evconcierge_auth::AuthService::try_new(config, provisioner).await.expect("auth service")
 }
 
-/// A Turnstile siteverify that passes exactly the token `human`. Returns its URL.
+/// A Turnstile siteverify that passes exactly the token `human`, solved on the suites'
+/// own host — and `elsewhere`, solved by a person on a host that is not ours. Returns its URL.
 pub async fn stub_turnstile() -> String {
 	use axum::{Form, Json, Router, routing::post};
 	async fn verify(Form(form): Form<std::collections::HashMap<String, String>>) -> Json<serde_json::Value> {
-		Json(serde_json::json!({ "success": form.get("response").map(String::as_str) == Some("human") }))
+		Json(match form.get("response").map(String::as_str) {
+			Some("human") => serde_json::json!({ "success": true, "hostname": "evinvest.test" }),
+			Some("elsewhere") => serde_json::json!({ "success": true, "hostname": "evil.example" }),
+			_ => serde_json::json!({ "success": false }),
+		})
 	}
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the turnstile stub");
 	let addr = listener.local_addr().unwrap();
@@ -171,10 +180,3 @@ pub async fn stub_turnstile() -> String {
 
 /// The origin every suite's web state is served from, as WebAuthn sees it.
 pub const WEBAUTHN_ORIGIN: &str = "https://evinvest.test";
-
-pub fn webauthn_for(origin: &str) -> webauthn_rs::Webauthn {
-	let url = webauthn_rs::prelude::Url::parse(origin).expect("a test origin parses");
-	webauthn_rs::WebauthnBuilder::new(url.host_str().expect("a test origin has a host"), &url)
-		.and_then(|b| b.build())
-		.expect("a test origin is a relying party")
-}

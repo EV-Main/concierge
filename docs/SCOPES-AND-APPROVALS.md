@@ -1,9 +1,16 @@
 # Scopes, approvals and the relying-party event streams — contract
 
-Status: **contract only.** The wire is in `contracts/proto/concierge/v1/scopes.proto`,
-`approvals.proto` and the comments on `events.proto`; nothing here is implemented in
-`runner/` yet, no service below is mounted, and calling one answers `UNIMPLEMENTED`.
-Banking, the `lib` projections, invest and admin build against this document.
+Status: **partly implemented.** The wire is in `contracts/proto/concierge/v1/scopes.proto`,
+`approvals.proto` and the comments on `events.proto`. Implemented in `runner/`: the
+registry (§3: `tenants` columns from migration 0031, `ScopeRegistry` mounted inside the
+user auth layer; a CLOSED scope's clients are refused), sign-in from a scope's hosts
+(§3.1: CORS and the `Origin` check on the closed route list, the passkey verifier's
+origins, OAuth `returnTo`, the sign-up ticket of migration 0032), the micro-frontend
+bundles under `/auth/mfe/*` (§3.1), the relying-party streams (§4: `ScopeEvents` and
+`UserEvents` read by a client credential, migration 0034) and the scope catalog's storage
+(`ScopeCatalogService`, §5.1, §6 — kinds are stored, nothing is proposed or executed yet).
+The approval services are not mounted yet and answer `UNIMPLEMENTED`. Banking, the `lib`
+projections, invest and admin build against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it
@@ -13,14 +20,15 @@ says so and why.
 
 ## 1. Surface
 
-| Service | File | Caller | Where it is mounted |
-| ------- | ---- | ------ | ------------------- |
-| `ScopeRegistry` | scopes.proto | first-party session, `typ=service` token | inside the user auth layer |
-| `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, like `UserEvents` |
-| `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener |
-| `ApprovalService` | approvals.proto | first-party session | inside the user auth layer |
-| `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener |
-| `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and now** a relying party's client credential | as today |
+| Service | File | Caller | Where it is mounted | Today |
+| ------- | ---- | ------ | ------------------- | ----- |
+| `ScopeRegistry` | scopes.proto | first-party session, `typ=service` token | inside the user auth layer | served (`runner/src/scopes.rs`) |
+| `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, like `UserEvents` | contract, `UNIMPLEMENTED` |
+| `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | contract, `UNIMPLEMENTED` |
+| `ScopeInboxService` | scope_inbox.proto | a relying party's client credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_inbox.rs`, §6) |
+| `ApprovalService` | approvals.proto | first-party session | inside the user auth layer | contract, `UNIMPLEMENTED` |
+| `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | contract, `UNIMPLEMENTED` |
+| `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and** a relying party's client credential | as today | bridge token only; the client credential is contract |
 
 A relying party's restricted access token still opens exactly one RPC,
 `UserDirectory.GetMe`. Votes are cast over a first-party session on `evinvest.ltd`,
@@ -92,7 +100,8 @@ a resource (D2): an admin of a scope holds the `<scope>:admin` alias, which dele
   plane refuses new debits of its accounts; its clients still sign people in and its
   streams are still read) or `CLOSED` (terminal: its clients sign nobody in, nothing new
   opens, history stays readable).
-- **`clients`**: a scope may have several relying-party clients (today one, `sa`).
+- **`clients`**: a scope may have several relying-party clients (today one each: client
+  `sa` in scope `sa`, client `invest` in scope `invest`, migrations 0025 and 0031).
 - **`observers`**: client ids that may also READ this scope's events and its users'
   lifecycle. invest runs allocations of other scopes (the `service_arb` allocation lives
   in `sa`) and checks `sa:admin` to authorise `sa`'s admins there, so `sa` names
@@ -100,15 +109,18 @@ a resource (D2): an admin of a scope holds the `<scope>:admin` alias, which dele
   accounts a service may open, debit or read there is banking's own configuration of
   service grants, and nothing on this plane widens it.
 - **Registry writes** are migrations and configuration, as `rp_clients` is today; there
-  is no write RPC. Every change bumps `version` and emits `SCOPE_CHANGED`.
+  is no write RPC. Every change bumps `version` (migration 0031's triggers, a client's
+  audience, `disabled_at` or scope included); `SCOPE_CHANGED` is to carry it once
+  `ScopeEvents` is served.
 
 ### 3.1 `origins`: sign-in from a scope's hosts
 
 `origins` are the scope's hosts exactly as a browser sends `Origin`, and they are held to
 rules a configuration slip cannot loosen:
 
-- `https` only; the host is `evinvest.ltd` or ends in `.evinvest.ltd`; a port only when
-  non-default; no path, no trailing slash, no wildcard, never `null`;
+- `https` only; the host ends in `.evinvest.ltd` — the bare `evinvest.ltd` is
+  `PUBLIC_ORIGIN`, never a scope's; a port (1-65535) only when non-default; no path, no
+  trailing slash, no wildcard, never `null`;
 - compared byte for byte; the answer carries `Access-Control-Allow-Origin` set to exactly
   the matched origin and `Vary: Origin`.
 
@@ -116,18 +128,55 @@ They widen CORS for a **closed list** of sign-in routes and nothing else:
 
 | Accepts a scope origin | `PUBLIC_ORIGIN` only |
 | ---------------------- | -------------------- |
-| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/email/verify/*`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user}`, never a token) | everything acting on an open session: `/auth/password/set`, `/auth/passkey/register`, `/auth/passkey/remove`, sessions, username, logout, `/kyc/*` |
+| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`, `/auth/password/signup/resend`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user, permissions}`, never a token) | everything acting on an open session or reading the account: `/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register/*`, `/auth/passkey/remove`, `/auth/sessions`, `/auth/username`, `/auth/methods`, `/auth/me`, `/auth/notifications/settings*`, `/auth/logout`, `/auth/logout/confirm`, `/kyc/*` |
+
+Signing out on a scope host ends the `evinvest.ltd` session too when the host sends the
+browser — a top-level navigation, not a call — to
+`https://evinvest.ltd/api/auth/logout/confirm?return_to=<scope origin + one of its return
+paths>`. That is a page on this origin with one button; the button's form carries the
+session's CSRF token and comes back with a 303 to `return_to`. Without a session the page
+answers the 303 at once.
 
 A route on the left accepts an `Origin` that is `PUBLIC_ORIGIN` or an origin of a scope
 that is `ACTIVE` or `FROZEN` — a frozen scope's clients still sign people in — and never
-one of a `CLOSED` scope. An OAuth `returnTo` must be one of these origins plus a path
-from the scope's `return_paths`, matched exactly.
+one of a `CLOSED` scope. The right column carries the CSRF double-submit, whose cookie a
+scope host cannot read, so email verification is not offered there. A password sign-up
+started on a scope host is confirmed instead by `/auth/password/signup/confirm` with the
+ticket the sign-up answered (migration 0032; the ticket lives a day, and
+`/auth/password/signup/resend` mails a new code under it): the address is verified and the
+password kept, where a code SIGN-IN on that mailbox would take the unverified account
+over. The sign-up hands a ticket out only when it was asked to mail a code (`verify`);
+if the ticket cannot be stored the answer says `ticket: null` with
+`ticket_error: "ticket_unavailable"` and the address is confirmed on `evinvest.ltd`
+instead. A ticket that is unknown, spent, expired or outlived by a revoke-all or a new
+password answers `/confirm` as a wrong code does, and `/resend` with `{ok: true}` and no
+mail.
+
+The allowlist is re-read from the registry at most 30 s apart (`web::allowlist`), so
+closing a scope or removing an origin takes effect without a restart. An absolute OAuth
+`returnTo` must be one of these origins plus a path from the scope's `return_paths`,
+matched exactly, or `/auth/login` answers 400; a relative or empty one lands on `/` as it
+always did.
+
+**Micro-frontend bundles.** `GET /auth/mfe/*` — publicly
+`https://evinvest.ltd/api/auth/mfe/*`, under the conductor's `/api/auth/*` rewrite — serves
+the directory `WEB_MFE_DIR` names; the manifest hosts read is `registry.json`. It is
+public and read-only: a scope origin gets `Access-Control-Allow-Origin` (no credentials)
+and `Vary: Origin`, files only (no index, no listing, no dotfile, nothing resolving
+outside the directory), esbuild-hashed names cached for a year and everything else for
+five minutes. With `WEB_MFE_DIR` unset or unreadable the route is not mounted and sign-in
+is unaffected; the image sets it only once `web/` exists in this repository.
 
 ---
 
 ## 4. Event streams for relying parties
 
 ### 4.1 Visibility
+
+Implemented in `runner/` as `scope_members` (migration 0034): a row is inserted, never
+deleted, on the user's first relying-party session with one of the scope's clients
+(`joined_by = sign_in`) or their first grant in its namespace (`grant`), in the same
+transaction. Grants and sessions that predate the table are backfilled at boot.
 
 A user is **visible to scope S** once they have signed in through one of S's clients, or
 held a grant in S's namespace. Visibility only grows: an account whose grants are all
@@ -143,7 +192,11 @@ names it an observer. The bridge token sees everything.
 scanned** for the caller — past the last event returned when the rows after it were not
 the caller's to see, so a filtered reader never re-scans them; unchanged when nothing
 was scanned. To the unfiltered reader (the bridge token) that is the max position
-returned, which is what banking stores today.
+returned, which is what banking stores today. A page that **fills `limit`** stops scanning at its last
+event, so its `next_position` is exactly that event's `position`; with `limit = 1` and
+one event returned, `next_position` is that event's position. `lib`'s
+`concierge_projection` relies on this to replay a parked event (§4.3) and confirm it got
+that one; the scan runs past the last event only when the page did not fill.
 
 **`UserEvents.PullUserLifecycle`**, read by a client credential: same request,
 filtered by visibility, and each row redacted — `seat_permissions` absent and
@@ -171,6 +224,23 @@ two events can never disagree about the current set.
 
 Banking reads `ScopeEvents` with the bridge token, learns scopes and their `state` from
 `SCOPE_CHANGED` and opens compartments only for known scopes.
+
+As implemented (`scope_events`, `bridge`, `infrastructure::scope_events`):
+
+- every event is written in the transaction of the change it describes — a grant or
+  revocation, a tenant catalog publication, a ROLE_CHANGED (a seat moves what it holds
+  where `granting_seats_hold_all`), a relying-party session — and `SCOPE_CHANGED` by a
+  trigger on `tenants`, which also fires for a client's audience, disabled flag or tenant
+  moving (0031 bumps the scope's `version` for those);
+- `GRANTS_CHANGED` carries what `GetMe` answers that scope's client — by the PERSISTED seat;
+  emergency access is per request and never on the stream — and is written only when the
+  set actually moved;
+- a client is served lifecycle rows of a user only past the `lifecycle_sequence` its
+  `MEMBER_JOINED` carried: history before the user became visible is not a direction's;
+- a filtered scan reads at most 5 000 rows per call, and the cursor moves past what it
+  scanned;
+- what a binary of the previous release changes during a rollout (a grant, a role, a
+  catalog) reaches the stream at the next boot (`scope_events::reconcile`), not before.
 
 ### 4.3 A kind the consumer cannot name
 
@@ -385,6 +455,70 @@ payment-consent trace, security notices) stay this plane's own. Today's
 `fund:quy-nhon` and `account:money-movement` move to `invest:` and `bank:`; carrying the
 existing subscriptions across is the implementation's migration.
 
+**Each direction has its own inbox (D21).** Which one a request reads is decided by the
+server from where the request came from, never by a request field
+(`notification::InboxView`):
+
+| Asked through | Inbox | Topics offered, inbox rows shown |
+| ------------- | ----- | -------------------------------- |
+| web, `Origin` = `PUBLIC_ORIGIN` or absent (a same-origin GET sends none) | platform | this plane's built-in topics and `bank:*`, for everyone |
+| web, `Origin` = an origin of a scope that still signs in (§3.1) | that scope's | its catalog's topics only, and only for a MEMBER of the scope (`scope_members`, §4.1); anyone else gets an empty list, not a refusal |
+| web, any other `Origin` | — | `403 {"error":"origin_not_allowed"}` |
+| gRPC `NotificationService` with a user's access token | platform | as above |
+| gRPC `ScopeInboxService` with a client credential, `user_id` in the request | the client's own scope's | as for the scope's host above, for an ACTIVE member; anyone else reads empty and writes `FAILED_PRECONDITION` |
+| web `?all=1` on `PUBLIC_ORIGIN` / gRPC metadata `x-ev-inbox-view: all` | summary | every namespace; needs `concierge:notifications:read_all` (seats `admin` and `owner`), else `403 {"error":"forbidden"}` / `PERMISSION_DENIED`; on a scope's host always `403` |
+
+The rule covers the settings read, following a topic (a topic outside the inbox is
+`unknown_topic` / `INVALID_ARGUMENT`, exactly like one that does not exist), the inbox
+list, its topic filter, the unread count and mark-read (`all` marks only that inbox). The
+two master channel switches are the account's across every inbox, so they are set only
+where the platform inbox is in view: from a scope's host `403 {"error":"platform_only"}`.
+On the web the summary is decided from the PERSISTED seat; break-glass elevation opens the
+console, not everyone's notifications. The summary is metadata on gRPC and not a request
+field because banking builds these request messages with struct literals (§1).
+
+**How a direction reaches its own inbox (decided 2026-10-14).** Its frontend talks to its
+own backend, and the backend calls `ScopeInboxService` with the client credential. A READ
+names the user by the concierge id it knows from its own session (its access token's
+`sub`, `ScopeEvent.user_id`): the inbox holds only what the scope's own services emitted.
+A WRITE — mark-read, following a topic — also carries the user's access token issued to
+THIS client (metadata `x-ev-user-token`), checked as `GetMe` checks it plus `aud` = the
+calling client's audience, and the user is taken from its `sub`: following a topic turns
+on mail to the user's address, and a client secret alone (or a leaked one) must not be
+able to do that to anyone. No or a bad token is `UNAUTHENTICATED`; another client's token,
+or a `user_id` that is not the token's user, `PERMISSION_DENIED`. Neither credentialed
+CORS on the account routes nor the client's user token on `NotificationService`: the
+account routes stay off the scope hosts' CORS list (§3.1), and a client's user token is
+admitted by the auth layer on `GetMe` alone — here it is a second proof beside the
+client's secret, never a credential on its own.
+
+- The namespace is the calling client's scope's, never a request field. An observer of a
+  scope (§3) gets its stream, never its inbox.
+- The user must be an ACTIVE member (`scope_members`, §4.1). An unknown id, a non-member
+  and a disabled account are one case: the list, the count and the settings answer empty
+  (the settings carry no address either), mark-read and following a topic answer
+  `FAILED_PRECONDITION`. The client learns nothing its stream did not tell it.
+- A topic outside the namespace's catalog in force is `INVALID_ARGUMENT`, as an unknown one;
+  mark-read of another inbox's id marks nothing (`marked` counts what flipped).
+- A disabled or unknown client and a wrong secret are `UNAUTHENTICATED`, a closed scope
+  `FAILED_PRECONDITION`, the bridge token `PERMISSION_DENIED` (`bank:` topics are the
+  platform inbox's).
+- The master channel switches are not offered: they act on every inbox, so they stay on
+  `PUBLIC_ORIGIN` (`NotificationService.SetChannelEnabled`, the account MFE).
+- Pages are explicit: `limit` 0 means 20, at most 100, `next_cursor` empty on the last. A
+  mark-read names at most 500 ids, here and on `NotificationService.MarkRead`.
+- The gRPC summary (`x-ev-inbox-view: all`) reads the PERSISTED seat, as the web does:
+  break-glass elevation (`OWNER_SUBJECTS`) does not open it.
+
+As implemented: a scope catalog's topics are offered in the inbox of their scope (gRPC and
+`/auth/notifications/settings`), may be followed and filtered on there, and disappear from
+the offer when a later catalog withdraws them. Not yet: `Emit` refuses a scope topic, because a
+`typ=service` token names no namespace to hold "only its own topics" against;
+`default_subscribed` is stored but not applied (an unsubscribe deletes the subscription
+row, so "never touched" cannot be told from "switched off"); `SubscribeAnonymous` takes
+built-in topics only; and the move of `fund:quy-nhon` / `account:money-movement` to
+`invest:` / `bank:` has not happened.
+
 ---
 
 ## 7. Decisions and open questions
@@ -406,6 +540,8 @@ position scanned (§4.2); `Scope.state` (§3).
 2. A direction receives `kyc_level` on the lifecycle stream and in `ScopeMember` (D5),
    although `GetMe` withholds it from relying parties today.
 3. Topic labels are one language; the frontends carry five locales.
+4. ~~How a scope's host reaches its own inbox~~ — decided 2026-10-14: through its own
+   backend and `ScopeInboxService` with the client credential (§6).
 
 **Known limitation until `typ=service` tokens:** a namespace is the unit of
 `ApprovalExecutionService`, so several clients of one namespace are indistinguishable

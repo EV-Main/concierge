@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use concierge::{
 	infrastructure::{db, notifications::PgNotifications},
-	ports::{NotificationDispatchRepository, NotificationRepository},
+	ports::{InboxTopics, NotificationDispatchRepository, NotificationRepository},
 };
 use uuid::Uuid;
 
@@ -75,7 +75,7 @@ async fn emit_requires_a_subscription_and_dedupes() {
 	assert!(retry.deduped, "the same dedupe key must not produce a second notification or a second email");
 	assert!(retry.notification_id.is_none());
 
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 1, "the retry did not inflate the inbox");
+	assert_eq!(repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"), 1, "the retry did not inflate the inbox");
 }
 
 #[tokio::test]
@@ -102,7 +102,11 @@ async fn channels_gate_delivery_independently_and_may_both_be_off() {
 	// Suppression is a read-path concern, so the inbox reads empty while in-app is off,
 	// and the history comes back when it is switched on again.
 	repo.set_channel_enabled(sub.id, Some(true), None).await.expect("in-app back on");
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 2, "re-enabling restores history rather than showing a gap");
+	assert_eq!(
+		repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"),
+		2,
+		"re-enabling restores history rather than showing a gap"
+	);
 }
 
 #[tokio::test]
@@ -121,34 +125,38 @@ async fn inbox_paginates_by_keyset_and_marks_read() {
 		repo.emit(user, TOPIC, "k", &format!("n{i}"), "", "", &format!("p{i}"), 100 + i).await.expect("emit");
 	}
 
-	let page1 = repo.list(sub.id, None, 2, false, None).await.expect("page 1");
+	let page1 = repo.list(sub.id, None, 2, false, None, &InboxTopics::Every).await.expect("page 1");
 	assert_eq!(page1.len(), 2, "the limit is honoured");
 
 	// The cursor is the previous page's last id, resolved server-side into its
 	// (created_at, id) key — the construct being proven here.
-	let page2 = repo.list(sub.id, Some(page1[1].id), 2, false, None).await.expect("page 2");
+	let page2 = repo.list(sub.id, Some(page1[1].id), 2, false, None, &InboxTopics::Every).await.expect("page 2");
 	assert_eq!(page2.len(), 2);
 	assert!(
 		page1.iter().all(|a| page2.iter().all(|b| a.id != b.id)),
 		"pages must not overlap, or the reader sees duplicates while scrolling"
 	);
 
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 5);
-	let marked = repo.mark_read(sub.id, &[page1[0].id], false).await.expect("mark one");
+	assert_eq!(repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"), 5);
+	let marked = repo.mark_read(sub.id, &[page1[0].id], false, &InboxTopics::Every).await.expect("mark one");
 	assert_eq!(marked, 1);
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 4);
+	assert_eq!(repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"), 4);
 
-	let unread_only = repo.list(sub.id, None, 10, true, None).await.expect("unread page");
+	let unread_only = repo.list(sub.id, None, 10, true, None, &InboxTopics::Every).await.expect("unread page");
 	assert_eq!(unread_only.len(), 4, "the read one drops out of the unread filter");
 
-	assert_eq!(repo.mark_read(sub.id, &[], true).await.expect("mark all"), 4, "mark-all only touches what is still unread");
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 0);
+	assert_eq!(
+		repo.mark_read(sub.id, &[], true, &InboxTopics::Every).await.expect("mark all"),
+		4,
+		"mark-all only touches what is still unread"
+	);
+	assert_eq!(repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"), 0);
 
 	// A foreign id must not be markable even though ids are unguessable.
 	let other = Uuid::new_v4();
 	let other_sub = repo.subscriber_for_user(other, "other@example.com", true).await.expect("other subscriber");
 	assert_eq!(
-		repo.mark_read(other_sub.id, &[page1[0].id], false).await.expect("cross-subscriber mark"),
+		repo.mark_read(other_sub.id, &[page1[0].id], false, &InboxTopics::Every).await.expect("cross-subscriber mark"),
 		0,
 		"mark_read is scoped by subscriber, so one user cannot touch another's inbox"
 	);
@@ -199,7 +207,11 @@ async fn unsubscribe_stops_email_without_touching_the_inbox() {
 	let after = repo.subscriber_for_user(user, "unsub@example.com", true).await.expect("reload");
 	assert!(!after.email_enabled, "List-Unsubscribe switches the email channel off");
 	assert!(after.in_app_enabled, "…and deliberately leaves the in-app channel alone");
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 1, "unsubscribing is not account deletion — the inbox survives");
+	assert_eq!(
+		repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"),
+		1,
+		"unsubscribing is not account deletion — the inbox survives"
+	);
 }
 
 #[tokio::test]

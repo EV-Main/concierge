@@ -29,7 +29,10 @@ use domain::{
 use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::users::{AdminAction, Named, account_named, record_action};
+use super::{
+	scope_events,
+	users::{AdminAction, Named, account_named, record_action},
+};
 use crate::ports::{
 	GrantActor, GrantAuthority, GrantHolderRecord, GrantOutcome, GrantRecord, GrantRepository, GrantSubject, PublishOutcome, RevokeOutcome, TenantCatalog, UngrantableAddress,
 };
@@ -168,7 +171,7 @@ async fn resolve_subject(conn: &mut PgConnection, subject: &GrantSubject) -> Res
 	}
 }
 
-async fn current_catalog(conn: &mut PgConnection, namespace: &str) -> Result<Option<TenantCatalog>, DomainError> {
+pub(crate) async fn current_catalog(conn: &mut PgConnection, namespace: &str) -> Result<Option<TenantCatalog>, DomainError> {
 	sqlx::query_as::<_, CatalogRow>(AssertSqlSafe(format!("{CURRENT_CATALOGS} WHERE t.namespace = $1 ORDER BY c.tenant_id, c.version DESC")))
 		.bind(namespace)
 		.fetch_optional(&mut *conn)
@@ -320,6 +323,7 @@ impl GrantRepository for PgGrants {
 		let mut action = action.clone();
 		action.detail = Some(serde_json::json!({ "target": target.as_str(), "grant_id": row.id }));
 		record_action(&mut tx, user_id, &action, now).await?;
+		scope_events::grants_moved(&mut tx, target.namespace(), user_id).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(GrantOutcome::Granted(row.into()))
 	}
@@ -355,6 +359,7 @@ impl GrantRepository for PgGrants {
 		let mut action = action.clone();
 		action.detail = Some(serde_json::json!({ "target": target.as_str(), "grant_id": grant_id }));
 		record_action(&mut tx, user_id, &action, now).await?;
+		scope_events::grants_moved(&mut tx, target.namespace(), user_id).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(RevokeOutcome::Revoked)
 	}
@@ -456,6 +461,7 @@ impl GrantRepository for PgGrants {
 			.execute(&mut *tx)
 			.await
 			.map_err(repo_err)?;
+		scope_events::catalog_moved(&mut tx, &tenant).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(PublishOutcome::Published)
 	}

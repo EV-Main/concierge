@@ -34,6 +34,7 @@ package concierge.v1;
 //   ApprovalExecutionService — the executing services, by service credential (outside
 //                              the user auth layer, like UserEvents). See the doc's
 //                              "Service callers".
+// Neither is served yet: both are contract and answer UNIMPLEMENTED.
 
 // ApprovalService — the human side: read, vote, veto, cancel, and open the kinds this
 // plane executes itself.
@@ -94,7 +95,9 @@ service ApprovalExecutionService {
   //
   // INVALID_ARGUMENT: unknown kind, unknown scope, a field the kind does not declare or
   // of the wrong type, a required field missing, a text field over its bound or carrying
-  // a control character or a link, a `subject_ref` not of the form `<type>:<uuid>`, a
+  // a control character or a link, a `subject_ref` not matching
+  // `^[a-z][a-z0-9_]*:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` or
+  // longer than 128 bytes (the same pattern banking scope/v1 enforces), a
   // USER field or `requested_by` naming no account. FAILED_PRECONDITION: the scope is
   // not ACTIVE, or the resolved roster is too small to decide (fewer than two platform
   // owners). ALREADY_EXISTS: a live

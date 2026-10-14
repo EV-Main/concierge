@@ -77,6 +77,15 @@ pub enum Own {
 	Sessions,
 }
 
+/// `concierge:notifications:read_all` — the summary inbox: every namespace's topics in one
+/// view, on `PUBLIC_ORIGIN` only. Each direction otherwise has its own inbox (D21), and
+/// an account's own inbox needs no permission beyond [`Own::Notifications`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+#[permission("concierge:notifications")]
+pub enum Notifications {
+	ReadAll,
+}
+
 /// Feature flags, maintenance, announcements, the client registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
 #[permission("concierge:platform")]
@@ -241,6 +250,7 @@ alias!(
 		Users::Suspend,
 		Users::Revoke,
 		Kyc::Manage,
+		Notifications::ReadAll,
 		Platform::Read,
 		Platform::Manage,
 		Iam::Grant,
@@ -277,6 +287,7 @@ alias!(
 		Users::Suspend,
 		Users::Revoke,
 		Kyc::Manage,
+		Notifications::ReadAll,
 		Roles::Grant,
 		Platform::Read,
 		Platform::Manage,
@@ -399,6 +410,13 @@ mod tests {
 			(2, pinned),
 			"a seat's bank:* set changed: bump SEAT_GENERATION, then pin the new sets and generation here"
 		);
+	}
+
+	#[test]
+	fn only_staff_read_every_namespace_s_notifications() {
+		assert_eq!(Notifications::ReadAll.as_str(), "concierge:notifications:read_all");
+		assert!(Role::Owner.may(Notifications::ReadAll) && Role::Admin.may(Notifications::ReadAll));
+		assert!(!Role::Operator.may(Notifications::ReadAll) && !Role::Investor.may(Notifications::ReadAll));
 	}
 
 	#[test]

@@ -43,7 +43,47 @@ pub fn authenticate_service<T>(expected: Option<&Arc<str>>, request: &Request<T>
 	}
 }
 
-fn bearer_token<T>(request: &Request<T>) -> Option<String> {
+pub(crate) fn bearer_token<T>(request: &Request<T>) -> Option<String> {
 	let value = request.metadata().get("authorization")?.to_str().ok()?;
 	value.strip_prefix("Bearer ").map(str::to_owned)
+}
+
+/// One page of a pull stream a caller reads through a filter
+/// (`docs/SCOPES-AND-APPROVALS.md` §4.2). `scanned` is `(position, visible, row)`, oldest
+/// first. The cursor is the MAXIMUM POSITION SCANNED: past rows the caller may not see, so
+/// a filtered reader never re-scans them, and `after` when nothing was scanned. A page that
+/// fills `limit` stops at its last row, so its cursor is exactly that row's position —
+/// what lets a consumer re-pull one parked event with `after = position - 1, limit = 1`.
+pub fn filtered_page<T>(scanned: impl IntoIterator<Item = (i64, bool, T)>, after: i64, limit: usize) -> (Vec<T>, i64) {
+	let mut next = after;
+	let mut page = Vec::new();
+	for (position, visible, row) in scanned {
+		if page.len() == limit {
+			break;
+		}
+		next = position;
+		if visible {
+			page.push(row);
+		}
+	}
+	(page, next)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::filtered_page;
+
+	#[test]
+	fn the_cursor_is_the_maximum_position_scanned() {
+		let scanned = || vec![(11, false, 'a'), (12, true, 'b'), (13, false, 'c'), (14, true, 'd'), (15, false, 'e')];
+		assert_eq!(filtered_page(scanned(), 10, 10), (vec!['b', 'd'], 15), "an unfilled page reports the last row it scanned");
+		assert_eq!(filtered_page(scanned(), 10, 2), (vec!['b', 'd'], 14), "a full page stops at its last event");
+		assert_eq!(filtered_page(scanned(), 10, 1), (vec!['b'], 12), "limit 1 answers exactly that event's position");
+		assert_eq!(
+			filtered_page(Vec::<(i64, bool, char)>::new(), 10, 5),
+			(vec![], 10),
+			"nothing scanned leaves the cursor where it was"
+		);
+		assert_eq!(filtered_page(vec![(11, false, 'a')], 10, 5), (vec![], 11), "a page of invisible rows still moves the cursor");
+	}
 }

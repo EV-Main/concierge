@@ -12,17 +12,23 @@
 //!     no zone-side OAuth. A zone signs a user in by linking to
 //!     `/api/auth/login?returnTo=<path>`; that is the entire zone-side contract.
 //!
-//! Ported from the cabinet BFF's token-handler (its `oauth`/`cookies`/`session`
-//! modules) minus everything banking: the money-plane pair is the cabinet's own
-//! concern, minted zone-side from the verified access token.
+//! Nothing banking lives here: the money-plane token pair is the cabinet's own concern,
+//! minted zone-side from the verified access token.
 
+mod account;
+pub mod allowlist;
 mod authorize;
+mod cors;
 mod kyc;
+mod logout;
+pub mod mfe;
 mod oauth;
+pub mod origins;
 mod passkey;
 mod routes;
 mod session;
 mod sign_in;
+mod signup;
 mod single_flight;
 mod turnstile;
 
@@ -31,6 +37,7 @@ use std::sync::Arc;
 
 use axum::{
 	Router,
+	http::Method,
 	routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
@@ -40,19 +47,22 @@ use evconcierge_auth::{AuthService, oauth::OAuthProvider};
 /// enforces. A test that hard-coded the number would keep passing after someone raised
 /// it, and the number is what stands between one account and the vendor balance.
 pub use kyc::START_MAX_PER_WINDOW;
+/// Re-exported for the same reason: the suite drives the passkey sign-in up to this budget.
+pub use passkey::SIGN_IN_STARTS_PER_MINUTE;
 pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
 use tokio::sync::Notify;
-pub use turnstile::{SITEVERIFY, Turnstile};
+pub use turnstile::{SITEVERIFY, Turnstile, is_test_secret};
 use webauthn_rs::{
 	Webauthn,
 	prelude::{DiscoverableAuthentication, PasskeyRegistration},
 };
 
 use crate::{
+	notification::RateLimiter,
 	ports::{CredentialRepository, GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
 	relying_party::RelyingParties,
-	web::{oauth::OAuthTxStore, passkey::Ceremonies, single_flight::KeyedLocks},
+	web::{allowlist::SignInAllowlist, oauth::OAuthTxStore, passkey::Ceremonies, single_flight::KeyedLocks},
 };
 
 /// Cookie names + shared attributes. `__Host-` prefixed when secure (production);
@@ -128,9 +138,10 @@ impl WebState {
 				turnstile: sign_in.turnstile,
 				credentials: sign_in.credentials,
 				mail_wake: sign_in.mail_wake,
-				webauthn: sign_in.webauthn,
+				allowlist: sign_in.allowlist,
 				passkey_registrations: Ceremonies::default(),
 				passkey_sign_ins: Ceremonies::default(),
+				passkey_sign_in_starts: RateLimiter::new(std::time::Duration::from_secs(60), passkey::SIGN_IN_STARTS_PER_MINUTE),
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
@@ -154,8 +165,9 @@ pub struct SignInDeps {
 	pub credentials: Arc<dyn CredentialRepository>,
 	/// The mail dispatcher's wake-up: a queued code leaves now rather than on the next tick.
 	pub mail_wake: Arc<Notify>,
-	/// The WebAuthn verifier, pinned to `PUBLIC_ORIGIN` and its host as the relying party.
-	pub webauthn: Arc<Webauthn>,
+	/// The scope hosts the sign-in routes answer besides `PUBLIC_ORIGIN`, and the passkey
+	/// verifier built over them — both following the registry.
+	pub allowlist: Arc<SignInAllowlist>,
 }
 
 /// What the identity-verification routes need, gathered so the composition root hands
@@ -182,27 +194,54 @@ pub struct KycDeps {
 /// The auth surface, mounted behind the conductor's `/api` prefix rewrites:
 /// `/api/auth/:rest*` → `/auth/:rest*`, `/api/callback/auth/*` → `/callback/auth/*`.
 pub fn router(state: WebState) -> Router {
+	// The routes a scope's host may call — closed on purpose (`docs/SCOPES-AND-APPROVALS.md`
+	// §3.1). Everything acting on an open session (email verification, password set,
+	// passkey register/remove, sessions, username, methods, `/auth/me`, notification
+	// settings, logout, `/kyc/*`) stays off this list: those carry the CSRF double-submit,
+	// or read the account, and a script on a scope host must be able to start a sign-in but
+	// never act for the account. A scope host proves a mailbox by signing in with a code,
+	// or confirms a password sign-up with its ticket (`signup`).
+	//
+	// `.layer` on these sub-routers and not `route_layer`: a route layer runs only for a
+	// method the route has, so the OPTIONS preflight of a POST route would never reach
+	// the CORS layer.
+	let allowlist = state.inner.allowlist.clone();
+	let scope_posts = Router::new()
+		.route("/auth/code/request", post(sign_in::request_code))
+		.route("/auth/code/verify", post(sign_in::verify_code))
+		.route("/auth/password/signup", post(sign_in::sign_up))
+		.route("/auth/password/signin", post(sign_in::sign_in))
+		.route("/auth/password/signup/confirm", post(signup::confirm))
+		.route("/auth/password/signup/resend", post(signup::resend))
+		.route("/auth/passkey/signin/options", post(passkey::signin_options))
+		.route("/auth/passkey/signin/verify", post(passkey::signin_verify))
+		.layer(cors::layer(allowlist.clone(), Method::POST));
+	let scope_reads = Router::new().route("/auth/session", get(routes::session)).layer(cors::layer(allowlist, Method::GET));
 	Router::new()
-		// k8s liveness/readiness probe target — the only unauthenticated route.
+		.merge(scope_posts)
+		.merge(scope_reads)
+		// k8s liveness/readiness probe target.
 		.route("/health", get(|| async { "ok" }))
 		.route("/auth/login", get(routes::login))
 		.route("/callback/auth/{provider}", get(routes::callback))
-		.route("/auth/session", get(routes::session))
 		.route("/auth/logout", post(routes::logout))
+		// The sign-out a scope's host sends the browser to, so that leaving the scope
+		// leaves this origin's session too. A page, not a call: a script on a scope host
+		// must never be able to end the session by itself, so a person presses the button.
+		.route("/auth/logout/confirm", get(logout::page).post(logout::confirm))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
-		.route("/auth/code/request", post(sign_in::request_code))
-		.route("/auth/code/verify", post(sign_in::verify_code))
 		.route("/auth/email/verify/request", post(sign_in::request_verification))
 		.route("/auth/email/verify/confirm", post(sign_in::confirm_verification))
-		.route("/auth/password/signup", post(sign_in::sign_up))
-		.route("/auth/password/signin", post(sign_in::sign_in))
 		.route("/auth/password/set", post(sign_in::set_password))
 		.route("/auth/username", post(sign_in::set_username))
 		.route("/auth/methods", get(sign_in::methods))
+		// The account MFE: `PUBLIC_ORIGIN` only, CSRF on every mutation (`web::account`).
+		.route("/auth/me", get(account::me))
+		.route("/auth/notifications/settings", get(account::notification_settings))
+		.route("/auth/notifications/settings/channel", post(account::set_channel))
+		.route("/auth/notifications/settings/topic", post(account::set_topic))
 		.route("/auth/passkey/register/options", post(passkey::register_options))
 		.route("/auth/passkey/register/verify", post(passkey::register_verify))
-		.route("/auth/passkey/signin/options", post(passkey::signin_options))
-		.route("/auth/passkey/signin/verify", post(passkey::signin_verify))
 		.route("/auth/passkey/remove", post(passkey::remove))
 		// The relying-party code flow's front door. It needs no CSRF token: it changes
 		// nothing a cross-site request could exploit — it only ever redirects to an
@@ -219,6 +258,7 @@ pub fn router(state: WebState) -> Router {
 		.route("/kyc/callback/didit", post(kyc::callback))
 		.with_state(state)
 }
+
 /// An opaque identifier: `n` bytes of CSPRNG entropy, base64url-encoded (no padding).
 fn random_token(n: usize) -> String {
 	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -245,9 +285,13 @@ struct Inner {
 	turnstile: Turnstile,
 	credentials: Arc<dyn CredentialRepository>,
 	mail_wake: Arc<Notify>,
-	webauthn: Arc<Webauthn>,
-	passkey_registrations: Ceremonies<(UserId, PasskeyRegistration)>,
-	passkey_sign_ins: Ceremonies<DiscoverableAuthentication>,
+	allowlist: Arc<SignInAllowlist>,
+	/// Each ceremony keeps the verifier that began it, so both halves check against one
+	/// reading of the allowlist even if it is rebuilt in between.
+	passkey_registrations: Ceremonies<(UserId, PasskeyRegistration, Arc<Webauthn>)>,
+	passkey_sign_ins: Ceremonies<(DiscoverableAuthentication, Arc<Webauthn>)>,
+	/// Per client address, in process: a replica's own ceremony store is what it protects.
+	passkey_sign_in_starts: RateLimiter,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
 	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/<provider>`.
 	public_origin: String,

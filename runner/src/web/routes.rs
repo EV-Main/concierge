@@ -1,11 +1,13 @@
-//! The auth route handlers. Shapes mirror the cabinet BFF's former
-//! `/api/auth/*` surface byte-for-byte (`SessionInfo` with a camelCase user,
-//! `SessionList` snake_case), so the zone frontends only changed the URL.
+//! The session and OAuth route handlers. `/auth/session` (`SessionInfo`, camelCase user)
+//! and `/auth/sessions` (snake_case entries) follow the cabinet BFF's former
+//! `/api/auth/*` shapes, which the zone frontends still read.
+
+use std::net::{IpAddr, SocketAddr};
 
 use axum::{
 	Json,
-	extract::{Path, Query, State},
-	http::{HeaderMap, StatusCode},
+	extract::{ConnectInfo, FromRequestParts, Path, Query, State},
+	http::{HeaderMap, StatusCode, request::Parts},
 	response::Redirect,
 };
 use axum_extra::extract::cookie::CookieJar;
@@ -80,13 +82,28 @@ impl SessionInfo {
 
 /// `GET /auth/login?provider=&returnTo=` — mint PKCE/state/nonce, stash the
 /// transaction server-side, and redirect the browser to the provider's consent screen.
+///
+/// `returnTo` is a path on this origin; an absolute `http(s)` URL on this origin, which
+/// counts as its path; or — for a sign-in started on a scope's host — that host's origin
+/// plus one of its scope's `return_paths`, byte for byte. Any other absolute `http(s)`
+/// target is refused first, before even the provider is looked up, rather than quietly
+/// rewritten: a host that sent it has a registry entry to fix. Everything else — empty,
+/// relative, or with some other scheme (`javascript:`, an app's `section:wallet`) — keeps
+/// its old answer and lands on `/`, so no link that worked before starts failing.
 pub async fn login(State(st): State<WebState>, jar: CookieJar, Query(q): Query<LoginQuery>) -> Result<(CookieJar, Redirect), (StatusCode, &'static str)> {
 	let st = &st.inner;
+	let return_to = match q.return_to.as_deref() {
+		Some(raw) if is_web_url(raw) => match same_origin_path(raw, &st.public_origin) {
+			Some(path) => safe_return_to(Some(path)),
+			None if st.allowlist.current().origins.is_return_target(raw) => raw.to_owned(),
+			None => return Err((StatusCode::BAD_REQUEST, "returnTo is not a registered landing")),
+		},
+		other => safe_return_to(other),
+	};
 	// A link that names no provider predates the choice, and meant Google.
 	let provider = st
 		.provider(q.provider.as_deref().unwrap_or("google"))
 		.ok_or((StatusCode::SERVICE_UNAVAILABLE, "sign-in method not configured"))?;
-	let return_to = safe_return_to(q.return_to.as_deref());
 	let ch = Challenge::new();
 	let tx_id = st.oauth.put(provider.name(), ch.state.clone(), ch.nonce.clone(), ch.code_verifier.clone(), return_to).await;
 	let url = provider.authorize_url(&st.redirect_uri(provider.name()), &ch.state, &ch.nonce, &ch.code_challenge);
@@ -96,7 +113,7 @@ pub async fn login(State(st): State<WebState>, jar: CookieJar, Query(q): Query<L
 /// `GET /callback/auth/{provider}` — validate the state against the stored transaction,
 /// redeem the code with the provider, resolve the account it opens, open a session, and
 /// redirect back to where the user came from.
-pub async fn callback(State(st): State<WebState>, Path(name): Path<String>, jar: CookieJar, headers: HeaderMap, Query(q): Query<CallbackQuery>) -> (CookieJar, Redirect) {
+pub async fn callback(State(st): State<WebState>, Path(name): Path<String>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Query(q): Query<CallbackQuery>) -> (CookieJar, Redirect) {
 	let st = &st.inner;
 	// The transaction is keyed by the HttpOnly tx cookie, so only the browser that
 	// started the flow holds it; `state` must then match the stored tx.
@@ -144,8 +161,11 @@ pub async fn callback(State(st): State<WebState>, Path(name): Path<String>, jar:
 			return fail(st, jar, &return_to, "session");
 		}
 	};
-	match open_session(st, jar, &headers, user.id()).await {
-		Ok(jar) => (clear_tx(st, jar), Redirect::to(&safe_return_to(Some(&tx.return_to)))),
+	match open_session(st, jar, &headers, &ip, user.id()).await {
+		Ok(jar) => {
+			let landing = st.landing(&tx.return_to);
+			(clear_tx(st, jar), Redirect::to(&landing))
+		}
 		Err((jar, reason)) => fail(st, jar, &return_to, reason),
 	}
 }
@@ -153,9 +173,9 @@ pub async fn callback(State(st): State<WebState>, Path(name): Path<String>, jar:
 /// Sign the browser in as `user`: close whatever session it held, open a new one, and
 /// set the session, CSRF and zone-shared access cookies. The one place every sign-in
 /// method ends. Errs with the jar untouched and a machine-readable reason.
-pub(super) async fn open_session(st: &super::Inner, jar: CookieJar, headers: &HeaderMap, user: UserId) -> Result<CookieJar, (CookieJar, &'static str)> {
+pub(super) async fn open_session(st: &super::Inner, jar: CookieJar, headers: &HeaderMap, ip: &ClientIp, user: UserId) -> Result<CookieJar, (CookieJar, &'static str)> {
 	let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-	let tokens = match st.auth.open_session(&user.to_string(), user_agent, client_ip(headers)).await {
+	let tokens = match st.auth.open_session(&user.to_string(), user_agent, ip.0.clone()).await {
 		Ok(tokens) => tokens,
 		Err(e) if e.code() == tonic::Code::PermissionDenied => return Err((jar, "disabled")),
 		Err(e) => {
@@ -225,8 +245,34 @@ pub async fn logout(State(st): State<WebState>, jar: CookieJar, headers: HeaderM
 	Ok((clear_session(st, jar), Json(json!({ "ok": true }))))
 }
 
+/// The refresh family behind the session, checked first-hand, or `None` — the locker
+/// entry dropped with it — when the family is dead.
+///
+/// `WebSessions::fresh` alone is not enough: it asks upstream only when the stored access
+/// token is about to lapse, so a session signed out from another device or revoked from
+/// the console still reads as live for up to the access TTL. A route that hands out or
+/// plants a credential on the session's strength asks this AFTER `fresh`, which may have
+/// rotated the refresh token.
+pub(super) async fn live_family_of(st: &super::Inner, session_id: &str) -> color_eyre::Result<Option<String>> {
+	let Some(refresh_token) = st.sessions.refresh_token(session_id).await? else {
+		return Ok(None);
+	};
+	match st
+		.auth
+		.live_family(&refresh_token)
+		.await
+		.map_err(|err| color_eyre::eyre::eyre!("refresh family unreadable: {err}"))?
+	{
+		Some(family) => Ok(Some(family)),
+		None => {
+			st.sessions.forget(session_id).await?;
+			Ok(None)
+		}
+	}
+}
+
 /// Drop a session and revoke its refresh family upstream.
-async fn close(st: &super::Inner, id: &str) -> color_eyre::Result<()> {
+pub(super) async fn close(st: &super::Inner, id: &str) -> color_eyre::Result<()> {
 	if let Some(refresh) = st.sessions.forget(id).await? {
 		// The session is already gone locally; an upstream blip must not keep it signed in here.
 		let _ = AuthRpc::logout(
@@ -315,6 +361,16 @@ impl super::Inner {
 	fn provider(&self, name: &str) -> Option<&OAuthProvider> {
 		self.providers.iter().find(|p| p.name() == name)
 	}
+
+	/// Where a finished (or failed) OAuth trip sends the browser. Re-checked although
+	/// `login` admitted it: the transaction is in-process state, and the redirect is the
+	/// one place an unchecked value would become an open redirect.
+	fn landing(&self, return_to: &str) -> String {
+		match self.allowlist.current().origins.is_return_target(return_to) {
+			true => return_to.to_owned(),
+			false => safe_return_to(Some(return_to)),
+		}
+	}
 }
 
 /// A session-store failure is a 500, never an auth verdict: the session may well
@@ -373,13 +429,19 @@ pub(super) enum CsrfOutcome {
 /// its presence is not session state, and it is what separates "not signed in" from
 /// "signed in with the wrong token" without looking anything up.
 pub(super) async fn csrf_outcome(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<CsrfOutcome, (StatusCode, &'static str)> {
+	csrf_outcome_of(st, jar, headers.get("x-ev-csrf").and_then(|v| v.to_str().ok())).await
+}
+
+/// [`csrf_outcome`] for a token presented some other way than the header — a form field,
+/// where the request is a plain HTML form and cannot set one.
+pub(super) async fn csrf_outcome_of(st: &super::Inner, jar: &CookieJar, presented: Option<&str>) -> Result<CsrfOutcome, (StatusCode, &'static str)> {
 	let Some(session_id) = jar.get(&st.cookies.session).map(|c| c.value().to_string()) else {
 		return Ok(CsrfOutcome::NoSession);
 	};
 	let Some(cookie) = jar.get(&st.cookies.csrf).map(|c| c.value().to_string()) else {
 		return Ok(CsrfOutcome::Mismatch);
 	};
-	let Some(header) = headers.get("x-ev-csrf").and_then(|v| v.to_str().ok()) else {
+	let Some(header) = presented else {
 		return Ok(CsrfOutcome::Mismatch);
 	};
 	if !ct_str_eq(&cookie, header) {
@@ -407,6 +469,13 @@ pub(super) struct SessionStoreDown;
 /// browser out from under itself.
 pub(super) struct Caller {
 	pub(super) id: UserId,
+	/// The seat as the directory resolves it NOW, break-glass included — the same
+	/// reading `/auth/session` reports.
+	pub(super) role: String,
+	pub(super) role_is_break_glass: bool,
+	/// The `token_version` the session's access token was minted under — the half of
+	/// `authz::caller_gate`'s check the live summary cannot supply.
+	pub(super) minted_token_version: Option<u64>,
 	access_token: String,
 	remaining_secs: i64,
 }
@@ -445,10 +514,23 @@ pub(super) async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<O
 	Ok(fresh.and_then(|f| {
 		Uuid::parse_str(&f.user.user_id).map(UserId::from_raw).ok().map(|id| Caller {
 			id,
+			role: f.user.role,
+			role_is_break_glass: f.user.role_is_break_glass,
+			minted_token_version: minted_token_version(&f.access_token),
 			access_token: f.access_token,
 			remaining_secs: f.remaining_secs,
 		})
 	}))
+}
+
+/// Read as the gRPC verifier reads it — into [`evconcierge_auth::Claims`], an absent claim
+/// being 0 — but without a signature check, which is sound only because of where the
+/// token comes from: the server-side session store, never the browser. `None` for a
+/// token that does not parse, which the caller refuses.
+fn minted_token_version(token: &str) -> Option<u64> {
+	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+	let payload = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
+	serde_json::from_slice::<evconcierge_auth::Claims>(&payload).ok().map(|claims| claims.token_version)
 }
 
 /// Constant-time string equality.
@@ -465,13 +547,30 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
 	a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
+/// An absolute `http:`/`https:` URL. Only these name a page a browser would be sent to;
+/// any other scheme was never honoured and is not refused now either.
+pub(super) fn is_web_url(raw: &str) -> bool {
+	raw.split_once("://")
+		.is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+}
+
+/// The path of `raw` when it is exactly this plane's origin followed by nothing or a path:
+/// `https://evinvest.ltd.evil.example` and `https://evinvest.ltd@evil.example` are not.
+pub(super) fn same_origin_path<'a>(raw: &'a str, public_origin: &str) -> Option<&'a str> {
+	match raw.strip_prefix(public_origin)? {
+		"" => Some("/"),
+		path if path.starts_with('/') => Some(path),
+		_ => None,
+	}
+}
+
 /// Clear the OAuth transaction cookie.
 fn clear_tx(st: &super::Inner, jar: CookieJar) -> CookieJar {
 	jar.add(st.cookies.removal(st.cookies.oauth_tx.clone(), true))
 }
 
 /// Clear the session + csrf + access cookies (sign-out / dead session).
-fn clear_session(st: &super::Inner, jar: CookieJar) -> CookieJar {
+pub(super) fn clear_session(st: &super::Inner, jar: CookieJar) -> CookieJar {
 	jar.add(st.cookies.removal(st.cookies.session.clone(), true))
 		.add(st.cookies.removal(st.cookies.csrf.clone(), false))
 		.add(st.cookies.removal(st.cookies.access.clone(), true))
@@ -480,18 +579,53 @@ fn clear_session(st: &super::Inner, jar: CookieJar) -> CookieJar {
 /// Abort the callback: clear the tx cookie and land the user back where they came
 /// from, signed out, with a machine-readable reason.
 fn fail(st: &super::Inner, jar: CookieJar, return_to: &str, reason: &str) -> (CookieJar, Redirect) {
-	let base = safe_return_to(Some(return_to));
+	let base = st.landing(return_to);
 	let sep = if base.contains('?') { '&' } else { '?' };
 	(clear_tx(st, jar), Redirect::to(&format!("{base}{sep}auth_error={reason}")))
 }
 
-/// Best-effort client IP for the device metadata stored on the refresh-token family.
-pub(super) fn client_ip(headers: &HeaderMap) -> String {
-	if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-		let first = xff.split(',').next().unwrap_or("").trim();
-		if !first.is_empty() {
-			return first.to_string();
-		}
+/// The address a request came from — one reading for Turnstile's `remoteip`, the device
+/// record on the refresh family and the per-address limits, so the three never disagree
+/// about who asked.
+///
+/// Cloudflare's `Cf-Connecting-IP` when present, else the TCP peer. Never the first hop of
+/// `X-Forwarded-For` nor `X-Real-IP`: the client writes those itself, and a limit keyed on
+/// them is a limit the caller picks a fresh key for on every request. Cloudflare sets
+/// `Cf-Connecting-IP` at its edge, overwriting whatever the client sent. Empty when neither
+/// is known (a test driving the router without a socket).
+pub struct ClientIp(pub String);
+
+impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
+	type Rejection = std::convert::Infallible;
+
+	async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+		let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|ConnectInfo(addr)| addr.ip());
+		Ok(Self(client_ip(&parts.headers, peer)))
 	}
-	headers.get("x-real-ip").and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+}
+
+fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>) -> String {
+	headers
+		.get("cf-connecting-ip")
+		.and_then(|v| v.to_str().ok())
+		.and_then(|v| v.trim().parse::<IpAddr>().ok())
+		.or(peer)
+		.map(|ip| ip.to_string())
+		.unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn an_absolute_return_to_on_this_origin_is_held_to_the_path_rules() {
+		let origin = "https://evinvest.ltd";
+		for raw in ["https://evinvest.ltd/\t/evil", "https://evinvest.ltd/\n/evil", "https://evinvest.ltd//evil"] {
+			let path = same_origin_path(raw, origin).expect("this origin followed by a path");
+			assert_eq!(safe_return_to(Some(path)), "/", "{raw:?}");
+		}
+		assert_eq!(safe_return_to(same_origin_path("https://evinvest.ltd/cabinet", origin)), "/cabinet");
+		assert_eq!(same_origin_path("https://evinvest.ltd\t/evil", origin), None);
+	}
 }

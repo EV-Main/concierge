@@ -396,10 +396,15 @@ impl User {
 	}
 
 	/// The mailbox was proven by somebody else than whoever registered this account
-	/// unverified: every session ends and the address is the prover's. The caller drops the
-	/// password that came with the squatted registration.
-	pub fn take_over(&mut self) {
+	/// unverified: every session ends, the address is the prover's, and nothing the
+	/// registrant chose survives on the aggregate — their handle gives way to `username`
+	/// (the default a new account on this address would get) and their profile is
+	/// emptied, since either could be planted to pass as the owner. The caller drops what
+	/// lives beside the aggregate: the password, the passkeys, the notification settings.
+	pub fn take_over(&mut self, username: Option<Username>) {
 		self.verify_email();
+		self.username = username;
+		self.profile = ProfileFields::default();
 		self.revoke_tokens();
 	}
 
@@ -1002,6 +1007,25 @@ mod tests {
 		user.set_role(Role::Admin);
 		assert_eq!(user.role(), Role::Admin);
 		assert_eq!(user.drain_events(), [UserEvent::RoleChanged]);
+	}
+
+	#[test]
+	fn a_takeover_keeps_nothing_the_registrant_chose() {
+		let mut user = User::provision(UserId::new(), AuthSubject::parse("g-1").unwrap(), Email::parse("a@b.c").unwrap(), false, None);
+		user.set_username(Username::parse("the_real_owner").unwrap());
+		user.update_profile(ProfileFields {
+			legal_name: Some("Not The Owner".into()),
+			..ProfileFields::default()
+		})
+		.unwrap();
+		user.drain_events();
+		let version = user.token_version();
+		user.take_over(Some(Username::parse("owner_default").unwrap()));
+		assert!(user.email_verified());
+		assert_eq!(user.token_version(), version + 1);
+		assert_eq!(user.username().map(Username::as_str), Some("owner_default"));
+		assert_eq!(user.legal_name(), None);
+		assert_eq!(user.drain_events(), [UserEvent::SessionsRevoked]);
 	}
 
 	#[test]

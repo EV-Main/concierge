@@ -17,8 +17,9 @@ package concierge.v1;
 // The seam is authenticated with a shared bridge service token (env
 // BRIDGE_SERVICE_TOKEN on both ends). Graduate to mTLS/SPIFFE at platform scale.
 //
-// RELYING PARTIES read the same RPC with their client credential instead
-// (docs/SCOPES-AND-APPROVALS.md, "Service callers"). The request is unchanged — the
+// RELYING PARTIES are to read the same RPC with their client credential instead
+// (docs/SCOPES-AND-APPROVALS.md, "Service callers") — contract only: today the RPC
+// admits the bridge token alone. The request is unchanged — the
 // filter comes from WHO is asking, never from a field a caller could widen: a client
 // sees only users visible to its scope and to the scopes that name it an observer, and
 // each row is redacted for it (`seat_permissions` absent, `permissions` empty — the
@@ -48,6 +49,11 @@ message PullUserLifecycleResponse {
   // event returned when the rows after it were not the caller's to see, so a filtered
   // reader never re-scans them; the request's `after_position` unchanged when nothing was
   // scanned. To the unfiltered reader (the bridge token) it is the max position returned.
+  // A page that FILLS `limit` ends its scan at its last event, so then `next_position` is
+  // exactly that event's `position` — in particular `limit = 1` returning one event
+  // answers that event's position, which is what lets a consumer re-pull ONE parked event
+  // (`after_position = position - 1, limit = 1`) and know it got that one and no other.
+  // The scan may run past the last event only when the page did not fill.
   int64 next_position = 2;
 }
 

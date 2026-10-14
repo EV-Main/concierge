@@ -321,7 +321,7 @@ impl UserDirectoryRepository for PgUsers {
 					AuthSubject::parse(&id.to_string())?,
 					identity.email.clone(),
 					identity.email_proven,
-					free_username(&mut tx, &identity.email).await?,
+					free_username(&mut tx, &identity.email, None).await?,
 				);
 				insert_user(&mut tx, user).await?
 			}
@@ -735,16 +735,50 @@ async fn linkable(conn: &mut PgConnection, identity: &ProvenIdentity, now: i64) 
 		_ => return Err(DomainError::Repository(format!("{} unverified password accounts share one address", squatted.len()))),
 	};
 	let mut user = load_for_update(conn, id).await?;
-	user.take_over();
+	user.take_over(free_username(conn, &identity.email, Some(id)).await?);
 	sqlx::query("DELETE FROM password_credentials WHERE user_id = $1")
 		.bind(id.raw())
 		.execute(&mut *conn)
 		.await
 		.map_err(repo_err)?;
+	// A passkey is a credential the squatter enrolled and the owner never sees until they
+	// look: left in place, it signs the squatter back in after the takeover.
+	let passkeys = sqlx::query("DELETE FROM passkey_credentials WHERE user_id = $1")
+		.bind(id.raw())
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?
+		.rows_affected();
+	reset_notification_settings(conn, id).await?;
 	update_row(conn, &user).await?;
 	let source = identity.provider.as_ref().map_or("email_code", |(provider, _)| provider.as_str());
-	record_action(conn, id, &AdminAction::system("taken_over_by_mailbox").with_detail(serde_json::json!({ "source": source })), now).await?;
+	let detail = serde_json::json!({ "source": source, "passkeys_removed": passkeys });
+	record_action(conn, id, &AdminAction::system("taken_over_by_mailbox").with_detail(detail), now).await?;
 	Ok(Some(user))
+}
+
+/// Back to the state an account that never opened its settings reads: both channels on,
+/// no topic followed. A squatter who switched mail off would otherwise silence the owner's
+/// own account. The row is kept rather than deleted — the inbox and the delivery queue
+/// refer to it.
+async fn reset_notification_settings(conn: &mut PgConnection, user: UserId) -> Result<(), DomainError> {
+	sqlx::query(
+		"DELETE FROM notification_subscriptions WHERE subscriber_id IN \
+		 (SELECT id FROM notification_subscribers WHERE user_id = $1)",
+	)
+	.bind(user.raw())
+	.execute(&mut *conn)
+	.await
+	.map_err(repo_err)?;
+	sqlx::query(
+		"UPDATE notification_subscribers SET in_app_enabled = TRUE, email_enabled = TRUE, email_verified = TRUE, updated_at = now() \
+		 WHERE user_id = $1",
+	)
+	.bind(user.raw())
+	.execute(&mut *conn)
+	.await
+	.map_err(repo_err)?;
+	Ok(())
 }
 
 /// Whom an account handle — an email or a username — names.
@@ -793,11 +827,13 @@ pub(crate) async fn account_named(conn: &mut PgConnection, handle: &str) -> Resu
 	Ok(id.map_or(Named::Nobody, |id| Named::One(UserId::from_raw(id))))
 }
 
-/// The first default handle for `email` nobody holds.
-pub(crate) async fn free_username(conn: &mut PgConnection, email: &Email) -> Result<Option<Username>, DomainError> {
+/// The first default handle for `email` nobody holds — nobody but `holder`, the account
+/// it is being chosen for, whose current handle is about to be replaced.
+pub(crate) async fn free_username(conn: &mut PgConnection, email: &Email, holder: Option<UserId>) -> Result<Option<Username>, DomainError> {
 	let candidates = Username::defaults_for(email);
-	let held: Vec<String> = sqlx::query_scalar("SELECT username FROM users WHERE username = ANY($1)")
+	let held: Vec<String> = sqlx::query_scalar("SELECT username FROM users WHERE username = ANY($1) AND id IS DISTINCT FROM $2")
 		.bind(candidates.iter().map(Username::as_str).collect::<Vec<_>>())
+		.bind(holder.map(|id| id.raw()))
 		.fetch_all(&mut *conn)
 		.await
 		.map_err(repo_err)?;
@@ -951,6 +987,7 @@ pub(crate) async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Re
 	if events.is_empty() {
 		return Ok(());
 	}
+	let seat_moved = events.contains(&UserEvent::RoleChanged);
 
 	// Serialize outbox appends against COMMIT order. `position` is a BIGSERIAL assigned at
 	// INSERT time, but two concurrent transactions can be assigned positions in one order
@@ -993,6 +1030,12 @@ pub(crate) async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Re
 		.execute(&mut *conn)
 		.await
 		.map_err(repo_err)?;
+	}
+	// A tenant whose granting seats hold all of it hands a seat change straight to every
+	// relying party that can see this user, so the scope stream re-states their set in the
+	// same transaction as the ROLE_CHANGED.
+	if seat_moved {
+		super::scope_events::seat_moved(conn, user.id()).await?;
 	}
 	Ok(())
 }
