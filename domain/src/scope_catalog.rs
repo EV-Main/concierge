@@ -197,7 +197,7 @@ impl NotificationTopic {
 
 /// Rendered into mail and screens as the publisher's words, never as markup: one line,
 /// no control character, no link a reader could be sent to.
-fn plain_text(text: &str, max_bytes: usize, may_be_empty: bool) -> Result<(), &'static str> {
+pub(crate) fn plain_text(text: &str, max_bytes: usize, may_be_empty: bool) -> Result<(), &'static str> {
 	if text.is_empty() && !may_be_empty {
 		return Err("is empty");
 	}
@@ -223,7 +223,7 @@ fn is_key(raw: &str) -> bool {
 	raw.len() <= 32 && is_identifier(raw)
 }
 
-fn is_currency(raw: &str) -> bool {
+pub(crate) fn is_currency(raw: &str) -> bool {
 	let mut bytes = raw.bytes();
 	(2..=16).contains(&raw.len()) && bytes.next().is_some_and(|b| b.is_ascii_uppercase()) && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
@@ -234,7 +234,7 @@ fn is_unsigned_integer(raw: &str) -> bool {
 
 /// `0|[1-9][0-9]*`, then optionally `.` and at most 18 digits not ending in `0` — the
 /// spelling `ApprovalAmount` requires, so a threshold compares with the amounts it tests.
-fn is_canonical_amount(raw: &str) -> bool {
+pub(crate) fn is_canonical_amount(raw: &str) -> bool {
 	match raw.split_once('.') {
 		None => is_unsigned_integer(raw),
 		Some((whole, fraction)) => is_unsigned_integer(whole) && (1..=18).contains(&fraction.len()) && fraction.bytes().all(|b| b.is_ascii_digit()) && !fraction.ends_with('0'),
