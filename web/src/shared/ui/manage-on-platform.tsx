@@ -1,5 +1,5 @@
 import { useT } from "@evinvest/i18n/react";
-import { buttonVariants, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@evinvest/uikit";
+import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@evinvest/uikit";
 import { ExternalLink } from "lucide-react";
 
 import { platformAccountUrl, type AccountSection } from "../config/origin";
@@ -20,11 +20,15 @@ export function ManageOnPlatform({ section, title }: { section: AccountSection; 
         <CardDescription>{t("account.managedOnPlatform", "These settings are managed on evinvest.ltd, where your account lives.")}</CardDescription>
       </CardHeader>
       <CardContent>
-        {/* A link wearing the button's classes: the kit's `Button href` takes no `target`. */}
-        <a className={buttonVariants({ variant: "outline" })} href={platformAccountUrl(api.origin, section)} target="_blank" rel="noopener noreferrer">
-          {t("account.openOnPlatform", "Open on evinvest.ltd")}
-          <ExternalLink className="size-4" aria-hidden />
-        </a>
+        {/* `asChild`: the kit's `Button href` takes no `target`. The outline variant sets no
+            text colour or decoration, so without them a host with no preflight paints the
+            user agent's link blue and underline. */}
+        <Button asChild variant="outline" className="text-ink no-underline">
+          <a href={platformAccountUrl(api.origin, section)} target="_blank" rel="noopener noreferrer">
+            {t("account.openOnPlatform", "Open on evinvest.ltd")}
+            <ExternalLink className="size-4" aria-hidden />
+          </a>
+        </Button>
       </CardContent>
     </Card>
   );

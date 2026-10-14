@@ -1,5 +1,5 @@
 import { DialogDescription, DialogHeader, DialogTitle } from "@evinvest/uikit";
-import type { FormEvent, ReactNode } from "react";
+import { createContext, useContext, type FormEvent, type ReactNode } from "react";
 
 // Proportions are openmarket's sign-in form (the reference the cabinet dialog was drawn
 // from), on our tokens; the off-scale steps are the `--sign-in-*` properties in
@@ -11,10 +11,17 @@ export const PRIMARY =
 export const SECONDARY =
   "inline-flex h-11.5 w-full cursor-pointer items-center justify-center gap-2.5 rounded-(--sign-in-radius) border border-transparent bg-ink/4 px-3.5 text-(length:--sign-in-text-body) font-semibold tracking-[-0.01em] text-ink no-underline transition-colors hover:border-ink/14 hover:bg-ink/6 disabled:cursor-default disabled:hover:border-transparent";
 
+/**
+ * The dialog's `aria-labelledby` target. The kit's Dialog does not wire its title to the
+ * content, and every screen draws its own heading, so the id travels by context.
+ */
+export const TitleIdContext = createContext<string | undefined>(undefined);
+
 export function Heading({ title, description }: { title: string; description?: string }) {
+  const id = useContext(TitleIdContext);
   return (
     <DialogHeader className="gap-1.5 text-center sm:text-center">
-      <DialogTitle className="text-(length:--sign-in-text-title) leading-normal tracking-[-0.01em]">{title}</DialogTitle>
+      <DialogTitle id={id} className="text-(length:--sign-in-text-title) leading-normal tracking-[-0.01em]">{title}</DialogTitle>
       {description && <DialogDescription className="text-(length:--sign-in-text-body) leading-snug">{description}</DialogDescription>}
     </DialogHeader>
   );

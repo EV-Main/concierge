@@ -43,11 +43,14 @@ export function platformAccountUrl(origin: string, section?: AccountSection): st
 }
 
 /**
- * The platform's sign-out confirmation, coming back to this page without its query or hash
- * (those may carry tokens). A scope host's own sign-out ends only its RP session; this ends
- * the platform session behind it, which the host cannot do cross-origin (§3.9 F).
+ * The platform's sign-out confirmation, coming back to this host's root. Concierge takes
+ * `return_to` only as a scope origin plus one of the scope's registered `return_paths`,
+ * byte for byte (`runner/src/web/origins.rs`, `is_return_target`); any other path is a 400
+ * and the platform session survives. The page the reader stood on is usually not
+ * registered; the root is the one path every scope host must register for this to work —
+ * the same target `@evinvest/concierge` (`sdk/`) sends.
  */
 export function platformLogoutUrl(origin: string): string {
-  const back = location.origin + location.pathname;
+  const back = `${location.origin}/`;
   return `${origin}/api/auth/logout/confirm?return_to=${encodeURIComponent(back)}`;
 }

@@ -32,10 +32,11 @@ through `ScopeInboxService`, and the host renders them itself.
 
 Sign-out on a scope host (the account page's Security tab, the chip in host mode) first
 fires `signout` for the host to end its own session, then navigates to
-`<EV_PUBLIC_ORIGIN>/api/auth/logout/confirm?return_to=<this page's origin + path>` so the
+`<EV_PUBLIC_ORIGIN>/api/auth/logout/confirm?return_to=<this host's origin>/` so the
 platform session ends too (`src/shared/element/host-sign-out.ts`). That page
 (`runner/src/web/logout.rs`) asks for one click, ends the platform session and returns to
-`return_to` once it passes the scope allowlist; it does not sign out on the GET, so a
+`return_to` once it passes the scope allowlist (so every scope host needs `/` among its
+`return_paths`, or sign-out there stops at a 400); it does not sign out on the GET, so a
 link elsewhere cannot sign a visitor out. Because the navigation follows
 the event at once, a host must end its session with a request that survives unload
 (`fetch(..., { keepalive: true })`, `sendBeacon`) or server-side.
