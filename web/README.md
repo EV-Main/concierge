@@ -24,8 +24,11 @@ username, notification settings, platform sign-out — is a link to
 `https://evinvest.ltd/admin/account`. On the platform origin they do it in place.
 `src/shared/config/origin.ts` (`isPlatformPage`) is that switch.
 
-Proving an address goes through `/code/request` + `/code/verify` on every host: the
-`/email/verify/*` routes need the CSRF cookie, which only the platform can read.
+A new account confirms its address in the dialog through the ticket `password/signup`
+hands back (`/password/signup/confirm`, `/resend`), which needs no CSRF cookie and so
+works on every host; without a ticket the dialog sends the reader to the platform. An
+existing account confirms it from Security on the platform (`/email/verify/*`). Never
+through `/code/verify`: that opens a session for whoever holds the mailbox.
 
 ## Styles
 

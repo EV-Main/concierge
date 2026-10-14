@@ -1,8 +1,6 @@
-// Delivery preferences — PROPOSED routes. concierge has no HTTP surface for notifications
-// yet (runner/src/web/mod.rs); the banking BFF used to proxy NotificationService for the
-// cabinet under /api/notifications/settings*. These paths and shapes are that BFF's, moved
-// under the plane's /api/auth prefix, and are what this section asks the plane to serve.
-// Until it does, every read answers 404 and the section says it is not available yet.
+// Delivery preferences (concierge runner/src/web/account.rs). Platform origin only, the
+// writes CSRF-checked. A plane without the routes answers 404, which the section shows as
+// "not available yet" rather than as a failure.
 
 import type { AuthApi } from "../../../shared/api/auth-api";
 import { bool, isRecord, listOf, str } from "../../../shared/lib/guard";

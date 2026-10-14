@@ -42,12 +42,14 @@ function parseMethods(raw: unknown): SignInMethods | null {
 
 export const readMethods = (api: AuthApi) => api.get("/methods", parseMethods);
 
-/**
- * Mail the signed-in account the code `/password/set` spends. Still /email/verify/request:
- * a password change is a platform-only action anyway, where the CSRF cookie is readable.
- * Proving the address itself goes through /code/* (email-verify-form.tsx).
- */
+/** Mail the signed-in account a code for its own address (it also arms `/password/set`). */
 export const requestVerification = (api: AuthApi) => api.send("POST", "/email/verify/request", {}, anyBody, true);
+
+/**
+ * Prove the account's address. Not `/code/verify`: that opens a session for whoever holds
+ * the mailbox, where this acts on the session the reader already has.
+ */
+export const confirmVerification = (api: AuthApi, code: string) => api.send("POST", "/email/verify/confirm", { code }, anyBody, true);
 
 /** A new password costs a mailed code: one a stolen session could plant without it would outlive the session's revocation. */
 export const setPassword = (api: AuthApi, password: string, code: string) => api.send("POST", "/password/set", { password, code }, anyBody, true);

@@ -3,9 +3,8 @@ import { Badge, Button, ListRow, Skeleton } from "@evinvest/uikit";
 import { useEffect, useState } from "react";
 
 import { useElement } from "../../../shared/element/element-context";
-import { readMethods, setPassword, type SignInMethods } from "../api/methods-api";
+import { confirmVerification, readMethods, setPassword, type SignInMethods } from "../api/methods-api";
 import { CodeForm } from "./code-form";
-import { EmailVerifyForm } from "./email-verify-form";
 import { Passkeys } from "./passkeys";
 import { UsernameForm } from "./username-form";
 
@@ -59,7 +58,7 @@ export function SignInMethodRows({ onChanged }: { onChanged: () => void }) {
           </Button>
         )}
       </ListRow>
-      {editing === "verify" && <EmailVerifyForm email={methods.email} onDone={done} />}
+      {editing === "verify" && <CodeForm action={t("auth.email.confirm", "Confirm")} submit={(code) => confirmVerification(api, code)} onDone={done} />}
       <ListRow label={t("auth.username.title", "Username")} description={methods.username ? `@${methods.username}` : t("auth.username.none", "None yet — once set, it signs you in like your email")}>
         <Button variant="outline" size="sm" onClick={() => toggle("username")}>
           {t("auth.username.change", "Change")}
