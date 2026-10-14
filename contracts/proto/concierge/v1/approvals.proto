@@ -238,6 +238,10 @@ enum EscalationTest {
   // A COUNT field above the threshold (a payout to more recipients than that). An integer
   // threshold, no currency.
   ESCALATION_TEST_COUNT_ABOVE = 5;
+  // The COUNT field plus the same field of every live or executed scope-level proposal of
+  // the same kind and scope counted as ROLLING_24H_AMOUNT_ABOVE counts, above the
+  // threshold: a payout split into single-recipient ones is still counted as one.
+  ESCALATION_TEST_ROLLING_24H_COUNT_ABOVE = 6;
 }
 
 enum ApprovalState {

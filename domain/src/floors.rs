@@ -32,6 +32,10 @@ pub enum KindFloor {
 	Platform,
 	/// Decided in the scope up to these limits.
 	Scope(&'static [Floor]),
+	/// A kind of a money namespace that moves no money, named here so that it may be
+	/// decided in its scope without limits. A kind of such a namespace the table does not
+	/// name is the owners' (see [`floor_of`]).
+	Unbounded,
 }
 
 const fn floor(parameter: &'static str, field_key: &'static str, test: EscalationTest, cap: &'static str, currency: &'static str) -> Floor {
@@ -46,8 +50,8 @@ const fn floor(parameter: &'static str, field_key: &'static str, test: Escalatio
 
 /// §4.4 of the organisation plan: what leaves the platform, crosses scopes, seeds or
 /// sweeps capital, sets a compartment's limits or grants holdings is always the owners';
-/// inside a scope, 1000 USDT per operation and 5000 USDT a day, a payout to one recipient,
-/// a valuation within 10 % and a fee change within its ceiling.
+/// inside a scope, 1000 USDT per operation and 5000 USDT a day, a payout to one recipient
+/// a day, a valuation within 10 % and a fee change within its ceiling.
 const TABLE: &[(&str, KindFloor)] = &[
 	("bank:payment", KindFloor::Platform),
 	("bank:scope_transfer", KindFloor::Platform),
@@ -67,8 +71,12 @@ const TABLE: &[(&str, KindFloor)] = &[
 		KindFloor::Scope(&[
 			floor("floor_per_operation", "total", EscalationTest::AmountAbove, "1000", "USDT"),
 			floor("floor_daily", "total", EscalationTest::Rolling24hAmountAbove, "5000", "USDT"),
-			// A distribution to more than one holder is a dividend: the owners' (D24).
 			floor("floor_recipients", "recipients", EscalationTest::CountAbove, "1", ""),
+			// One recipient a day in a scope: a payout split into single-recipient ones must
+			// not pass as many small decisions what is one distribution (decided by the session).
+			floor("floor_daily_recipients", "recipients", EscalationTest::Rolling24hCountAbove, "1", ""),
+			// A distribution to every holder is a dividend: the owners' (D24).
+			floor("floor_distribution", "distribution", EscalationTest::FlagSet, "", ""),
 		]),
 	),
 	(
@@ -81,8 +89,21 @@ const TABLE: &[(&str, KindFloor)] = &[
 	),
 ];
 
+/// What the table holds `kind` to. `None` for a kind of a namespace the table does not
+/// govern. A kind of a governed namespace (`bank`, `invest`) the table does not name is
+/// [`KindFloor::Platform`]: an allow-list, so a money kind added to a catalog before it is
+/// added here goes to the owners rather than slipping past them.
 pub fn floor_of(kind: &str) -> Option<KindFloor> {
-	TABLE.iter().find(|(name, _)| *name == kind).map(|(_, floor)| *floor)
+	if let Some((_, floor)) = TABLE.iter().find(|(name, _)| *name == kind) {
+		return Some(*floor);
+	}
+	let namespace = kind.split(':').next().unwrap_or_default();
+	TABLE.iter().any(|(name, _)| name.split(':').next() == Some(namespace)).then_some(KindFloor::Platform)
+}
+
+/// Whether `parameter` is one the table reserves for its own escalations.
+pub fn is_floor_parameter(parameter: &str) -> bool {
+	parameter.starts_with("floor_")
 }
 
 /// The stricter of two thresholds of one test: `None` when either does not parse, which a
@@ -90,7 +111,7 @@ pub fn floor_of(kind: &str) -> Option<KindFloor> {
 pub fn stricter(test: EscalationTest, a: &str, b: &str) -> Option<String> {
 	match test {
 		EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => Some(if amount_above(a, b) { b } else { a }.to_owned()),
-		EscalationTest::AbsBpsAbove | EscalationTest::CountAbove => Some(a.parse::<u64>().ok()?.min(b.parse::<u64>().ok()?).to_string()),
+		EscalationTest::AbsBpsAbove | EscalationTest::CountAbove | EscalationTest::Rolling24hCountAbove => Some(a.parse::<u64>().ok()?.min(b.parse::<u64>().ok()?).to_string()),
 		EscalationTest::FlagSet => Some(String::new()),
 	}
 }
@@ -99,7 +120,7 @@ pub fn stricter(test: EscalationTest, a: &str, b: &str) -> Option<String> {
 fn looser(floor: &Floor, threshold: &str) -> bool {
 	match floor.test {
 		EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => amount_above(threshold, floor.cap),
-		EscalationTest::AbsBpsAbove | EscalationTest::CountAbove => match (threshold.parse::<u64>(), floor.cap.parse::<u64>()) {
+		EscalationTest::AbsBpsAbove | EscalationTest::CountAbove | EscalationTest::Rolling24hCountAbove => match (threshold.parse::<u64>(), floor.cap.parse::<u64>()) {
 			(Ok(value), Ok(cap)) => value > cap,
 			_ => true,
 		},
@@ -107,15 +128,20 @@ fn looser(floor: &Floor, threshold: &str) -> bool {
 	}
 }
 
-/// A publication of a known kind is refused if it is looser than the table: a platform
-/// kind at scope level, a floor's field missing or of another type, or an escalation of the
-/// floor's test and field above its cap or in another currency.
+/// A publication of a governed kind is refused if it is looser than the table: a platform
+/// kind — named, or of a governed namespace and not named — at scope level, or a scope kind
+/// published at scope level with a floor's field missing or of another type, or with an
+/// escalation of the floor's test and field above its cap or in another currency. A scope
+/// kind published at the platform is stricter and needs none of that.
 pub fn check(kind: &ApprovalKind) -> Result<(), String> {
 	let name = &kind.name;
 	match floor_of(name) {
-		None => Ok(()),
-		Some(KindFloor::Platform) if kind.level != ApprovalLevel::Platform => Err(format!("approval kind `{name}` is always decided by the platform owners")),
+		None | Some(KindFloor::Unbounded) => Ok(()),
+		Some(KindFloor::Platform) if kind.level != ApprovalLevel::Platform => Err(format!(
+			"approval kind `{name}` is decided by the platform owners: this plane's floor names it so, or does not name it at all"
+		)),
 		Some(KindFloor::Platform) => Ok(()),
+		Some(KindFloor::Scope(_)) if kind.level == ApprovalLevel::Platform => Ok(()),
 		Some(KindFloor::Scope(floors)) => {
 			for floor in floors {
 				let field = kind.fields.iter().find(|f| f.key == floor.field_key);
@@ -136,46 +162,57 @@ pub fn check(kind: &ApprovalKind) -> Result<(), String> {
 	}
 }
 
-/// `kind` as a proposal is measured against: at the platform if the table says so, its
-/// own escalations capped at the floor, and every floor it does not cover added beside
-/// them.
+/// `kind` as a proposal is measured against: at the platform if the table says so, else
+/// its own escalations capped at the floor and EVERY floor beside them. The floors are
+/// always there, under their own names, so a scope policy that tightened one keeps
+/// tightening it whatever the publisher's next catalog declares (review of #142).
 pub fn floored(kind: &ApprovalKind) -> ApprovalKind {
 	let mut floored = kind.clone();
 	match floor_of(&kind.name) {
-		None => {}
+		None | Some(KindFloor::Unbounded) => {}
 		Some(KindFloor::Platform) => {
 			floored.level = ApprovalLevel::Platform;
 			floored.escalations.clear();
 		}
 		Some(KindFloor::Scope(floors)) => {
+			if floored.level == ApprovalLevel::Platform {
+				floored.escalations.clear();
+				return floored;
+			}
 			for floor in floors {
-				// An escalation in another currency than the cap's cannot be capped: it does
-				// not cover the floor, whose own escalation is added and escalates what it
-				// cannot measure.
-				let mut covered = false;
 				for e in floored
 					.escalations
 					.iter_mut()
 					.filter(|e| e.test == floor.test && e.field_key == floor.field_key && e.currency == floor.currency)
 				{
-					covered = true;
 					if let Some(stricter) = stricter(floor.test, &e.default_threshold, floor.cap) {
 						e.default_threshold = stricter;
 					}
 				}
-				if !covered && floored.level == ApprovalLevel::Scope {
-					floored.escalations.push(Escalation {
-						parameter: floor.parameter.to_owned(),
-						field_key: floor.field_key.to_owned(),
-						test: floor.test,
-						default_threshold: floor.cap.to_owned(),
-						currency: floor.currency.to_owned(),
-					});
-				}
+				floored.escalations.retain(|e| e.parameter != floor.parameter);
+				floored.escalations.push(Escalation {
+					parameter: floor.parameter.to_owned(),
+					field_key: floor.field_key.to_owned(),
+					test: floor.test,
+					default_threshold: floor.cap.to_owned(),
+					currency: floor.currency.to_owned(),
+				});
 			}
 		}
 	}
 	floored
+}
+
+/// The table's rules no escalation test can state, fired over a proposal's fields.
+pub fn special_fired(kind: &str, fields: &[crate::approvals::Field]) -> Vec<String> {
+	use crate::approvals::FieldValue;
+	let mut fired = Vec::new();
+	// A payout to nobody is not a payout the scope can decide: whatever it moves, it
+	// moves to no named holder, and only the owners should be asked about that.
+	if kind == "bank:scope_payout" && fields.iter().any(|f| f.key == "recipients" && f.value == FieldValue::Count(0)) {
+		fired.push("floor_no_recipients".to_owned());
+	}
+	fired
 }
 
 #[cfg(test)]
@@ -247,7 +284,10 @@ mod tests {
 		let per_operation = floored.escalations.iter().find(|e| e.parameter == "per_operation").unwrap();
 		assert_eq!(per_operation.default_threshold, "1000", "a stored looser catalog is capped at the floor");
 		assert!(floored.escalations.iter().any(|e| e.parameter == "floor_daily"), "an uncovered floor is added");
-		assert!(!floored.escalations.iter().any(|e| e.parameter == "floor_per_operation"), "a covered one is not doubled");
+		assert!(
+			floored.escalations.iter().any(|e| e.parameter == "floor_per_operation"),
+			"a covered one is kept too, under its own name, for a scope policy to hold onto"
+		);
 
 		let tight = kind(
 			"bank:account_transfer",
@@ -258,6 +298,31 @@ mod tests {
 		assert_eq!(check(&tight), Ok(()));
 		assert_eq!(super::floored(&tight).escalations[0].default_threshold, "500", "a stricter catalog stands");
 		assert!(check(&kind("bank:account_transfer", ApprovalLevel::Scope, vec![field("value", FieldType::Amount)], vec![])).is_err());
+	}
+
+	#[test]
+	fn a_governed_namespace_is_an_allow_list() {
+		let unknown = kind("bank:new_rail", ApprovalLevel::Scope, vec![field("amount", FieldType::Amount)], vec![]);
+		assert!(check(&unknown).is_err(), "a bank kind the table does not name is not a scope's");
+		assert_eq!(floored(&unknown).level, ApprovalLevel::Platform, "and a stored one goes to the owners");
+		let elsewhere = kind("sa:lead_bonus", ApprovalLevel::Scope, vec![], vec![]);
+		assert_eq!(check(&elsewhere), Ok(()), "a namespace the table does not govern is its publisher's");
+	}
+
+	#[test]
+	fn a_scope_kind_published_at_the_platform_needs_no_floor_field() {
+		assert_eq!(check(&kind("bank:account_transfer", ApprovalLevel::Platform, vec![], vec![])), Ok(()));
+	}
+
+	#[test]
+	fn a_payout_to_nobody_goes_to_the_owners() {
+		use crate::approvals::{Field, FieldValue};
+		let fields = [Field {
+			key: "recipients".into(),
+			value: FieldValue::Count(0),
+		}];
+		assert_eq!(special_fired("bank:scope_payout", &fields), vec!["floor_no_recipients".to_owned()]);
+		assert!(special_fired("bank:account_transfer", &fields).is_empty());
 	}
 
 	#[test]
