@@ -11,8 +11,8 @@ bundles under `/auth/mfe/*` (§3.1), the relying-party streams (§4: `ScopeEvent
 (`ScopeCatalogService`, §5.1, §6) and the approvals of the kinds a namespace publishes
 (§5.7: both approval services, this plane's own `concierge:*` kinds and their executor,
 stored scope policies, the proven initiator and the pause after the owners change (D24(1),
-(2)); migrations 0036–0038). Not yet: the approval mail, the floor on the known money kinds
-and `ESCALATION_TEST_COUNT_ABOVE` (§5.7). Banking, the `lib` projections, invest and admin build against this document.
+(2)), the floor on the known money kinds and `ESCALATION_TEST_COUNT_ABOVE` (§5.3);
+migrations 0036–0038). Not yet: the approval mail (§5.7). Banking, the `lib` projections, invest and admin build against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it
@@ -331,8 +331,9 @@ containment is never slower than the grant).
   service's proposal nobody is excluded: a service cannot prove which person asked it, so
   the person it names (`requested_by`, an `auth_subject`) is information shown to voters
   — it moves no quorum and keeps nobody off the roster. For a `concierge:*` proposal the
-  opener is proven by their session and is kept off the roster (D23): nobody votes on
-  what they asked for. A `PLATFORM` proposal is refused at open (`FAILED_PRECONDITION`)
+  opener is proven by their session and is kept off the roster (D23), and so is the
+  account a `scope_admin_grant` would seat, when an owner: nobody votes on
+  what they asked for, or on their own seat. A `PLATFORM` proposal is refused at open (`FAILED_PRECONDITION`)
   with fewer than two owners, or when the opener is the only one left to decide.
 - **A proven initiator of a money decision does not decide it** (D24(1)): a proposer may
   present, in metadata `x-ev-user-token`, an access token of this plane that `requested_by`
@@ -370,8 +371,10 @@ containment is never slower than the grant).
 - **A vote is the seat's** (decided): a vote counts only while its voter still holds the
   seat the roster was drawn from — for an owner, the persisted `owner` role AND an active
   account, so a suspended owner has no say. Removing an admin after their FOR takes it
-  back and the proposal needs another vote to pass; and when the seated voters who have
-  not voted AGAINST are fewer than the threshold, the proposal is `REJECTED`. `voters` on
+  back and the proposal needs another vote to pass. It is `REJECTED` only when seated
+  voters cast more AGAINSTs than the roster can spare (more than roster − threshold); a
+  proposal that can no longer be carried only because seats were lost stays `OPEN` until it
+  expires — a removal is not a vote against (review of #140). `voters` on
   `Approval` still shows every vote as cast: whether one counts is decided from the seats
   at each vote, not stored on it. A proposal that already PASSED is not reopened when its
   voters lose their seats: inside the delay any owner (or remaining roster member) vetoes
@@ -391,7 +394,8 @@ containment is never slower than the grant).
   opening instant would let a proposal kept open a day drop out while still able to pass,
   and an execution count from when it was asked rather than when the money moved; a
   proposal that ends rejected, vetoed, expired, cancelled or void stops counting);
-  `ABS_BPS_ABOVE`; `FLAG_SET`.
+  `ABS_BPS_ABOVE`; `FLAG_SET`; `COUNT_ABOVE` (a COUNT field above an integer threshold —
+  a payout to more recipients than that).
 - **The scope policy** (`ScopeApprovalPolicy`: quorum, delay, lifetime, threshold
   overrides) is changed only by `concierge:scope_policy_change`, which is always
   `PLATFORM`: a scope able to lower its own thresholds would decide for itself what
@@ -400,6 +404,24 @@ containment is never slower than the grant).
   against the catalogs then in force.
 
 ### 5.3 Kinds
+
+**The floor this plane keeps** (D24, decided by the session; `domain::floors`, one
+table): whatever a publisher's catalog says, `bank:payment`, `bank:scope_transfer`,
+`bank:seed_capital`, `bank:treasury_surplus`, `bank:compartment_policy` and
+`invest:holder_grant` are decided by the platform owners; `bank:account_transfer` escalates
+above 1000 USDT on `amount` and above 5000 USDT a day; `bank:scope_payout` above 1000 USDT
+on `total`, 5000 USDT a day, and above one `recipients` (COUNT — a distribution to more
+than one holder); `invest:valuation_override` above 10 % (`deviation`, 1000 bps);
+`invest:fee_policy` when `raises_ceiling` is set. It binds twice: a publication of such a
+kind at scope level, without the field the floor tests, or with an escalation of that test
+and field above the cap or in another currency is refused; and a proposal is measured
+against the stricter of the table and the catalog in force, the table's own escalations
+(`floor_per_operation`, `floor_daily`, `floor_recipients`, `floor_deviation`,
+`floor_ceiling` in `escalated_by`) added where the catalog has none — so a catalog stored
+before the table, or published wrong, cannot keep from the owners what the table sends
+them. A scope policy may only tighten a threshold from the stricter of the two. A catalog
+is republished whole, so one stored kind that breaks the floor blocks the namespace's
+next publication until that kind is fixed.
 
 `bank:*` — final; banking is the only proposer and executor of each.
 
@@ -556,7 +578,8 @@ in `domain::approvals`.
   as a service would and carries each out with its outcome in ONE transaction, so a grant
   or an installed policy never exists without the executed decision behind it. If it stops,
   passed decisions lapse to `VOID` unexecuted after 72 hours — nothing is done that was not
-  decided.
+  decided. A pass with a failed execution doubles the pause before the next one, up to 15
+  minutes, so a store that refuses every write is not asked again every 30 s.
 - **The scope roster** is the ACTIVE accounts holding an unrevoked grant of exactly
   `<namespace>:admin`. A seat that holds every permission of a namespace without a row
   (`granting_seats_hold_all`) is not on it: what it may do on the scope's surface is not a
@@ -612,8 +635,7 @@ in `domain::approvals`.
   (`over_scope_budget`) with a `FLAG_SET` escalation, which sends that proposal to the
   owners. A kind's own thresholds here are the backstop behind that budget, not the
   budget.
-- **Not yet**: the mail of §5.5; the floor this plane keeps on the level and thresholds of
-  the known money kinds (D24, decided by the session), and `ESCALATION_TEST_COUNT_ABOVE`. A catalog already
+- **Not yet**: the mail of §5.5. A catalog already
   stored that delegates `<namespace>:admin` is not re-checked; the next publication is.
   Until the mail exists a roster member learns of a proposal by
   `ListApprovals { awaiting_my_vote }`.

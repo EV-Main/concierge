@@ -686,6 +686,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   the seated voters can no longer carry is rejected; a scope's policy only tightens a kind's
   thresholds;
   any owner vetoes any proposal inside its delay; a scope's delay is never under an hour.
+  The known money kinds are held to one table in `domain::floors` (platform level, or caps
+  on their scope escalations) at publication AND at every proposal, whatever the catalog
+  says.
   Expiry, executability and the 72 h lapse to `void` are time predicates and nothing sweeps
   for them; every transition writes its `approval_events` row in the same transaction.
 - **Two loops act on their own: the hold sweep and the approval executor.** Everything
