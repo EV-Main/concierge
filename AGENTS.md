@@ -91,6 +91,7 @@ retired in favour of `HoldUser` plus `GovernanceService.OpenUserSuspension`.
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
 | Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams — contract only, not yet mounted; also which consumer-built messages and services must never grow | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
+| `web/` — the plane's microfrontends (`mfe-concierge-sign-in`, `-account`, `-account-chip`): React + `@evinvest/uikit` custom elements built to `web/dist/` with `registry.json`, served under `/auth/mfe/*`; which actions work on a scope host and which link to the platform | [`web/README.md`](./web/README.md) |
 | `concierge_iam` (+ `_derive`) — permission scopes: `#[derive(Permission)]` enums, `alias!`, the concrete `PermissionSet` a service asks `may` of, `Pattern` containment, the `Catalog` a tenant publishes. I/O-free, wasm-safe, published to crates.io so consumers need no protoc | [`iam/`](./iam) |
 | **Design** — operator (admin) surface over this plane | [§ Design](#design) |
 
