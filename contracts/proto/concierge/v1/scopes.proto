@@ -79,21 +79,48 @@ message Scope {
   // Plain text, at most 80 bytes.
   string display_name = 4;
   // The https origins of the scope's hosts (`https://invest.evinvest.ltd`), exactly as a
-  // browser sends `Origin`: scheme, host, port only when non-default, no path, no
-  // trailing slash. The sign-in surface answers CORS for these and accepts a
-  // credential POST whose `Origin` is one of them or PUBLIC_ORIGIN.
+  // browser sends `Origin`: `https` only; the host is `evinvest.ltd` or ends in
+  // `.evinvest.ltd`; port only when non-default; no path, no trailing slash, no
+  // wildcard, never `null`. Compared byte for byte; the answer's
+  // `Access-Control-Allow-Origin` is exactly the matched origin, with `Vary: Origin`.
+  //
+  // They widen CORS on a CLOSED list of sign-in routes only — `/auth/code/request`,
+  // `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`,
+  // `/auth/email/verify/*`, `/auth/passkey/signin/*` and `GET /auth/session`, which
+  // answers them `{authenticated, user}` and never a token. Everything that acts on an
+  // open session (`/auth/password/set`, `/auth/passkey/register|remove`, sessions,
+  // username, logout, `/kyc/*`) accepts PUBLIC_ORIGIN alone. An OAuth `returnTo` must be
+  // one of these origins plus a path from `return_paths`.
   repeated string origins = 5;
   // The relying-party clients signing people in for this scope. A scope may have none
   // (`main` is first-party) or several.
   repeated ScopeClient clients = 6;
   // The clients that may read THIS scope's events and its users' lifecycle besides its
   // own: a direction that runs resources of other scopes (invest runs allocations for
-  // `sa`) is named on each scope it serves. Client ids.
+  // `sa`) is named on each scope it serves. Client ids. READ access to this plane's
+  // streams and nothing else: an observer holds no right on the money plane, where a
+  // service's grants are banking's own configuration.
   repeated string observers = 7;
   // Unix SECONDS.
   int64 created_at = 8;
-  // Bumped on every change to anything above; SCOPE_CHANGED carries it.
+  // Bumped on every change to anything in this message; SCOPE_CHANGED carries it.
   uint64 version = 9;
+  ScopeState state = 10;
+  // The paths an OAuth `returnTo` may name on `origins` (`/cabinet`, `/auth/callback`),
+  // each starting with a single `/`, matched exactly — no prefix, no query.
+  repeated string return_paths = 11;
+}
+
+enum ScopeState {
+  SCOPE_STATE_UNSPECIFIED = 0;
+  SCOPE_STATE_ACTIVE = 1;
+  // Stopped, reversibly: no new approval proposal opens in it and the money plane refuses
+  // new debits of its accounts. Its clients still sign people in and its streams are
+  // still read, because a direction has to learn it was frozen.
+  SCOPE_STATE_FROZEN = 2;
+  // Terminal: its clients sign nobody in and nothing new opens in it. Its history stays
+  // readable on every stream.
+  SCOPE_STATE_CLOSED = 3;
 }
 
 message ScopeClient {
@@ -160,9 +187,11 @@ message PullScopeEventsRequest {
 message PullScopeEventsResponse {
   // Oldest-first by `position`.
   repeated ScopeEvent events = 1;
-  // The next `after_position`: the max `position` returned, or the request's
-  // `after_position` unchanged when nothing matched. Visibility is applied inside the
-  // query, so rows the caller may not see never hold the cursor back.
+  // The cursor to pass as the next `after_position`: the MAXIMUM POSITION SCANNED for
+  // this caller — the same rule on every concierge pull stream. It may lie past the last
+  // event returned when the rows after it were not the caller's to see, so a filtered
+  // reader never re-scans them; the request's `after_position` unchanged when nothing was
+  // scanned. To the unfiltered reader (the bridge token) it is the max position returned.
   int64 next_position = 2;
 }
 
@@ -201,7 +230,8 @@ message ScopeEvent {
   Scope scope_snapshot = 7;
 
   // The user, under GRANTS_CHANGED and MEMBER_JOINED: concierge id and the opaque,
-  // immutable account subject, as on UserLifecycleEvent.
+  // immutable account subject, as on UserLifecycleEvent. A projection keys on
+  // `auth_subject`, the one user key every plane and every approval field shares.
   string user_id = 8;
   string auth_subject = 9;
 

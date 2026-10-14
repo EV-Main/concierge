@@ -3,7 +3,7 @@
 
 use evconcierge_contracts::concierge::v1::{
 	Approval, ApprovalAmount, ApprovalEscalation, ApprovalFieldSpec, ApprovalFieldType, ApprovalFieldValue, ApprovalKindSpec, ApprovalLevel, ApprovalState, EscalationTest,
-	PublishScopeCatalogRequest, Scope, ScopeClient, ScopeEvent, ScopeGrants, approval_field_value::Value, scope_event::Kind,
+	PublishScopeCatalogRequest, Scope, ScopeClient, ScopeEvent, ScopeGrants, ScopeState, approval_field_value::Value, scope_event::Kind,
 };
 use prost::Message;
 
@@ -46,6 +46,8 @@ fn a_scope_snapshot_round_trips_with_its_clients_and_observers() {
 		observers: vec!["invest".to_string()],
 		created_at: 1_700_000_000,
 		version: 3,
+		state: ScopeState::Frozen as i32,
+		return_paths: vec!["/auth/callback".to_string()],
 	};
 	let event = ScopeEvent {
 		kind: Kind::ScopeChanged as i32,
@@ -56,6 +58,7 @@ fn a_scope_snapshot_round_trips_with_its_clients_and_observers() {
 	};
 	let decoded = round_trip(&event);
 	assert_eq!(decoded.kind(), Kind::ScopeChanged);
+	assert_eq!(decoded.scope_snapshot.as_ref().map(Scope::state), Some(ScopeState::Frozen));
 	assert_eq!(decoded.scope_snapshot, Some(scope));
 }
 
@@ -65,24 +68,24 @@ fn every_typed_field_value_keeps_its_type() {
 	// rendered as the wrong thing in front of someone approving money.
 	let fields = vec![
 		field(
-			"amount",
+			"total",
 			Value::Amount(ApprovalAmount {
 				value: "1200.5".to_string(),
 				currency: "USDT".to_string(),
 			}),
 		),
 		field("deviation", Value::Bps(-1_250)),
-		field("raises_ceiling", Value::Flag(false)),
-		field("holder", Value::UserId("user-uuid".to_string())),
+		field("distribution", Value::Flag(false)),
+		field("recipient", Value::AuthSubject("google-sub-1234567890".to_string())),
 		field("effective_at", Value::Timestamp(1_700_000_000)),
-		field("holders", Value::Count(0)),
+		field("recipients", Value::Count(0)),
 		field("memo", Value::Text(String::new())),
 	];
 	let approval = Approval {
-		kind: "bank:scope_transfer".to_string(),
+		kind: "bank:scope_payout".to_string(),
 		scope: "sa".to_string(),
 		level: ApprovalLevel::Platform as i32,
-		escalated_by: vec!["per_operation".to_string()],
+		escalated_by: vec!["distribution".to_string()],
 		state: ApprovalState::Passed as i32,
 		fields: fields.clone(),
 		..Default::default()
@@ -117,6 +120,7 @@ fn a_published_kind_keeps_its_escalation_parameters() {
 			default_threshold: "1000".to_string(),
 			currency: String::new(),
 		}],
+		proposer: String::new(),
 	};
 	let request = PublishScopeCatalogRequest {
 		version: 1_700_000_000,

@@ -43,8 +43,11 @@ message PullUserLifecycleRequest {
 message PullUserLifecycleResponse {
   // The matched events, oldest-first by `position`.
   repeated UserLifecycleEvent events = 1;
-  // The cursor to pass as the next `after_position`: the max `position` returned, or
-  // the request's `after_position` unchanged when no rows matched.
+  // The cursor to pass as the next `after_position`: the MAXIMUM POSITION SCANNED for
+  // this caller — the same rule on every concierge pull stream. It may lie past the last
+  // event returned when the rows after it were not the caller's to see, so a filtered
+  // reader never re-scans them; the request's `after_position` unchanged when nothing was
+  // scanned. To the unfiltered reader (the bridge token) it is the max position returned.
   int64 next_position = 2;
 }
 

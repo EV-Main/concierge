@@ -86,17 +86,41 @@ a resource (D2): an admin of a scope holds the `<scope>:admin` alias, which dele
 
 - **`main`** is the implicit root: no tenant row, no namespace (`namespace` empty), its
   permissions are the seats' (`concierge:*`, `iam:*`, `bank:*`) and its deciders are
-  the platform owners. Every other scope has `parent = "main"`.
-- **`origins`** are the scope's hosts as a browser sends `Origin`. The sign-in surface
-  answers CORS for them and accepts a credential POST whose `Origin` is one of them or
-  `PUBLIC_ORIGIN`. Nothing else widens: OAuth `returnTo` must be on one of these origins.
+  the platform owners. Every other scope has `parent = "main"`. A scope id is
+  `[a-z][a-z0-9_]{0,31}` here and on the money plane alike.
+- **`state`**: `ACTIVE`, `FROZEN` (reversible: no new proposal opens in it and the money
+  plane refuses new debits of its accounts; its clients still sign people in and its
+  streams are still read) or `CLOSED` (terminal: its clients sign nobody in, nothing new
+  opens, history stays readable).
 - **`clients`**: a scope may have several relying-party clients (today one, `sa`).
-- **`observers`**: client ids that may also read this scope's events and its users'
+- **`observers`**: client ids that may also READ this scope's events and its users'
   lifecycle. invest runs allocations of other scopes (the `service_arb` allocation lives
   in `sa`) and checks `sa:admin` to authorise `sa`'s admins there, so `sa` names
-  `invest` as an observer. Without this invest could not see the grants it authorises on.
+  `invest` as an observer. **An observer holds no right on the money plane**: which
+  accounts a service may open, debit or read there is banking's own configuration of
+  service grants, and nothing on this plane widens it.
 - **Registry writes** are migrations and configuration, as `rp_clients` is today; there
   is no write RPC. Every change bumps `version` and emits `SCOPE_CHANGED`.
+
+### 3.1 `origins`: sign-in from a scope's hosts
+
+`origins` are the scope's hosts exactly as a browser sends `Origin`, and they are held to
+rules a configuration slip cannot loosen:
+
+- `https` only; the host is `evinvest.ltd` or ends in `.evinvest.ltd`; a port only when
+  non-default; no path, no trailing slash, no wildcard, never `null`;
+- compared byte for byte; the answer carries `Access-Control-Allow-Origin` set to exactly
+  the matched origin and `Vary: Origin`.
+
+They widen CORS for a **closed list** of sign-in routes and nothing else:
+
+| Accepts a scope origin | `PUBLIC_ORIGIN` only |
+| ---------------------- | -------------------- |
+| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/email/verify/*`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user}`, never a token) | everything acting on an open session: `/auth/password/set`, `/auth/passkey/register`, `/auth/passkey/remove`, sessions, username, logout, `/kyc/*` |
+
+A credential POST on the left accepts an `Origin` that is `PUBLIC_ORIGIN` or one of an
+`ACTIVE` scope's origins. An OAuth `returnTo` must be one of these origins plus a path
+from the scope's `return_paths`, matched exactly.
 
 ---
 
@@ -114,11 +138,16 @@ names it an observer. The bridge token sees everything.
 
 ### 4.2 The two streams
 
-**`UserEvents.PullUserLifecycle`**, read by a client credential: same request, same
-cursor semantics, filtered inside the query by visibility (so invisible rows never hold
-the cursor back), and each row redacted — `seat_permissions` absent and `permissions`
-empty. `kyc_level` is carried: directions layer their own policy on the KYC level and
-may not manage it (D5).
+**Cursor, on every concierge pull stream:** `next_position` is the **maximum position
+scanned** for the caller — past the last event returned when the rows after it were not
+the caller's to see, so a filtered reader never re-scans them; unchanged when nothing
+was scanned. To the unfiltered reader (the bridge token) that is the max position
+returned, which is what banking stores today.
+
+**`UserEvents.PullUserLifecycle`**, read by a client credential: same request,
+filtered by visibility, and each row redacted — `seat_permissions` absent and
+`permissions` empty. `kyc_level` is carried: directions layer their own policy on the
+KYC level and may not manage it (D5).
 
 **`ScopeEvents.PullScopeEvents`** is a separate stream because `UserLifecycleEvent.Kind`
 is the money plane's vocabulary: banking stops its single cursor on a kind it cannot
@@ -128,29 +157,30 @@ it until banking redeployed. Kinds:
 
 | Kind | Carries | Ordered by |
 | ---- | ------- | ---------- |
-| `SCOPE_CHANGED` | the whole `Scope` after the change | the scope's `version` |
+| `SCOPE_CHANGED` | the whole `Scope` after the change, `state` included | the scope's `version` |
 | `GRANTS_CHANGED` | the user's whole concrete permission set in that scope (present-and-empty = holds nothing, apply it) | per (scope, user) `sequence` |
 | `MEMBER_JOINED` | the identity snapshot a projection seeds from (`ScopeMember`) and the lifecycle `sequence` it is as of | per (scope, user) `sequence` |
 
-A direction seeds a user's row from `MEMBER_JOINED` and applies lifecycle events whose
-`sequence` exceeds `lifecycle_sequence`. A lifecycle event for a user whose
-`MEMBER_JOINED` has not arrived yet is parked by subject, as banking parks a subject it
-has not provisioned. Snapshots, not deltas, so a redelivery is harmless and two events
-can never disagree about the current set.
+A user is keyed by `auth_subject` on every plane and in every approval field. A
+direction seeds a user's row from `MEMBER_JOINED` and applies lifecycle events whose
+`sequence` exceeds `lifecycle_sequence`. Parking a lifecycle event whose
+`MEMBER_JOINED` has not arrived yet is a requirement on `lib`'s projection; the
+contract does not change for it. Snapshots, not deltas, so a redelivery is harmless and
+two events can never disagree about the current set.
 
-Banking reads `ScopeEvents` with the bridge token, learns scopes from `SCOPE_CHANGED`
-and opens compartments only for known scopes.
+Banking reads `ScopeEvents` with the bridge token, learns scopes and their `state` from
+`SCOPE_CHANGED` and opens compartments only for known scopes.
 
 ### 4.3 A kind the consumer cannot name
 
 Concierge ships ahead of its consumers, so an unknown kind is the ordinary shape of a
 mid-rollout event; prost decodes it as `KIND_UNSPECIFIED`. The rule depends on what a
-swallowed event would cost:
+swallowed event would cost (decided):
 
-- **Money (banking): Halt.** The cursor stops on the event and the consumer alerts;
-  upgrading the binary is the only thing that unblocks it. Marking it applied is how a
-  freeze or a scope closure gets swallowed while money keeps moving under rules this
-  plane already revoked. This is banking's behaviour today and applies to both streams.
+- **Money (banking): Halt, on both streams.** The cursor stops on the event and the
+  consumer alerts; upgrading the binary is the only thing that unblocks it. Marking it
+  applied is how a freeze or a scope closure gets swallowed while money keeps moving
+  under rules this plane already revoked.
 - **Directions (invest, sa, admin, via `lib`'s `concierge_projection`): Park.** Record
   the event's `position` and `event_id`, advance the cursor, and replay after an
   upgrade by re-pulling with `after_position = position - 1, limit = 1`. Park the
@@ -172,31 +202,48 @@ every scope. `GovernanceService` and `MailRelayService` stay as they are until t
 contract step of the reorganisation; the new kinds below replace banking's consilium
 tables, whose foreign keys become `subject_ref`s on banking's side.
 
-### 5.1 Kinds and catalogs
+### 5.1 One owner per kind: proposer = executor
 
-A kind is declared by the service that executes it, in its namespace:
-`bank:payment`, `invest:valuation_override`, `concierge:scope_admin_grant`. It is
-published whole with `ScopeCatalogService.PublishScopeCatalog` (versioned like
+A kind belongs to the namespace that published it (`ApprovalKindSpec.proposer`), and
+that namespace is the kind's **only proposer and only executor**: only it opens a
+proposal of the kind (`Propose`), reads it as a service (`GetProposal`), pulls its
+decisions (`PullApproved`) and reports their outcome (`ReportOutcome`). Nobody presents
+someone else's decision as authority for an act of their own — a decision is never a
+token another service can carry to the money plane.
+
+So a direction that needs money moved does not hold an approval: it asks banking
+(banking's `RequestPayout`/`RequestTransfer`), banking stores the request whole, opens
+the `bank:*` proposal with every money field, executes it from `PullApproved` — one
+decision, one execution, unique by approval id on banking's side — and reports the
+outcome. The direction follows it by `subject_ref` on banking's money stream.
+
+Kinds are published whole with `ScopeCatalogService.PublishScopeCatalog` (versioned like
 `PublishCatalog`); `concierge:*` kinds are this plane's own, built in at version 0. A
-service may open proposals only for kinds of its own namespace, in any registered scope
-— invest proposes `invest:valuation_override` in `sa` because the allocation is there.
+proposer may open proposals of its kinds in any registered `ACTIVE` scope — invest
+proposes `invest:valuation_override` in `sa` because the allocation is there.
+
+`Approval.proposer` is the kind's namespace; `Approval.requested_by_client` is the
+client whose credential opened it, for the audit trail only.
 
 A kind declares (`ApprovalKindSpec`): a label and description in plain text; its
 **level** before escalation; its **fields**, each with a type from a closed set
 (`TEXT`, `AMOUNT`, `BPS`, `FLAG`, `USER`, `TIMESTAMP`, `COUNT`) that this plane knows
 how to render; and its **escalations**, each naming a field, a test and a default
-threshold.
+threshold. A `USER` field carries an `auth_subject`.
 
 ### 5.2 Who decides
 
 | Level | Roster | Threshold | Delay (veto window) | Lifetime |
 | ----- | ------ | --------- | ------------------- | -------- |
-| `PLATFORM` | persisted `owner` seats (break-glass seats nobody) | more than half of the voters | 24 h, veto by any voter | 72 h |
-| `SCOPE` | active holders of `<scope>:admin` | the scope policy's `quorum_bps`, default more than half of the voters | the policy's `delay_secs`, default 1 h, veto by any voter | the policy's `ttl_secs`, default and ceiling 72 h |
+| `PLATFORM` | persisted `owner` seats (break-glass seats nobody) | more than half of the roster | 24 h, veto by any roster member | 72 h |
+| `SCOPE` | active holders of `<scope>:admin` | the scope policy's `quorum_bps`, default more than half of the roster | the policy's `delay_secs`, default 1 h, veto by any roster member | the policy's `ttl_secs`, default and ceiling 72 h |
 
-- **Voters** are the roster frozen at open minus the initiator; the initiator never
-  votes. `threshold = max(1, ceil(voters × quorum_bps / 10000))`, platform at 5001 bps.
-  A proposal whose voters would be nobody is refused at open (`FAILED_PRECONDITION`).
+- **Quorum is over the whole roster frozen at open:**
+  `threshold = max(1, ceil(roster × quorum_bps / 10000))`, platform at 5001 bps. Nobody
+  is excluded. A service cannot prove which person asked it, so the person it names
+  (`requested_by`, an `auth_subject`) is information shown to voters — it moves no
+  quorum and keeps nobody off the roster. A `PLATFORM` proposal with fewer than two
+  owners on the roster is refused at open (`FAILED_PRECONDITION`).
 - **Escalation to `PLATFORM`** happens at open and is frozen with the roster
   (`Approval.escalated_by` says why):
   - any declared escalation test fires against the scope's threshold (or the kind's
@@ -205,78 +252,93 @@ threshold.
   - a proposal in scope `main` is always `PLATFORM`.
 - **Tests:** `AMOUNT_ABOVE` (an amount in another currency than the parameter's escalates
   — fail safe); `ROLLING_24H_AMOUNT_ABOVE` — the amount plus every **live or executed**
-  scope-level proposal of the same kind and scope opened in the trailing 24 h;
-  `ABS_BPS_ABOVE`; `FLAG_SET`.
-
-  *Departure from the plan:* the plan counts the daily window over executed decisions.
-  Counting only executed ones lets several proposals opened together each pass under the
-  window and then execute together above it, so open and passed ones count too. A
-  proposal that ends rejected, vetoed, expired, cancelled or void stops counting.
-
+  scope-level proposal of the same kind and scope opened in the trailing 24 h (decided:
+  counting only executed ones would let proposals opened together each pass under the
+  window and then execute together above it; a proposal that ends rejected, vetoed,
+  expired, cancelled or void stops counting); `ABS_BPS_ABOVE`; `FLAG_SET`.
 - **The scope policy** (`ScopeApprovalPolicy`: quorum, delay, lifetime, threshold
   overrides) is changed only by `concierge:scope_policy_change`, which is always
   `PLATFORM`: a scope able to lower its own thresholds would decide for itself what
-  needs the owners. The new policy is validated at open and again at execution against
-  the catalogs then in force.
+  needs the owners. It does not carry compartment limits — those are the money plane's
+  `bank:compartment_policy`. The new policy is validated at open and again at execution
+  against the catalogs then in force.
 
-### 5.3 Defaults (the plan's table, as kinds)
+### 5.3 Kinds
 
-Suggested specs; names and fields of `bank:*` and `invest:*` are their owners' to
-confirm (§7).
+`bank:*` — final; banking is the only proposer and executor of each.
 
 | Kind | Level | Escalations (default) | Fields |
 | ---- | ----- | --------------------- | ------ |
-| `bank:payment` — from a scope account off the platform (L1) or into another scope | PLATFORM | — | tier, source, destination (TEXT), amount |
-| `bank:seed_capital` | PLATFORM | — | allocation (TEXT), amount |
+| `bank:payment` — from a scope account off the platform (L1) only | PLATFORM | — | tier, source, destination (TEXT), amount |
+| `bank:scope_transfer` — between two scopes | PLATFORM, always | — | from_account, to_account (TEXT), amount |
+| `bank:account_transfer` — between accounts of one scope | SCOPE | `per_operation` AMOUNT_ABOVE 1000 USDT; `daily` ROLLING_24H_AMOUNT_ABOVE 5000 USDT | from_account, to_account (TEXT), amount |
+| `bank:scope_payout` — discretionary payout from a scope account to users | SCOPE | `per_operation` AMOUNT_ABOVE 1000 USDT on `total`; `distribution` FLAG_SET | from_account (TEXT), total (AMOUNT), recipients (COUNT), recipient (USER, only when there is one line), lines_digest (TEXT), distribution (FLAG) |
+| `bank:seed_capital` | PLATFORM | — | to_account (TEXT), amount |
 | `bank:treasury_surplus` | PLATFORM | — | amount, destination (TEXT) |
-| `bank:scope_transfer` — between accounts of one scope | SCOPE | `per_operation` AMOUNT_ABOVE 1000 USDT; `daily` ROLLING_24H_AMOUNT_ABOVE 5000 USDT | from_account, to_account (TEXT), amount |
-| `bank:scope_payout` — from a scope account to one user | SCOPE | `per_operation` AMOUNT_ABOVE 1000 USDT | from_account (TEXT), recipient (USER), amount |
+| `bank:compartment_policy` — a scope's compartment limits, default mandates, automatic ceilings | PLATFORM | — | banking's to define |
+
+`lines_digest` is SHA-256, lowercase hex, over the payout's lines as canonical
+`<auth_subject>|<amount>` strings, sorted and joined by `\n`, each amount in this
+plane's canonical decimal; banking computes it over the payout it stored. A
+distribution to every holder of an allocation is a `bank:scope_payout` with
+`distribution` set, which always escalates — there is no separate dividend kind.
+
+`invest:*` — **proposals; invest confirms them.**
+
+| Kind | Level | Escalations (default) | Fields |
+| ---- | ----- | --------------------- | ------ |
 | `invest:valuation_override` | SCOPE | `max_deviation` ABS_BPS_ABOVE 1000 (10 %) | allocation (TEXT), mark (AMOUNT), deviation (BPS) — invest still refuses beyond the 50 % cap before proposing |
 | `invest:fee_policy` | SCOPE | `ceiling` FLAG_SET on raises_ceiling | allocation, basis, crystallization (TEXT); current and proposed management/performance/hurdle (BPS); raises_ceiling (FLAG) |
 | `invest:holder_grant` | PLATFORM | — | allocation (TEXT), holder (USER), units (AMOUNT, unit code) |
-| `invest:dividend_distribution` — to every holder | PLATFORM | — | allocation (TEXT), amount, holders (COUNT) |
-| `concierge:scope_admin_grant` | PLATFORM | — | scope, grantee |
-| `concierge:scope_policy_change` | PLATFORM | — | scope, the policy |
+
+`concierge:*` — this plane's own, opened over `ApprovalService` and executed by this
+plane's own puller.
+
+| Kind | Level | Opened by |
+| ---- | ----- | --------- |
+| `concierge:scope_admin_grant` | PLATFORM | a seat holding `iam:tenants:grant` |
+| `concierge:scope_policy_change` | PLATFORM | such a seat, or an admin of the scope |
 
 Assigning an operator in a scope is still a delegated `GrantPermission` by a
-`<scope>:admin`, with no approval. This plane's own two kinds are opened over
-`ApprovalService`: `scope_admin_grant` by a seat holding `iam:tenants:grant`,
-`scope_policy_change` by such a seat or by an admin of the scope.
+`<scope>:admin`, with no approval.
 
 ### 5.4 Life of a proposal
 
 ```
-OPEN ──(threshold met)──▶ PASSED ──(executable_at passes; executor pulls)──▶ EXECUTED
+OPEN ──(threshold met)──▶ PASSED ──(executable_at passes; proposer pulls)──▶ EXECUTED
   │                         │                                               EXECUTION_FAILED
   │                         ├─ veto ─▶ VETOED                                VOID
   ├─ votes against ─▶ REJECTED
   ├─ expires_at ─▶ EXPIRED   (lazy, like the governance consilia)
-  └─ initiator / proposing service ─▶ CANCELLED   (also from PASSED inside the delay)
+  └─ proposer withdraws ─▶ CANCELLED   (also from PASSED inside the delay)
 ```
 
-- **Propose** (`ApprovalExecutionService.Propose`): the proposing service has already
-  decided the initiator may ask (it owns that surface); this plane checks the
-  initiator is an active account and keeps them off the roster. `subject_ref` is the
-  service's own reference, opaque here (≤ 256 bytes printable ASCII, never shown to
-  voters); at most one live (`OPEN`/`PASSED`) proposal per kind, scope and
-  `subject_ref`. Idempotent by `dedupe_key` per namespace.
+- **Propose** (`ApprovalExecutionService.Propose`): the proposer has already decided the
+  person may ask (it owns that surface). `subject_ref` is `<type>:<uuid>` — `type`
+  `[a-z][a-z0-9_]{0,31}`, a lowercase hyphenated UUID, at most 128 bytes, the same rule
+  on both planes — opaque here beyond that shape and never shown to voters; at most one
+  live (`OPEN`/`PASSED`) proposal per kind, scope and `subject_ref`. Idempotent by
+  `dedupe_key` per namespace.
 - **Text** — `TEXT` fields, `reason`, a veto reason, an outcome detail — is one line,
   bounded, refused if it carries a control character or a link (`://`, `www.`), and
   rendered attributed to whoever wrote it, never as this plane's own words. There is no
   free-form markup anywhere: the mail is rendered here from the kind's labels and the
-  typed values (`USER` resolved to the account's email here, `BPS` to a percentage here).
-- **Veto and cancel** are possible while `OPEN` and while `PASSED` before
-  `executable_at`. After that the executor owns the proposal and only `ReportOutcome`
-  moves it.
+  typed values (`USER` resolved from its `auth_subject` to the account's email here,
+  `BPS` to a percentage here).
+- **Veto** by any roster member, and **withdrawal** by the proposer
+  (`WithdrawProposal`) — or, for a `concierge:*` proposal, by the person who opened it
+  over a session (`CancelApproval`) — are possible while `OPEN` and while `PASSED`
+  before `executable_at`. After that the proposer owns the proposal and only
+  `ReportOutcome` moves it.
 - **Pull** (`PullApproved`) serves `PASSED` proposals of the caller's namespace whose
   `executable_at` is behind the clock and that have no outcome, oldest first. A pull
   claims nothing: the same proposal is served on every pull until its outcome is
-  reported, so the executor is idempotent per proposal id. Executable is a time
+  reported, so the proposer is idempotent per proposal id. Executable is a time
   predicate over `PASSED`, not a state, so nothing has to sweep for a proposal to become
-  pullable. Concierge's own kinds are executed by this plane's own puller.
-- **`payload_hash`** binds what was approved to what is executed. The executor
-  recomputes it from its own record of the subject and refuses to act on a mismatch:
-  SHA-256, lowercase hex, over the UTF-8 bytes of
+  pullable.
+- **`payload_hash`** binds what was approved to what is executed. The proposer computes
+  it over the operation it STORED when it proposed, compares it at execution, and
+  refuses to act on a mismatch: SHA-256, lowercase hex, over the UTF-8 bytes of
 
   ```
   ev-approval-v1\n<kind>\n<scope>\n<subject_ref>\n
@@ -285,29 +347,28 @@ OPEN ──(threshold met)──▶ PASSED ──(executable_at passes; executor
   `<type>` is the enum suffix (`AMOUNT`, `BPS`, …) and `<value>` is the text verbatim,
   `<value> <currency>` for an amount (the canonical decimal is enforced at Propose for
   exactly this reason), the decimal integer for `BPS`/`TIMESTAMP`/`COUNT`,
-  `true`/`false` for a flag, and the lowercase UUID for a user. No field may contain a
+  `true`/`false` for a flag, and the `auth_subject` for a user. No field may contain a
   tab or a newline, so the encoding is unambiguous.
 - **ReportOutcome**: `EXECUTED`, `FAILED` (terminal; a retry is a new proposal) or
   `VOID` (no longer applies; nothing attempted). Repeating the same outcome is a no-op.
 
 ### 5.5 Mail
 
-On open, every voter at a VERIFIED address gets the approval mail; on the terminal
-state, the voters and the initiator get the outcome. Both are rendered here by one
-template per purpose from the kind's spec, bypass notification preferences (an approval
-nobody can switch off, like the governance mails), and link only to this plane's own
-approvals page on `PUBLIC_ORIGIN`. They carry no code: voting happens over a session,
-not from a mailbox.
+On open, every roster member at a VERIFIED address gets the approval mail; on the
+terminal state, the roster and the person named in `requested_by` get the outcome. Both
+are rendered here by one template per purpose from the kind's spec, bypass notification
+preferences (an approval nobody can switch off, like the governance mails), and link
+only to this plane's own approvals page on `PUBLIC_ORIGIN`. They carry no code: voting
+happens over a session, not from a mailbox.
 
-### 5.6 Granting a scope admin
+### 5.6 Scope admins (decided)
 
 While `concierge:scope_admin_grant` exists, `UserDirectory.GrantPermission` refuses a
 `<scope>:admin` target and names `ApprovalService.ProposeScopeAdminGrant` — the
-behaviour `SetRole` has for `admin`. **Taking the grant away stays one act**
-(`RevokePermission` by a seat holding `iam:tenants:grant`): the plan's table puts
-removal at the platform level too, but containing a rogue admin must never be the
-slower path, which is the rule this plane already keeps for `Role::Admin`. Open question
-for the owner (§7).
+behaviour `SetRole` has for `admin`. **Removing a scope admin is immediate, with no
+approval** (`RevokePermission` by a seat holding `iam:tenants:grant`): containing a
+rogue admin must never be the slower path, the rule this plane already keeps for
+`Role::Admin`.
 
 ---
 
@@ -323,30 +384,22 @@ existing subscriptions across is the implementation's migration.
 
 ---
 
-## 7. Open questions
+## 7. Decisions and open questions
 
-**To banking**
+**Decided (review of 2026-10-14):** proposer = executor per kind (§5.1); quorum over the
+whole roster, `requested_by` informational (§5.2); the `bank:*` kinds of §5.3, with no
+`invest:dividend_distribution`; compartment limits in `bank:compartment_policy`, not in
+`scope_policy_change`; removing a scope admin is immediate (§5.6); the daily window
+counts live and executed proposals (§5.2); banking halts on an unknown kind on both
+streams (§4.3); `observers` grant nothing on the money plane (§3); the closed CORS route
+list and the `origins` rules (§3.1); `auth_subject` as the user key everywhere;
+`subject_ref` as `<type>:<uuid>` of at most 128 bytes; `next_position` as the maximum
+position scanned (§4.2); `Scope.state` (§3).
 
-1. Kind names and fields in §5.3: is `bank:payment` the right home for both L1 and
-   cross-scope transfers, or two kinds? Are on-chain revenue payouts (today's
-   `PAYOUT_APPROVAL`) `bank:payment` with tier `external`?
-2. `subject_ref` format. Suggested `<type>:<uuid>` (`payment:4f…`, `transfer:…`) so a
-   proposal list reads without a lookup; this plane never parses it.
-3. Compartment limits (`scope_policies`, §3.2 of the plan) are platform-level changes:
-   a `bank:compartment_policy` kind of banking's own, or should
-   `concierge:scope_policy_change` carry them?
-4. Is the bridge token acceptable as the approvals credential (§2), or does banking want
-   a separate secret before service tokens exist?
-5. Halt on an unknown `ScopeEvent` kind as on lifecycle kinds — confirm, since banking
-   will see every scope's events.
+**Open**
 
-**To the owner**
-
-6. Scope-admin removal: one act (as proposed here) or a platform approval (as the plan's
-   table says).
-7. The daily window counts live as well as executed proposals (§5.2).
-8. A direction receives `kyc_level` on the lifecycle stream and in `ScopeMember` (D5),
+1. Is the bridge token acceptable as banking's approvals credential (§2) until service
+   tokens exist, or does banking want a separate secret?
+2. A direction receives `kyc_level` on the lifecycle stream and in `ScopeMember` (D5),
    although `GetMe` withholds it from relying parties today.
-9. A service may propose its kinds in any scope (§5.1); the alternative is an explicit
-   per-scope list, at the cost of one more thing to configure per allocation move.
-10. Topic labels are one language; the frontends carry five locales.
+3. Topic labels are one language; the frontends carry five locales.
