@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use domain::{error::DomainError, scopes::ScopeState};
-use sqlx::PgPool;
+use sqlx::{FromRow, PgPool, Row};
 
 use crate::ports::{ScopeClientRecord, ScopeRecord, ScopeRepository};
 
@@ -61,24 +61,53 @@ impl TryFrom<ScopeRow> for ScopeRecord {
 	}
 }
 
-#[async_trait]
-impl ScopeRepository for PgScopes {
-	async fn scopes(&self) -> Result<Vec<ScopeRecord>, DomainError> {
-		// One statement, so a scope and its clients are read from the same snapshot.
-		sqlx::query_as::<_, ScopeRow>(
+impl PgScopes {
+	/// Every scope, or the one `id` names. One statement, so a scope and its clients are
+	/// read from the same snapshot.
+	///
+	/// A row that does not decode is skipped at `error!`, never returned as an error: the
+	/// registry is read at boot and on every refresh of the sign-in allowlist, and one bad
+	/// row must cost that scope its sign-in, not the plane its start. Losing a scope's
+	/// origins is the safe direction to fail in.
+	async fn read(&self, id: Option<&str>) -> Result<Vec<ScopeRecord>, DomainError> {
+		let rows = sqlx::query(
 			"SELECT t.id, t.namespace, t.parent, t.display_name, t.origins, t.return_paths, t.observers, t.state, t.version, t.created_at,
 			        coalesce(array_agg(c.client_id ORDER BY c.client_id) FILTER (WHERE c.client_id IS NOT NULL), '{}') AS client_ids,
 			        coalesce(array_agg(c.audience ORDER BY c.client_id) FILTER (WHERE c.client_id IS NOT NULL), '{}') AS audiences,
 			        coalesce(array_agg(c.disabled_at IS NOT NULL ORDER BY c.client_id) FILTER (WHERE c.client_id IS NOT NULL), '{}') AS disabled
 			 FROM tenants t LEFT JOIN rp_clients c ON c.tenant_id = t.id
+			 WHERE $1::TEXT IS NULL OR t.id = $1
 			 GROUP BY t.id
 			 ORDER BY t.id",
 		)
+		.bind(id)
 		.fetch_all(&self.pool)
 		.await
-		.map_err(|e| DomainError::Repository(format!("scope registry not read: {e}")))?
-		.into_iter()
-		.map(ScopeRecord::try_from)
-		.collect()
+		.map_err(|e| DomainError::Repository(format!("scope registry not read: {e}")))?;
+		Ok(rows
+			.iter()
+			.filter_map(|row| {
+				let decoded = ScopeRow::from_row(row).map_err(|e| DomainError::Repository(e.to_string())).and_then(ScopeRecord::try_from);
+				match decoded {
+					Ok(scope) => Some(scope),
+					Err(e) => {
+						let id: Option<String> = row.try_get("id").ok();
+						tracing::error!(scope = ?id, error = %e, "scope registry row does not decode; the scope is left out");
+						None
+					}
+				}
+			})
+			.collect())
+	}
+}
+
+#[async_trait]
+impl ScopeRepository for PgScopes {
+	async fn scopes(&self) -> Result<Vec<ScopeRecord>, DomainError> {
+		self.read(None).await
+	}
+
+	async fn scope(&self, id: &str) -> Result<Option<ScopeRecord>, DomainError> {
+		Ok(self.read(Some(id)).await?.into_iter().next())
 	}
 }

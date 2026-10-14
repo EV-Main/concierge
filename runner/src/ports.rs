@@ -422,8 +422,12 @@ pub struct ScopeClientRecord {
 /// The scope registry. Read-only: scopes are written by migration and configuration.
 #[async_trait]
 pub trait ScopeRepository: Send + Sync {
-	/// Every registered scope with its clients, by id.
+	/// Every registered scope with its clients, by id. A row that does not decode is
+	/// left out (and reported), not an error.
 	async fn scopes(&self) -> Result<Vec<ScopeRecord>, DomainError>;
+
+	/// One scope by id; `None` when there is none or its row does not decode.
+	async fn scope(&self, id: &str) -> Result<Option<ScopeRecord>, DomainError>;
 }
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).

@@ -51,9 +51,11 @@ impl ScopeState {
 	}
 }
 
-/// An origin exactly as a browser sends `Origin`: `https` only, the host [`SITE`] or a
-/// subdomain of it, a port only when non-default, nothing after the authority. No
-/// wildcard and never `null` — both fall out of the host rule.
+/// A scope origin, exactly as a browser sends `Origin`: `https` only, a SUBdomain of
+/// [`SITE`] (the bare host is `PUBLIC_ORIGIN`, this plane's own, and never a scope's), a
+/// port 1-65535 only when non-default, nothing after the authority. No wildcard and
+/// never `null` — both fall out of the host rule. Mirrored by `scope_origins_valid`
+/// (migration 0031).
 pub fn is_sign_in_origin(raw: &str) -> bool {
 	let Some(authority) = raw.strip_prefix("https://") else {
 		return false;
@@ -68,11 +70,9 @@ pub fn is_sign_in_origin(raw: &str) -> bool {
 			return false;
 		}
 	}
-	host == SITE
-		|| host
-			.strip_suffix(SITE)
-			.and_then(|rest| rest.strip_suffix('.'))
-			.is_some_and(|labels| labels.split('.').all(is_dns_label))
+	host.strip_suffix(SITE)
+		.and_then(|rest| rest.strip_suffix('.'))
+		.is_some_and(|labels| labels.split('.').all(is_dns_label))
 }
 
 fn is_dns_label(label: &str) -> bool {
@@ -103,12 +103,7 @@ mod tests {
 
 	#[test]
 	fn origins_are_https_hosts_under_the_site() {
-		for ok in [
-			"https://evinvest.ltd",
-			"https://invest.evinvest.ltd",
-			"https://a-b.c1.evinvest.ltd",
-			"https://sa.evinvest.ltd:8443",
-		] {
+		for ok in ["https://invest.evinvest.ltd", "https://a-b.c1.evinvest.ltd", "https://sa.evinvest.ltd:8443"] {
 			assert!(is_sign_in_origin(ok), "{ok}");
 		}
 		for bad in [
@@ -116,6 +111,10 @@ mod tests {
 			"https://invest.evinvest.ltd/",
 			"https://invest.evinvest.ltd/cabinet",
 			"https://invest.evinvest.ltd:443",
+			"https://evinvest.ltd",
+			"https://evinvest.ltd:8443",
+			"https://invest.evinvest.ltd:0",
+			"https://invest.evinvest.ltd:65536",
 			"https://invest.evinvest.ltd:",
 			"https://invest.evinvest.ltd:080",
 			"https://invest.evinvest.ltd:99999",

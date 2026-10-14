@@ -7,8 +7,8 @@
 --                   CHECK later is a migration either way, and loosening is the safe
 --                   direction to discover it in.
 --   display_name  — plain text, at most 80 bytes.
---   origins       — the https origins of the scope's hosts, exactly as a browser sends
---                   `Origin`. They widen CORS and the `Origin` check on the sign-in routes
+--   origins       — the https origins of the scope's hosts (subdomains of evinvest.ltd,
+--                   never the bare host), exactly as a browser sends `Origin`. They widen CORS and the `Origin` check on the sign-in routes
 --                   only, so the shape is held HERE as well as in code
 --                   (`domain::scopes::is_sign_in_origin`): a row a configuration slip
 --                   could write with `http://`, a path or a foreign host would otherwise
@@ -46,11 +46,18 @@
 SET LOCAL lock_timeout = '3s';
 
 -- IMMUTABLE helpers so the array CHECKs read as one rule each; a CHECK cannot hold a
--- subquery over `unnest`. They mirror `domain::scopes`.
+-- subquery over `unnest`. They mirror `domain::scopes` rule for rule, so a row the boot
+-- would drop as malformed cannot be written in the first place.
+--
+-- A NULL element is refused explicitly: `bool_and` skips NULLs, so without the
+-- `array_position` guard `ARRAY[NULL]` would pass and then fail to decode. The host is
+-- a SUBdomain of evinvest.ltd — the bare host is `PUBLIC_ORIGIN`, this plane's own,
+-- never a scope's — and a port is 1-65535 and never the default 443.
 CREATE FUNCTION scope_origins_valid(origins TEXT[]) RETURNS BOOLEAN
 LANGUAGE SQL IMMUTABLE STRICT AS $$
-    SELECT coalesce(bool_and(
-        o ~ '^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*evinvest\.ltd(:[1-9][0-9]{0,4})?$'
+    SELECT array_position(origins, NULL) IS NULL AND coalesce(bool_and(
+        o ~ '^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+evinvest\.ltd(:[1-9][0-9]{0,4})?$'
+        AND coalesce(substring(o FROM ':([0-9]+)$')::INTEGER BETWEEN 1 AND 65535, TRUE)
         AND o !~ ':443$'
     ), TRUE)
     FROM unnest(origins) AS o
@@ -58,7 +65,8 @@ $$;
 
 CREATE FUNCTION scope_return_paths_valid(paths TEXT[]) RETURNS BOOLEAN
 LANGUAGE SQL IMMUTABLE STRICT AS $$
-    SELECT coalesce(bool_and(p = '/' OR p ~ '^(/[A-Za-z0-9._~%!$&''()*+,;=:@-]+)+$'), TRUE)
+    SELECT array_position(paths, NULL) IS NULL
+       AND coalesce(bool_and(p = '/' OR p ~ '^(/[A-Za-z0-9._~%!$&''()*+,;=:@-]+)+$'), TRUE)
     FROM unnest(paths) AS p
 $$;
 
@@ -77,7 +85,8 @@ ALTER TABLE tenants
     ADD CONSTRAINT tenants_origins CHECK (cardinality(origins) <= 16 AND scope_origins_valid(origins)),
     ADD CONSTRAINT tenants_return_paths CHECK (cardinality(return_paths) <= 16 AND scope_return_paths_valid(return_paths)),
     ADD CONSTRAINT tenants_state CHECK (state IN ('active', 'frozen', 'closed')),
-    ADD CONSTRAINT tenants_observers CHECK (cardinality(observers) <= 16 AND array_to_string(observers, ' ') ~ '^([a-z][a-z0-9_]{0,31}( [a-z][a-z0-9_]{0,31})*)?$'),
+    -- `array_to_string` drops NULL elements, hence the explicit guard.
+    ADD CONSTRAINT tenants_observers CHECK (cardinality(observers) <= 16 AND array_position(observers, NULL) IS NULL AND array_to_string(observers, ' ') ~ '^([a-z][a-z0-9_]{0,31}( [a-z][a-z0-9_]{0,31})*)?$'),
     ADD CONSTRAINT tenants_version CHECK (version >= 1);
 
 UPDATE tenants
