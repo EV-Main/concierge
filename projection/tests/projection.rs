@@ -444,7 +444,7 @@ async fn should_apply_and_unblock_a_queued_lifecycle_key_in_order_once_member_jo
 
 /// A MEMBER_JOINED is recorded as applied before its user's lifecycle sequence is raised,
 /// in two units of work. Cut between them (a database blip; `run()` dropped at shutdown,
-/// which GUIDE.md calls safe) and the re-pulled MEMBER_JOINED is skipped as a duplicate,
+/// which the crate README calls safe) and the re-pulled MEMBER_JOINED is skipped as a duplicate,
 /// so the raise never happens and every later lifecycle event of the user parks as
 /// AwaitingMember — a SUSPENDED included.
 #[tokio::test]
