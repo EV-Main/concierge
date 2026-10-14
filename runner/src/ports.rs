@@ -25,7 +25,7 @@
 
 use async_trait::async_trait;
 use domain::{
-	approvals::{Action, ApprovalState, Decision, Field, Outcome, ScopePolicy, Vote as ApprovalVote},
+	approvals::{Action, ApprovalState, Decision, Field, Outcome, PlatformPolicy, ScopePolicy, Vote as ApprovalVote},
 	architecture::{Reader, Repository},
 	auth::ProvenIdentity,
 	authz::Role,
@@ -536,6 +536,35 @@ pub struct NewApproval {
 	pub exclude: Option<UserId>,
 	/// What this plane's executor does once it passes; `concierge:*` kinds only.
 	pub action: Option<Action>,
+	/// The account a service proved asked for it, when it presented that account's fresh
+	/// token. The adapter holds it against `requested_by`, spends the token, and for a
+	/// platform decision keeps them off the roster and tells them (D24(1)).
+	pub proven: Option<ProvenInitiator>,
+}
+
+/// What a user token presented with a proposal proves: whose it is, the `token_version` it
+/// was minted under, and its digest — one token proves one request.
+#[derive(Clone, Debug)]
+pub struct ProvenInitiator {
+	pub user: UserId,
+	pub token_version: u64,
+	/// SHA-256 of the token, lowercase hex: the token itself is never stored.
+	pub token_digest: String,
+}
+
+/// This plane's own token verifier as an approval sees it: whose access token a proposer
+/// presented beside `requested_by` (D24(1)). A port, so the rule can be exercised without a
+/// signing key; production mounts `evconcierge_auth::Verifier`.
+#[async_trait]
+pub trait UserTokenVerifier: Send + Sync {
+	async fn verify(&self, token: &str) -> Result<evconcierge_auth::Claims, evconcierge_auth::AuthError>;
+}
+
+#[async_trait]
+impl UserTokenVerifier for evconcierge_auth::Verifier {
+	async fn verify(&self, token: &str) -> Result<evconcierge_auth::Claims, evconcierge_auth::AuthError> {
+		evconcierge_auth::Verifier::verify(self, token).await
+	}
 }
 
 /// Whom a person-facing RPC names: by id, or by a handle resolved as
@@ -586,6 +615,8 @@ pub struct ApprovalRecord {
 	pub decision: Decision,
 	/// What this plane's executor does with it; `concierge:*` kinds only.
 	pub action: Option<Action>,
+	/// The proposer presented `requested_by`'s own fresh token with it.
+	pub requested_by_proven: bool,
 	/// The instant this record was read at, on the store's clock: what a reader projects
 	/// `decision` through.
 	pub as_of: i64,
@@ -663,6 +694,9 @@ pub trait ApprovalRepository: Send + Sync {
 	/// An ACTIVE account, its `auth_subject` and whether its address is verified. A handle
 	/// naming several accounts names nobody (`Validation`).
 	async fn person(&self, who: PersonRef<'_>) -> Result<Option<(UserId, String, bool)>, DomainError>;
+
+	/// The platform's policy in force and when the owner roster last changed.
+	async fn platform_policy(&self) -> Result<(PlatformPolicy, i64), DomainError>;
 
 	/// Carry out one passed `concierge:*` proposal and record its outcome, in one
 	/// transaction. `None` when it is not (or no longer) this plane's to execute now.

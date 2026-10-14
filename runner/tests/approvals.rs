@@ -28,10 +28,11 @@ use domain::{authz::Role, users::UserId};
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
 	Approval, ApprovalAmount, ApprovalEscalation, ApprovalFieldSpec, ApprovalFieldType, ApprovalFieldValue, ApprovalKindSpec, ApprovalLevel, ApprovalOutcome, ApprovalState,
-	ApprovalThreshold, ApprovalVote, CancelApprovalRequest, EscalationTest, GetApprovalRequest, GetProposalRequest, GetScopeApprovalPolicyRequest, ListApprovalKindsRequest,
-	ListApprovalsRequest, ProposeRequest, ProposeScopeAdminGrantRequest, ProposeScopePolicyChangeRequest, PublishScopeCatalogRequest, PullApprovedRequest, ReportOutcomeRequest,
-	ScopeApprovalPolicy, VetoApprovalRequest, VoteApprovalRequest, WithdrawProposalRequest, approval_execution_service_server::ApprovalExecutionService, approval_field_value::Value,
-	approval_service_server::ApprovalService, propose_scope_admin_grant_request, scope_catalog_service_server::ScopeCatalogService,
+	ApprovalThreshold, ApprovalVote, CancelApprovalRequest, EscalationTest, GetApprovalRequest, GetPlatformApprovalPolicyRequest, GetProposalRequest, GetScopeApprovalPolicyRequest,
+	ListApprovalKindsRequest, ListApprovalsRequest, PlatformApprovalPolicy, ProposePlatformPolicyChangeRequest, ProposeRequest, ProposeScopeAdminGrantRequest,
+	ProposeScopePolicyChangeRequest, PublishScopeCatalogRequest, PullApprovedRequest, ReportOutcomeRequest, ScopeApprovalPolicy, VetoApprovalRequest, VoteApprovalRequest,
+	WithdrawProposalRequest, approval_execution_service_server::ApprovalExecutionService, approval_field_value::Value, approval_service_server::ApprovalService,
+	propose_scope_admin_grant_request, scope_catalog_service_server::ScopeCatalogService,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, PgPool};
@@ -54,6 +55,7 @@ struct Fx {
 	catalogs: ScopeCatalogs,
 	people: Approvals,
 	services: ApprovalExecution,
+	tokens: Arc<FakeTokens>,
 	repo: Arc<PgApprovals>,
 	clock: Arc<AtomicI64>,
 }
@@ -80,9 +82,11 @@ async fn setup() -> Option<Fx> {
 	let catalog_repo = Arc::new(PgScopeCatalogs::new(pool.clone()));
 	let clock = Arc::new(AtomicI64::new(T0));
 	let repo = Arc::new(PgApprovals::with_fixed_time(pool.clone(), clock.clone()));
+	let tokens = Arc::new(FakeTokens::default());
 	Some(Fx {
 		people: Approvals::new(users.clone(), Arc::new(BreakGlass::new(Vec::new())), repo.clone(), catalog_repo.clone()),
-		services: ApprovalExecution::new(callers.clone(), repo.clone(), catalog_repo.clone()),
+		services: ApprovalExecution::new(callers.clone(), repo.clone(), catalog_repo.clone()).with_user_tokens(tokens.clone()),
+		tokens,
 		repo,
 		catalogs: ScopeCatalogs::new(callers, catalog_repo),
 		rp: PgRelyingParties::new(pool.clone()),
@@ -91,6 +95,46 @@ async fn setup() -> Option<Fx> {
 		url,
 		clock,
 	})
+}
+
+/// This plane's verifier as the approvals see it: a token is valid when a test minted it.
+/// The signature check itself is `evconcierge_auth`'s and tested there.
+#[derive(Default)]
+struct FakeTokens {
+	issued: std::sync::Mutex<std::collections::HashMap<String, Claims>>,
+}
+
+#[async_trait::async_trait]
+impl concierge::ports::UserTokenVerifier for FakeTokens {
+	async fn verify(&self, token: &str) -> Result<Claims, evconcierge_auth::AuthError> {
+		self.issued.lock().unwrap().get(token).cloned().ok_or(evconcierge_auth::AuthError::InvalidToken)
+	}
+}
+
+impl FakeTokens {
+	/// A token for `user` minted at `iat`, the instant its freshness is judged by.
+	fn mint(&self, user: UserId, iat: i64) -> String {
+		let token = format!("token-{}", Uuid::new_v4());
+		self.issued.lock().unwrap().insert(
+			token.clone(),
+			Claims {
+				sub: user.to_string(),
+				iss: "https://auth.concierge.ev".into(),
+				aud: "concierge".into(),
+				exp: u64::MAX,
+				iat: u64::try_from(iat).unwrap(),
+				typ: TokenType::Access,
+				jti: None,
+				token_version: 0,
+			},
+		);
+		token
+	}
+}
+
+fn with_user_token<T>(mut request: Request<T>, token: &str) -> Request<T> {
+	request.metadata_mut().insert("x-ev-user-token", MetadataValue::try_from(token).unwrap());
+	request
 }
 
 fn as_client<T>(body: T, scope: &Scope) -> Request<T> {
@@ -973,8 +1017,16 @@ async fn an_owner_who_lost_the_seat_cannot_vote_on_a_frozen_roster() {
 		.execute(&fx.pool)
 		.await
 		.unwrap();
-	assert_eq!(code(fx.vote(owners[0], &opened.id, ApprovalVote::For).await), Some(Code::PermissionDenied));
-	assert_eq!(fx.vote(owners[1], &opened.id, ApprovalVote::For).await.unwrap().voters.len(), 3, "the roster did not move");
+	let read = fx.get(owners[1], &opened.id).await;
+	assert_eq!(state(&read), ApprovalState::Void, "a change of the owners voids every live platform decision (D24)");
+	assert!(read.void_reason.contains("owners changed"), "{}", read.void_reason);
+	assert_eq!(code(fx.vote(owners[1], &opened.id, ApprovalVote::For).await), Some(Code::FailedPrecondition));
+	let event: String = sqlx::query_scalar("SELECT event FROM approval_events WHERE approval_id = $1::uuid ORDER BY id DESC LIMIT 1")
+		.bind(&opened.id)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(event, "roster_changed", "written in the transaction that moved the seat");
 }
 
 /// The money plane speaks for `bank` in every scope; a relying party only in its own.
@@ -984,36 +1036,7 @@ async fn the_bridge_proposes_in_any_scope() {
 	let scope = fx.scope().await;
 	fx.admins(&scope, 2).await;
 	fx.at(T0);
-	let kind = format!("bank:t_{}", &scope.id[2..]);
-	let version = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-	let mut published = fx
-		.catalogs
-		.get_scope_catalog(as_bridge(evconcierge_contracts::concierge::v1::GetScopeCatalogRequest {}))
-		.await
-		.map(|r| r.into_inner().approval_kinds)
-		.unwrap_or_default();
-	published.retain(|k| k.name != kind);
-	published.insert(
-		0,
-		ApprovalKindSpec {
-			name: kind.clone(),
-			label: "Transfer".into(),
-			description: String::new(),
-			level: ApprovalLevel::Scope as i32,
-			fields: vec![spec("amount", ApprovalFieldType::Amount)],
-			escalations: vec![],
-			proposer: String::new(),
-		},
-	);
-	published.truncate(64);
-	fx.catalogs
-		.publish_scope_catalog(as_bridge(PublishScopeCatalogRequest {
-			version,
-			approval_kinds: published,
-			notification_topics: vec![],
-		}))
-		.await
-		.expect("publish bank's catalog");
+	let kind = fx.bank_kind(&scope).await;
 	let opened = fx
 		.services
 		.propose(as_bridge(ProposeRequest {
@@ -1238,28 +1261,23 @@ impl Fx {
 	}
 
 	/// A `bank:` kind of the money plane's catalog, published for this test.
-	async fn bank_kind(&self, scope: &Scope) -> String {
-		let kind = format!("bank:t_{}", &scope.id[2..]);
-		let version = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 1;
-		let mut published = self
+	/// Add `kind` to the money plane's catalog. Every suite in this binary shares that one
+	/// catalog and republishes it whole, so publications are serialised and versioned past
+	/// the stored one, or two tests would each publish a catalog missing the other's kind.
+	async fn publish_bank_kind(&self, kind: ApprovalKindSpec) {
+		static BANK_CATALOG: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+		let _serial = BANK_CATALOG.lock().await;
+		let stored = self
 			.catalogs
 			.get_scope_catalog(as_bridge(evconcierge_contracts::concierge::v1::GetScopeCatalogRequest {}))
 			.await
-			.map(|r| r.into_inner().approval_kinds)
-			.unwrap_or_default();
-		published.retain(|k| k.name != kind);
-		published.insert(
-			0,
-			ApprovalKindSpec {
-				name: kind.clone(),
-				label: "Transfer".into(),
-				description: String::new(),
-				level: ApprovalLevel::Scope as i32,
-				fields: vec![spec("amount", ApprovalFieldType::Amount)],
-				escalations: vec![],
-				proposer: String::new(),
-			},
-		);
+			.map(tonic::Response::into_inner)
+			.ok();
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+		let version = stored.as_ref().map_or(now, |c| c.version + 1).max(now);
+		let mut published = stored.map(|c| c.approval_kinds).unwrap_or_default();
+		published.retain(|k| k.name != kind.name);
+		published.insert(0, kind);
 		published.truncate(64);
 		self.catalogs
 			.publish_scope_catalog(as_bridge(PublishScopeCatalogRequest {
@@ -1269,6 +1287,20 @@ impl Fx {
 			}))
 			.await
 			.expect("publish bank's catalog");
+	}
+
+	async fn bank_kind(&self, scope: &Scope) -> String {
+		let kind = format!("bank:t_{}", &scope.id[2..]);
+		self.publish_bank_kind(ApprovalKindSpec {
+			name: kind.clone(),
+			label: "Transfer".into(),
+			description: String::new(),
+			level: ApprovalLevel::Scope as i32,
+			fields: vec![spec("amount", ApprovalFieldType::Amount)],
+			escalations: vec![],
+			proposer: String::new(),
+		})
+		.await;
 		kind
 	}
 }
@@ -1630,24 +1662,83 @@ async fn a_scope_admin_is_an_account_with_a_proven_address() {
 	assert!(!fx.holds_admin(&scope, subject).await);
 }
 
-/// A suspended owner keeps the role and loses the seat's say: their vote is refused and a
-/// FOR they cast before does not count.
+/// A temporary hold is one operator's brake, not a change of the owners (D24(2), owner's
+/// decision): the held owner has no say while held, and nothing is voided or paused.
 #[tokio::test]
-async fn a_suspended_owner_has_no_say() {
+async fn a_hold_on_an_owner_is_not_a_change_of_the_owners() {
 	let Some(fx) = setup().await else { return };
 	let (_lock, owners) = fx.owners(3).await;
 	let scope = fx.scope().await;
-	let subject = fx.user("subject").await;
 	fx.at(T0);
-	let opened = fx.grant_admin(owners[0], &scope, subject).await.unwrap();
+	let opened = fx.grant_admin(owners[0], &scope, fx.user("subject").await).await.unwrap();
 	fx.vote(owners[1], &opened.id, ApprovalVote::For).await.unwrap();
-	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
+	let changed = fx.platform_policy(owners[0]).await.roster_changed_at;
+
+	let action = concierge::infrastructure::users::AdminAction {
+		actor: Some(owners[2]),
+		action: "held",
+		reason: "credential stuffing".into(),
+		..Default::default()
+	};
+	fx.users.hold_user(owners[1], &action, owners[2], fx.db_now().await).await.expect("an owner holds an owner");
+	assert_eq!(state(&fx.get(owners[2], &opened.id).await), ApprovalState::Open, "a hold voids nothing");
+	assert_eq!(fx.platform_policy(owners[0]).await.roster_changed_at, changed, "and pauses nothing");
+	let other = fx.grant_admin(owners[0], &scope, fx.user("other").await).await;
+	assert!(other.is_ok(), "new platform decisions still open: {other:?}");
+	let still = fx.vote(owners[2], &opened.id, ApprovalVote::For).await.unwrap();
+	assert_ne!(state(&still), ApprovalState::Passed, "the held owner's FOR does not carry it while held");
+
+	let lift = concierge::infrastructure::users::AdminAction {
+		actor: Some(owners[2]),
+		action: "reinstated",
+		..Default::default()
+	};
+	fx.users.reinstate_outside_governance(owners[1], &lift, fx.db_now().await).await.expect("the hold is lifted");
+	assert_eq!(fx.platform_policy(owners[0]).await.roster_changed_at, changed, "lifting a hold is no change either");
+}
+
+/// An owner suspended indefinitely by the consilium's verdict, and reinstated from it, IS a
+/// change of the owners: live platform decisions are void and new ones pause.
+#[tokio::test]
+async fn a_consilium_suspension_of_an_owner_changes_the_owners() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	fx.at(T0);
+	let opened = fx.grant_admin(owners[0], &scope, fx.user("subject").await).await.unwrap();
+	let before = fx.platform_policy(owners[0]).await.roster_changed_at;
+
+	// The columns the executed suspension verdict writes (`domain::users::User::suspend`).
+	sqlx::query("UPDATE users SET status = 'disabled', suspended_by = 'governance' WHERE id = $1")
 		.bind(owners[1].raw())
 		.execute(&fx.pool)
 		.await
 		.unwrap();
-	let one = fx.vote(owners[2], &opened.id, ApprovalVote::For).await.unwrap();
-	assert_eq!(state(&one), ApprovalState::Rejected, "the suspended owner's FOR is gone, so two of two can no longer be reached");
+	assert_eq!(state(&fx.get(owners[0], &opened.id).await), ApprovalState::Void);
+	let suspended = fx.platform_policy(owners[0]).await;
+	assert!(suspended.roster_changed_at >= before, "stamped by the store's clock");
+	fx.at(suspended.roster_changed_at + i64::from(suspended.cooldown_secs) - 1);
+	assert_eq!(
+		code(fx.grant_admin(owners[0], &scope, fx.user("next").await).await),
+		Some(Code::FailedPrecondition),
+		"platform decisions pause"
+	);
+
+	sqlx::query("UPDATE users SET status = 'active', suspended_by = NULL WHERE id = $1")
+		.bind(owners[1].raw())
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	assert!(
+		fx.platform_policy(owners[0]).await.roster_changed_at >= suspended.roster_changed_at,
+		"reinstating from a verdict is a change too"
+	);
+	let changes: i64 = sqlx::query_scalar("SELECT count(*) FROM approval_events WHERE approval_id = $1::uuid AND event = 'roster_changed'")
+		.bind(&opened.id)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(changes, 1, "voided once, by the suspension");
 }
 
 /// One decision the executor cannot carry out must not stop the ones behind it.
@@ -1701,4 +1792,324 @@ async fn a_vote_that_can_no_longer_be_won_is_rejected() {
 	let against = fx.vote(admins[1], &opened.id, ApprovalVote::Against).await.unwrap();
 	assert_eq!(state(&against), ApprovalState::Rejected, "one seated voter is left and two are needed");
 	assert_eq!(code(fx.vote(admins[2], &opened.id, ApprovalVote::For).await), Some(Code::FailedPrecondition));
+}
+
+// ---------------------------------------------------------------------------------
+// D24: a proven initiator of a money decision, and the pause after the owners change.
+// ---------------------------------------------------------------------------------
+
+impl Fx {
+	/// A platform-level `bank:` kind, published beside the money plane's others.
+	async fn bank_platform_kind(&self, scope: &Scope) -> String {
+		let kind = format!("bank:p_{}", &scope.id[2..]);
+		self.publish_bank_kind(ApprovalKindSpec {
+			name: kind.clone(),
+			label: "Transfer".into(),
+			description: String::new(),
+			level: ApprovalLevel::Platform as i32,
+			fields: vec![spec("amount", ApprovalFieldType::Amount)],
+			escalations: vec![],
+			proposer: String::new(),
+		})
+		.await;
+		kind
+	}
+
+	async fn payment(&self, kind: &str, scope: &Scope, asker: Option<UserId>, token: Option<&str>) -> Result<Approval, tonic::Status> {
+		let requested_by = match asker {
+			Some(user) => self.auth_subject(user).await,
+			None => String::new(),
+		};
+		let request = as_bridge(ProposeRequest {
+			kind: kind.into(),
+			requested_by,
+			fields: vec![amount("10", "USDT")],
+			..transfer(scope, "10")
+		});
+		let request = match token {
+			Some(token) => with_user_token(request, token),
+			None => request,
+		};
+		self.services.propose(request).await.map(tonic::Response::into_inner)
+	}
+
+	async fn db_now(&self) -> i64 {
+		sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::BIGINT")
+			.fetch_one(&self.pool)
+			.await
+			.unwrap()
+	}
+
+	async fn platform_policy(&self, owner: UserId) -> PlatformApprovalPolicy {
+		self.people
+			.get_platform_approval_policy(as_user(owner, GetPlatformApprovalPolicyRequest {}))
+			.await
+			.expect("an owner reads it")
+			.into_inner()
+	}
+}
+
+/// D24(1): the person who asked for a money decision does not decide it — when the
+/// proposer proves who that was with their own access token. A name alone proves nothing
+/// and changes nothing.
+#[tokio::test]
+async fn a_proven_initiator_does_not_vote_on_a_money_decision() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let kind = fx.bank_platform_kind(&scope).await;
+	fx.at(T0);
+
+	let named = fx.payment(&kind, &scope, Some(owners[0]), None).await.unwrap();
+	assert_eq!(named.voters.len(), 3, "a name without a token is information");
+	fx.services
+		.withdraw_proposal(as_bridge(WithdrawProposalRequest {
+			approval_id: named.id.clone(),
+			reason: String::new(),
+		}))
+		.await
+		.unwrap();
+
+	assert!(!named.requested_by_proven);
+	let token = fx.tokens.mint(owners[0], T0);
+	let proven = fx.payment(&kind, &scope, Some(owners[0]), Some(&token)).await.expect("a proven initiator");
+	assert_eq!((proven.voters.len(), proven.threshold), (2, 2), "the two other owners decide");
+	assert!(proven.requested_by_proven, "the deciders read that the name was proven");
+	let notice: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.dedupe_key = $2")
+		.bind(owners[0].raw())
+		.bind(format!("approval:{}", proven.id))
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(notice, 1, "the person it names hears that a decision was opened in their name");
+	assert_eq!(code(fx.vote(owners[0], &proven.id, ApprovalVote::For).await), Some(Code::PermissionDenied));
+
+	let elsewhere = fx.tokens.mint(owners[1], T0);
+	assert_eq!(
+		code(fx.payment(&kind, &scope, Some(owners[0]), Some(&elsewhere)).await),
+		Some(Code::PermissionDenied),
+		"the token is someone else's"
+	);
+	assert_eq!(code(fx.payment(&kind, &scope, Some(owners[0]), Some("forged")).await), Some(Code::Unauthenticated));
+	fx.services
+		.withdraw_proposal(as_bridge(WithdrawProposalRequest {
+			approval_id: proven.id.clone(),
+			reason: String::new(),
+		}))
+		.await
+		.unwrap();
+	let spent = fx.payment(&kind, &scope, Some(owners[0]), Some(&token)).await.unwrap_err();
+	assert_eq!(spent.code(), Code::FailedPrecondition, "one token proves one request: {}", spent.message());
+	assert!(spent.message().contains("already spent"), "{}", spent.message());
+	let stale = fx.tokens.mint(owners[0], T0 - 121);
+	assert_eq!(
+		code(fx.payment(&kind, &scope, Some(owners[0]), Some(&stale)).await),
+		Some(Code::Unauthenticated),
+		"a proof is a token minted for this request, not one kept from a session"
+	);
+	assert_eq!(
+		code(fx.payment(&kind, &scope, None, Some(&token)).await),
+		Some(Code::InvalidArgument),
+		"a token names no one without requested_by"
+	);
+}
+
+/// Taking the initiator off a service's roster must not leave one owner deciding a money
+/// decision alone: two others are required.
+#[tokio::test]
+async fn a_proven_initiator_needs_two_other_owners() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(2).await;
+	let scope = fx.scope().await;
+	let kind = fx.bank_platform_kind(&scope).await;
+	fx.at(T0);
+	let token = fx.tokens.mint(owners[0], T0);
+	let refused = fx.payment(&kind, &scope, Some(owners[0]), Some(&token)).await.unwrap_err();
+	assert_eq!(refused.code(), Code::FailedPrecondition);
+	assert!(refused.message().contains("besides the initiator"), "{}", refused.message());
+	assert!(refused.message().contains("not_enough_owners_besides_initiator"), "a code a proposer can tell from the others");
+}
+
+/// The floor of two other deciders counts owners who can decide: a held owner is on the
+/// roster and has no say while held.
+#[tokio::test]
+async fn the_floor_counts_owners_who_can_decide() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let kind = fx.bank_platform_kind(&scope).await;
+	let action = concierge::infrastructure::users::AdminAction {
+		actor: Some(owners[1]),
+		action: "held",
+		reason: "credential stuffing".into(),
+		..Default::default()
+	};
+	fx.users.hold_user(owners[2], &action, owners[1], fx.db_now().await).await.expect("an owner holds an owner");
+	fx.at(T0);
+	let token = fx.tokens.mint(owners[0], T0);
+	let refused = fx.payment(&kind, &scope, Some(owners[0]), Some(&token)).await.unwrap_err();
+	assert_eq!(refused.code(), Code::FailedPrecondition, "one active owner besides the initiator: {}", refused.message());
+	assert!(fx.payment(&kind, &scope, None, None).await.is_ok(), "two active owners decide a decision nobody proved");
+}
+
+/// The pause holds in the store too: a platform row written inside it — by a binary that
+/// does not know the rule — is refused by the database.
+#[tokio::test]
+async fn the_store_refuses_a_platform_decision_inside_the_pause() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(2).await;
+	let policy = fx.platform_policy(owners[0]).await;
+	let inside = policy.roster_changed_at + i64::from(policy.cooldown_secs) - 1;
+	let insert = |created_at: i64| {
+		sqlx::query(
+			"INSERT INTO approvals (id, kind, proposer, scope, level, subject_ref, fields, payload_hash, reason, roster_size, threshold, \
+			 policy_version, delay_secs, created_at, expires_at, dedupe_key) \
+			 VALUES (gen_random_uuid(), 'bank:direct', 'bank', 'main', 'platform', 'payment:' || gen_random_uuid(), '[]', repeat('0', 64), 'r', 2, 2, \
+			 0, 86400, $1, $1 + 100, gen_random_uuid()::TEXT)",
+		)
+		.bind(created_at)
+		.execute(&fx.pool)
+	};
+	let refused = insert(inside).await.unwrap_err();
+	assert!(refused.to_string().contains("pause"), "{refused}");
+	insert(inside + 1).await.expect("after the pause the row is the code's to judge");
+}
+
+/// D24(2): after the owners change, platform decisions pause for the platform policy's
+/// cool-down, and the live ones were voided by the change itself.
+#[tokio::test]
+async fn platform_decisions_pause_after_the_owners_change() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	fx.admins(&scope, 2).await;
+	let kind = fx.bank_platform_kind(&scope).await;
+	let policy = fx.platform_policy(owners[0]).await;
+	assert!(policy.cooldown_secs > 0, "this suite never installs a zero cool-down");
+	let changed = policy.roster_changed_at;
+	assert!(changed > 0, "seating the owners was a change");
+
+	fx.at(changed + i64::from(policy.cooldown_secs) - 1);
+	let paused = fx.payment(&kind, &scope, None, None).await.unwrap_err();
+	assert_eq!(paused.code(), Code::FailedPrecondition, "{}", paused.message());
+	assert_eq!(
+		fx.propose(&scope, transfer(&scope, "10")).await.level,
+		ApprovalLevel::Scope as i32,
+		"a scope's own decisions do not pause"
+	);
+
+	fx.at(changed + i64::from(policy.cooldown_secs));
+	let live = fx.payment(&kind, &scope, None, None).await.expect("the pause is over");
+	fx.users.set_role(fx.user("newcomer").await, Role::Owner).await.unwrap();
+	let read = fx.get(owners[0], &live.id).await;
+	assert_eq!(state(&read), ApprovalState::Void);
+	let after = fx.platform_policy(owners[0]).await;
+	assert!(after.roster_changed_at >= fx.db_now().await - 60, "the change is stamped by the store's clock");
+}
+
+#[tokio::test]
+async fn the_owners_set_the_platform_cooldown() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	fx.at(T0);
+	let propose = |who: UserId, cooldown_secs: u32| {
+		fx.people.propose_platform_policy_change(as_user(
+			who,
+			ProposePlatformPolicyChangeRequest {
+				policy: Some(PlatformApprovalPolicy {
+					version: 0,
+					cooldown_secs,
+					roster_changed_at: 0,
+				}),
+				reason: "Owners rotate weekly now".into(),
+			},
+		))
+	};
+	assert_eq!(code(propose(owners[0], 15 * 24 * 3600).await), Some(Code::InvalidArgument), "at most 14 days");
+	let admin = fx.user("admin").await;
+	fx.users.set_role(admin, Role::Admin).await.unwrap();
+	assert_eq!(code(propose(admin, 7200).await), Some(Code::PermissionDenied), "owners only");
+
+	let before = fx.platform_policy(owners[0]).await;
+	let opened = propose(owners[0], 7200).await.expect("an owner opens it").into_inner();
+	assert_eq!((opened.kind.as_str(), opened.voters.len()), ("concierge:platform_policy", 2));
+	assert!(opened.fields.iter().any(|f| f.key == "cooldown_secs" && f.value == Some(Value::Count(7200))));
+	fx.vote(owners[1], &opened.id, ApprovalVote::For).await.unwrap();
+	fx.vote(owners[2], &opened.id, ApprovalVote::For).await.unwrap();
+	fx.at(T0 + 24 * HOUR);
+	fx.execute().await;
+	assert_eq!(state(&fx.get(owners[0], &opened.id).await), ApprovalState::Executed);
+	let after = fx.platform_policy(owners[0]).await;
+	assert_eq!((after.version, after.cooldown_secs), (before.version + 1, 7200));
+}
+
+/// Only someone taken OFF a platform roster is told a decision was opened in their name:
+/// a proven scope admin was never on it and has no veto to cast (live run of #141).
+#[tokio::test]
+async fn only_an_owner_taken_off_the_roster_is_told() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, _owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let admin = fx.admins(&scope, 2).await[0];
+	let kind = fx.bank_platform_kind(&scope).await;
+	fx.at(T0);
+	let token = fx.tokens.mint(admin, T0);
+	let opened = fx.payment(&kind, &scope, Some(admin), Some(&token)).await.expect("a proven admin asks");
+	assert!(opened.requested_by_proven);
+	assert_eq!(opened.voters.len(), 3, "an admin was never on the owners' roster");
+	let notices: i64 = sqlx::query_scalar(
+		"SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id \
+		 WHERE s.user_id = $1 AND n.kind = 'approval_opened_in_your_name'",
+	)
+	.bind(admin.raw())
+	.fetch_one(&fx.pool)
+	.await
+	.unwrap();
+	assert_eq!(notices, 0, "nothing to veto, nothing to tell");
+}
+
+/// A retry under the same `dedupe_key` that carries a token is held to what the first call
+/// was: the token must be the named person's, or the answer is the same refusal.
+#[tokio::test]
+async fn a_retry_with_a_token_is_checked_as_the_first_call_was() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let kind = fx.bank_platform_kind(&scope).await;
+	fx.at(T0);
+	let request = |token: Option<String>| {
+		let request = as_bridge(ProposeRequest {
+			kind: kind.clone(),
+			scope: scope.id.clone(),
+			subject_ref: "payment:4f0c1a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b".into(),
+			requested_by: String::new(),
+			reason: "Monthly rebalance".into(),
+			fields: vec![amount("10", "USDT")],
+			dedupe_key: format!("retry-{}", scope.id),
+		});
+		(request, token)
+	};
+	let asker = fx.auth_subject(owners[0]).await;
+	let send = |token: Option<String>| {
+		let (mut request, token) = request(token);
+		request.get_mut().requested_by = asker.clone();
+		let request = match token {
+			Some(token) => with_user_token(request, &token),
+			None => request,
+		};
+		fx.services.propose(request)
+	};
+	let first = send(Some(fx.tokens.mint(owners[0], T0))).await.expect("the first call").into_inner();
+	let again = send(Some(fx.tokens.mint(owners[0], T0)))
+		.await
+		.expect("a retry with a fresh token of the same person")
+		.into_inner();
+	assert_eq!(again.id, first.id);
+	assert_eq!(send(None).await.expect("a retry without a token").into_inner().id, first.id);
+	assert_eq!(
+		code(send(Some(fx.tokens.mint(owners[1], T0))).await),
+		Some(Code::PermissionDenied),
+		"someone else's token is refused on a retry as on the first call"
+	);
+	assert_eq!(code(send(Some(fx.tokens.mint(owners[0], T0 - 121))).await), Some(Code::Unauthenticated), "and a stale one");
 }

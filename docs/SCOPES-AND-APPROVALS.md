@@ -10,8 +10,9 @@ bundles under `/auth/mfe/*` (§3.1), the relying-party streams (§4: `ScopeEvent
 `UserEvents` read by a client credential, migration 0034), the scope catalog's storage
 (`ScopeCatalogService`, §5.1, §6) and the approvals of the kinds a namespace publishes
 (§5.7: both approval services, this plane's own `concierge:*` kinds and their executor,
-stored scope policies; migrations 0036, 0037). Not yet: the approval mail and the owners'
-decisions D24 (§5.7). Banking, the `lib` projections, invest and admin build against this document.
+stored scope policies, the proven initiator and the pause after the owners change (D24(1),
+(2)); migrations 0036–0038). Not yet: the approval mail, the floor on the known money kinds
+and `ESCALATION_TEST_COUNT_ABOVE` (§5.7). Banking, the `lib` projections, invest and admin build against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it
@@ -333,6 +334,39 @@ containment is never slower than the grant).
   opener is proven by their session and is kept off the roster (D23): nobody votes on
   what they asked for. A `PLATFORM` proposal is refused at open (`FAILED_PRECONDITION`)
   with fewer than two owners, or when the opener is the only one left to decide.
+- **A proven initiator of a money decision does not decide it** (D24(1)): a proposer may
+  present, in metadata `x-ev-user-token`, an access token of this plane that `requested_by`
+  holds (banking forwards the owner's). Verified as every RPC here verifies one, its `sub`
+  must be `requested_by`, the account still active at that token's `token_version`, the
+  token minted no more than 120 s before the call (else `UNAUTHENTICATED`), and never used
+  before: its SHA-256 is spent in the transaction that opens the proposal
+  (`approval_initiator_proofs`; a second use is `FAILED_PRECONDITION` "this proof was
+  already spent"). What that proves is honest and narrow: the service held that person's
+  fresh token, so it could act with their session at that moment — not that they read the
+  proposal. When the proposal resolves to `PLATFORM` that person is kept off the roster,
+  the proposal says `requested_by_proven`, and — if they were on that roster, i.e. an
+  owner — they get an inbox notice (topic `account:money-movement`, no link, no code) that a
+  decision was opened in their name: if they did not ask for it, their veto stops it. A
+  proven account that is no owner has no vote and no veto there, and is not told. A retry
+  under the same `dedupe_key` with a token is checked as the first call was and spends
+  nothing; a proposer mints a fresh token for each retry. Two OTHER ACTIVE owners must remain
+  (`FAILED_PRECONDITION`, code word `not_enough_owners_besides_initiator`; a proposer must
+  not retry it without the token): one owner must not decide another's money alone, so
+  0036's floor of two for a service's proposal is not relaxed, and a held owner, who has no
+  say, does not count towards it. At scope level a proven initiator stays on the roster, as
+  every admin does. Without a token the name stays information.
+- **The platform pauses after its owners change** (D24(2)): any change of the owner roster
+  — a seat granted or taken, an owner suspended indefinitely by the consilium's verdict
+  (`suspended_by = governance`) or reinstated from one, on any path, written by any binary —
+  voids every live `PLATFORM` proposal in the same transaction (`void_reason` "the
+  platform owners changed while it was live", history event `roster_changed`) and stamps
+  `roster_changed_at`; for the platform policy's `cooldown_secs` after it (default 48 h,
+  0..=14 days, changed only by `concierge:platform_policy`) no `PLATFORM` proposal opens
+  (`FAILED_PRECONDITION`) — a service's escalated one, a money one and this plane's own
+  alike. A scope's own decisions do not pause. A temporary HOLD on an owner (`admin_hold`)
+  and its release, by the sweep or by `ReinstateUser`, are not a change (owner's decision):
+  the held owner simply has no vote while held, and one operator's brake must not also void
+  the owners' decisions and pause the platform.
 - **A vote is the seat's** (decided): a vote counts only while its voter still holds the
   seat the roster was drawn from — for an owner, the persisted `owner` role AND an active
   account, so a suspended owner has no say. Removing an admin after their FOR takes it
@@ -401,6 +435,7 @@ executor loop once passed (D23).
 | Kind | Level | Opened by | Fields | Executed as |
 | ---- | ----- | --------- | ------ | ----------- |
 | `concierge:scope_admin_grant` | PLATFORM | a seat holding `iam:tenants:grant`, for an account with a VERIFIED address | account (USER) | a grant of `<namespace>:admin`, `granted_by` the opener; VOID if the account is no longer active or verified, or the scope no longer active |
+| `concierge:platform_policy` | PLATFORM | a persisted owner | cooldown_secs (COUNT) | the platform's next policy `version` |
 | `concierge:scope_policy_change` | PLATFORM | such a seat, or an admin of the scope | quorum_bps, delay_secs, ttl_secs, thresholds (COUNT), and one `threshold` TEXT field per override, `<kind>/<parameter>=<value>` — the values are in `payload_hash`; the whole policy is also `Approval.proposed_policy` | the scope's next policy `version`, checked again against the catalogs then in force; VOID if it no longer fits |
 
 Assigning an operator in a scope is still a delegated `GrantPermission` by a
@@ -441,7 +476,10 @@ OPEN ──(threshold met)──▶ PASSED ──(executable_at passes; proposer
   proposer pulls it still has an hour to report. At `execute_by` the decision lapses to
   `VOID` (`void_reason` says so, no outcome) and a report on it is refused. A pull
   claims nothing: the same proposal is served on every pull until its outcome is
-  reported, so the proposer is idempotent per proposal id. Executable is a time
+  reported, so the proposer is idempotent per proposal id. A pulled decision can still go
+  `VOID` before the proposer acts — the owners changed (§5.2) — and a pull is not told:
+  the money plane re-reads the proposal (`GetProposal`) immediately before it moves money,
+  and acts only on `PASSED`. Executable is a time
   predicate over `PASSED`, not a state, so nothing has to sweep for a proposal to become
   pullable.
 - **`payload_hash`** binds what was approved to what is executed. The proposer computes
@@ -550,10 +588,32 @@ in `domain::approvals`.
 - **An escalation that cannot be measured fires**: an absent AMOUNT or BPS field, or an
   amount in another currency, sends the proposal to the owners; only an unset FLAG stays
   down.
-- **Not yet**: the mail of §5.5; and the owners' decisions D24 — a money initiator
-  proven by a token kept off the platform roster, the cool-down after the owner roster
-  changes (`concierge:platform_policy`), the floor this plane keeps on the level and
-  thresholds of the known money kinds, and `ESCALATION_TEST_COUNT_ABOVE`. A catalog already
+- **The roster change is a trigger** on `users` (migration 0038,
+  `platform_roster_changed`, on `role` and `suspended_by`): the seat moves on many paths —
+  admission, removal, resignation, genesis, a suspension verdict, a reinstatement from one
+  — and from the previous binary during a rollout; the row is the one place all of them
+  pass. A hold only moves `status` and `suspended_by = admin_hold`, which the trigger
+  ignores. It
+  stamps `platform_roster` first, which `propose` holds `FOR SHARE` while it opens a
+  platform decision, so an open and a change never miss each other.
+- **The pause is the store's too**: a `BEFORE INSERT` trigger on `approvals`
+  (`approvals_platform_pause`, migration 0038) refuses a `PLATFORM` row created inside the
+  pause, with the same lock and arithmetic as the code — a binary that predates the rule,
+  or a check that raced a change, cannot open one. `platform_roster` is seeded from the
+  last executed owner admission, removal, or suspension / reinstatement of a current owner
+  in `governance_event`; a resignation and the genesis seed leave no event and are not
+  dated.
+- **The executor locks accounts before the proposal**: a grant takes the two `users` rows
+  it names first, then the proposal row — the order a change of the owners takes them
+  (its `users` row, then the trigger's `approvals` rows) — so the two cannot deadlock.
+- **One daily budget per scope** (D24(4)) is the money plane's to count: everything that
+  leaves a scope without the owners — its automatic payouts and its scope-level decisions
+  — draws on it, and when a request would exceed it banking sets a FLAG field
+  (`over_scope_budget`) with a `FLAG_SET` escalation, which sends that proposal to the
+  owners. A kind's own thresholds here are the backstop behind that budget, not the
+  budget.
+- **Not yet**: the mail of §5.5; the floor this plane keeps on the level and thresholds of
+  the known money kinds (D24, decided by the session), and `ESCALATION_TEST_COUNT_ABOVE`. A catalog already
   stored that delegates `<namespace>:admin` is not re-checked; the next publication is.
   Until the mail exists a roster member learns of a proposal by
   `ListApprovals { awaiting_my_vote }`.
