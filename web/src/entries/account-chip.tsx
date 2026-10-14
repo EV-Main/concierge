@@ -7,15 +7,18 @@
 //     platform's sign-in dialog (`data-intent`, `data-return-to` are passed on to it).
 //   • host (`data-mode="host"`) — a host with its own session writes name, email, links and
 //     service groups (`hostAttributes`); the chip fetches nothing and turns Sign out into a
-//     `signout` event.
+//     `signout` event — then, off the platform origin, navigates to the platform's sign-out
+//     confirmation (shared/element/host-sign-out.ts).
 // Events (bubbling, composed): `signout` (host mode), `ev:navigate` (cancelable, `{ href }`,
 // a plain same-origin menu-link click offered to the host's router). `[data-ready]` is set
 // once the chip has painted; `data-layout="menu"` keeps the name below `sm`.
-import { dispatchSignOut, HOST_ATTRIBUTE_NAMES, HOST_ATTRS, isHostMode, readHostProps } from "@evinvest/mfe";
+import { HOST_ATTRIBUTE_NAMES, HOST_ATTRS, isHostMode, readHostProps } from "@evinvest/mfe";
 import css from "virtual:mfe/css";
 
 import { AccountChip, HostAccountChip } from "../features/account-chip";
+import { apiOriginOf } from "../shared/config/origin";
 import { defineElement } from "../shared/element/define-element";
+import { signOutOnHost } from "../shared/element/host-sign-out";
 
 defineElement({
   tag: "mfe-concierge-account-chip",
@@ -24,7 +27,7 @@ defineElement({
   render(host) {
     const read = (name: string) => host.getAttribute(name);
     return isHostMode(read) ? (
-      <HostAccountChip {...readHostProps(read)} onSignOut={() => dispatchSignOut(host)} />
+      <HostAccountChip {...readHostProps(read)} onSignOut={() => signOutOnHost(host, apiOriginOf(host))} />
     ) : (
       <AccountChip intent={read(HOST_ATTRS.intent)} returnTo={read(HOST_ATTRS.returnTo)} />
     );

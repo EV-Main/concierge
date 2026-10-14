@@ -2,9 +2,9 @@ import { useT } from "@evinvest/i18n/react";
 import { Dialog, DialogContent, Logo } from "@evinvest/uikit";
 
 import { useElement } from "../../../shared/element/element-context";
+import { loginHref } from "../../../shared/lib/return-to";
 import { confirmSignUp, passkeySignIn, passwordSignIn, passwordSignUp, requestCode, resendSignUpCode, verifyCode } from "../api/sign-in-api";
 import { errorText, oauthErrorText } from "../model/errors";
-import { loginHref } from "../model/return-to";
 import { firstScreen, useSignInFlow } from "../model/use-sign-in-flow";
 import { CodeEntry } from "./code-entry";
 import { CodeScreen } from "./code-screen";

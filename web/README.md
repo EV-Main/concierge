@@ -24,6 +24,16 @@ username, notification settings, platform sign-out — is a link to
 `https://evinvest.ltd/admin/account`. On the platform origin they do it in place.
 `src/shared/config/origin.ts` (`isPlatformPage`) is that switch.
 
+Sign-out on a scope host (the account page's Security tab, the chip in host mode) first
+fires `signout` for the host to end its own session, then navigates to
+`<EV_PUBLIC_ORIGIN>/api/auth/logout/confirm?return_to=<this page's origin + path>` so the
+platform session ends too (`src/shared/element/host-sign-out.ts`). **Depends on concierge
+serving that confirmation page** (it ends the platform session and returns to
+`return_to` after checking it against the scope allowlist); until it ships, the
+navigation lands on a 404 after the host's own sign-out. Because the navigation follows
+the event at once, a host must end its session with a request that survives unload
+(`fetch(..., { keepalive: true })`, `sendBeacon`) or server-side.
+
 A new account confirms its address in the dialog through the ticket `password/signup`
 hands back (`/password/signup/confirm`, `/resend`), which needs no CSRF cookie and so
 works on every host; without a ticket the dialog sends the reader to the platform. An
@@ -52,7 +62,8 @@ Build-time configuration (`scripts/config.mjs`, the only place it is read):
 
 | Variable | Default | |
 | --- | --- | --- |
-| `EV_PUBLIC_ORIGIN` | `https://evinvest.ltd` | the plane's origin; an element's `data-origin` overrides it |
+| `EV_PUBLIC_ORIGIN` | `https://evinvest.ltd` | the plane's origin; must be `https:` unless `EV_ALLOW_ORIGIN_OVERRIDE` is set |
+| `EV_ALLOW_ORIGIN_OVERRIDE` | unset (off) | `1` for dev and stand builds only: elements honour `data-origin`, `EV_PUBLIC_ORIGIN` may be `http:`, and the bare `ev_csrf` cookie is read. Never in production — `data-origin` would let any script on a host page aim the elements' credentialed calls elsewhere |
 | `EV_TURNSTILE_SITEKEY` | unset | unset, the forms stay disabled with "Captcha failed to load" |
 | `EV_SA_PANEL_URL` | unset | the chip's Services entry |
 | `EV_MFE_BASE_PATH` | `/api/auth/mfe/` | where hosts load `dist/` from (concierge's `/auth/mfe/*` behind the conductor's `/api/auth` rewrite); registry `scriptUrl`s are root-relative under it |

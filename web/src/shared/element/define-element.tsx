@@ -56,6 +56,9 @@ export function defineElement(spec: ElementSpec): void {
     #root: Root | undefined;
 
     connectedCallback() {
+      // React renders into the light DOM, so a host's PostHog autocapture and session
+      // replay would otherwise record the email, name and form input shown here.
+      this.classList.add("ph-no-capture");
       attachStylesheet(spec.tag, spec.css);
       spec.onConnect?.(this);
       this.#root = createRoot(this);

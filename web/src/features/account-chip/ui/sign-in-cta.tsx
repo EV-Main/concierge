@@ -4,6 +4,7 @@ import type { MouseEvent } from "react";
 
 import { BUILD } from "../../../shared/config/build";
 import { useElement } from "../../../shared/element/element-context";
+import { loginHref } from "../../../shared/lib/return-to";
 import { CHIP_FOCUS } from "../lib/chip-parts";
 import { openSignIn } from "../lib/open-sign-in";
 
@@ -13,13 +14,14 @@ import { openSignIn } from "../lib/open-sign-in";
  * so a host's own primary-ink text utility cannot pin them (chip-parts.ts).
  *
  * The click opens the platform's dialog over the page; the href is the fallback when the
- * dialog cannot be loaded (or JavaScript is off): Google sign-in coming back here.
+ * dialog cannot be loaded (or JavaScript is off): the platform's OAuth login coming back
+ * to this host — an absolute URL off the platform, or the platform would land on its own
+ * page of the same path.
  */
 export function SignInCta({ intent, returnTo, onSignedIn }: { intent: string | null; returnTo: string | null; onSignedIn: () => void }) {
   const t = useT();
   const { api } = useElement();
-  const back = typeof location === "undefined" ? "/" : location.pathname + location.search;
-  const fallback = `${api.origin}/api/auth/login?returnTo=${encodeURIComponent(back)}`;
+  const fallback = loginHref(api.origin, null, returnTo);
 
   const open = (e: MouseEvent<HTMLAnchorElement>) => {
     if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;

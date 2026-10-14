@@ -5,9 +5,10 @@
 //   open                    present while the dialog shows
 //   data-intent             `signup` opens on sign-up; `signin`/`login` (default) on the email code
 //   data-return-to          where an OAuth round trip lands: a root-relative path or an absolute
-//                           URL on the host (model/return-to.ts)
+//                           URL on the host (shared/lib/return-to.ts)
 //   data-turnstile-sitekey  overrides the built-in Turnstile site key
-//   data-origin             overrides the identity plane's origin (default https://evinvest.ltd)
+//   data-origin             overrides the identity plane's origin (default https://evinvest.ltd);
+//                           dev and stand builds only (EV_ALLOW_ORIGIN_OVERRIDE)
 // Events (bubbling, composed, no detail):
 //   ev:signed-in            the platform session exists; the host starts its own RP login
 //   ev:close                dismissed (Escape, backdrop, close button); the host drops `open`

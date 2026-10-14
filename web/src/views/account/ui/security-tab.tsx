@@ -7,6 +7,7 @@ import { SessionsCard } from "../../../features/sessions";
 import { SignInMethodRows } from "../../../features/sign-in-methods";
 import { anyBody } from "../../../shared/api/auth-api";
 import { useElement } from "../../../shared/element/element-context";
+import { signOutOnHost } from "../../../shared/element/host-sign-out";
 import { ManageOnPlatform } from "../../../shared/ui/manage-on-platform";
 
 export function SecurityTab({ onChanged }: { onChanged: () => void }) {
@@ -38,8 +39,9 @@ export function SecurityTab({ onChanged }: { onChanged: () => void }) {
 }
 
 /**
- * Sign out. On the platform the element ends the platform session first (only it can);
- * everywhere it then tells the host (`signout`), which ends its own session.
+ * Sign out. On the platform the element ends the platform session first (only it can),
+ * then tells the host (`signout`). On a scope host it tells the host, which ends its own
+ * session, and goes to the platform's sign-out confirmation for the platform session.
  */
 function SignOutCard() {
   const t = useT();
@@ -48,7 +50,8 @@ function SignOutCard() {
 
   async function signOut() {
     setFailed(false);
-    if (platform && !(await api.send("POST", "/logout", {}, anyBody, true)).ok) return setFailed(true);
+    if (!platform) return signOutOnHost(host, api.origin);
+    if (!(await api.send("POST", "/logout", {}, anyBody, true)).ok) return setFailed(true);
     dispatchSignOut(host);
   }
 

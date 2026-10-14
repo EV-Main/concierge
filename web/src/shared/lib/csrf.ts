@@ -2,7 +2,10 @@
 // platform origin, so this only ever finds a token on a platform page — which is the only
 // place a mutation is offered (config/origin.ts, isPlatformPage).
 
+import { BUILD } from "../config/build";
+
 const CSRF_HEADER = "x-ev-csrf";
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 function readCookie(name: string): string | null {
   const prefix = `${name}=`;
@@ -17,7 +20,10 @@ function readCookie(name: string): string | null {
 }
 
 export function csrfHeader(): Record<string, string> {
-  // The `__Host-` cookie first, so a plain `ev_csrf` planted from a subdomain cannot shadow it.
-  const token = readCookie("__Host-ev_csrf") ?? readCookie("ev_csrf");
+  // Production reads the `__Host-` cookie only: a plain `ev_csrf` can be planted from any
+  // subdomain, and falling back to it would let that value pass double-submit whenever the
+  // real one is missing. The plain name is what a dev plane sets over http.
+  const devCookie = BUILD.allowOriginOverride || LOOPBACK.has(location.hostname);
+  const token = readCookie("__Host-ev_csrf") ?? (devCookie ? readCookie("ev_csrf") : null);
   return token ? { [CSRF_HEADER]: token } : {};
 }

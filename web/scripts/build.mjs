@@ -76,6 +76,7 @@ const common = {
     "process.env.NODE_ENV": '"production"',
     __EV_BUILD__: JSON.stringify({
       publicOrigin: config.publicOrigin,
+      allowOriginOverride: config.allowOriginOverride,
       turnstileSiteKey: config.turnstileSiteKey,
       saPanelUrl: config.saPanelUrl,
       registryPath: `${config.basePath}registry.json`,
