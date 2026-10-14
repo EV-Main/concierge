@@ -17,7 +17,11 @@
 //! we don't control, so the large-err lint does not apply in this module.
 #![allow(clippy::result_large_err)]
 
-use std::sync::Arc;
+use std::{
+	collections::HashMap,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use domain::{
 	approvals::{self as rules, Amount, ApprovalState, Field, FieldValue, Outcome, REASON_BYTES, TEXT_FIELD_BYTES, Vote},
@@ -343,7 +347,9 @@ impl ApprovalService for Approvals {
 			.chain(
 				catalogs
 					.into_iter()
-					.flat_map(|(namespace, catalog)| catalog.approval_kinds.into_iter().map(move |k| kind_to(k, &namespace))),
+					// As proposals are measured: the floor's level and escalations, not the
+					// catalog's alone. `GetScopeCatalog` answers the publisher what it published.
+					.flat_map(|(namespace, catalog)| catalog.approval_kinds.into_iter().map(move |k| kind_to(domain::floors::floored(&k), &namespace))),
 			)
 			.collect();
 		Ok(Response::new(ListApprovalKindsResponse { kinds }))
@@ -588,6 +594,10 @@ impl Approvals {
 	/// so kept off the roster (D23).
 	#[allow(clippy::too_many_arguments)] // why: every argument is a distinct part of the proposal; a struct for one private call would only rename them
 	async fn open_own(&self, opener: UserId, kind: &str, scope: String, subject_ref: String, fields: Vec<Field>, reason: String, action: rules::Action) -> Result<Approval, Status> {
+		let mut exclude = vec![opener];
+		if let rules::Action::GrantAdmin { user, .. } = &action {
+			exclude.push(UserId::from_raw(*user));
+		}
 		let kind = rules::builtin_kinds()
 			.into_iter()
 			.find(|k| k.name == kind)
@@ -612,7 +622,7 @@ impl Approvals {
 			reason,
 			dedupe_key: Uuid::new_v4().to_string(),
 			client: String::new(),
-			exclude: Some(opener),
+			exclude,
 			action: Some(action),
 			proven: None,
 		};
@@ -740,6 +750,9 @@ impl ApprovalExecutionService for ApprovalExecution {
 			.map_err(domain_to_status)?
 			.and_then(|catalog| catalog.approval_kinds.into_iter().find(|k| k.name == req.kind))
 			.ok_or_else(|| Status::invalid_argument(format!("unknown approval kind `{}`", req.kind)))?;
+		// Measured as this plane's floor requires, whatever the catalog in force says — it
+		// may predate the floor or be the publisher's mistake (D24).
+		let kind = domain::floors::floored(&kind);
 		rules::check_subject_ref(&req.subject_ref).map_err(invalid)?;
 		rules::check_text("reason", &req.reason, REASON_BYTES).map_err(invalid)?;
 		rules::check_dedupe_key(&req.dedupe_key).map_err(invalid)?;
@@ -767,7 +780,7 @@ impl ApprovalExecutionService for ApprovalExecution {
 			reason: req.reason,
 			dedupe_key: req.dedupe_key,
 			client,
-			exclude: None,
+			exclude: Vec::new(),
 			action: None,
 			proven,
 		};
@@ -875,35 +888,122 @@ const PROOF_MAX_AGE_SECS: i64 = 120;
 const EXECUTOR_BATCH: i64 = 100;
 
 /// One pass of this plane's executor: carry out every passed `concierge:*` proposal that
-/// is due, each in its own transaction with its outcome. Returns how many it closed.
-pub async fn execute_due(approvals: &dyn ApprovalRepository) -> Result<usize, domain::error::DomainError> {
-	let mut closed = 0;
-	for due in approvals.pull(rules::OWN_NAMESPACE, EXECUTOR_BATCH).await? {
-		// One decision the store cannot carry out must not hold up the ones behind it; it
-		// stays passed and is tried again next pass, until it lapses.
+/// is due and not waiting out its own backoff, each in its own transaction with its outcome.
+pub async fn execute_due(approvals: &dyn ApprovalRepository, backoff: &mut ExecutorBackoff, interval: Duration) -> Result<ExecutorPass, domain::error::DomainError> {
+	let mut pass = ExecutorPass::default();
+	let due = approvals.pull(rules::OWN_NAMESPACE, EXECUTOR_BATCH).await?;
+	let now = Instant::now();
+	backoff.forget_all_but(&due.iter().map(|d| d.id).collect::<Vec<_>>());
+	for due in due {
+		// One decision the store cannot carry out must not hold up the ones behind it, nor
+		// be asked again every pass: it waits out its own backoff, until it lapses.
+		if !backoff.due(due.id, now) {
+			pass.deferred += 1;
+			continue;
+		}
 		match approvals.execute(due.id).await {
 			Ok(Some(outcome)) => {
 				tracing::info!(approval = %due.id, kind = %due.kind, scope = %due.scope, outcome = outcome.as_str(), "approval executed by this plane");
-				closed += 1;
+				backoff.succeeded(due.id);
+				pass.closed += 1;
 			}
-			Ok(None) => {}
-			Err(err) => tracing::error!(approval = %due.id, kind = %due.kind, scope = %due.scope, %err, "executing an approval failed; it is retried next pass"),
+			Ok(None) => backoff.succeeded(due.id),
+			Err(err) => {
+				let retry_in = backoff.failed(due.id, now, interval);
+				tracing::error!(approval = %due.id, kind = %due.kind, scope = %due.scope, %err, retry_in_secs = retry_in.as_secs(), "executing an approval failed");
+				pass.failed += 1;
+			}
 		}
 	}
-	Ok(closed)
+	Ok(pass)
+}
+
+/// What one executor pass did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecutorPass {
+	pub closed: usize,
+	pub failed: usize,
+	/// Due, and skipped while it waits out its own backoff.
+	pub deferred: usize,
+}
+
+/// The longest one failing decision waits between attempts.
+const EXECUTOR_MAX_PAUSE: Duration = Duration::from_secs(15 * 60);
+
+/// The wait after `failing` attempts in a row at one decision: the interval, doubled per
+/// failure, up to [`EXECUTOR_MAX_PAUSE`].
+pub fn executor_pause(interval: Duration, failing: u32) -> Duration {
+	interval.saturating_mul(1u32 << failing.min(10)).min(EXECUTOR_MAX_PAUSE.max(interval))
+}
+
+/// Per-decision backoff (review of #142): a decision the store keeps refusing is retried
+/// ever less often, while every other due decision is executed on the ordinary interval —
+/// one poisoned decision must not hold the healthy ones back. In memory: a restart retries
+/// at once, which is the right answer to whatever was wrong before it.
+#[derive(Debug, Default)]
+pub struct ExecutorBackoff {
+	failing: HashMap<Uuid, (u32, Instant)>,
+}
+
+impl ExecutorBackoff {
+	pub fn due(&self, id: Uuid, now: Instant) -> bool {
+		self.failing.get(&id).is_none_or(|(_, next)| now >= *next)
+	}
+
+	/// Records a failure; answers how long until the next attempt.
+	pub fn failed(&mut self, id: Uuid, now: Instant, interval: Duration) -> Duration {
+		let failures = self.failing.get(&id).map_or(0, |(n, _)| *n).saturating_add(1);
+		let wait = executor_pause(interval, failures);
+		self.failing.insert(id, (failures, now + wait));
+		wait
+	}
+
+	pub fn succeeded(&mut self, id: Uuid) {
+		self.failing.remove(&id);
+	}
+
+	/// Drops every decision no longer due — executed, vetoed, lapsed — so the map holds at
+	/// most one batch.
+	pub fn forget_all_but(&mut self, due: &[Uuid]) {
+		self.failing.retain(|id, _| due.contains(id));
+	}
 }
 
 /// The executor loop (D23): what this plane's own approvals do once passed. A second loop
 /// beside the hold sweep, because a passed decision nobody carries out lapses unexecuted
 /// after its window — and unlike a service, this plane has nobody else to pull it.
-pub async fn run_executor(approvals: Arc<dyn ApprovalRepository>, interval: std::time::Duration) {
+pub async fn run_executor(approvals: Arc<dyn ApprovalRepository>, interval: Duration) {
 	tracing::info!(interval_secs = interval.as_secs(), "approval executor started");
+	let mut backoff = ExecutorBackoff::default();
 	loop {
-		match execute_due(approvals.as_ref()).await {
-			Ok(closed) if usize::try_from(EXECUTOR_BATCH).is_ok_and(|batch| closed >= batch) => continue,
+		match execute_due(approvals.as_ref(), &mut backoff, interval).await {
+			Ok(pass) if pass.failed == 0 && pass.deferred == 0 && usize::try_from(EXECUTOR_BATCH).is_ok_and(|batch| pass.closed >= batch) => continue,
 			Ok(_) => {}
 			Err(err) => tracing::error!(%err, "the approval executor failed; passed concierge:* decisions are not being carried out"),
 		}
 		tokio::time::sleep(interval).await;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn the_executor_backs_off_per_decision() {
+		let every = Duration::from_secs(30);
+		assert_eq!(executor_pause(every, 1), Duration::from_secs(60));
+		assert_eq!(executor_pause(every, 40), EXECUTOR_MAX_PAUSE, "and stops growing");
+
+		let (poisoned, healthy) = (Uuid::new_v4(), Uuid::new_v4());
+		let t0 = Instant::now();
+		let mut backoff = ExecutorBackoff::default();
+		assert_eq!(backoff.failed(poisoned, t0, every), Duration::from_secs(60));
+		assert!(!backoff.due(poisoned, t0 + every), "the failing one waits out its own pause");
+		assert!(backoff.due(healthy, t0), "a healthy one is never held back by it");
+		assert!(backoff.due(poisoned, t0 + Duration::from_secs(60)));
+		assert_eq!(backoff.failed(poisoned, t0, every), Duration::from_secs(120), "and waits longer each time");
+		backoff.forget_all_but(&[healthy]);
+		assert!(backoff.due(poisoned, t0), "a decision no longer due is forgotten");
 	}
 }

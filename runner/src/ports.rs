@@ -532,8 +532,9 @@ pub struct NewApproval {
 	/// The opening client; empty for the bridge token and for this plane's own kinds.
 	pub client: String,
 	/// Kept off the roster: the person who opened a `concierge:*` proposal over a session,
-	/// proven by it, so they do not vote on what they asked for (D23).
-	pub exclude: Option<UserId>,
+	/// proven by it, so they do not vote on what they asked for (D23) — first, as the one
+	/// its history names — and anyone it would seat, who does not vote on their own seat.
+	pub exclude: Vec<UserId>,
 	/// What this plane's executor does once it passes; `concierge:*` kinds only.
 	pub action: Option<Action>,
 	/// The account a service proved asked for it, when it presented that account's fresh

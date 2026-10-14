@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	error::DomainError,
-	scope_catalog::{ApprovalKind, ApprovalLevel, EscalationTest, FieldSpec, FieldType, is_canonical_amount, is_currency, plain_text},
+	scope_catalog::{ApprovalKind, ApprovalLevel, Escalation, EscalationTest, FieldSpec, FieldType, is_canonical_amount, is_currency, plain_text},
 	users::UserId,
 };
 
@@ -180,29 +180,34 @@ impl ScopePolicy {
 			if self.thresholds[..i].iter().any(|o| o.kind == t.kind && o.parameter == t.parameter) {
 				return Err(format!("threshold `{}`/`{}` is given twice", t.kind, t.parameter));
 			}
+			// Measured against the kind as a proposal is: floored, so "only tightens" counts
+			// from the table's cap where it is stricter than the catalog.
 			let escalation = kinds
 				.iter()
-				.filter(|k| k.name == t.kind && k.level == ApprovalLevel::Scope)
-				.flat_map(|k| k.escalations.iter())
+				.filter(|k| k.name == t.kind)
+				.map(crate::floors::floored)
+				.filter(|k| k.level == ApprovalLevel::Scope)
+				.flat_map(|k| k.escalations)
 				.find(|e| e.parameter == t.parameter)
 				.ok_or_else(|| format!("threshold `{}`/`{}` names no escalation of a scope-level kind in force", t.kind, t.parameter))?;
 			let shaped = match escalation.test {
 				EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => is_canonical_amount(&t.value),
-				EscalationTest::AbsBpsAbove => t.value.parse::<u64>().is_ok_and(|v| v.to_string() == t.value),
+				EscalationTest::AbsBpsAbove | EscalationTest::CountAbove | EscalationTest::Rolling24hCountAbove => t.value.parse::<u64>().is_ok_and(|v| v.to_string() == t.value),
 				EscalationTest::FlagSet => false,
 			};
 			if !shaped {
 				return Err(format!("threshold `{}`/`{}` is not a value its test takes", t.kind, t.parameter));
 			}
-			// Until this plane holds its own floor on the known money kinds, a scope may only
-			// make a kind's escalation stricter than the kind publishes it (decided): a looser
-			// one would let the scope keep for itself what its publisher sends to the owners.
+			// A scope may only make a kind's escalation stricter than the kind is measured by
+			// (decided): a looser one would let the scope keep for itself what its publisher,
+			// or this plane's floor, sends to the owners.
 			let looser = match escalation.test {
 				EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => amount_above(&t.value, &escalation.default_threshold),
-				EscalationTest::AbsBpsAbove => match (t.value.parse::<u64>(), escalation.default_threshold.parse::<u64>()) {
-					(Ok(value), Ok(default)) => value > default,
-					_ => true,
-				},
+				EscalationTest::AbsBpsAbove | EscalationTest::CountAbove | EscalationTest::Rolling24hCountAbove =>
+					match (t.value.parse::<u64>(), escalation.default_threshold.parse::<u64>()) {
+						(Ok(value), Ok(default)) => value > default,
+						_ => true,
+					},
 				EscalationTest::FlagSet => true,
 			};
 			if looser {
@@ -215,8 +220,39 @@ impl ScopePolicy {
 		Ok(())
 	}
 
-	fn threshold_of<'a>(&'a self, kind: &str, parameter: &str, default: &'a str) -> &'a str {
-		self.thresholds.iter().find(|t| t.kind == kind && t.parameter == parameter).map_or(default, |t| t.value.as_str())
+	/// The policy as installed: a threshold on a catalog escalation the floor also covers
+	/// (same test, field and currency) is moved onto the floor's parameter, which this plane
+	/// keeps whatever the publisher's next catalog says — so the next catalog cannot drop the
+	/// scope's tightening by renaming or removing its own escalation (review of #142). Two
+	/// thresholds landing on one parameter keep the stricter.
+	pub fn anchored(&self, kinds: &[ApprovalKind]) -> ScopePolicy {
+		let mut anchored = ScopePolicy {
+			thresholds: Vec::new(),
+			..self.clone()
+		};
+		for t in &self.thresholds {
+			let kind = kinds.iter().find(|k| k.name == t.kind).map(crate::floors::floored);
+			let escalation = kind.as_ref().and_then(|k| k.escalations.iter().find(|e| e.parameter == t.parameter));
+			let floor = kind.as_ref().zip(escalation).and_then(|(k, e)| {
+				k.escalations
+					.iter()
+					.find(|f| crate::floors::is_floor_parameter(&f.parameter) && f.test == e.test && f.field_key == e.field_key && f.currency == e.currency)
+			});
+			let parameter = floor.map_or_else(|| t.parameter.clone(), |f| f.parameter.clone());
+			let test = escalation.map(|e| e.test);
+			match anchored.thresholds.iter_mut().find(|o| o.kind == t.kind && o.parameter == parameter) {
+				Some(existing) =>
+					if let Some(stricter) = test.and_then(|test| crate::floors::stricter(test, &existing.value, &t.value)) {
+						existing.value = stricter;
+					},
+				None => anchored.thresholds.push(Threshold {
+					kind: t.kind.clone(),
+					parameter,
+					value: t.value.clone(),
+				}),
+			}
+		}
+		anchored
 	}
 }
 
@@ -512,10 +548,30 @@ pub fn amount_sum(a: &str, b: &str) -> String {
 /// it was opened, and an execution a day after its proposal rather than after the money moved.
 pub fn fired_escalations(kind: &ApprovalKind, fields: &[Field], policy: &ScopePolicy, window: &[Vec<Field>]) -> Vec<String> {
 	let value_of = |fields: &[Field], key: &str| fields.iter().find(|f| f.key == key).map(|f| f.value.clone());
-	kind.escalations
+	// A policy threshold binds by WHAT it tests, not by name: every escalation of the same
+	// test, field and currency as the one it names is held to it. Never looser than the
+	// default the kind is measured by — a policy installed before the floor may hold an
+	// override above it.
+	let held_to = |e: &Escalation| -> Option<String> {
+		policy
+			.thresholds
+			.iter()
+			.filter(|t| t.kind == kind.name)
+			.filter(|t| {
+				kind.escalations
+					.iter()
+					.any(|named| named.parameter == t.parameter && named.test == e.test && named.field_key == e.field_key && named.currency == e.currency)
+			})
+			.try_fold(e.default_threshold.clone(), |held, t| crate::floors::stricter(e.test, &held, &t.value))
+	};
+	let mut fired: Vec<String> = kind
+		.escalations
 		.iter()
 		.filter(|e| {
-			let threshold = policy.threshold_of(&kind.name, &e.parameter, &e.default_threshold);
+			let Some(threshold) = held_to(e) else {
+				return true;
+			};
+			let threshold = threshold.as_str();
 			let value = value_of(fields, &e.field_key);
 			// A field that cannot be compared — absent, of another type, in another currency —
 			// escalates: what this plane cannot measure goes to the owners (fail safe). Only
@@ -540,10 +596,24 @@ pub fn fired_escalations(kind: &ApprovalKind, fields: &[Field], policy: &ScopePo
 				}
 				EscalationTest::AbsBpsAbove => !matches!(value, Some(FieldValue::Bps(bps)) if threshold.parse::<u64>().is_ok_and(|limit| bps.unsigned_abs() <= limit)),
 				EscalationTest::FlagSet => matches!(value, Some(FieldValue::Flag(true))),
+				EscalationTest::CountAbove => !matches!(value, Some(FieldValue::Count(n)) if threshold.parse::<u64>().is_ok_and(|limit| n <= limit)),
+				EscalationTest::Rolling24hCountAbove => {
+					let Some(FieldValue::Count(n)) = value else { return true };
+					let total = window
+						.iter()
+						.filter_map(|prior| match value_of(prior, &e.field_key) {
+							Some(FieldValue::Count(p)) => Some(p),
+							_ => None,
+						})
+						.fold(n, u64::saturating_add);
+					threshold.parse::<u64>().map_or(true, |limit| total > limit)
+				}
 			}
 		})
 		.map(|e| e.parameter.clone())
-		.collect()
+		.collect();
+	fired.extend(crate::floors::special_fired(&kind.name, fields));
+	fired
 }
 
 /// Who decides a proposal, frozen at open.
@@ -907,16 +977,17 @@ impl Decision {
 		self.transition(ApprovalEvent::Voted);
 		let seated = || self.voters.iter().filter(|x| !unseated.contains(&x.user_id));
 		let fors = seated().filter(|x| x.vote == Vote::For).count();
-		// What could still carry it: seated FORs and seated votes not cast yet. Neither
-		// vote of someone who lost the seat counts, either way.
-		let reachable = seated().filter(|x| x.vote != Vote::Against).count();
+		// Rejected only by seated AGAINSTs, more than the roster could spare (review of
+		// #140): a seat lost is not a vote against, so what can no longer be carried for
+		// want of seats waits out its lifetime rather than being decided by a removal.
+		let againsts = seated().filter(|x| x.vote == Vote::Against).count();
 		let threshold = usize::try_from(self.threshold).unwrap_or(usize::MAX);
 		if fors >= threshold {
 			self.state = ApprovalState::Passed;
 			self.passed_at = Some(now);
 			self.executable_at = Some(now.saturating_add(self.delay_secs));
 			self.transition(ApprovalEvent::Passed);
-		} else if reachable < threshold {
+		} else if againsts > self.voters.len().saturating_sub(threshold) {
 			self.close(ApprovalState::Rejected, ApprovalEvent::Rejected, now);
 		}
 		Ok(())
@@ -987,7 +1058,6 @@ mod tests {
 	use uuid::Uuid;
 
 	use super::*;
-	use crate::scope_catalog::Escalation;
 
 	fn uid() -> UserId {
 		UserId::from_raw(Uuid::new_v4())
@@ -1257,16 +1327,18 @@ mod tests {
 	}
 
 	#[test]
-	fn a_vote_that_can_no_longer_be_won_is_lost() {
+	fn only_seated_againsts_reject() {
 		let roster = [uid(), uid(), uid()];
 		let mut d = Decision::open(&roster, 2, 0, 1000);
 		d.vote(roster[0], Vote::For, 1, &[]).unwrap();
 		d.vote(roster[1], Vote::Against, 2, &[roster[0]]).unwrap();
-		assert_eq!(d.state, ApprovalState::Rejected, "one seated vote left of the two needed");
+		assert_eq!(d.state, ApprovalState::Open, "a lost seat is no vote against");
+		d.vote(roster[2], Vote::Against, 3, &[roster[0]]).unwrap();
+		assert_eq!(d.state, ApprovalState::Rejected, "two seated AGAINSTs of three");
 		let mut d = Decision::open(&roster, 2, 0, 1000);
 		d.vote(roster[0], Vote::Against, 1, &[]).unwrap();
-		d.vote(roster[1], Vote::For, 2, &[roster[0]]).unwrap();
-		assert_eq!(d.state, ApprovalState::Open, "the unseated AGAINST counts no more than a FOR would");
+		d.vote(roster[1], Vote::Against, 2, &[roster[0]]).unwrap();
+		assert_eq!(d.state, ApprovalState::Open, "an unseated AGAINST counts no more than a FOR would");
 	}
 
 	#[test]
@@ -1286,6 +1358,73 @@ mod tests {
 		};
 		assert_ne!(with("500"), with("900"));
 		assert!(with("500").contains("threshold\tTEXT\tbank:account_transfer/per_operation=500\n"));
+	}
+
+	fn transfer_with(escalations: Vec<Escalation>) -> ApprovalKind {
+		ApprovalKind { escalations, ..transfer_kind() }
+	}
+
+	fn policy_with(parameter: &str, value: &str) -> ScopePolicy {
+		ScopePolicy {
+			thresholds: vec![Threshold {
+				kind: "bank:account_transfer".into(),
+				parameter: parameter.into(),
+				value: value.into(),
+			}],
+			..ScopePolicy::default()
+		}
+	}
+
+	fn per_operation_at(threshold: &str) -> Escalation {
+		Escalation {
+			parameter: "per_operation".into(),
+			field_key: "amount".into(),
+			test: EscalationTest::AmountAbove,
+			default_threshold: threshold.into(),
+			currency: "USDT".into(),
+		}
+	}
+
+	/// A scope's tightening of a catalog escalation is anchored on the floor at install, so
+	/// a catalog that later drops or renames its own escalation drops nothing.
+	#[test]
+	fn a_policy_threshold_outlives_the_catalog_escalation_it_named() {
+		let before = vec![transfer_with(vec![per_operation_at("1000")])];
+		let installed = policy_with("per_operation", "700").anchored(&before);
+		assert_eq!(installed.thresholds[0].parameter, "floor_per_operation");
+		let dropped = crate::floors::floored(&transfer_with(vec![]));
+		assert_eq!(fired_escalations(&dropped, &[amount("750", "USDT")], &installed, &[]), vec!["floor_per_operation"]);
+	}
+
+	/// A policy stored above the floor — before the floor existed — binds at the floor.
+	#[test]
+	fn a_stored_policy_above_the_floor_binds_at_the_floor() {
+		let kind = crate::floors::floored(&transfer_with(vec![per_operation_at("1000")]));
+		let fired = fired_escalations(&kind, &[amount("1500", "USDT")], &policy_with("per_operation", "5000"), &[]);
+		assert!(fired.contains(&"floor_per_operation".to_owned()), "{fired:?}");
+	}
+
+	#[test]
+	fn recipients_are_counted_over_the_day() {
+		let payout = ApprovalKind {
+			name: "bank:scope_payout".into(),
+			fields: vec![],
+			escalations: vec![Escalation {
+				parameter: "floor_daily_recipients".into(),
+				field_key: "recipients".into(),
+				test: EscalationTest::Rolling24hCountAbove,
+				default_threshold: "1".into(),
+				currency: String::new(),
+			}],
+			..transfer_kind()
+		};
+		let recipients = |n: u64| Field {
+			key: "recipients".into(),
+			value: FieldValue::Count(n),
+		};
+		let policy = ScopePolicy::default();
+		assert!(fired_escalations(&payout, &[recipients(1)], &policy, &[]).is_empty());
+		assert_eq!(fired_escalations(&payout, &[recipients(1)], &policy, &[vec![recipients(1)]]), vec!["floor_daily_recipients"]);
 	}
 
 	#[test]

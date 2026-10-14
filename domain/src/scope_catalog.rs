@@ -46,15 +46,18 @@ pub enum EscalationTest {
 	Rolling24hAmountAbove,
 	AbsBpsAbove,
 	FlagSet,
+	CountAbove,
+	Rolling24hCountAbove,
 }
 
 impl EscalationTest {
 	/// The one field type each test reads.
-	fn tests(self) -> FieldType {
+	pub(crate) fn tests(self) -> FieldType {
 		match self {
 			Self::AmountAbove | Self::Rolling24hAmountAbove => FieldType::Amount,
 			Self::AbsBpsAbove => FieldType::Bps,
 			Self::FlagSet => FieldType::Flag,
+			Self::CountAbove | Self::Rolling24hCountAbove => FieldType::Count,
 		}
 	}
 }
@@ -162,6 +165,11 @@ impl ApprovalKind {
 			if !is_key(parameter) || self.escalations[..i].iter().any(|e| &e.parameter == parameter) {
 				return Err(format!("approval kind `{name}` escalation `{parameter}` is not a unique `[a-z][a-z0-9_]{{0,31}}` key"));
 			}
+			// `floor_*` names this plane's own escalations: a publisher's one under that name
+			// would be taken for the floor in `escalated_by` and in a scope's policy.
+			if crate::floors::is_floor_parameter(parameter) {
+				return Err(format!("approval kind `{name}` escalation `{parameter}`: `floor_*` names this plane's own floor"));
+			}
 			let Some(field) = self.fields.iter().find(|f| f.key == escalation.field_key) else {
 				return Err(format!("approval kind `{name}` escalation `{parameter}` tests no field of the kind"));
 			};
@@ -178,12 +186,13 @@ impl ApprovalKind {
 				EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => is_canonical_amount(threshold) && is_currency(&escalation.currency),
 				EscalationTest::AbsBpsAbove => is_unsigned_integer(threshold) && escalation.currency.is_empty(),
 				EscalationTest::FlagSet => threshold.is_empty() && escalation.currency.is_empty(),
+				EscalationTest::CountAbove | EscalationTest::Rolling24hCountAbove => is_unsigned_integer(threshold) && escalation.currency.is_empty(),
 			};
 			if !shaped {
 				return Err(format!("approval kind `{name}` escalation `{parameter}` has a threshold or currency its test does not take"));
 			}
 		}
-		Ok(())
+		crate::floors::check(self)
 	}
 }
 
@@ -344,8 +353,37 @@ mod tests {
 			assert!(catalog(vec![kind], vec![]).check("bank", &[]).is_err(), "{field_key} {threshold} {currency}");
 		}
 		let mut kind = amount_kind();
-		kind.escalations[0].default_threshold = "1000.5".into();
+		kind.escalations[0].default_threshold = "999.5".into();
 		assert_eq!(catalog(vec![kind], vec![]).check("bank", &[]), Ok(()));
+		let mut kind = amount_kind();
+		kind.escalations[0].default_threshold = "1000.5".into();
+		assert!(catalog(vec![kind], vec![]).check("bank", &[]).is_err(), "above this plane's floor for a transfer");
+	}
+
+	#[test]
+	fn a_count_escalation_takes_an_integer_and_no_currency() {
+		let mut kind = amount_kind();
+		kind.name = "sa:headcount".into();
+		kind.fields[0] = FieldSpec {
+			key: "seats".into(),
+			label: "Seats".into(),
+			field_type: FieldType::Count,
+			required: true,
+			repeated: false,
+		};
+		kind.escalations[0] = Escalation {
+			parameter: "crowd".into(),
+			field_key: "seats".into(),
+			test: EscalationTest::CountAbove,
+			default_threshold: "3".into(),
+			currency: String::new(),
+		};
+		assert_eq!(catalog(vec![kind.clone()], vec![]).check("sa", &[]), Ok(()));
+		kind.escalations[0].currency = "USDT".into();
+		assert!(catalog(vec![kind.clone()], vec![]).check("sa", &[]).is_err());
+		kind.escalations[0].currency = String::new();
+		kind.escalations[0].parameter = "floor_crowd".into();
+		assert!(catalog(vec![kind], vec![]).check("sa", &[]).is_err(), "`floor_*` is this plane's own name");
 	}
 
 	#[test]

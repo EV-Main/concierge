@@ -22,6 +22,8 @@ pub mod authz;
 
 pub mod error;
 
+pub mod floors;
+
 pub mod governance;
 
 pub mod iam;
