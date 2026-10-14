@@ -4,7 +4,8 @@
 //! these requests already; CORS only decides whether the calling page may READ the
 //! answer. Hence credentials are allowed and the allowed origin is echoed exactly —
 //! never `*`, which a browser refuses beside credentials anyway — with `Vary: Origin`.
-//! Mounted on the listed routes alone (`router`); every other route gets no CORS header.
+//! Mounted on the listed routes alone (`router`); no other route gets a CORS header from it.
+//! `/auth/mfe/*` sets its own, credential-less (`web::mfe`).
 
 use std::{sync::Arc, time::Duration};
 

@@ -1,6 +1,6 @@
-//! The auth route handlers. Shapes mirror the cabinet BFF's former
-//! `/api/auth/*` surface byte-for-byte (`SessionInfo` with a camelCase user,
-//! `SessionList` snake_case), so the zone frontends only changed the URL.
+//! The session and OAuth route handlers. `/auth/session` (`SessionInfo`, camelCase user)
+//! and `/auth/sessions` (snake_case entries) follow the cabinet BFF's former
+//! `/api/auth/*` shapes, which the zone frontends still read.
 
 use axum::{
 	Json,

@@ -2,12 +2,12 @@ use std::{fs, path::PathBuf};
 
 /// Compile every `proto/<pkg>/v1/*.proto` into Rust with tonic — BOTH client and
 /// server stubs. The runner includes the servers; other service repos that depend
-/// on this crate (by git, or from crates.io) include the clients. Each package's generated module is
-/// pulled into `src/lib.rs` via `tonic::include_proto!("<pkg>.v1")`.
+/// on this crate (by git, or from crates.io) include the clients. Each package's
+/// generated module is pulled into `src/lib.rs` via `tonic::include_proto!("<pkg>.v1")`.
 ///
-/// `concierge.v1` is the whole user/identity + platform plane surface: auth,
-/// directory, the deferred notification/log seams, the cross-plane lifecycle
-/// events, and health.
+/// `concierge.v1` is the whole user/identity + platform plane surface, one file per
+/// service area under `proto/concierge/v1/`, served or not: a contract may land before
+/// its server does.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let proto_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto");
 

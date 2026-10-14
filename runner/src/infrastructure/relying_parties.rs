@@ -1,5 +1,5 @@
 //! Postgres adapter for relying parties (`rp_clients`, `rp_codes`, `rp_sessions`,
-//! migration 0025).
+//! migration 0025), each read with its scope's state (`tenants.state`, migration 0031).
 //!
 //! Nothing secret is stored in a form that can be presented back: client secrets, codes
 //! and refresh secrets are all SHA-256 digests. A plain digest and not a slow KDF because

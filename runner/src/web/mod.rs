@@ -12,9 +12,8 @@
 //!     no zone-side OAuth. A zone signs a user in by linking to
 //!     `/api/auth/login?returnTo=<path>`; that is the entire zone-side contract.
 //!
-//! Ported from the cabinet BFF's token-handler (its `oauth`/`cookies`/`session`
-//! modules) minus everything banking: the money-plane pair is the cabinet's own
-//! concern, minted zone-side from the verified access token.
+//! Nothing banking lives here: the money-plane token pair is the cabinet's own concern,
+//! minted zone-side from the verified access token.
 
 mod account;
 pub mod allowlist;
@@ -192,10 +191,11 @@ pub struct KycDeps {
 pub fn router(state: WebState) -> Router {
 	// The routes a scope's host may call — closed on purpose (`docs/SCOPES-AND-APPROVALS.md`
 	// §3.1). Everything acting on an open session (email verification, password set,
-	// passkey register/remove, sessions, username, logout, `/kyc/*`) stays off this list:
-	// those carry the CSRF double-submit, whose cookie a scope host cannot read, and a
-	// script there must be able to start a sign-in but never act for the account. A scope
-	// host proves a mailbox by signing in with a code.
+	// passkey register/remove, sessions, username, methods, `/auth/me`, notification
+	// settings, logout, `/kyc/*`) stays off this list: those carry the CSRF double-submit,
+	// or read the account, and a script on a scope host must be able to start a sign-in but
+	// never act for the account. A scope host proves a mailbox by signing in with a code,
+	// or confirms a password sign-up with its ticket (`signup`).
 	//
 	// `.layer` on these sub-routers and not `route_layer`: a route layer runs only for a
 	// method the route has, so the OPTIONS preflight of a POST route would never reach
@@ -215,7 +215,7 @@ pub fn router(state: WebState) -> Router {
 	Router::new()
 		.merge(scope_posts)
 		.merge(scope_reads)
-		// k8s liveness/readiness probe target — the only unauthenticated route.
+		// k8s liveness/readiness probe target.
 		.route("/health", get(|| async { "ok" }))
 		.route("/auth/login", get(routes::login))
 		.route("/callback/auth/{provider}", get(routes::callback))

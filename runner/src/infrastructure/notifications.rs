@@ -583,10 +583,11 @@ impl NotificationDispatchRepository for PgNotifications {
 
 /// Create-or-refresh the subscriber row behind a signed-in user on an open connection.
 ///
-/// A signed-in subscriber is confirmed on sight: the identity plane only ever holds an
-/// address Google already verified, so a second opt-in round trip would be friction
-/// with no security value. Shared with the governance adapter, which must resolve a
-/// recipient inside its own transaction.
+/// A signed-in subscriber is confirmed on sight: double opt-in guards the account-less
+/// path, where nobody has proved anything. Whether the address may be mailed is
+/// `email_verified`, copied from the account on every upsert and required by `emit` —
+/// an account made by password sign-up starts unverified. Shared with the governance
+/// adapter, which must resolve a recipient inside its own transaction.
 pub(crate) async fn upsert_subscriber(conn: &mut PgConnection, user_id: Uuid, email: &str, email_verified: bool) -> Result<SubscriberRow, DomainError> {
 	sqlx::query_as::<_, SubscriberRow>(
 		"INSERT INTO notification_subscribers (user_id, email, email_verified, confirmed_at, unsubscribe_token) \
