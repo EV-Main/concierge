@@ -1,6 +1,6 @@
 [package]
 name = "evconcierge_client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A relying party's calls into the EV concierge identity plane: code + PKCE sign-in, GetMe, catalog publishing under the client credential."
 license = "BlueOak-1.0.0"

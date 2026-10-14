@@ -1,6 +1,6 @@
 [package]
 name = "evconcierge_contracts"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "gRPC wire contracts of the EV concierge identity plane: the .proto sources and the tonic client and server stubs generated from them."
 license = "BlueOak-1.0.0"
