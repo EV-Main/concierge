@@ -9,8 +9,9 @@
 //! existence is not a probe one namespace can run against another's. A person sees what
 //! [`visible`] says, and an invisible proposal is the same `NOT_FOUND`.
 //!
-//! Not served yet: the `concierge:*` kinds this plane executes itself (`CancelApproval`,
-//! `ProposeScopeAdminGrant`, `ProposeScopePolicyChange`) and the approval mail (§5.5).
+//! This plane is also a proposer: its own `concierge:*` kinds are opened over a session
+//! (the opener, proven by it, is kept off the roster) and carried out by [`run_executor`].
+//! Not served yet: the approval mail (§5.5).
 //!
 //! `Result<_, Status>` is tonic's mandated handler signature; `Status` is a large type
 //! we don't control, so the large-err lint does not apply in this module.
@@ -20,6 +21,7 @@ use std::sync::Arc;
 
 use domain::{
 	approvals::{self as rules, Amount, ApprovalState, Field, FieldValue, Outcome, REASON_BYTES, TEXT_FIELD_BYTES, Vote},
+	authz::Iam,
 	scope_catalog::ApprovalLevel as Level,
 	scopes::ROOT,
 	users::UserId,
@@ -28,15 +30,15 @@ use evconcierge_contracts::concierge::v1::{
 	self as cc, Approval, ApprovalAmount, ApprovalFieldValue, CancelApprovalRequest, GetApprovalRequest, GetProposalRequest, GetScopeApprovalPolicyRequest, ListApprovalKindsRequest,
 	ListApprovalKindsResponse, ListApprovalsRequest, ListApprovalsResponse, ProposeRequest, ProposeScopeAdminGrantRequest, ProposeScopePolicyChangeRequest, PullApprovedRequest,
 	PullApprovedResponse, ReportOutcomeRequest, ScopeApprovalPolicy, VetoApprovalRequest, VoteApprovalRequest, WithdrawProposalRequest,
-	approval_execution_service_server::ApprovalExecutionService, approval_field_value, approval_service_server::ApprovalService,
+	approval_execution_service_server::ApprovalExecutionService, approval_field_value, approval_service_server::ApprovalService, propose_scope_admin_grant_request,
 };
 use sha2::{Digest, Sha256};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
-	authz::caller_gate,
-	ports::{ApprovalActor, ApprovalFilter, ApprovalRecord, ApprovalRepository, ApprovalViewer, NewApproval, Proposed, ScopeCatalogRepository, UserDirectoryRepository},
+	authz::{caller_gate, require_permission},
+	ports::{ApprovalActor, ApprovalFilter, ApprovalRecord, ApprovalRepository, ApprovalViewer, NewApproval, PersonRef, Proposed, ScopeCatalogRepository, UserDirectoryRepository},
 	scope_catalog::kind_to,
 	service_caller::{ServiceCaller, ServiceCallers},
 	support::domain_to_status,
@@ -181,6 +183,15 @@ pub fn approval_to(record: ApprovalRecord, reader: Reader) -> Approval {
 	let now = record.as_of;
 	let state = decision.effective_state(now);
 	let decided_at = decision.effective_decided_at(now).unwrap_or(0);
+	// A lapse projected before anything wrote it says why, as the written one will.
+	let void_reason = match (state, decision.state) {
+		(ApprovalState::Void, ApprovalState::Passed) => rules::LAPSED.to_owned(),
+		_ => decision.void_reason.clone(),
+	};
+	let proposed_policy = match (&record.action, reader) {
+		(Some(rules::Action::InstallPolicy { scope, policy }), Reader::Decider | Reader::Bystander) => Some(policy_to(scope, policy.clone())),
+		(Some(rules::Action::InstallPolicy { .. } | rules::Action::GrantAdmin { .. }) | None, _) => None,
+	};
 	let (requested_by, mut requested_by_email) = record.requested_by.map(|(_, p)| (p.auth_subject, p.email)).unwrap_or_default();
 	let mut vetoed_by = record.vetoed_by.map(|p| p.auth_subject).unwrap_or_default();
 	let mut voters: Vec<cc::ApprovalVoter> = decision
@@ -229,12 +240,14 @@ pub fn approval_to(record: ApprovalRecord, reader: Reader) -> Approval {
 		decided_at,
 		vetoed_by,
 		veto_reason: decision.veto_reason.clone(),
-		void_reason: decision.void_reason.clone(),
+		void_reason,
 		outcome: outcome_to(decision.outcome) as i32,
 		outcome_detail: decision.outcome_detail.clone(),
 		proposer: record.proposer,
 		version: decision.version,
 		requested_by_client: record.requested_by_client,
+		execute_by: decision.execute_by().unwrap_or(0),
+		proposed_policy,
 	}
 }
 
@@ -276,13 +289,24 @@ fn cursor_from(raw: &str) -> Result<Option<(i64, Uuid)>, Status> {
 #[derive(Clone)]
 pub struct Approvals {
 	users: Arc<dyn UserDirectoryRepository>,
+	break_glass: Arc<crate::authz::BreakGlass>,
 	approvals: Arc<dyn ApprovalRepository>,
 	catalogs: Arc<dyn ScopeCatalogRepository>,
 }
 
 impl Approvals {
-	pub fn new(users: Arc<dyn UserDirectoryRepository>, approvals: Arc<dyn ApprovalRepository>, catalogs: Arc<dyn ScopeCatalogRepository>) -> Self {
-		Self { users, approvals, catalogs }
+	pub fn new(
+		users: Arc<dyn UserDirectoryRepository>,
+		break_glass: Arc<crate::authz::BreakGlass>,
+		approvals: Arc<dyn ApprovalRepository>,
+		catalogs: Arc<dyn ScopeCatalogRepository>,
+	) -> Self {
+		Self {
+			users,
+			break_glass,
+			approvals,
+			catalogs,
+		}
 	}
 
 	/// The signed-in person, gated as every user RPC is (status, `token_version`). A
@@ -312,9 +336,14 @@ impl ApprovalService for Approvals {
 	async fn list_approval_kinds(&self, request: Request<ListApprovalKindsRequest>) -> Result<Response<ListApprovalKindsResponse>, Status> {
 		self.caller(&request).await?;
 		let catalogs = self.catalogs.all_current().await.map_err(domain_to_status)?;
-		let kinds = catalogs
+		let kinds = rules::builtin_kinds()
 			.into_iter()
-			.flat_map(|(namespace, catalog)| catalog.approval_kinds.into_iter().map(move |k| kind_to(k, &namespace)))
+			.map(|k| kind_to(k, rules::OWN_NAMESPACE))
+			.chain(
+				catalogs
+					.into_iter()
+					.flat_map(|(namespace, catalog)| catalog.approval_kinds.into_iter().map(move |k| kind_to(k, &namespace))),
+			)
 			.collect();
 		Ok(Response::new(ListApprovalKindsResponse { kinds }))
 	}
@@ -399,18 +428,164 @@ impl ApprovalService for Approvals {
 		Ok(Response::new(approval_to(record, reader)))
 	}
 
-	async fn cancel_approval(&self, _request: Request<CancelApprovalRequest>) -> Result<Response<Approval>, Status> {
-		Err(Status::unimplemented(
-			"CancelApproval arrives with the concierge:* kinds; a service's proposal is withdrawn by its proposer or vetoed",
-		))
+	async fn cancel_approval(&self, request: Request<CancelApprovalRequest>) -> Result<Response<Approval>, Status> {
+		let viewer = self.viewer(&request).await?;
+		let id = approval_id(&request.into_inner().approval_id)?;
+		let (record, reader) = self.visible_record(&viewer, id).await?;
+		// Only a `concierge:*` proposal has an opener a session proved; a service's is
+		// withdrawn by its proposer or vetoed.
+		let opened_it = record.proposer == rules::OWN_NAMESPACE && record.requested_by.as_ref().is_some_and(|(by, _)| *by == viewer.user);
+		if !opened_it {
+			return Err(Status::permission_denied("only the person who opened this plane's own proposal cancels it"));
+		}
+		let record = self
+			.approvals
+			.withdraw(id, rules::OWN_NAMESPACE, ApprovalActor::Person(viewer.user), "")
+			.await
+			.map_err(domain_to_status)?;
+		Ok(Response::new(approval_to(record, reader)))
 	}
 
-	async fn propose_scope_admin_grant(&self, _request: Request<ProposeScopeAdminGrantRequest>) -> Result<Response<Approval>, Status> {
-		Err(Status::unimplemented("concierge:scope_admin_grant is not served yet"))
+	async fn propose_scope_admin_grant(&self, request: Request<ProposeScopeAdminGrantRequest>) -> Result<Response<Approval>, Status> {
+		let caller = self.caller(&request).await?;
+		require_permission(self.users.as_ref(), &self.break_glass, &request, Iam::Grant).await?;
+		let req = request.into_inner();
+		if req.scope == ROOT {
+			return Err(Status::invalid_argument("scope `main` has no admins: its deciders are the platform owners"));
+		}
+		rules::check_text("reason", &req.reason, REASON_BYTES).map_err(invalid)?;
+		let named = match &req.subject {
+			Some(propose_scope_admin_grant_request::Subject::UserId(raw)) =>
+				PersonRef::Id(UserId::from_raw(Uuid::parse_str(raw).map_err(|_| Status::invalid_argument("user_id is not a user id"))?)),
+			Some(propose_scope_admin_grant_request::Subject::Account(handle)) => PersonRef::Handle(handle),
+			None => return Err(Status::invalid_argument("name the account by user_id or account")),
+		};
+		let (subject, subject_ref_name, verified) = self
+			.approvals
+			.person(named)
+			.await
+			.map_err(domain_to_status)?
+			.ok_or_else(|| Status::not_found("no active account by that name"))?;
+		// A scope admin is reached by the approvals' mail; an unproven address hands the
+		// seat to whoever holds that mailbox.
+		if !verified {
+			return Err(Status::failed_precondition("the account's address is not verified"));
+		}
+		// The grant names its opener as `granted_by`, and nobody grants to themselves
+		// (`grants_not_to_self`).
+		if subject == caller {
+			return Err(Status::permission_denied("nobody proposes themselves as a scope's admin"));
+		}
+		let fields = vec![Field {
+			key: "account".into(),
+			value: FieldValue::User(subject_ref_name),
+		}];
+		let action = rules::Action::GrantAdmin {
+			user: subject.raw(),
+			scope: req.scope.clone(),
+			granted_by: caller.raw(),
+		};
+		let record = self
+			.open_own(caller, rules::SCOPE_ADMIN_GRANT, req.scope, format!("user:{}", subject.raw()), fields, req.reason, action)
+			.await?;
+		Ok(Response::new(record))
 	}
 
-	async fn propose_scope_policy_change(&self, _request: Request<ProposeScopePolicyChangeRequest>) -> Result<Response<Approval>, Status> {
-		Err(Status::unimplemented("concierge:scope_policy_change is not served yet"))
+	async fn propose_scope_policy_change(&self, request: Request<ProposeScopePolicyChangeRequest>) -> Result<Response<Approval>, Status> {
+		let caller = self.caller(&request).await?;
+		let viewer = self.approvals.viewer(caller).await.map_err(domain_to_status)?;
+		let req = request.get_ref();
+		let wanted = req.policy.clone().ok_or_else(|| Status::invalid_argument("name the policy to install"))?;
+		if wanted.scope == ROOT {
+			return Err(Status::invalid_argument("scope `main` has no policy: it is decided by the platform owners' consilium"));
+		}
+		if !viewer.admin_of.contains(&wanted.scope) {
+			require_permission(self.users.as_ref(), &self.break_glass, &request, Iam::Grant)
+				.await
+				.map_err(|_| Status::permission_denied("a scope's policy change is opened by its admins or a granting seat"))?;
+		}
+		let reason = request.into_inner().reason;
+		rules::check_text("reason", &reason, REASON_BYTES).map_err(invalid)?;
+		let policy = rules::ScopePolicy {
+			version: 0,
+			quorum_bps: wanted.quorum_bps,
+			delay_secs: wanted.delay_secs,
+			ttl_secs: wanted.ttl_secs,
+			thresholds: wanted
+				.thresholds
+				.into_iter()
+				.map(|t| rules::Threshold {
+					kind: t.kind,
+					parameter: t.parameter,
+					value: t.value,
+				})
+				.collect(),
+		};
+		let kinds: Vec<_> = self
+			.catalogs
+			.all_current()
+			.await
+			.map_err(domain_to_status)?
+			.into_iter()
+			.flat_map(|(_, catalog)| catalog.approval_kinds)
+			.collect();
+		policy.check(&kinds).map_err(invalid)?;
+		// One live change per scope: the subject is the scope's policy, named by a UUID
+		// derived from the scope so every change of it collides on the live-subject index.
+		let digest = Sha256::digest(format!("scope_policy:{}", wanted.scope).as_bytes());
+		let mut bytes = [0u8; 16];
+		bytes.copy_from_slice(&digest[..16]);
+		let subject_ref = format!("scope_policy:{}", Uuid::from_bytes(bytes));
+		let fields = rules::policy_fields(&policy);
+		let action = rules::Action::InstallPolicy {
+			scope: wanted.scope.clone(),
+			policy,
+		};
+		let record = self.open_own(caller, rules::SCOPE_POLICY_CHANGE, wanted.scope, subject_ref, fields, reason, action).await?;
+		Ok(Response::new(record))
+	}
+}
+
+impl Approvals {
+	/// Open one of this plane's own kinds for `opener`, who is proven by the session and
+	/// so kept off the roster (D23).
+	#[allow(clippy::too_many_arguments)] // why: every argument is a distinct part of the proposal; a struct for one private call would only rename them
+	async fn open_own(&self, opener: UserId, kind: &str, scope: String, subject_ref: String, fields: Vec<Field>, reason: String, action: rules::Action) -> Result<Approval, Status> {
+		let kind = rules::builtin_kinds()
+			.into_iter()
+			.find(|k| k.name == kind)
+			.ok_or_else(|| Status::internal("a built-in kind is missing"))?;
+		let fields = rules::check_fields(&kind, fields).map_err(invalid)?;
+		let (_, opener_subject, _) = self
+			.approvals
+			.person(PersonRef::Id(opener))
+			.await
+			.map_err(domain_to_status)?
+			.ok_or_else(|| Status::permission_denied("no active account behind this token"))?;
+		let payload_hash = hex(&Sha256::digest(rules::payload_preimage(&kind.name, &scope, &subject_ref, &fields)));
+		let new = NewApproval {
+			id: Uuid::new_v4(),
+			kind,
+			proposer: rules::OWN_NAMESPACE.to_owned(),
+			scope,
+			subject_ref,
+			fields,
+			payload_hash,
+			requested_by: Some(opener_subject),
+			reason,
+			dedupe_key: Uuid::new_v4().to_string(),
+			client: String::new(),
+			exclude: Some(opener),
+			action: Some(action),
+		};
+		let record = match self.approvals.propose(new).await.map_err(domain_to_status)? {
+			Proposed::Opened(record) | Proposed::Existing(record) => record,
+			Proposed::Saturated => return Err(Status::resource_exhausted("too many of this plane's own proposals are live in this scope")),
+		};
+		tracing::info!(approval = %record.id, kind = %record.kind, scope = %record.scope, by = %opener, "approval opened over a session");
+		let viewer = self.approvals.viewer(opener).await.map_err(domain_to_status)?;
+		let reader = visible(&viewer, &record).unwrap_or(Reader::Bystander);
+		Ok(approval_to(record, reader))
 	}
 }
 
@@ -487,6 +662,7 @@ impl ApprovalExecutionService for ApprovalExecution {
 			ServiceCaller::Bridge => String::new(),
 			ServiceCaller::Client(client) => client.client_id.clone(),
 		};
+		let scope = req.scope.clone();
 		let new = NewApproval {
 			id: Uuid::new_v4(),
 			kind,
@@ -499,6 +675,8 @@ impl ApprovalExecutionService for ApprovalExecution {
 			reason: req.reason,
 			dedupe_key: req.dedupe_key,
 			client,
+			exclude: None,
+			action: None,
 		};
 		let record = match self.approvals.propose(new).await.map_err(domain_to_status)? {
 			Proposed::Opened(record) => {
@@ -508,9 +686,10 @@ impl ApprovalExecutionService for ApprovalExecution {
 			Proposed::Existing(record) => record,
 			Proposed::Saturated => {
 				return Err(Status::resource_exhausted(format!(
-					"`{}` already holds {} live proposals; withdraw or wait for some before opening more",
+					"`{}` already holds {} live proposals in scope `{}`; withdraw or wait for some before opening more",
 					caller.namespace(),
-					rules::MAX_LIVE_PER_PROPOSER
+					rules::MAX_LIVE_PER_PROPOSER,
+					scope
 				)));
 			}
 		};
@@ -583,4 +762,41 @@ impl ApprovalExecutionService for ApprovalExecution {
 
 fn hex(bytes: &[u8]) -> String {
 	bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// How many due `concierge:*` decisions one executor pass takes on.
+const EXECUTOR_BATCH: i64 = 100;
+
+/// One pass of this plane's executor: carry out every passed `concierge:*` proposal that
+/// is due, each in its own transaction with its outcome. Returns how many it closed.
+pub async fn execute_due(approvals: &dyn ApprovalRepository) -> Result<usize, domain::error::DomainError> {
+	let mut closed = 0;
+	for due in approvals.pull(rules::OWN_NAMESPACE, EXECUTOR_BATCH).await? {
+		// One decision the store cannot carry out must not hold up the ones behind it; it
+		// stays passed and is tried again next pass, until it lapses.
+		match approvals.execute(due.id).await {
+			Ok(Some(outcome)) => {
+				tracing::info!(approval = %due.id, kind = %due.kind, scope = %due.scope, outcome = outcome.as_str(), "approval executed by this plane");
+				closed += 1;
+			}
+			Ok(None) => {}
+			Err(err) => tracing::error!(approval = %due.id, kind = %due.kind, scope = %due.scope, %err, "executing an approval failed; it is retried next pass"),
+		}
+	}
+	Ok(closed)
+}
+
+/// The executor loop (D23): what this plane's own approvals do once passed. A second loop
+/// beside the hold sweep, because a passed decision nobody carries out lapses unexecuted
+/// after its window — and unlike a service, this plane has nobody else to pull it.
+pub async fn run_executor(approvals: Arc<dyn ApprovalRepository>, interval: std::time::Duration) {
+	tracing::info!(interval_secs = interval.as_secs(), "approval executor started");
+	loop {
+		match execute_due(approvals.as_ref()).await {
+			Ok(closed) if usize::try_from(EXECUTOR_BATCH).is_ok_and(|batch| closed >= batch) => continue,
+			Ok(_) => {}
+			Err(err) => tracing::error!(%err, "the approval executor failed; passed concierge:* decisions are not being carried out"),
+		}
+		tokio::time::sleep(interval).await;
+	}
 }

@@ -542,7 +542,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   verdict (naming `OpenUserReinstatement`), or the consilium would be advisory. A disabled row with `suspended_by IS NULL` predates
   the column and deliberately keeps the OLD semantics — one-act, never lapsing — because
   that is the rule those accounts were suspended under; there is no backfill.
-- **The hold sweep is the ONE thing in this plane that sweeps.** Consilium expiry is
+- **The hold sweep is load-bearing.** Consilium expiry is
   lazy on purpose (a write path expires a due proposal before acting, read paths project
   it as expired), so nothing has to be running for a stale proposal to be unusable. A
   hold cannot work that way: its whole purpose is the frozen flag the money plane
@@ -666,16 +666,27 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   service never reads the deciders' emails or subjects. The level, the escalations and the
   roster are decided in the opening transaction, opens are serialised per proposer
   namespace by an advisory lock (the rolling 24h limit sums LIVE proposals and executions
-  of the last day; a namespace holds at most 200 live), and every instant is the
-  database's `now()`, never a replica's. Nobody is excluded from the roster
-  (`requested_by` is what a service says, not a proof); what keeps one person from acting
-  alone is the threshold over the whole roster, `sole_admin` escalation, the two-owner
-  floor — and that `<ns>:admin`, the scope roster, is granted only by a persisted owner and
-  never delegated (`GrantPermission`, `Catalog::check`). A member who lost the seat after
-  open keeps their place and loses the vote; any owner vetoes any proposal inside its
-  delay. Expiry, executability and the 72 h lapse to `void` are time predicates and
-  nothing sweeps; every transition writes its `approval_events` row in the same
-  transaction.
+  of the last day; a namespace holds at most 200 live per scope), and every instant is the
+  database's `clock_timestamp()` read after the act's locks, never a replica's. Nobody is
+  excluded from a service's roster (`requested_by` is what a service says, not a proof);
+  the opener of this plane's own `concierge:*` proposal, proven by the session, is (D23).
+  What keeps one person from acting alone is the threshold over the whole roster,
+  `sole_admin` escalation, the two-owner floor — and that `<ns>:admin`, the scope roster,
+  is granted ONLY by an executed `concierge:scope_admin_grant` (`GrantPermission` refuses
+  it to everyone), never delegated, and only to an account with a verified address. A vote
+  counts only while its voter holds the seat (a suspended owner holds none), and a proposal
+  the seated voters can no longer carry is rejected; a scope's policy only tightens a kind's
+  thresholds;
+  any owner vetoes any proposal inside its delay; a scope's delay is never under an hour.
+  Expiry, executability and the 72 h lapse to `void` are time predicates and nothing sweeps
+  for them; every transition writes its `approval_events` row in the same transaction.
+- **Two loops act on their own: the hold sweep and the approval executor.** Everything
+  else in this plane is lazy (a write path settles a due proposal before acting, read
+  paths project it). The hold sweep exists because a lapse the money plane must MIRROR has
+  to be a written `user_outbox` row; the executor (`approvals::run_executor`, D23) exists
+  because this plane is the proposer of its own `concierge:*` kinds and nobody else will
+  pull them — it carries each passed decision out with its outcome in one transaction. A
+  third loop needs the same kind of reason; "it would be convenient" is not one.
 - **Each direction has its own inbox, and the server picks it (D21).** The notification
   routes (`/auth/notifications/settings*`) resolve `notification::InboxView` from the
   `Origin`: `PUBLIC_ORIGIN` or none → the platform inbox (built-in topics and `bank:*`), a

@@ -9,9 +9,9 @@ origins, OAuth `returnTo`, the sign-up ticket of migration 0032), the micro-fron
 bundles under `/auth/mfe/*` (§3.1), the relying-party streams (§4: `ScopeEvents` and
 `UserEvents` read by a client credential, migration 0034), the scope catalog's storage
 (`ScopeCatalogService`, §5.1, §6) and the approvals of the kinds a namespace publishes
-(§5.7: `ApprovalExecutionService` whole, `ApprovalService` but for the `concierge:*` kinds;
-migration 0036). Not yet: the `concierge:*` kinds, stored scope policies and the approval
-mail (§5.7). Banking, the `lib` projections, invest and admin build against this document.
+(§5.7: both approval services, this plane's own `concierge:*` kinds and their executor,
+stored scope policies; migrations 0036, 0037). Not yet: the approval mail and the owners'
+decisions D24 (§5.7). Banking, the `lib` projections, invest and admin build against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it
@@ -27,7 +27,7 @@ says so and why.
 | `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_catalog.rs`) |
 | `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_events.rs`) |
 | `ScopeInboxService` | scope_inbox.proto | a relying party's client credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_inbox.rs`, §6) |
-| `ApprovalService` | approvals.proto | first-party session | inside the user auth layer | served (`runner/src/approvals.rs`) but `CancelApproval`, `ProposeScopeAdminGrant`, `ProposeScopePolicyChange`, which answer `UNIMPLEMENTED` (§5.7) |
+| `ApprovalService` | approvals.proto | first-party session | inside the user auth layer | served (`runner/src/approvals.rs`) |
 | `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/approvals.rs`) |
 | `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and** a relying party's client credential | as today | served for both |
 
@@ -326,11 +326,22 @@ lapses to `VOID`; any persisted owner may veto ANY proposal inside its delay (de
 containment is never slower than the grant).
 
 - **Quorum is over the whole roster frozen at open:**
-  `threshold = max(1, ceil(roster × quorum_bps / 10000))`, platform at 5001 bps. Nobody
-  is excluded. A service cannot prove which person asked it, so the person it names
-  (`requested_by`, an `auth_subject`) is information shown to voters — it moves no
-  quorum and keeps nobody off the roster. A `PLATFORM` proposal with fewer than two
-  owners on the roster is refused at open (`FAILED_PRECONDITION`).
+  `threshold = max(1, ceil(roster × quorum_bps / 10000))`, platform at 5001 bps. For a
+  service's proposal nobody is excluded: a service cannot prove which person asked it, so
+  the person it names (`requested_by`, an `auth_subject`) is information shown to voters
+  — it moves no quorum and keeps nobody off the roster. For a `concierge:*` proposal the
+  opener is proven by their session and is kept off the roster (D23): nobody votes on
+  what they asked for. A `PLATFORM` proposal is refused at open (`FAILED_PRECONDITION`)
+  with fewer than two owners, or when the opener is the only one left to decide.
+- **A vote is the seat's** (decided): a vote counts only while its voter still holds the
+  seat the roster was drawn from — for an owner, the persisted `owner` role AND an active
+  account, so a suspended owner has no say. Removing an admin after their FOR takes it
+  back and the proposal needs another vote to pass; and when the seated voters who have
+  not voted AGAINST are fewer than the threshold, the proposal is `REJECTED`. `voters` on
+  `Approval` still shows every vote as cast: whether one counts is decided from the seats
+  at each vote, not stored on it. A proposal that already PASSED is not reopened when its
+  voters lose their seats: inside the delay any owner (or remaining roster member) vetoes
+  it (§5.6).
 - **Escalation to `PLATFORM`** happens at open and is frozen with the roster
   (`Approval.escalated_by` says why):
   - any declared escalation test fires against the scope's threshold (or the kind's
@@ -383,13 +394,14 @@ distribution to every holder of an allocation is a `bank:scope_payout` with
 | `invest:fee_policy` | SCOPE | `ceiling` FLAG_SET on raises_ceiling | allocation, basis, crystallization (TEXT); current and proposed management/performance/hurdle (BPS); raises_ceiling (FLAG) |
 | `invest:holder_grant` | PLATFORM | — | allocation (TEXT), holder (USER), units (AMOUNT, unit code) |
 
-`concierge:*` — this plane's own, opened over `ApprovalService` and executed by this
-plane's own puller.
+`concierge:*` — this plane's own, built in at catalog version 0 (listed by
+`ListApprovalKinds` first), opened over `ApprovalService` and carried out by this plane's
+executor loop once passed (D23).
 
-| Kind | Level | Opened by |
-| ---- | ----- | --------- |
-| `concierge:scope_admin_grant` | PLATFORM | a seat holding `iam:tenants:grant` |
-| `concierge:scope_policy_change` | PLATFORM | such a seat, or an admin of the scope |
+| Kind | Level | Opened by | Fields | Executed as |
+| ---- | ----- | --------- | ------ | ----------- |
+| `concierge:scope_admin_grant` | PLATFORM | a seat holding `iam:tenants:grant`, for an account with a VERIFIED address | account (USER) | a grant of `<namespace>:admin`, `granted_by` the opener; VOID if the account is no longer active or verified, or the scope no longer active |
+| `concierge:scope_policy_change` | PLATFORM | such a seat, or an admin of the scope | quorum_bps, delay_secs, ttl_secs, thresholds (COUNT), and one `threshold` TEXT field per override, `<kind>/<parameter>=<value>` — the values are in `payload_hash`; the whole policy is also `Approval.proposed_policy` | the scope's next policy `version`, checked again against the catalogs then in force; VOID if it no longer fits |
 
 Assigning an operator in a scope is still a delegated `GrantPermission` by a
 `<scope>:admin`, with no approval.
@@ -424,10 +436,10 @@ OPEN ──(threshold met)──▶ PASSED ──(executable_at passes; proposer
   before `executable_at`. After that the proposer owns the proposal and only
   `ReportOutcome` moves it.
 - **Pull** (`PullApproved`) serves `PASSED` proposals of the caller's namespace whose
-  `executable_at` is behind the clock by less than 72 hours and that have no outcome,
-  oldest first. Past that window the decision lapses to `VOID` (`void_reason` says so, no
-  outcome), and a report on it is refused: a proposer must not start executing past
-  `executable_at` + 72 h. A pull
+  `executable_at` is behind the clock and whose `execute_by` (`executable_at` + 72 h, on
+  `Approval`) is more than an hour ahead, with no outcome, oldest first: whatever a
+  proposer pulls it still has an hour to report. At `execute_by` the decision lapses to
+  `VOID` (`void_reason` says so, no outcome) and a report on it is refused. A pull
   claims nothing: the same proposal is served on every pull until its outcome is
   reported, so the proposer is idempotent per proposal id. Executable is a time
   predicate over `PASSED`, not a state, so nothing has to sweep for a proposal to become
@@ -451,8 +463,8 @@ OPEN ──(threshold met)──▶ PASSED ──(executable_at passes; proposer
   are. `ApprovalExecutionService` answers with `voters[].auth_subject`, `voters[].email`,
   `requested_by_email` and `vetoed_by` empty; a person who sees a proposal only as its
   `requested_by` reads no voter's email.
-- **Bounds**: a namespace holds at most 200 live proposals (`RESOURCE_EXHAUSTED` past
-  that); an amount has at most 30 whole digits.
+- **Bounds**: a namespace holds at most 200 live proposals in one scope
+  (`RESOURCE_EXHAUSTED` past that); an amount has at most 30 whole digits.
 
 ### 5.5 Mail
 
@@ -465,22 +477,26 @@ happens over a session, not from a mailbox.
 
 ### 5.6 Scope admins (decided)
 
-While `concierge:scope_admin_grant` exists, `UserDirectory.GrantPermission` refuses a
-`<scope>:admin` target and names `ApprovalService.ProposeScopeAdminGrant` — the
-behaviour `SetRole` has for `admin`. Until it is served, `GrantPermission` grants a
-`<scope>:admin` target only on a persisted platform owner's call — any other seat holding
-`iam:tenants:grant`, break-glass included, is `PERMISSION_DENIED` — and no catalog may
-delegate `<namespace>:admin` (`Catalog::check`): one `admin` seat able to hand out the alias
-could fill a scope's roster with accounts it controls and pass its quorum with no owner
-asked. **Removing a scope admin is immediate, with no
+`UserDirectory.GrantPermission` refuses a `<scope>:admin` target to every caller — an
+`admin` seat, an owner, emergency access — and names `ApprovalService.ProposeScopeAdminGrant`,
+the behaviour `SetRole` has for `admin`; the alias is granted only by an executed
+`concierge:scope_admin_grant`. No catalog may delegate `<namespace>:admin`
+(`Catalog::check`): a seat able to hand out the alias could fill a scope's roster with
+accounts it controls and pass its quorum with no owner asked. The account must have a
+VERIFIED address, checked at open and again at execution: the seat is reached by the
+approvals' mail, and an unproven address hands it to whoever holds the mailbox.
+Removing an admin takes back their votes on OPEN proposals at once (§5.2); a proposal they
+already carried to PASSED is stopped only by a veto inside its delay — any owner may cast
+it. **Removing a scope admin is immediate, with no
 approval** (`RevokePermission` by a seat holding `iam:tenants:grant`): containing a
 rogue admin must never be the slower path, the rule this plane already keeps for
 `Role::Admin`.
 
 ### 5.7 As implemented
 
-`runner/src/approvals.rs` (both services), `infrastructure::approvals` (migration 0036:
-`approvals`, the frozen roster `approval_voters`, the history `approval_events`), the rules
+`runner/src/approvals.rs` (both services and the executor loop), `infrastructure::approvals`
+(migration 0036: `approvals`, the frozen roster `approval_voters`, the history
+`approval_events`; migration 0037: `approvals.action`, `scope_approval_policies`), the rules
 in `domain::approvals`.
 
 - **Opening** resolves everything inside one transaction: the kind is the one in the
@@ -489,12 +505,20 @@ in `domain::approvals`.
   `sole_admin` and the roster are decided and frozen there. Opens are serialised per
   proposer namespace by a transaction-scoped advisory lock, which is what makes the rolling
   window and the live cap hold for a batch opened at once — without it eight simultaneous
-  1 000 USDT proposals each see an empty window. Locks follow the plane's order: the owner
-  roster (`users FOR SHARE`) before `tenants`. `dedupe_key` is **required** (1-128 bytes):
-  an executor that cannot repeat a `Propose` safely cannot be idempotent either.
-- **Time** is the database's (`now()` of the writing transaction), never a replica's
-  clock: a delay, an expiry and a lapse are compared on one clock however many replicas
-  write.
+  1 000 USDT proposals each see an empty window. The owner roster is read before `tenants`,
+  without a row lock: a seat that moves afterwards is caught at the vote, and holding every
+  owner row for each open would queue every role change behind it. `dedupe_key` is
+  **required** (1-128 bytes): an executor that cannot repeat a `Propose` safely cannot be
+  idempotent either.
+- **Time** is the database's — `clock_timestamp()`, read once the locks an act needs are
+  held — never a replica's clock: a delay, an expiry and a lapse are compared on one clock
+  however many replicas write, at the instant the act takes effect.
+- **The executor** (`approvals::run_executor`, every 30 s) is the second loop in this plane
+  that acts on its own, beside the hold sweep: it pulls the passed `concierge:*` decisions
+  as a service would and carries each out with its outcome in ONE transaction, so a grant
+  or an installed policy never exists without the executed decision behind it. If it stops,
+  passed decisions lapse to `VOID` unexecuted after 72 hours — nothing is done that was not
+  decided.
 - **The scope roster** is the ACTIVE accounts holding an unrevoked grant of exactly
   `<namespace>:admin`. A seat that holds every permission of a namespace without a row
   (`granting_seats_hold_all`) is not on it: what it may do on the scope's surface is not a
@@ -502,13 +526,17 @@ in `domain::approvals`.
   consilia count it.
 - **A frozen roster keeps its size, not its votes.** A member who lost the seat it was
   drawn from after open (an `owner` seat, the `<namespace>:admin` grant) is refused
-  `PERMISSION_DENIED` on a vote and a veto, while the threshold stays what it was: removing
-  an admin is the containment step and must bite at once (§5.6), and shrinking the roster
-  would let a removal lower the bar.
-- **Policy**: no scope has a stored one yet; every scope is measured against the default
-  (`version` 1, 5001 bps, 3600 s, 72 h, no overrides) until `concierge:scope_policy_change`
-  exists to change it. `GetScopeApprovalPolicy` answers that default to the scope's admins
-  and the owners, and `INVALID_ARGUMENT` for `main`.
+  `PERMISSION_DENIED` on a vote and a veto, and a FOR they cast before is not counted,
+  while the threshold stays what it was: removing an admin is the containment step and
+  must bite at once (§5.6), and shrinking the roster would let a removal lower the bar.
+- **A scope may only tighten** (decided, until this plane keeps its own floor on the known
+  money kinds, D24): a policy's threshold is never above the kind's own
+  `default_threshold`.
+- **Policy**: a scope with no installed policy is on the default (`version` 1, 5001 bps,
+  3600 s, 72 h, no overrides); an executed `concierge:scope_policy_change` installs the next
+  version (`scope_approval_policies`, every version kept). A scope's delay is never under
+  an hour, in the domain and in a CHECK on both tables. `GetScopeApprovalPolicy` answers
+  the scope's admins and the owners, and `INVALID_ARGUMENT` for `main`.
 - **Visibility** of one proposal to a person: a persisted owner, an admin of its scope,
   the account it names as `requested_by`, or a member of its roster. Anything else, and
   an unknown id, is one `NOT_FOUND` — on the execution side too, for a proposal of another
@@ -519,11 +547,15 @@ in `domain::approvals`.
   its deadline commits the expiry or lapse even when the act is then refused.
 - **`awaiting_my_vote`** asks only for votes the vote RPC would accept: a member who lost
   the seat is not listed as awaited.
-- **Not yet**: `ListApprovalKinds` lists the published kinds only, the `concierge:*` kinds
-  (`scope_admin_grant`, `scope_policy_change`, `CancelApproval`) and their executor, the
-  stored scope policy, `GrantPermission`'s outright refusal of a `<scope>:admin` target
-  naming the RPC (§5.6; owners only until then), and the mail of §5.5. A catalog already
-  stored that delegates `<namespace>:admin` is not re-checked; the next publication is. Until the mail exists a roster member learns of a proposal by
+- **An escalation that cannot be measured fires**: an absent AMOUNT or BPS field, or an
+  amount in another currency, sends the proposal to the owners; only an unset FLAG stays
+  down.
+- **Not yet**: the mail of §5.5; and the owners' decisions D24 — a money initiator
+  proven by a token kept off the platform roster, the cool-down after the owner roster
+  changes (`concierge:platform_policy`), the floor this plane keeps on the level and
+  thresholds of the known money kinds, and `ESCALATION_TEST_COUNT_ABOVE`. A catalog already
+  stored that delegates `<namespace>:admin` is not re-checked; the next publication is.
+  Until the mail exists a roster member learns of a proposal by
   `ListApprovals { awaiting_my_vote }`.
 
 ---

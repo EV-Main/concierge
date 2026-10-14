@@ -14,8 +14,9 @@
 //! lock covers both. Locks are then taken in the plane's order: `users` (the owner roster,
 //! `FOR SHARE`) before `tenants`.
 //!
-//! Every instant is the DATABASE's (`now()` of the transaction), never a replica's clock:
-//! deadlines decided by several replicas must be decided on one clock.
+//! Every instant is the DATABASE's (`clock_timestamp()`, read once the locks an act needs
+//! are held), never a replica's clock: deadlines decided by several replicas must be
+//! decided on one clock.
 
 use std::{
 	collections::HashMap,
@@ -28,8 +29,8 @@ use std::{
 use async_trait::async_trait;
 use domain::{
 	approvals::{
-		self, Decision, EXECUTION_WINDOW_SECS, Field, FieldValue, MAX_LIVE_PER_PROPOSER, MAX_TTL_SECS, Outcome, PLATFORM_DELAY_SECS, PLATFORM_MIN_ROSTER, PLATFORM_QUORUM_BPS,
-		ROLLING_WINDOW_SECS, ScopePolicy, Vote, Voter,
+		self, Action, Decision, EXECUTION_WINDOW_SECS, Field, FieldValue, MAX_LIVE_PER_PROPOSER, MAX_TTL_SECS, Outcome, PLATFORM_DELAY_SECS, PLATFORM_MIN_ROSTER, PLATFORM_QUORUM_BPS,
+		PULL_MARGIN_SECS, ROLLING_WINDOW_SECS, ScopePolicy, Vote, Voter,
 	},
 	error::DomainError,
 	scope_catalog::ApprovalLevel,
@@ -39,7 +40,12 @@ use domain::{
 use sqlx::{PgConnection, PgPool, Row, postgres::PgRow};
 use uuid::Uuid;
 
-use crate::ports::{ApprovalActor, ApprovalFilter, ApprovalPerson, ApprovalRecord, ApprovalRepository, ApprovalViewer, NewApproval, Proposed};
+use super::{
+	grants::{ApprovedGrant, grant_by_approval},
+	scope_catalogs,
+	users::{Named, account_named},
+};
+use crate::ports::{ApprovalActor, ApprovalFilter, ApprovalPerson, ApprovalRecord, ApprovalRepository, ApprovalViewer, NewApproval, PersonRef, Proposed};
 
 fn repo_err(err: sqlx::Error) -> DomainError {
 	DomainError::Repository(err.to_string())
@@ -48,7 +54,7 @@ fn repo_err(err: sqlx::Error) -> DomainError {
 const COLUMNS: &str = "a.id, a.kind, a.proposer, a.scope, a.level, a.escalated_by, a.state, a.subject_ref, a.fields, a.payload_hash, \
 	a.requested_by, rb.auth_subject AS rb_subject, rb.email AS rb_email, a.reason, a.threshold, a.policy_version, a.delay_secs, \
 	a.created_at, a.expires_at, a.passed_at, a.executable_at, a.decided_at, a.vetoed_by, vb.auth_subject AS vb_subject, vb.email AS vb_email, \
-	a.veto_reason, a.void_reason, a.outcome, a.outcome_detail, a.requested_by_client, a.version";
+	a.veto_reason, a.void_reason, a.outcome, a.outcome_detail, a.requested_by_client, a.version, a.action";
 const FROM: &str = " FROM approvals a LEFT JOIN users rb ON rb.id = a.requested_by LEFT JOIN users vb ON vb.id = a.vetoed_by";
 
 fn level_str(level: ApprovalLevel) -> &'static str {
@@ -149,6 +155,12 @@ fn record_of(row: &PgRow, voters: Vec<Voter>, people: Vec<ApprovalPerson>, as_of
 		policy_version: unsigned(get_i64("policy_version")?, "policy_version")?,
 		created_at: get_i64("created_at")?,
 		requested_by_client: row.try_get("requested_by_client").map_err(repo_err)?,
+		action: row
+			.try_get::<Option<serde_json::Value>, _>("action")
+			.map_err(repo_err)?
+			.map(serde_json::from_value)
+			.transpose()
+			.map_err(|e| DomainError::Repository(format!("stored approval action is unreadable: {e}")))?,
 		as_of,
 		decision: Decision {
 			state: approvals::ApprovalState::parse(row.try_get("state").map_err(repo_err)?)?,
@@ -269,9 +281,12 @@ async fn finish(
 	result.map(|()| stored)
 }
 
-/// The persisted owners: the platform roster. Break-glass seats nobody.
+/// The persisted owners: the platform roster. Break-glass seats nobody. Read without a
+/// lock: a seat that moves after the roster is frozen is caught where it matters, at the
+/// vote (`holds_seat`, `unseated`), and holding every owner row for each proposal would
+/// queue every role change behind every open.
 async fn owners(conn: &mut PgConnection) -> Result<Vec<UserId>, DomainError> {
-	let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE role = 'owner' ORDER BY id FOR SHARE")
+	let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE role = 'owner' ORDER BY id")
 		.fetch_all(conn)
 		.await
 		.map_err(repo_err)?;
@@ -296,7 +311,7 @@ async fn scope_admins(conn: &mut PgConnection, namespace: &str) -> Result<Vec<Us
 /// one is the containment step and must bite at once (§5.6).
 async fn holds_seat(conn: &mut PgConnection, record: &ApprovalRecord, user: UserId) -> Result<bool, DomainError> {
 	let query = match record.level {
-		ApprovalLevel::Platform => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND role = 'owner')").bind(user.raw()),
+		ApprovalLevel::Platform => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND role = 'owner' AND status = 'active')").bind(user.raw()),
 		ApprovalLevel::Scope => sqlx::query_scalar(
 			"SELECT EXISTS (SELECT 1 FROM grants g JOIN tenants t ON t.namespace = g.namespace JOIN users u ON u.id = g.user_id \
 			 WHERE t.id = $2 AND g.user_id = $1 AND g.target = t.namespace || ':admin' AND g.revoked_at IS NULL AND u.status = 'active')",
@@ -342,7 +357,10 @@ impl PgApprovals {
 		Self { pool, clock: Clock::Database }
 	}
 
-	/// Every instant read from `now` instead of the database. For suites only.
+	/// Every instant read from `now` instead of the database. For suites only: an
+	/// integration test is another crate, so `cfg(test)` cannot hide it, and a feature
+	/// would put a second clock one flag away from production.
+	#[doc(hidden)]
 	pub fn with_fixed_time(pool: PgPool, now: Arc<AtomicI64>) -> Self {
 		Self { pool, clock: Clock::Fixed(now) }
 	}
@@ -351,15 +369,23 @@ impl PgApprovals {
 	/// comparison it makes is against one value.
 	async fn instant(&self, conn: &mut PgConnection) -> Result<i64, DomainError> {
 		match &self.clock {
-			Clock::Database => sqlx::query_scalar("SELECT extract(epoch FROM now())::BIGINT").fetch_one(conn).await.map_err(repo_err),
+			// `clock_timestamp()`, not `now()`: `now()` is when the transaction began, which
+			// can be long before a lock it then waited for was granted.
+			Clock::Database => sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::BIGINT")
+				.fetch_one(conn)
+				.await
+				.map_err(repo_err),
 			Clock::Fixed(now) => Ok(now.load(Ordering::SeqCst)),
 		}
 	}
 
 	async fn begin_locked(&self, id: Uuid) -> Result<(sqlx::Transaction<'_, sqlx::Postgres>, ApprovalRecord, i64), DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let mut record = load(&mut tx, id, true, 0).await?.ok_or_else(|| not_found(id))?;
+		// Read after the row lock is held, so a deadline is judged at the instant the act
+		// takes effect, not before it waited.
 		let now = self.instant(&mut tx).await?;
-		let record = load(&mut tx, id, true, now).await?.ok_or_else(|| not_found(id))?;
+		record.as_of = now;
 		Ok((tx, record, now))
 	}
 }
@@ -373,8 +399,8 @@ impl ApprovalRepository for PgApprovals {
 
 	async fn propose(&self, new: NewApproval) -> Result<Proposed, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		let now = self.instant(&mut tx).await?;
 		advisory_lock(&mut tx, &format!("approval_proposer:{}", new.proposer)).await?;
+		let now = self.instant(&mut tx).await?;
 		let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM approvals WHERE proposer = $1 AND dedupe_key = $2")
 			.bind(&new.proposer)
 			.bind(&new.dedupe_key)
@@ -396,12 +422,13 @@ impl ApprovalRepository for PgApprovals {
 			};
 		}
 		let live: i64 = sqlx::query_scalar(
-			"SELECT count(*) FROM approvals WHERE proposer = $1 \
+			"SELECT count(*) FROM approvals WHERE proposer = $1 AND scope = $4 \
 			 AND ((state = 'open' AND expires_at > $2) OR (state = 'passed' AND executable_at + $3 > $2))",
 		)
 		.bind(&new.proposer)
 		.bind(now)
 		.bind(EXECUTION_WINDOW_SECS)
+		.bind(&new.scope)
 		.fetch_one(&mut *tx)
 		.await
 		.map_err(repo_err)?;
@@ -409,8 +436,8 @@ impl ApprovalRepository for PgApprovals {
 			return Ok(Proposed::Saturated);
 		}
 
-		// `users` before `tenants`, the plane's lock order, so the owner roster is read
-		// first even when this proposal ends up at the scope.
+		// `users` before `tenants`, the plane's order, even when this proposal ends up at
+		// the scope.
 		let owners = owners(&mut tx).await?;
 		let in_root = new.scope == ROOT;
 		let namespace = if in_root {
@@ -480,9 +507,21 @@ impl ApprovalRepository for PgApprovals {
 			Some(namespace) => scope_admins(&mut tx, namespace).await?,
 			None => Vec::new(),
 		};
-		// No policy table yet: every scope is measured against the default until
-		// `concierge:scope_policy_change` exists to change one.
-		let policy = (!in_root).then(ScopePolicy::default);
+		if let (Some(Action::GrantAdmin { user, .. }), Some(namespace)) = (&new.action, &namespace) {
+			let held: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM grants WHERE user_id = $1 AND target = $2 || ':admin' AND revoked_at IS NULL)")
+				.bind(user)
+				.bind(namespace)
+				.fetch_one(&mut *tx)
+				.await
+				.map_err(repo_err)?;
+			if held {
+				return Err(DomainError::Precondition("the account already holds the scope's admin alias".into()));
+			}
+		}
+		let policy = match &namespace {
+			Some(_) => Some(current_policy(&mut tx, &new.scope).await?),
+			None => None,
+		};
 		let fired = match &policy {
 			Some(policy) if new.kind.level == ApprovalLevel::Scope => {
 				let window: Vec<serde_json::Value> = sqlx::query_scalar(
@@ -512,12 +551,18 @@ impl ApprovalRepository for PgApprovals {
 		let policy_version = policy.as_ref().map_or(0, |p| p.version);
 		let (roster, quorum_bps, delay_secs, ttl_secs) = match (resolution.level, &policy) {
 			(ApprovalLevel::Scope, Some(policy)) => (admins, policy.quorum_bps, policy.delay_secs, policy.ttl_secs.min(MAX_TTL_SECS)),
-			(ApprovalLevel::Platform, _) | (ApprovalLevel::Scope, None) => (owners, PLATFORM_QUORUM_BPS, PLATFORM_DELAY_SECS, MAX_TTL_SECS),
+			(ApprovalLevel::Platform, _) | (ApprovalLevel::Scope, None) => {
+				if owners.len() < PLATFORM_MIN_ROSTER {
+					return Err(DomainError::Precondition(format!(
+						"fewer than {PLATFORM_MIN_ROSTER} platform owners: nobody may decide for the platform alone"
+					)));
+				}
+				(owners, PLATFORM_QUORUM_BPS, PLATFORM_DELAY_SECS, MAX_TTL_SECS)
+			}
 		};
-		if resolution.level == ApprovalLevel::Platform && roster.len() < PLATFORM_MIN_ROSTER {
-			return Err(DomainError::Precondition(format!(
-				"fewer than {PLATFORM_MIN_ROSTER} platform owners: nobody may decide for the platform alone"
-			)));
+		let roster: Vec<UserId> = roster.into_iter().filter(|u| Some(*u) != new.exclude).collect();
+		if roster.is_empty() {
+			return Err(DomainError::Precondition("nobody but the one who asked could decide it".into()));
 		}
 		let threshold = approvals::threshold(roster.len(), quorum_bps);
 		let mut decision = Decision::open(&roster, threshold, i64::from(delay_secs), now + i64::from(ttl_secs));
@@ -527,8 +572,8 @@ impl ApprovalRepository for PgApprovals {
 		let policy_version = i64::try_from(policy_version).map_err(|_| DomainError::Repository("policy version overflows".into()))?;
 		sqlx::query(
 			"INSERT INTO approvals (id, kind, proposer, scope, level, escalated_by, subject_ref, fields, payload_hash, requested_by, reason, roster_size, \
-			 threshold, policy_version, delay_secs, created_at, expires_at, requested_by_client, dedupe_key) \
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+			 threshold, policy_version, delay_secs, created_at, expires_at, requested_by_client, dedupe_key, action) \
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
 		)
 		.bind(new.id)
 		.bind(&new.kind.name)
@@ -549,6 +594,13 @@ impl ApprovalRepository for PgApprovals {
 		.bind(decision.expires_at)
 		.bind(&new.client)
 		.bind(&new.dedupe_key)
+		.bind(
+			new.action
+				.as_ref()
+				.map(serde_json::to_value)
+				.transpose()
+				.map_err(|e| DomainError::Repository(format!("approval action does not encode: {e}")))?,
+		)
 		.execute(&mut *tx)
 		.await
 		.map_err(repo_err)?;
@@ -559,10 +611,10 @@ impl ApprovalRepository for PgApprovals {
 			.execute(&mut *tx)
 			.await
 			.map_err(repo_err)?;
-		let actor_client = if new.client.is_empty() {
-			crate::service_caller::BRIDGE_PUBLISHER
-		} else {
-			new.client.as_str()
+		let opener = match (&new.exclude, new.client.as_str()) {
+			(Some(person), _) => ApprovalActor::Person(*person),
+			(None, "") => ApprovalActor::Service(crate::service_caller::BRIDGE_PUBLISHER),
+			(None, client) => ApprovalActor::Service(client),
 		};
 		let detail = serde_json::json!({
 			"level": level_str(resolution.level),
@@ -571,7 +623,7 @@ impl ApprovalRepository for PgApprovals {
 			"threshold": threshold,
 			"dedupe_key": new.dedupe_key,
 		});
-		write_events(&mut tx, new.id, &mut decision, Some(ApprovalActor::Service(actor_client)), &detail, now).await?;
+		write_events(&mut tx, new.id, &mut decision, Some(opener), &detail, now).await?;
 		let stored = load(&mut tx, new.id, false, now).await?.ok_or_else(|| not_found(new.id))?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(Proposed::Opened(stored))
@@ -638,7 +690,8 @@ impl ApprovalRepository for PgApprovals {
 		let result = if record.decision.is_voter(voter) && record.decision.state.is_live() && !holds_seat(&mut tx, &record, voter).await? {
 			Err(DomainError::Forbidden("you no longer hold the seat this roster was drawn from".into()))
 		} else {
-			record.decision.vote(voter, vote, now)
+			let unseated = unseated(&mut tx, &record).await?;
+			record.decision.vote(voter, vote, now, &unseated)
 		};
 		finish(tx, record, result, ApprovalActor::Person(voter), serde_json::json!({ "vote": vote.as_str() }), now).await
 	}
@@ -666,20 +719,25 @@ impl ApprovalRepository for PgApprovals {
 	}
 
 	async fn pull(&self, proposer: &str, limit: i64) -> Result<Vec<ApprovalRecord>, DomainError> {
-		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
-		let now = self.instant(&mut conn).await?;
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let now = self.instant(&mut tx).await?;
+		// `FOR SHARE`: a veto or a lapse cannot commit between choosing a row and reading it,
+		// so what is served was pullable when it was read.
 		let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-			"SELECT {COLUMNS}{FROM} WHERE a.proposer = $1 AND a.state = 'passed' AND a.executable_at <= $2 AND a.executable_at + $4 > $2 \
-			 ORDER BY a.executable_at, a.id LIMIT $3"
+			"SELECT {COLUMNS}{FROM} WHERE a.proposer = $1 AND a.state = 'passed' AND a.executable_at <= $2 AND a.executable_at + $4 - $5 > $2 \
+			 ORDER BY a.executable_at, a.id LIMIT $3 FOR SHARE OF a"
 		)))
 		.bind(proposer)
 		.bind(now)
 		.bind(limit)
 		.bind(EXECUTION_WINDOW_SECS)
-		.fetch_all(&mut *conn)
+		.bind(PULL_MARGIN_SECS)
+		.fetch_all(&mut *tx)
 		.await
 		.map_err(repo_err)?;
-		records_of(&mut conn, rows, now).await
+		let records = records_of(&mut tx, rows, now).await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(records)
 	}
 
 	async fn report(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, outcome: Outcome, detail: &str) -> Result<ApprovalRecord, DomainError> {
@@ -693,11 +751,157 @@ impl ApprovalRepository for PgApprovals {
 	}
 
 	async fn policy(&self, scope: &str) -> Result<Option<ScopePolicy>, DomainError> {
+		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
 		let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1)")
 			.bind(scope)
-			.fetch_one(&self.pool)
+			.fetch_one(&mut *conn)
 			.await
 			.map_err(repo_err)?;
-		Ok(known.then(ScopePolicy::default))
+		if !known {
+			return Ok(None);
+		}
+		current_policy(&mut conn, scope).await.map(Some)
 	}
+
+	async fn person(&self, who: PersonRef<'_>) -> Result<Option<(UserId, String, bool)>, DomainError> {
+		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+		let id = match who {
+			PersonRef::Id(id) => id,
+			PersonRef::Handle(handle) => match account_named(&mut conn, handle).await? {
+				Named::One(id) => id,
+				Named::Nobody => return Ok(None),
+				Named::Several => return Err(DomainError::Validation("this handle names more than one account; name it by user_id".into())),
+			},
+		};
+		let row: Option<(String, bool)> = sqlx::query_as("SELECT auth_subject, email_verified FROM users WHERE id = $1 AND status = 'active'")
+			.bind(id.raw())
+			.fetch_optional(&mut *conn)
+			.await
+			.map_err(repo_err)?;
+		Ok(row.map(|(subject, verified)| (id, subject, verified)))
+	}
+
+	async fn execute(&self, id: Uuid) -> Result<Option<Outcome>, DomainError> {
+		let (mut tx, mut record, now) = self.begin_locked(id).await?;
+		if record.proposer != approvals::OWN_NAMESPACE {
+			return Ok(None);
+		}
+		if record.decision.expire_if_due(now) {
+			persist(&mut tx, id, &mut record.decision, None, &serde_json::json!({}), now).await?;
+			tx.commit().await.map_err(repo_err)?;
+			return Ok(None);
+		}
+		if !record.decision.is_pullable(now) {
+			return Ok(None);
+		}
+		let refused = match &record.action {
+			None => Some("nothing to execute was stored with it".to_owned()),
+			Some(Action::GrantAdmin { user, scope, granted_by }) => match grant_by_approval(&mut tx, UserId::from_raw(*user), scope, UserId::from_raw(*granted_by), id, now).await? {
+				ApprovedGrant::Granted | ApprovedGrant::AlreadyHeld => None,
+				ApprovedGrant::Inapplicable(why) => Some(why.to_owned()),
+			},
+			Some(Action::InstallPolicy { scope, policy }) => {
+				let kinds = scope_catalogs::current_kinds(&mut *tx).await?;
+				match policy.check(&kinds) {
+					Err(why) => Some(why),
+					Ok(()) => {
+						install_policy(&mut tx, scope, policy, id, now).await?;
+						None
+					}
+				}
+			}
+		};
+		let (outcome, detail) = match refused {
+			None => (Outcome::Executed, String::new()),
+			Some(why) => (Outcome::Void, clip(&why, approvals::TEXT_FIELD_BYTES)),
+		};
+		record.decision.report(outcome, &detail, now)?;
+		persist(
+			&mut tx,
+			id,
+			&mut record.decision,
+			Some(ApprovalActor::Service(approvals::OWN_NAMESPACE)),
+			&serde_json::json!({ "outcome": outcome.as_str(), "detail": detail }),
+			now,
+		)
+		.await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(Some(outcome))
+	}
+}
+
+/// `text` cut to at most `max` bytes on a character boundary: an outcome detail is bounded
+/// by its column.
+fn clip(text: &str, max: usize) -> String {
+	let mut end = text.len().min(max);
+	while !text.is_char_boundary(end) {
+		end -= 1;
+	}
+	text[..end].to_owned()
+}
+
+/// The members of `record`'s roster who no longer hold the seat it was drawn from.
+async fn unseated(conn: &mut PgConnection, record: &ApprovalRecord) -> Result<Vec<UserId>, DomainError> {
+	let query = match record.level {
+		ApprovalLevel::Platform =>
+		// A suspended owner keeps the role and has no say while suspended.
+			sqlx::query_scalar("SELECT v.user_id FROM approval_voters v JOIN users u ON u.id = v.user_id WHERE v.approval_id = $1 AND (u.role <> 'owner' OR u.status <> 'active')")
+				.bind(record.id),
+		ApprovalLevel::Scope => sqlx::query_scalar(
+			"SELECT v.user_id FROM approval_voters v WHERE v.approval_id = $1 AND NOT EXISTS ( \
+			   SELECT 1 FROM grants g JOIN tenants t ON t.namespace = g.namespace JOIN users u ON u.id = g.user_id \
+			   WHERE t.id = $2 AND g.user_id = v.user_id AND g.target = t.namespace || ':admin' AND g.revoked_at IS NULL AND u.status = 'active')",
+		)
+		.bind(record.id)
+		.bind(record.scope.clone()),
+	};
+	let ids: Vec<Uuid> = query.fetch_all(conn).await.map_err(repo_err)?;
+	Ok(ids.into_iter().map(UserId::from_raw).collect())
+}
+
+/// The policy `scope` is measured against now: its newest installed version, else the
+/// default.
+async fn current_policy(conn: &mut PgConnection, scope: &str) -> Result<ScopePolicy, DomainError> {
+	let row: Option<(i64, i32, i32, i32, serde_json::Value)> =
+		sqlx::query_as("SELECT version, quorum_bps, delay_secs, ttl_secs, thresholds FROM scope_approval_policies WHERE scope = $1 ORDER BY version DESC LIMIT 1")
+			.bind(scope)
+			.fetch_optional(conn)
+			.await
+			.map_err(repo_err)?;
+	let Some((version, quorum_bps, delay_secs, ttl_secs, thresholds)) = row else {
+		return Ok(ScopePolicy::default());
+	};
+	let positive = |v: i32, column: &str| u32::try_from(v).map_err(|_| DomainError::Repository(format!("scope_approval_policies.{column} is negative")));
+	Ok(ScopePolicy {
+		version: unsigned(version, "policy version")?,
+		quorum_bps: positive(quorum_bps, "quorum_bps")?,
+		delay_secs: positive(delay_secs, "delay_secs")?,
+		ttl_secs: positive(ttl_secs, "ttl_secs")?,
+		thresholds: serde_json::from_value(thresholds).map_err(|e| DomainError::Repository(format!("stored policy thresholds are unreadable: {e}")))?,
+	})
+}
+
+/// Install `policy` as `scope`'s next version, on the authority of executed approval `id`.
+async fn install_policy(conn: &mut PgConnection, scope: &str, policy: &ScopePolicy, id: Uuid, now: i64) -> Result<(), DomainError> {
+	// Serialises two installs into one scope, so each gets its own version.
+	advisory_lock(conn, &format!("scope_policy:{scope}")).await?;
+	let next = current_policy(conn, scope).await?.version + 1;
+	let thresholds = serde_json::to_value(&policy.thresholds).map_err(|e| DomainError::Repository(format!("policy thresholds do not encode: {e}")))?;
+	let to_i32 = |v: u32| i32::try_from(v).map_err(|_| DomainError::Repository("a policy value overflows".into()));
+	sqlx::query(
+		"INSERT INTO scope_approval_policies (scope, version, quorum_bps, delay_secs, ttl_secs, thresholds, approval_id, installed_at) \
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+	)
+	.bind(scope)
+	.bind(i64::try_from(next).map_err(|_| DomainError::Repository("policy version overflows".into()))?)
+	.bind(to_i32(policy.quorum_bps)?)
+	.bind(to_i32(policy.delay_secs)?)
+	.bind(to_i32(policy.ttl_secs)?)
+	.bind(thresholds)
+	.bind(id)
+	.bind(now)
+	.execute(conn)
+	.await
+	.map_err(repo_err)?;
+	Ok(())
 }

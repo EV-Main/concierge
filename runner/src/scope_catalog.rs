@@ -95,6 +95,8 @@ fn kind_from(spec: ApprovalKindSpec) -> Result<ApprovalKind, String> {
 					key: f.key,
 					label: f.label,
 					required: f.required,
+					// A published kind cannot ask for a repeatable field; only this plane's own do.
+					repeated: false,
 				})
 			})
 			.collect::<Result<_, String>>()?,

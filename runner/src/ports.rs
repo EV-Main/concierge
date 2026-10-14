@@ -25,7 +25,7 @@
 
 use async_trait::async_trait;
 use domain::{
-	approvals::{ApprovalState, Decision, Field, Outcome, ScopePolicy, Vote as ApprovalVote},
+	approvals::{Action, ApprovalState, Decision, Field, Outcome, ScopePolicy, Vote as ApprovalVote},
 	architecture::{Reader, Repository},
 	auth::ProvenIdentity,
 	authz::Role,
@@ -111,9 +111,9 @@ pub enum GrantOutcome {
 	/// The actor may not grant this target, or addressed the subject by id as a delegate.
 	Denied,
 	/// `<namespace>:admin` seats its holder on the scope's approval roster
-	/// (`docs/SCOPES-AND-APPROVALS.md` §5.6), so only a persisted owner grants it — never a
-	/// seat that merely holds `iam:tenants:grant`, never by emergency access.
-	OwnersOnly,
+	/// (`docs/SCOPES-AND-APPROVALS.md` §5.6), so it is granted only by an executed
+	/// `concierge:scope_admin_grant` — never by a seat, whatever it holds.
+	ByApprovalOnly,
 	/// The subject is the actor.
 	ToSelf,
 	/// No tenant owns the target's namespace. Said only to a seat.
@@ -529,8 +529,21 @@ pub struct NewApproval {
 	pub requested_by: Option<String>,
 	pub reason: String,
 	pub dedupe_key: String,
-	/// The opening client; empty for the bridge token.
+	/// The opening client; empty for the bridge token and for this plane's own kinds.
 	pub client: String,
+	/// Kept off the roster: the person who opened a `concierge:*` proposal over a session,
+	/// proven by it, so they do not vote on what they asked for (D23).
+	pub exclude: Option<UserId>,
+	/// What this plane's executor does once it passes; `concierge:*` kinds only.
+	pub action: Option<Action>,
+}
+
+/// Whom a person-facing RPC names: by id, or by a handle resolved as
+/// `GrantPermissionRequest.account` is.
+#[derive(Clone, Copy, Debug)]
+pub enum PersonRef<'a> {
+	Id(UserId),
+	Handle(&'a str),
 }
 
 #[derive(Clone, Debug)]
@@ -571,6 +584,8 @@ pub struct ApprovalRecord {
 	pub created_at: i64,
 	pub requested_by_client: String,
 	pub decision: Decision,
+	/// What this plane's executor does with it; `concierge:*` kinds only.
+	pub action: Option<Action>,
 	/// The instant this record was read at, on the store's clock: what a reader projects
 	/// `decision` through.
 	pub as_of: i64,
@@ -644,6 +659,14 @@ pub trait ApprovalRepository: Send + Sync {
 
 	/// The policy scope `scope` is measured against; `None` for an unknown scope.
 	async fn policy(&self, scope: &str) -> Result<Option<ScopePolicy>, DomainError>;
+
+	/// An ACTIVE account, its `auth_subject` and whether its address is verified. A handle
+	/// naming several accounts names nobody (`Validation`).
+	async fn person(&self, who: PersonRef<'_>) -> Result<Option<(UserId, String, bool)>, DomainError>;
+
+	/// Carry out one passed `concierge:*` proposal and record its outcome, in one
+	/// transaction. `None` when it is not (or no longer) this plane's to execute now.
+	async fn execute(&self, id: Uuid) -> Result<Option<Outcome>, DomainError>;
 }
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).

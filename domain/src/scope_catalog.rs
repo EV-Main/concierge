@@ -65,6 +65,11 @@ pub struct FieldSpec {
 	pub label: String,
 	pub field_type: FieldType,
 	pub required: bool,
+	/// May be given more than once. Only this plane's own kinds declare one (a policy's
+	/// threshold overrides, one field each): a published kind cannot ask for it, and a
+	/// catalog stored before the flag existed reads it as `false`.
+	#[serde(default)]
+	pub repeated: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -267,12 +272,14 @@ mod tests {
 					label: "From".into(),
 					field_type: FieldType::Text,
 					required: true,
+					repeated: false,
 				},
 				FieldSpec {
 					key: "amount".into(),
 					label: "Amount".into(),
 					field_type: FieldType::Amount,
 					required: true,
+					repeated: false,
 				},
 			],
 			escalations: vec![Escalation {
