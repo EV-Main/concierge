@@ -41,11 +41,12 @@ use sqlx::{PgConnection, PgPool, Row, postgres::PgRow};
 use uuid::Uuid;
 
 use super::{
-	grants::{ApprovedGrant, grant_by_approval},
+	grants::{ApprovedGrant, grant_by_approval, lock_accounts},
+	notifications::upsert_subscriber,
 	scope_catalogs,
 	users::{Named, account_named},
 };
-use crate::ports::{ApprovalActor, ApprovalFilter, ApprovalPerson, ApprovalRecord, ApprovalRepository, ApprovalViewer, NewApproval, PersonRef, Proposed};
+use crate::ports::{ApprovalActor, ApprovalFilter, ApprovalPerson, ApprovalRecord, ApprovalRepository, ApprovalViewer, NewApproval, PersonRef, Proposed, ProvenInitiator};
 
 fn repo_err(err: sqlx::Error) -> DomainError {
 	DomainError::Repository(err.to_string())
@@ -54,7 +55,7 @@ fn repo_err(err: sqlx::Error) -> DomainError {
 const COLUMNS: &str = "a.id, a.kind, a.proposer, a.scope, a.level, a.escalated_by, a.state, a.subject_ref, a.fields, a.payload_hash, \
 	a.requested_by, rb.auth_subject AS rb_subject, rb.email AS rb_email, a.reason, a.threshold, a.policy_version, a.delay_secs, \
 	a.created_at, a.expires_at, a.passed_at, a.executable_at, a.decided_at, a.vetoed_by, vb.auth_subject AS vb_subject, vb.email AS vb_email, \
-	a.veto_reason, a.void_reason, a.outcome, a.outcome_detail, a.requested_by_client, a.version, a.action";
+	a.veto_reason, a.void_reason, a.outcome, a.outcome_detail, a.requested_by_client, a.version, a.action, a.requested_by_proven";
 const FROM: &str = " FROM approvals a LEFT JOIN users rb ON rb.id = a.requested_by LEFT JOIN users vb ON vb.id = a.vetoed_by";
 
 fn level_str(level: ApprovalLevel) -> &'static str {
@@ -161,6 +162,7 @@ fn record_of(row: &PgRow, voters: Vec<Voter>, people: Vec<ApprovalPerson>, as_of
 			.map(serde_json::from_value)
 			.transpose()
 			.map_err(|e| DomainError::Repository(format!("stored approval action is unreadable: {e}")))?,
+		requested_by_proven: row.try_get("requested_by_proven").map_err(repo_err)?,
 		as_of,
 		decision: Decision {
 			state: approvals::ApprovalState::parse(row.try_get("state").map_err(repo_err)?)?,
@@ -285,12 +287,15 @@ async fn finish(
 /// lock: a seat that moves after the roster is frozen is caught where it matters, at the
 /// vote (`holds_seat`, `unseated`), and holding every owner row for each proposal would
 /// queue every role change behind every open.
-async fn owners(conn: &mut PgConnection) -> Result<Vec<UserId>, DomainError> {
-	let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE role = 'owner' ORDER BY id")
+/// Returns the roster and, apart, the owners who can decide now (active): a held owner
+/// is on the roster with no say, and a floor counts only those who have one.
+async fn owners(conn: &mut PgConnection) -> Result<(Vec<UserId>, Vec<UserId>), DomainError> {
+	let rows: Vec<(Uuid, bool)> = sqlx::query_as("SELECT id, status = 'active' FROM users WHERE role = 'owner' ORDER BY id")
 		.fetch_all(conn)
 		.await
 		.map_err(repo_err)?;
-	Ok(ids.into_iter().map(UserId::from_raw).collect())
+	let active = rows.iter().filter(|(_, active)| *active).map(|(id, _)| UserId::from_raw(*id)).collect();
+	Ok((rows.into_iter().map(|(id, _)| UserId::from_raw(id)).collect(), active))
 }
 
 /// The active holders of `<namespace>:admin`: a scope's roster.
@@ -328,6 +333,59 @@ async fn user_by_subject(conn: &mut PgConnection, subject: &str) -> Result<Optio
 		.fetch_optional(conn)
 		.await
 		.map_err(repo_err)
+}
+
+/// The SQLSTATE the store's pause raises (migration 0038, `approvals_platform_pause`).
+const PAUSE_SQLSTATE: &str = "EVA01";
+
+/// Spend a proof: one token proves one request. Spent in the transaction that opens the
+/// proposal, so a refused open spends nothing and a committed one can never be repeated
+/// under another `dedupe_key`.
+async fn spend_proof(conn: &mut PgConnection, proven: &ProvenInitiator, approval: Uuid, now: i64) -> Result<(), DomainError> {
+	let spent: Option<String> =
+		sqlx::query_scalar("INSERT INTO approval_initiator_proofs (token_digest, approval_id, at) VALUES ($1, $2, $3) ON CONFLICT (token_digest) DO NOTHING RETURNING token_digest")
+			.bind(&proven.token_digest)
+			.bind(approval)
+			.bind(now)
+			.fetch_optional(conn)
+			.await
+			.map_err(repo_err)?;
+	if spent.is_none() {
+		return Err(DomainError::Precondition("this proof was already spent: mint a token for each request".into()));
+	}
+	Ok(())
+}
+
+/// Tell the person a money decision names, proven by their token and so kept off its
+/// roster, that it was opened in their name: if they did not ask for it, the one thing
+/// that stops it is their veto. Platform words only — no link, no code, nothing the service
+/// wrote — filed under money movement like a consent's trace, and written whatever they
+/// follow: nobody subscribes to being named in a decision about money.
+async fn tell_initiator(conn: &mut PgConnection, user: UserId, approval: Uuid, scope: &str, now: i64) -> Result<(), DomainError> {
+	let (email, verified): (Option<String>, bool) = sqlx::query_as("SELECT email, email_verified FROM users WHERE id = $1")
+		.bind(user.raw())
+		.fetch_one(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	let subscriber = upsert_subscriber(conn, user.raw(), email.as_deref().unwrap_or_default(), verified).await?;
+	sqlx::query(
+		"INSERT INTO notifications (subscriber_id, topic, kind, title, body, dedupe_key, occurred_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+		 ON CONFLICT (subscriber_id, dedupe_key) DO NOTHING",
+	)
+	.bind(subscriber.id)
+	.bind("account:money-movement")
+	.bind("approval_opened_in_your_name")
+	.bind("A money decision was opened in your name")
+	.bind(format!(
+		"A decision in scope {scope} names you as the person who asked for it, with your session as proof. \
+		 The other platform owners decide it without you. If you did not ask for it, veto it in the approvals console."
+	))
+	.bind(format!("approval:{approval}"))
+	.bind(now)
+	.execute(conn)
+	.await
+	.map_err(repo_err)?;
+	Ok(())
 }
 
 /// A persisted, active owner: the seat that vetoes anything (decided) and sees everything.
@@ -438,7 +496,7 @@ impl ApprovalRepository for PgApprovals {
 
 		// `users` before `tenants`, the plane's order, even when this proposal ends up at
 		// the scope.
-		let owners = owners(&mut tx).await?;
+		let (owners, active_owners) = owners(&mut tx).await?;
 		let in_root = new.scope == ROOT;
 		let namespace = if in_root {
 			None
@@ -468,7 +526,7 @@ impl ApprovalRepository for PgApprovals {
 		};
 		// A token proves who asked only if it is that person's, still standing as it was
 		// when the token was minted.
-		if let Some((proven, token_version)) = new.proven {
+		if let Some(ProvenInitiator { user: proven, token_version, .. }) = new.proven {
 			if requested_by != Some(proven.raw()) {
 				return Err(DomainError::Forbidden("the user token is not requested_by's".into()));
 			}
@@ -574,7 +632,7 @@ impl ApprovalRepository for PgApprovals {
 			let platform = current_platform_policy(&mut tx).await?;
 			if let Err(reopens) = platform.admits(changed_at, now) {
 				return Err(DomainError::Precondition(format!(
-					"the platform owners changed at {changed_at}: no platform decision opens before {reopens}"
+					"the platform owners changed recently: no platform decision opens before {reopens}"
 				)));
 			}
 		}
@@ -582,7 +640,7 @@ impl ApprovalRepository for PgApprovals {
 		let (roster, quorum_bps, delay_secs, ttl_secs) = match (resolution.level, &policy) {
 			(ApprovalLevel::Scope, Some(policy)) => (admins, policy.quorum_bps, policy.delay_secs, policy.ttl_secs.min(MAX_TTL_SECS)),
 			(ApprovalLevel::Platform, _) | (ApprovalLevel::Scope, None) => {
-				if owners.len() < PLATFORM_MIN_ROSTER {
+				if active_owners.len() < PLATFORM_MIN_ROSTER {
 					return Err(DomainError::Precondition(format!(
 						"fewer than {PLATFORM_MIN_ROSTER} platform owners: nobody may decide for the platform alone"
 					)));
@@ -592,20 +650,28 @@ impl ApprovalRepository for PgApprovals {
 		};
 		// A service's proven initiator leaves a platform roster only (D24(1)); a scope's
 		// admins decide their own scope as they always did.
-		let proven_out = match (resolution.level, new.proven) {
-			(ApprovalLevel::Platform, Some((initiator, _))) => Some(initiator),
+		let proven_out = match (resolution.level, &new.proven) {
+			(ApprovalLevel::Platform, Some(proven)) => Some(proven.user),
 			(ApprovalLevel::Platform | ApprovalLevel::Scope, _) => None,
 		};
 		let before = roster.len();
 		let roster: Vec<UserId> = roster.into_iter().filter(|u| Some(*u) != new.exclude && Some(*u) != proven_out).collect();
-		if roster.is_empty() {
+		// The floors count who can DECIDE: an owner on hold is on the roster with no say.
+		let deciders = match resolution.level {
+			ApprovalLevel::Platform => roster.iter().filter(|u| active_owners.contains(u)).count(),
+			ApprovalLevel::Scope => roster.len(),
+		};
+		if deciders == 0 {
 			return Err(DomainError::Precondition("nobody but the one who asked could decide it".into()));
 		}
 		// A service's proposal keeps its floor of two deciders even with the initiator gone:
-		// one owner must not decide another's money alone.
-		if roster.len() < before && new.proposer != approvals::OWN_NAMESPACE && roster.len() < PLATFORM_MIN_ROSTER {
+		// one owner must not decide another's money alone. The code word lets the proposer
+		// tell this refusal from the others: retrying without the token would put the
+		// initiator back on the roster, which is the one thing this refusal exists to stop.
+		if roster.len() < before && new.proposer != approvals::OWN_NAMESPACE && deciders < PLATFORM_MIN_ROSTER {
 			return Err(DomainError::Precondition(format!(
-				"not enough owners besides the initiator: {PLATFORM_MIN_ROSTER} others must decide it"
+				"not_enough_owners_besides_initiator: not enough active owners besides the initiator — {PLATFORM_MIN_ROSTER} others must decide it; \
+				 do not retry without the token"
 			)));
 		}
 		let threshold = approvals::threshold(roster.len(), quorum_bps);
@@ -616,8 +682,8 @@ impl ApprovalRepository for PgApprovals {
 		let policy_version = i64::try_from(policy_version).map_err(|_| DomainError::Repository("policy version overflows".into()))?;
 		sqlx::query(
 			"INSERT INTO approvals (id, kind, proposer, scope, level, escalated_by, subject_ref, fields, payload_hash, requested_by, reason, roster_size, \
-			 threshold, policy_version, delay_secs, created_at, expires_at, requested_by_client, dedupe_key, action) \
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
+			 threshold, policy_version, delay_secs, created_at, expires_at, requested_by_client, dedupe_key, action, requested_by_proven) \
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
 		)
 		.bind(new.id)
 		.bind(&new.kind.name)
@@ -645,9 +711,15 @@ impl ApprovalRepository for PgApprovals {
 				.transpose()
 				.map_err(|e| DomainError::Repository(format!("approval action does not encode: {e}")))?,
 		)
+		.bind(new.proven.is_some())
 		.execute(&mut *tx)
 		.await
-		.map_err(repo_err)?;
+		.map_err(|err| match err {
+			// The store's own pause (migration 0038): a change of the owners committed
+			// between the check above and this insert is refused like the check refuses.
+			sqlx::Error::Database(db) if db.code().as_deref() == Some(PAUSE_SQLSTATE) => DomainError::Precondition(db.message().to_owned()),
+			other => repo_err(other),
+		})?;
 		let roster_ids: Vec<Uuid> = roster.iter().map(|u| u.raw()).collect();
 		sqlx::query("INSERT INTO approval_voters (approval_id, user_id) SELECT $1, unnest($2::uuid[])")
 			.bind(new.id)
@@ -655,6 +727,12 @@ impl ApprovalRepository for PgApprovals {
 			.execute(&mut *tx)
 			.await
 			.map_err(repo_err)?;
+		if let Some(proven) = &new.proven {
+			spend_proof(&mut tx, proven, new.id, now).await?;
+			if proven_out.is_some() {
+				tell_initiator(&mut tx, proven.user, new.id, &new.scope, now).await?;
+			}
+		}
 		let opener = match (&new.exclude, new.client.as_str()) {
 			(Some(person), _) => ApprovalActor::Person(*person),
 			(None, "") => ApprovalActor::Service(crate::service_caller::BRIDGE_PUBLISHER),
@@ -832,7 +910,22 @@ impl ApprovalRepository for PgApprovals {
 	}
 
 	async fn execute(&self, id: Uuid) -> Result<Option<Outcome>, DomainError> {
-		let (mut tx, mut record, now) = self.begin_locked(id).await?;
+		// A grant locks the two accounts it names before the proposal, in the order a change
+		// of the owners takes them (the `users` row, then the trigger's `approvals` rows):
+		// taken the other way round, the executor and an owner's role change could each
+		// hold what the other waits for.
+		let accounts = {
+			let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+			match load(&mut conn, id, false, 0).await?.and_then(|r| r.action) {
+				Some(Action::GrantAdmin { user, granted_by, .. }) => vec![UserId::from_raw(user), UserId::from_raw(granted_by)],
+				Some(Action::InstallPolicy { .. } | Action::InstallPlatformPolicy { .. }) | None => Vec::new(),
+			}
+		};
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		lock_accounts(&mut tx, &accounts).await?;
+		let mut record = load(&mut tx, id, true, 0).await?.ok_or_else(|| not_found(id))?;
+		let now = self.instant(&mut tx).await?;
+		record.as_of = now;
 		if record.proposer != approvals::OWN_NAMESPACE {
 			return Ok(None);
 		}

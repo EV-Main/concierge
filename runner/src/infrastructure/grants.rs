@@ -472,6 +472,12 @@ impl GrantRepository for PgGrants {
 	}
 }
 
+/// Lock the `users` rows of `ids` `FOR UPDATE`, in id order: for a writer that must take
+/// them before rows of its own, in the order every other writer here takes them.
+pub(crate) async fn lock_accounts(conn: &mut PgConnection, ids: &[UserId]) -> Result<(), DomainError> {
+	lock_users(conn, ids).await.map(drop)
+}
+
 /// What an executed `concierge:scope_admin_grant` did.
 pub(crate) enum ApprovedGrant {
 	Granted,

@@ -536,11 +536,20 @@ pub struct NewApproval {
 	pub exclude: Option<UserId>,
 	/// What this plane's executor does once it passes; `concierge:*` kinds only.
 	pub action: Option<Action>,
-	/// The account a service proved asked for it — the subject of the user access token it
-	/// presented, and that token's `token_version` — when it presented one. The adapter
-	/// holds it against `requested_by` and, for a platform decision, keeps them off the
-	/// roster (D24(1)).
-	pub proven: Option<(UserId, u64)>,
+	/// The account a service proved asked for it, when it presented that account's fresh
+	/// token. The adapter holds it against `requested_by`, spends the token, and for a
+	/// platform decision keeps them off the roster and tells them (D24(1)).
+	pub proven: Option<ProvenInitiator>,
+}
+
+/// What a user token presented with a proposal proves: whose it is, the `token_version` it
+/// was minted under, and its digest — one token proves one request.
+#[derive(Clone, Debug)]
+pub struct ProvenInitiator {
+	pub user: UserId,
+	pub token_version: u64,
+	/// SHA-256 of the token, lowercase hex: the token itself is never stored.
+	pub token_digest: String,
 }
 
 /// This plane's own token verifier as an approval sees it: whose access token a proposer
@@ -606,6 +615,8 @@ pub struct ApprovalRecord {
 	pub decision: Decision,
 	/// What this plane's executor does with it; `concierge:*` kinds only.
 	pub action: Option<Action>,
+	/// The proposer presented `requested_by`'s own fresh token with it.
+	pub requested_by_proven: bool,
 	/// The instant this record was read at, on the store's clock: what a reader projects
 	/// `decision` through.
 	pub as_of: i64,

@@ -4,8 +4,14 @@
 --   platform_approval_policies — every platform policy ever installed, one row per version,
 --                                written only by an executed `concierge:platform_policy`.
 --                                No row: the default, version 1, 48 h.
---   platform_roster            — one row: when the owner roster last changed. 0 at this
---                                migration: what moved before it is not a change it can date.
+--   platform_roster            — one row: when the owner roster last changed. Seeded from the
+--                                last EXECUTED owner admission or removal, or suspension or
+--                                reinstatement of an account that is an owner now, in
+--                                `governance_event`; 0 when there is none. A resignation and
+--                                the genesis seed leave no event, so they cannot be dated.
+--   approval_initiator_proofs  — the digest of every user token that proved who asked for a
+--                                proposal (D24(1)): one token proves one request.
+--   approvals.requested_by_proven — whether that proof came with the proposal.
 --
 -- WHY A TRIGGER ON `users`: the roster moves on many paths — an executed admission or
 -- removal, a resignation, the genesis seed, a hold, a suspension, a reinstatement, the hold
@@ -52,7 +58,50 @@ CREATE TABLE platform_roster (
     changed_at  BIGINT NOT NULL,
     CONSTRAINT platform_roster_singleton CHECK (singleton)
 );
-INSERT INTO platform_roster (singleton, changed_at) VALUES (TRUE, 0);
+INSERT INTO platform_roster (singleton, changed_at)
+SELECT TRUE, coalesce(max(e.occurred_at), 0)
+FROM governance_event e
+LEFT JOIN user_proposal p ON p.id = e.user_proposal_id
+LEFT JOIN users u ON u.id = p.subject_user_id
+WHERE e.kind = 'EXECUTED'
+  AND (e.removal_id IS NOT NULL OR e.admission_id IS NOT NULL OR (p.kind IN ('suspension', 'reinstatement') AND u.role = 'owner'));
+
+ALTER TABLE approvals ADD COLUMN requested_by_proven BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE approval_initiator_proofs (
+    -- SHA-256 of the token, lowercase hex; the token itself is never stored.
+    token_digest  TEXT PRIMARY KEY,
+    approval_id   UUID NOT NULL REFERENCES approvals (id),
+    at            BIGINT NOT NULL,
+    CONSTRAINT approval_initiator_proofs_digest CHECK (token_digest ~ '^[0-9a-f]{64}$')
+);
+
+-- The pause, held by the store as well as by the code: a PLATFORM row written inside it —
+-- by a binary that predates the rule, or by one whose check raced a change of the owners —
+-- is refused. Same lock as the code takes, and the same arithmetic: the newest installed
+-- cool-down, else the default 48 h. `EVA01` lets the code answer it as the refusal it is.
+CREATE FUNCTION approvals_platform_pause() RETURNS TRIGGER
+LANGUAGE plpgsql AS $$
+DECLARE
+    changed BIGINT;
+    cooldown BIGINT;
+BEGIN
+    SELECT changed_at INTO changed FROM platform_roster FOR SHARE;
+    SELECT cooldown_secs INTO cooldown FROM platform_approval_policies ORDER BY version DESC LIMIT 1;
+    cooldown := coalesce(cooldown, 172800);
+    IF NEW.created_at < changed + cooldown THEN
+        RAISE EXCEPTION 'platform decisions pause after the owners change: none opens before %', changed + cooldown
+            USING ERRCODE = 'EVA01';
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER approvals_platform_pause
+BEFORE INSERT ON approvals
+FOR EACH ROW
+WHEN (NEW.level = 'platform')
+EXECUTE FUNCTION approvals_platform_pause();
 
 ALTER TABLE approvals DROP CONSTRAINT approvals_passed;
 ALTER TABLE approvals ADD CONSTRAINT approvals_passed CHECK ((passed_at IS NULL) = (executable_at IS NULL)

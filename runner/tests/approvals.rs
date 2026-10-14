@@ -112,7 +112,8 @@ impl concierge::ports::UserTokenVerifier for FakeTokens {
 }
 
 impl FakeTokens {
-	fn mint(&self, user: UserId) -> String {
+	/// A token for `user` minted at `iat`, the instant its freshness is judged by.
+	fn mint(&self, user: UserId, iat: i64) -> String {
 		let token = format!("token-{}", Uuid::new_v4());
 		self.issued.lock().unwrap().insert(
 			token.clone(),
@@ -121,7 +122,7 @@ impl FakeTokens {
 				iss: "https://auth.concierge.ev".into(),
 				aud: "concierge".into(),
 				exp: u64::MAX,
-				iat: 0,
+				iat: u64::try_from(iat).unwrap(),
 				typ: TokenType::Access,
 				jti: None,
 				token_version: 0,
@@ -1869,18 +1870,43 @@ async fn a_proven_initiator_does_not_vote_on_a_money_decision() {
 		.await
 		.unwrap();
 
-	let token = fx.tokens.mint(owners[0]);
+	assert!(!named.requested_by_proven);
+	let token = fx.tokens.mint(owners[0], T0);
 	let proven = fx.payment(&kind, &scope, Some(owners[0]), Some(&token)).await.expect("a proven initiator");
 	assert_eq!((proven.voters.len(), proven.threshold), (2, 2), "the two other owners decide");
+	assert!(proven.requested_by_proven, "the deciders read that the name was proven");
+	let notice: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.dedupe_key = $2")
+		.bind(owners[0].raw())
+		.bind(format!("approval:{}", proven.id))
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(notice, 1, "the person it names hears that a decision was opened in their name");
 	assert_eq!(code(fx.vote(owners[0], &proven.id, ApprovalVote::For).await), Some(Code::PermissionDenied));
 
-	let elsewhere = fx.tokens.mint(owners[1]);
+	let elsewhere = fx.tokens.mint(owners[1], T0);
 	assert_eq!(
 		code(fx.payment(&kind, &scope, Some(owners[0]), Some(&elsewhere)).await),
 		Some(Code::PermissionDenied),
 		"the token is someone else's"
 	);
 	assert_eq!(code(fx.payment(&kind, &scope, Some(owners[0]), Some("forged")).await), Some(Code::Unauthenticated));
+	fx.services
+		.withdraw_proposal(as_bridge(WithdrawProposalRequest {
+			approval_id: proven.id.clone(),
+			reason: String::new(),
+		}))
+		.await
+		.unwrap();
+	let spent = fx.payment(&kind, &scope, Some(owners[0]), Some(&token)).await.unwrap_err();
+	assert_eq!(spent.code(), Code::FailedPrecondition, "one token proves one request: {}", spent.message());
+	assert!(spent.message().contains("already spent"), "{}", spent.message());
+	let stale = fx.tokens.mint(owners[0], T0 - 121);
+	assert_eq!(
+		code(fx.payment(&kind, &scope, Some(owners[0]), Some(&stale)).await),
+		Some(Code::Unauthenticated),
+		"a proof is a token minted for this request, not one kept from a session"
+	);
 	assert_eq!(
 		code(fx.payment(&kind, &scope, None, Some(&token)).await),
 		Some(Code::InvalidArgument),
@@ -1897,10 +1923,56 @@ async fn a_proven_initiator_needs_two_other_owners() {
 	let scope = fx.scope().await;
 	let kind = fx.bank_platform_kind(&scope).await;
 	fx.at(T0);
-	let token = fx.tokens.mint(owners[0]);
+	let token = fx.tokens.mint(owners[0], T0);
 	let refused = fx.payment(&kind, &scope, Some(owners[0]), Some(&token)).await.unwrap_err();
 	assert_eq!(refused.code(), Code::FailedPrecondition);
 	assert!(refused.message().contains("besides the initiator"), "{}", refused.message());
+	assert!(refused.message().contains("not_enough_owners_besides_initiator"), "a code a proposer can tell from the others");
+}
+
+/// The floor of two other deciders counts owners who can decide: a held owner is on the
+/// roster and has no say while held.
+#[tokio::test]
+async fn the_floor_counts_owners_who_can_decide() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let kind = fx.bank_platform_kind(&scope).await;
+	let action = concierge::infrastructure::users::AdminAction {
+		actor: Some(owners[1]),
+		action: "held",
+		reason: "credential stuffing".into(),
+		..Default::default()
+	};
+	fx.users.hold_user(owners[2], &action, owners[1], fx.db_now().await).await.expect("an owner holds an owner");
+	fx.at(T0);
+	let token = fx.tokens.mint(owners[0], T0);
+	let refused = fx.payment(&kind, &scope, Some(owners[0]), Some(&token)).await.unwrap_err();
+	assert_eq!(refused.code(), Code::FailedPrecondition, "one active owner besides the initiator: {}", refused.message());
+	assert!(fx.payment(&kind, &scope, None, None).await.is_ok(), "two active owners decide a decision nobody proved");
+}
+
+/// The pause holds in the store too: a platform row written inside it — by a binary that
+/// does not know the rule — is refused by the database.
+#[tokio::test]
+async fn the_store_refuses_a_platform_decision_inside_the_pause() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(2).await;
+	let policy = fx.platform_policy(owners[0]).await;
+	let inside = policy.roster_changed_at + i64::from(policy.cooldown_secs) - 1;
+	let insert = |created_at: i64| {
+		sqlx::query(
+			"INSERT INTO approvals (id, kind, proposer, scope, level, subject_ref, fields, payload_hash, reason, roster_size, threshold, \
+			 policy_version, delay_secs, created_at, expires_at, dedupe_key) \
+			 VALUES (gen_random_uuid(), 'bank:direct', 'bank', 'main', 'platform', 'payment:' || gen_random_uuid(), '[]', repeat('0', 64), 'r', 2, 2, \
+			 0, 86400, $1, $1 + 100, gen_random_uuid()::TEXT)",
+		)
+		.bind(created_at)
+		.execute(&fx.pool)
+	};
+	let refused = insert(inside).await.unwrap_err();
+	assert!(refused.to_string().contains("pause"), "{refused}");
+	insert(inside + 1).await.expect("after the pause the row is the code's to judge");
 }
 
 /// D24(2): after the owners change, platform decisions pause for the platform policy's

@@ -335,15 +335,23 @@ containment is never slower than the grant).
   what they asked for. A `PLATFORM` proposal is refused at open (`FAILED_PRECONDITION`)
   with fewer than two owners, or when the opener is the only one left to decide.
 - **A proven initiator of a money decision does not decide it** (D24(1)): a proposer may
-  present, in metadata `x-ev-user-token`, the access token of this plane that
-  `requested_by` signed in with (banking forwards the owner's). Verified as every RPC here
-  verifies one, its `sub` must be `requested_by` and the account still active at that
-  token's `token_version`; then, when the proposal resolves to `PLATFORM`, that person is
-  kept off the roster — and two OTHER owners must remain (`FAILED_PRECONDITION` "not
-  enough owners besides the initiator"): one owner must not decide another's money alone,
-  so 0036's floor of two for a service's proposal is not relaxed. At scope level a proven
-  initiator stays on the roster, as every admin does. Without a token the name stays
-  information.
+  present, in metadata `x-ev-user-token`, an access token of this plane that `requested_by`
+  holds (banking forwards the owner's). Verified as every RPC here verifies one, its `sub`
+  must be `requested_by`, the account still active at that token's `token_version`, the
+  token minted no more than 120 s before the call (else `UNAUTHENTICATED`), and never used
+  before: its SHA-256 is spent in the transaction that opens the proposal
+  (`approval_initiator_proofs`; a second use is `FAILED_PRECONDITION` "this proof was
+  already spent"). What that proves is honest and narrow: the service held that person's
+  fresh token, so it could act with their session at that moment — not that they read the
+  proposal. When the proposal resolves to `PLATFORM` that person is kept off the roster,
+  the proposal says `requested_by_proven`, and they get an inbox notice (topic
+  `account:money-movement`, no link, no code) that a decision was opened in their name — if
+  they did not ask for it, their veto stops it. Two OTHER ACTIVE owners must remain
+  (`FAILED_PRECONDITION`, code word `not_enough_owners_besides_initiator`; a proposer must
+  not retry it without the token): one owner must not decide another's money alone, so
+  0036's floor of two for a service's proposal is not relaxed, and a held owner, who has no
+  say, does not count towards it. At scope level a proven initiator stays on the roster, as
+  every admin does. Without a token the name stays information.
 - **The platform pauses after its owners change** (D24(2)): any change of the owner roster
   — a seat granted or taken, an owner suspended indefinitely by the consilium's verdict
   (`suspended_by = governance`) or reinstated from one, on any path, written by any binary —
@@ -465,7 +473,10 @@ OPEN ──(threshold met)──▶ PASSED ──(executable_at passes; proposer
   proposer pulls it still has an hour to report. At `execute_by` the decision lapses to
   `VOID` (`void_reason` says so, no outcome) and a report on it is refused. A pull
   claims nothing: the same proposal is served on every pull until its outcome is
-  reported, so the proposer is idempotent per proposal id. Executable is a time
+  reported, so the proposer is idempotent per proposal id. A pulled decision can still go
+  `VOID` before the proposer acts — the owners changed (§5.2) — and a pull is not told:
+  the money plane re-reads the proposal (`GetProposal`) immediately before it moves money,
+  and acts only on `PASSED`. Executable is a time
   predicate over `PASSED`, not a state, so nothing has to sweep for a proposal to become
   pullable.
 - **`payload_hash`** binds what was approved to what is executed. The proposer computes
@@ -582,6 +593,16 @@ in `domain::approvals`.
   ignores. It
   stamps `platform_roster` first, which `propose` holds `FOR SHARE` while it opens a
   platform decision, so an open and a change never miss each other.
+- **The pause is the store's too**: a `BEFORE INSERT` trigger on `approvals`
+  (`approvals_platform_pause`, migration 0038) refuses a `PLATFORM` row created inside the
+  pause, with the same lock and arithmetic as the code — a binary that predates the rule,
+  or a check that raced a change, cannot open one. `platform_roster` is seeded from the
+  last executed owner admission, removal, or suspension / reinstatement of a current owner
+  in `governance_event`; a resignation and the genesis seed leave no event and are not
+  dated.
+- **The executor locks accounts before the proposal**: a grant takes the two `users` rows
+  it names first, then the proposal row — the order a change of the owners takes them
+  (its `users` row, then the trigger's `approvals` rows) — so the two cannot deadlock.
 - **One daily budget per scope** (D24(4)) is the money plane's to count: everything that
   leaves a scope without the owners — its automatic payouts and its scope-level decisions
   — draws on it, and when a request would exceed it banking sets a FLAG field

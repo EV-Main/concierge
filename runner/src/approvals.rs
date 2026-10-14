@@ -248,6 +248,7 @@ pub fn approval_to(record: ApprovalRecord, reader: Reader) -> Approval {
 		requested_by_client: record.requested_by_client,
 		execute_by: decision.execute_by().unwrap_or(0),
 		proposed_policy,
+		requested_by_proven: record.requested_by_proven,
 	}
 }
 
@@ -671,7 +672,7 @@ impl ApprovalExecution {
 	/// token, presented in `x-ev-user-token` beside `requested_by` (D24(1)). No token: the
 	/// name is information and proves nothing. Whether it is `requested_by`'s, and still
 	/// speaks for an active account, is decided where the proposal is opened.
-	async fn proven_initiator(&self, token: &Option<String>, requested_by: &str) -> Result<Option<(UserId, u64)>, Status> {
+	async fn proven_initiator(&self, token: &Option<String>, requested_by: &str) -> Result<Option<crate::ports::ProvenInitiator>, Status> {
 		let Some(token) = token else { return Ok(None) };
 		if requested_by.is_empty() {
 			return Err(Status::invalid_argument("a user token proves who asked: name them in requested_by"));
@@ -685,7 +686,20 @@ impl ApprovalExecution {
 			return Err(Status::unauthenticated("invalid user token"));
 		}
 		let user = Uuid::parse_str(&claims.sub).map_err(|_| Status::unauthenticated("invalid user token"))?;
-		Ok(Some((UserId::from_raw(user), claims.token_version)))
+		// Fresh: a token kept from a session an hour ago proves the service could act as
+		// that person then, not that they asked for this. Paired with spending the digest,
+		// a proof is one token minted for one request.
+		let now = self.approvals.now().await.map_err(domain_to_status)?;
+		if i64::try_from(claims.iat).map_or(true, |iat| iat < now - PROOF_MAX_AGE_SECS) {
+			return Err(Status::unauthenticated(format!(
+				"the user token is older than {PROOF_MAX_AGE_SECS} seconds: mint one for this request"
+			)));
+		}
+		Ok(Some(crate::ports::ProvenInitiator {
+			user: UserId::from_raw(user),
+			token_version: claims.token_version,
+			token_digest: hex(&Sha256::digest(token.as_bytes())),
+		}))
 	}
 }
 
@@ -851,6 +865,11 @@ fn derived_uuid(name: &str) -> Uuid {
 fn hex(bytes: &[u8]) -> String {
 	bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// The oldest a user token may be to prove who asked for a proposal (D24(1), review of
+/// #141): long enough for the money plane to mint one and call, short enough that a token
+/// lifted from a session cannot be replayed into a proof later.
+const PROOF_MAX_AGE_SECS: i64 = 120;
 
 /// How many due `concierge:*` decisions one executor pass takes on.
 const EXECUTOR_BATCH: i64 = 100;

@@ -133,17 +133,27 @@ service ApprovalExecutionService {
   // longer than 128 bytes (the same pattern banking scope/v1 enforces), a
   // USER field or `requested_by` naming no account. FAILED_PRECONDITION: the scope is
   // not ACTIVE; the resolved roster is too small to decide (fewer than two platform
-  // owners, or fewer than two besides a proven initiator); or the proposal resolves to
+  // ACTIVE owners, or fewer than two ACTIVE owners besides a proven initiator — this one
+  // carries the code word `not_enough_owners_besides_initiator`; do NOT retry it without the
+  // token, which would put the initiator back on the roster); a spent proof ("this proof was
+  // already spent"); or the proposal resolves to
   // PLATFORM while the platform pauses after a change of its owners (PlatformApprovalPolicy
   // `cooldown_secs` from `roster_changed_at`). PERMISSION_DENIED: a relying party naming a
   // scope other than its own; a user token that is not `requested_by`'s or no longer
-  // speaks for an active account. UNAUTHENTICATED: a user token this plane does not verify.
+  // speaks for an active account. UNAUTHENTICATED: a user token this plane does not verify,
+  // or one minted more than 120 seconds before the call.
   //
   // Metadata `x-ev-user-token`: optionally, `requested_by`'s own access token of this plane
   // (`typ=access`, verified as every RPC of this plane verifies one; `requested_by`
-  // required with it). It PROVES who asked, and when the proposal resolves to PLATFORM that
-  // person is kept off its roster (D24(1)) — two other owners must remain. Without it the
-  // name is information and its holder votes like anyone. Every live PLATFORM proposal is
+  // required with it), minted no more than 120 seconds before the call and spent by it: one
+  // token proves one request. What it proves is that the service held that person's fresh
+  // token — that it could act with their session at that moment — not that they read this
+  // proposal. When the proposal resolves to PLATFORM that person is kept off its roster
+  // (D24(1)) — two other ACTIVE owners must remain — the proposal says
+  // `requested_by_proven`, and they find a notice in their inbox (topic
+  // `account:money-movement`) that a decision was opened in their name, so that a request
+  // they did not make meets their veto. Without a token the name is information and its
+  // holder votes like anyone. Every live PLATFORM proposal is
   // VOID the moment the owner roster changes (`void_reason` says so).
   // RESOURCE_EXHAUSTED: the namespace already holds 200 live (OPEN, or PASSED and not
   // lapsed) proposals in this scope. ALREADY_EXISTS: a live
@@ -455,6 +465,12 @@ message Approval {
   // whole — every threshold override with its value, which the fields carry too, so
   // `payload_hash` is taken over them. Absent on every other kind, and to a service.
   ScopeApprovalPolicy proposed_policy = 30;
+  // The proposer presented `requested_by`'s own fresh access token with the proposal (see
+  // Propose): the service held that person's token minted within two minutes, spent once.
+  // What it shows is that the service could act with that person's session at that
+  // moment — not that the person read this proposal. Such a person is kept off a PLATFORM
+  // roster and told in their inbox that a decision was opened in their name.
+  bool requested_by_proven = 31;
 }
 
 message ListApprovalKindsRequest {}

@@ -3,6 +3,10 @@
 -- NOT VALID: a VOID that never passed and a `roster_changed` event may already exist.
 SET LOCAL lock_timeout = '3s';
 
+DROP TRIGGER approvals_platform_pause ON approvals;
+DROP FUNCTION approvals_platform_pause();
+DROP TABLE approval_initiator_proofs;
+ALTER TABLE approvals DROP COLUMN requested_by_proven;
 DROP TRIGGER users_owner_roster_inserted ON users;
 DROP TRIGGER users_owner_roster_updated ON users;
 DROP FUNCTION platform_roster_changed();
