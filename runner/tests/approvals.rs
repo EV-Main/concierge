@@ -1774,10 +1774,11 @@ async fn the_executor_carries_on_past_a_failing_decision() {
 	assert_eq!(state(&fx.get(owners[0], &broken.id).await), ApprovalState::Passed, "left for the next pass");
 }
 
-/// A vote that can no longer be won is lost: a FOR of someone who lost the seat is not
-/// one of the votes that could still carry it.
+/// A proposal is REJECTED only by the AGAINST votes of seated members — more of them than
+/// the roster could spare. A seat lost does not reject anything: what can no longer be
+/// carried for want of seats is left to expire (review of #140).
 #[tokio::test]
-async fn a_vote_that_can_no_longer_be_won_is_rejected() {
+async fn only_seated_against_votes_reject() {
 	let Some(fx) = setup().await else { return };
 	let scope = fx.scope().await;
 	let admins = fx.admins(&scope, 3).await;
@@ -1790,8 +1791,14 @@ async fn a_vote_that_can_no_longer_be_won_is_rejected() {
 		.await
 		.unwrap();
 	let against = fx.vote(admins[1], &opened.id, ApprovalVote::Against).await.unwrap();
-	assert_eq!(state(&against), ApprovalState::Rejected, "one seated voter is left and two are needed");
-	assert_eq!(code(fx.vote(admins[2], &opened.id, ApprovalVote::For).await), Some(Code::FailedPrecondition));
+	assert_eq!(state(&against), ApprovalState::Open, "one seated AGAINST of three is not more than the one the roster can spare");
+	let last = fx.vote(admins[2], &opened.id, ApprovalVote::For).await.unwrap();
+	assert_eq!(state(&last), ApprovalState::Open, "the removed admin's FOR still does not count; it waits out its lifetime");
+
+	let second = fx.propose(&scope, transfer(&scope, "10")).await;
+	assert_eq!((second.voters.len(), second.threshold), (2, 2), "the two admins left");
+	let rejected = fx.vote(admins[1], &second.id, ApprovalVote::Against).await.unwrap();
+	assert_eq!(state(&rejected), ApprovalState::Rejected, "two of two are needed: one seated AGAINST is one too many");
 }
 
 // ---------------------------------------------------------------------------------
@@ -2112,4 +2119,175 @@ async fn a_retry_with_a_token_is_checked_as_the_first_call_was() {
 		"someone else's token is refused on a retry as on the first call"
 	);
 	assert_eq!(code(send(Some(fx.tokens.mint(owners[0], T0 - 121))).await), Some(Code::Unauthenticated), "and a stale one");
+}
+
+// ---------------------------------------------------------------------------------
+// The floor this plane keeps on the known money kinds, whatever their catalog says (D24).
+// ---------------------------------------------------------------------------------
+
+impl Fx {
+	async fn publish_bank(&self, spec: ApprovalKindSpec) -> Result<(), tonic::Status> {
+		static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+		let _serial = SERIAL.lock().await;
+		let stored = self
+			.catalogs
+			.get_scope_catalog(as_bridge(evconcierge_contracts::concierge::v1::GetScopeCatalogRequest {}))
+			.await
+			.map(tonic::Response::into_inner)
+			.ok();
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+		let version = stored.as_ref().map_or(now, |c| c.version + 1).max(now);
+		let mut kinds = stored.map(|c| c.approval_kinds).unwrap_or_default();
+		kinds.retain(|k| k.name != spec.name);
+		kinds.insert(0, spec);
+		kinds.truncate(64);
+		self.catalogs
+			.publish_scope_catalog(as_bridge(PublishScopeCatalogRequest {
+				version,
+				approval_kinds: kinds,
+				notification_topics: vec![],
+			}))
+			.await
+			.map(drop)
+	}
+}
+
+fn bank_spec(name: &str, level: ApprovalLevel, fields: Vec<ApprovalFieldSpec>, escalations: Vec<ApprovalEscalation>) -> ApprovalKindSpec {
+	ApprovalKindSpec {
+		name: name.into(),
+		label: "Money".into(),
+		description: String::new(),
+		level: level as i32,
+		fields,
+		escalations,
+		proposer: String::new(),
+	}
+}
+
+#[tokio::test]
+async fn a_known_money_kind_is_published_no_looser_than_the_floor() {
+	let Some(fx) = setup().await else { return };
+	let amount_field = || vec![spec("amount", ApprovalFieldType::Amount)];
+	let refused = fx.publish_bank(bank_spec("bank:payment", ApprovalLevel::Scope, amount_field(), vec![])).await.unwrap_err();
+	assert_eq!(refused.code(), Code::InvalidArgument, "a payment off the platform is the owners' always: {}", refused.message());
+	let loose = ApprovalEscalation {
+		parameter: "per_operation".into(),
+		field_key: "amount".into(),
+		test: EscalationTest::AmountAbove as i32,
+		default_threshold: "2000".into(),
+		currency: "USDT".into(),
+	};
+	assert_eq!(
+		code(fx.publish_bank(bank_spec("bank:account_transfer", ApprovalLevel::Scope, amount_field(), vec![loose])).await),
+		Some(Code::InvalidArgument),
+		"a transfer escalates above 1000 USDT at the latest"
+	);
+	assert_eq!(
+		code(
+			fx.publish_bank(bank_spec("bank:account_transfer", ApprovalLevel::Scope, vec![spec("value", ApprovalFieldType::Amount)], vec![]))
+				.await
+		),
+		Some(Code::InvalidArgument),
+		"the floor reads the field the contract names"
+	);
+}
+
+/// The floor holds even where the catalog says nothing: a transfer above 1000 USDT and a
+/// payout to more than one recipient go to the owners.
+#[tokio::test]
+async fn the_floor_escalates_what_the_catalog_left_out() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, _owners) = fx.owners(2).await;
+	let scope = fx.scope().await;
+	fx.admins(&scope, 2).await;
+	fx.publish_bank(bank_spec("bank:account_transfer", ApprovalLevel::Scope, vec![spec("amount", ApprovalFieldType::Amount)], vec![]))
+		.await
+		.expect("a transfer kind with no escalations of its own");
+	fx.publish_bank(bank_spec(
+		"bank:scope_payout",
+		ApprovalLevel::Scope,
+		vec![spec("total", ApprovalFieldType::Amount), spec("recipients", ApprovalFieldType::Count)],
+		vec![],
+	))
+	.await
+	.expect("a payout kind with no escalations of its own");
+	fx.at(T0);
+	let propose = |kind: &str, fields: Vec<ApprovalFieldValue>| {
+		fx.services.propose(as_bridge(ProposeRequest {
+			kind: kind.into(),
+			fields,
+			..transfer(&scope, "1")
+		}))
+	};
+	let small = propose("bank:account_transfer", vec![amount("10", "USDT")]).await.unwrap().into_inner();
+	assert_eq!(small.level, ApprovalLevel::Scope as i32);
+	let big = propose("bank:account_transfer", vec![amount("1000.01", "USDT")]).await.unwrap().into_inner();
+	assert_eq!((big.level, big.escalated_by), (ApprovalLevel::Platform as i32, vec!["floor_per_operation".to_owned()]));
+
+	let total = |value: &str| ApprovalFieldValue {
+		key: "total".into(),
+		value: Some(Value::Amount(ApprovalAmount {
+			value: value.into(),
+			currency: "USDT".into(),
+		})),
+	};
+	let recipients = |n: u64| ApprovalFieldValue {
+		key: "recipients".into(),
+		value: Some(Value::Count(n)),
+	};
+	let one = propose("bank:scope_payout", vec![total("10"), recipients(1)]).await.unwrap().into_inner();
+	assert_eq!(one.level, ApprovalLevel::Scope as i32);
+	let many = propose("bank:scope_payout", vec![total("10"), recipients(2)]).await.unwrap().into_inner();
+	assert_eq!((many.level, many.escalated_by), (ApprovalLevel::Platform as i32, vec!["floor_recipients".to_owned()]));
+}
+
+/// A catalog may escalate on a count itself (`ESCALATION_TEST_COUNT_ABOVE`).
+#[tokio::test]
+async fn a_kind_escalates_on_a_count() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, _owners) = fx.owners(2).await;
+	let scope = fx.scope().await;
+	fx.admins(&scope, 2).await;
+	let kind = format!("bank:c_{}", &scope.id[2..]);
+	fx.publish_bank(bank_spec(
+		&kind,
+		ApprovalLevel::Scope,
+		vec![spec("seats", ApprovalFieldType::Count)],
+		vec![ApprovalEscalation {
+			parameter: "crowd".into(),
+			field_key: "seats".into(),
+			test: EscalationTest::CountAbove as i32,
+			default_threshold: "3".into(),
+			currency: String::new(),
+		}],
+	))
+	.await
+	.expect("a count escalation is publishable");
+	fx.at(T0);
+	let seats = |n: u64| {
+		fx.services.propose(as_bridge(ProposeRequest {
+			kind: kind.clone(),
+			fields: vec![ApprovalFieldValue {
+				key: "seats".into(),
+				value: Some(Value::Count(n)),
+			}],
+			..transfer(&scope, "1")
+		}))
+	};
+	assert_eq!(seats(3).await.unwrap().into_inner().level, ApprovalLevel::Scope as i32, "three is not above three");
+	assert_eq!(seats(4).await.unwrap().into_inner().escalated_by, vec!["crowd".to_owned()]);
+}
+
+/// The person a scope admin grant names does not decide it either, when they are an owner:
+/// nobody votes on their own seat (review of #140).
+#[tokio::test]
+async fn an_owner_named_by_a_grant_does_not_decide_it() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	fx.at(T0);
+	let opened = fx.grant_admin(owners[0], &scope, owners[1]).await.expect("an owner may become a scope's admin");
+	let voters: Vec<String> = fx.get(owners[2], &opened.id).await.voters.into_iter().map(|v| v.auth_subject).collect();
+	assert_eq!(voters, vec![fx.auth_subject(owners[2]).await], "neither the opener nor the subject");
+	assert_eq!(code(fx.vote(owners[1], &opened.id, ApprovalVote::For).await), Some(Code::PermissionDenied));
 }

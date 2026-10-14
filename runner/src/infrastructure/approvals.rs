@@ -670,7 +670,7 @@ impl ApprovalRepository for PgApprovals {
 		// has no vote on a platform decision and no veto to cast, so a notice inviting one
 		// would point at a door that is shut.
 		let initiator_removed = proven_out.is_some_and(|initiator| roster.contains(&initiator));
-		let roster: Vec<UserId> = roster.into_iter().filter(|u| Some(*u) != new.exclude && Some(*u) != proven_out).collect();
+		let roster: Vec<UserId> = roster.into_iter().filter(|u| !new.exclude.contains(u) && Some(*u) != proven_out).collect();
 		// The floors count who can DECIDE: an owner on hold is on the roster with no say.
 		let deciders = match resolution.level {
 			ApprovalLevel::Platform => roster.iter().filter(|u| active_owners.contains(u)).count(),
@@ -748,7 +748,7 @@ impl ApprovalRepository for PgApprovals {
 				tell_initiator(&mut tx, proven.user, new.id, &new.scope, now).await?;
 			}
 		}
-		let opener = match (&new.exclude, new.client.as_str()) {
+		let opener = match (new.exclude.first(), new.client.as_str()) {
 			(Some(person), _) => ApprovalActor::Person(*person),
 			(None, "") => ApprovalActor::Service(crate::service_caller::BRIDGE_PUBLISHER),
 			(None, client) => ApprovalActor::Service(client),

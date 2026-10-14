@@ -588,6 +588,10 @@ impl Approvals {
 	/// so kept off the roster (D23).
 	#[allow(clippy::too_many_arguments)] // why: every argument is a distinct part of the proposal; a struct for one private call would only rename them
 	async fn open_own(&self, opener: UserId, kind: &str, scope: String, subject_ref: String, fields: Vec<Field>, reason: String, action: rules::Action) -> Result<Approval, Status> {
+		let mut exclude = vec![opener];
+		if let rules::Action::GrantAdmin { user, .. } = &action {
+			exclude.push(UserId::from_raw(*user));
+		}
 		let kind = rules::builtin_kinds()
 			.into_iter()
 			.find(|k| k.name == kind)
@@ -612,7 +616,7 @@ impl Approvals {
 			reason,
 			dedupe_key: Uuid::new_v4().to_string(),
 			client: String::new(),
-			exclude: Some(opener),
+			exclude,
 			action: Some(action),
 			proven: None,
 		};
@@ -740,6 +744,9 @@ impl ApprovalExecutionService for ApprovalExecution {
 			.map_err(domain_to_status)?
 			.and_then(|catalog| catalog.approval_kinds.into_iter().find(|k| k.name == req.kind))
 			.ok_or_else(|| Status::invalid_argument(format!("unknown approval kind `{}`", req.kind)))?;
+		// Measured as this plane's floor requires, whatever the catalog in force says — it
+		// may predate the floor or be the publisher's mistake (D24).
+		let kind = domain::floors::floored(&kind);
 		rules::check_subject_ref(&req.subject_ref).map_err(invalid)?;
 		rules::check_text("reason", &req.reason, REASON_BYTES).map_err(invalid)?;
 		rules::check_dedupe_key(&req.dedupe_key).map_err(invalid)?;
@@ -767,7 +774,7 @@ impl ApprovalExecutionService for ApprovalExecution {
 			reason: req.reason,
 			dedupe_key: req.dedupe_key,
 			client,
-			exclude: None,
+			exclude: Vec::new(),
 			action: None,
 			proven,
 		};
@@ -876,21 +883,41 @@ const EXECUTOR_BATCH: i64 = 100;
 
 /// One pass of this plane's executor: carry out every passed `concierge:*` proposal that
 /// is due, each in its own transaction with its outcome. Returns how many it closed.
-pub async fn execute_due(approvals: &dyn ApprovalRepository) -> Result<usize, domain::error::DomainError> {
-	let mut closed = 0;
+pub async fn execute_due(approvals: &dyn ApprovalRepository) -> Result<ExecutorPass, domain::error::DomainError> {
+	let mut pass = ExecutorPass::default();
 	for due in approvals.pull(rules::OWN_NAMESPACE, EXECUTOR_BATCH).await? {
 		// One decision the store cannot carry out must not hold up the ones behind it; it
 		// stays passed and is tried again next pass, until it lapses.
 		match approvals.execute(due.id).await {
 			Ok(Some(outcome)) => {
 				tracing::info!(approval = %due.id, kind = %due.kind, scope = %due.scope, outcome = outcome.as_str(), "approval executed by this plane");
-				closed += 1;
+				pass.closed += 1;
 			}
 			Ok(None) => {}
-			Err(err) => tracing::error!(approval = %due.id, kind = %due.kind, scope = %due.scope, %err, "executing an approval failed; it is retried next pass"),
+			Err(err) => {
+				tracing::error!(approval = %due.id, kind = %due.kind, scope = %due.scope, %err, "executing an approval failed; it is retried next pass");
+				pass.failed += 1;
+			}
 		}
 	}
-	Ok(closed)
+	Ok(pass)
+}
+
+/// What one executor pass did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecutorPass {
+	pub closed: usize,
+	pub failed: usize,
+}
+
+/// The longest the executor waits between passes while they keep failing.
+const EXECUTOR_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The pause after `failing` passes in a row that failed: the interval, doubled per failing
+/// pass up to [`EXECUTOR_MAX_PAUSE`]. A store that refuses every write would otherwise be
+/// asked again every interval, filling the log with one error per due decision per pass.
+pub fn executor_pause(interval: std::time::Duration, failing: u32) -> std::time::Duration {
+	interval.saturating_mul(1u32 << failing.min(10)).min(EXECUTOR_MAX_PAUSE.max(interval))
 }
 
 /// The executor loop (D23): what this plane's own approvals do once passed. A second loop
@@ -898,12 +925,36 @@ pub async fn execute_due(approvals: &dyn ApprovalRepository) -> Result<usize, do
 /// after its window — and unlike a service, this plane has nobody else to pull it.
 pub async fn run_executor(approvals: Arc<dyn ApprovalRepository>, interval: std::time::Duration) {
 	tracing::info!(interval_secs = interval.as_secs(), "approval executor started");
+	let mut failing = 0u32;
 	loop {
 		match execute_due(approvals.as_ref()).await {
-			Ok(closed) if usize::try_from(EXECUTOR_BATCH).is_ok_and(|batch| closed >= batch) => continue,
-			Ok(_) => {}
-			Err(err) => tracing::error!(%err, "the approval executor failed; passed concierge:* decisions are not being carried out"),
+			Ok(pass) if pass.failed == 0 && usize::try_from(EXECUTOR_BATCH).is_ok_and(|batch| pass.closed >= batch) => {
+				failing = 0;
+				continue;
+			}
+			Ok(pass) if pass.failed == 0 => failing = 0,
+			Ok(_) => failing = failing.saturating_add(1),
+			Err(err) => {
+				tracing::error!(%err, "the approval executor failed; passed concierge:* decisions are not being carried out");
+				failing = failing.saturating_add(1);
+			}
 		}
-		tokio::time::sleep(interval).await;
+		tokio::time::sleep(executor_pause(interval, failing)).await;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use super::*;
+
+	#[test]
+	fn the_executor_backs_off_while_its_passes_fail() {
+		let every = Duration::from_secs(30);
+		assert_eq!(executor_pause(every, 0), every, "a clean pass keeps the interval");
+		assert_eq!(executor_pause(every, 1), Duration::from_secs(60));
+		assert_eq!(executor_pause(every, 3), Duration::from_secs(240));
+		assert_eq!(executor_pause(every, 40), EXECUTOR_MAX_PAUSE, "and stops growing");
 	}
 }

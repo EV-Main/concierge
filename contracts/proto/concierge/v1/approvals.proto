@@ -235,6 +235,9 @@ enum EscalationTest {
   ESCALATION_TEST_ABS_BPS_ABOVE = 3;
   // A FLAG field that is set. Takes no threshold.
   ESCALATION_TEST_FLAG_SET = 4;
+  // A COUNT field above the threshold (a payout to more recipients than that). An integer
+  // threshold, no currency.
+  ESCALATION_TEST_COUNT_ABOVE = 5;
 }
 
 enum ApprovalState {
@@ -250,9 +253,10 @@ enum ApprovalState {
   APPROVAL_STATE_EXECUTED = 3;
   // The proposer tried and failed. Terminal: a retry is a new proposal.
   APPROVAL_STATE_EXECUTION_FAILED = 4;
-  // The threshold can no longer be reached: the voters still holding their seat who have
-  // not voted AGAINST are fewer than it. A vote of someone who lost the seat counts neither
-  // way.
+  // Voters still holding their seat cast more AGAINSTs than the roster can spare (more
+  // than roster − threshold). A vote of someone who lost the seat counts neither way; a
+  // proposal that can no longer be carried only for want of seats stays OPEN until it
+  // expires.
   APPROVAL_STATE_REJECTED = 5;
   APPROVAL_STATE_VETOED = 6;
   APPROVAL_STATE_EXPIRED = 7;

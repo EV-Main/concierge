@@ -79,6 +79,7 @@ fn test_from(raw: i32) -> Result<EscalationTest, String> {
 		Ok(cc::EscalationTest::Rolling24hAmountAbove) => Ok(EscalationTest::Rolling24hAmountAbove),
 		Ok(cc::EscalationTest::AbsBpsAbove) => Ok(EscalationTest::AbsBpsAbove),
 		Ok(cc::EscalationTest::FlagSet) => Ok(EscalationTest::FlagSet),
+		Ok(cc::EscalationTest::CountAbove) => Ok(EscalationTest::CountAbove),
 		Ok(cc::EscalationTest::Unspecified) | Err(_) => Err("an escalation names its test".into()),
 	}
 }
@@ -157,6 +158,7 @@ pub(crate) fn kind_to(kind: ApprovalKind, proposer: &str) -> ApprovalKindSpec {
 					EscalationTest::Rolling24hAmountAbove => cc::EscalationTest::Rolling24hAmountAbove,
 					EscalationTest::AbsBpsAbove => cc::EscalationTest::AbsBpsAbove,
 					EscalationTest::FlagSet => cc::EscalationTest::FlagSet,
+					EscalationTest::CountAbove => cc::EscalationTest::CountAbove,
 				} as i32,
 				default_threshold: e.default_threshold,
 				currency: e.currency,

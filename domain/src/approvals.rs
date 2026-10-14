@@ -180,26 +180,30 @@ impl ScopePolicy {
 			if self.thresholds[..i].iter().any(|o| o.kind == t.kind && o.parameter == t.parameter) {
 				return Err(format!("threshold `{}`/`{}` is given twice", t.kind, t.parameter));
 			}
+			// Measured against the kind as a proposal is: floored, so "only tightens" counts
+			// from the table's cap where it is stricter than the catalog.
 			let escalation = kinds
 				.iter()
-				.filter(|k| k.name == t.kind && k.level == ApprovalLevel::Scope)
-				.flat_map(|k| k.escalations.iter())
+				.filter(|k| k.name == t.kind)
+				.map(crate::floors::floored)
+				.filter(|k| k.level == ApprovalLevel::Scope)
+				.flat_map(|k| k.escalations)
 				.find(|e| e.parameter == t.parameter)
 				.ok_or_else(|| format!("threshold `{}`/`{}` names no escalation of a scope-level kind in force", t.kind, t.parameter))?;
 			let shaped = match escalation.test {
 				EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => is_canonical_amount(&t.value),
-				EscalationTest::AbsBpsAbove => t.value.parse::<u64>().is_ok_and(|v| v.to_string() == t.value),
+				EscalationTest::AbsBpsAbove | EscalationTest::CountAbove => t.value.parse::<u64>().is_ok_and(|v| v.to_string() == t.value),
 				EscalationTest::FlagSet => false,
 			};
 			if !shaped {
 				return Err(format!("threshold `{}`/`{}` is not a value its test takes", t.kind, t.parameter));
 			}
-			// Until this plane holds its own floor on the known money kinds, a scope may only
-			// make a kind's escalation stricter than the kind publishes it (decided): a looser
-			// one would let the scope keep for itself what its publisher sends to the owners.
+			// A scope may only make a kind's escalation stricter than the kind is measured by
+			// (decided): a looser one would let the scope keep for itself what its publisher,
+			// or this plane's floor, sends to the owners.
 			let looser = match escalation.test {
 				EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => amount_above(&t.value, &escalation.default_threshold),
-				EscalationTest::AbsBpsAbove => match (t.value.parse::<u64>(), escalation.default_threshold.parse::<u64>()) {
+				EscalationTest::AbsBpsAbove | EscalationTest::CountAbove => match (t.value.parse::<u64>(), escalation.default_threshold.parse::<u64>()) {
 					(Ok(value), Ok(default)) => value > default,
 					_ => true,
 				},
@@ -515,7 +519,12 @@ pub fn fired_escalations(kind: &ApprovalKind, fields: &[Field], policy: &ScopePo
 	kind.escalations
 		.iter()
 		.filter(|e| {
-			let threshold = policy.threshold_of(&kind.name, &e.parameter, &e.default_threshold);
+			// Never looser than the default the kind is measured by: a policy installed before
+			// the floor existed may hold an override above it.
+			let Some(threshold) = crate::floors::stricter(e.test, policy.threshold_of(&kind.name, &e.parameter, &e.default_threshold), &e.default_threshold) else {
+				return true;
+			};
+			let threshold = threshold.as_str();
 			let value = value_of(fields, &e.field_key);
 			// A field that cannot be compared — absent, of another type, in another currency —
 			// escalates: what this plane cannot measure goes to the owners (fail safe). Only
@@ -540,6 +549,7 @@ pub fn fired_escalations(kind: &ApprovalKind, fields: &[Field], policy: &ScopePo
 				}
 				EscalationTest::AbsBpsAbove => !matches!(value, Some(FieldValue::Bps(bps)) if threshold.parse::<u64>().is_ok_and(|limit| bps.unsigned_abs() <= limit)),
 				EscalationTest::FlagSet => matches!(value, Some(FieldValue::Flag(true))),
+				EscalationTest::CountAbove => !matches!(value, Some(FieldValue::Count(n)) if threshold.parse::<u64>().is_ok_and(|limit| n <= limit)),
 			}
 		})
 		.map(|e| e.parameter.clone())
@@ -907,16 +917,17 @@ impl Decision {
 		self.transition(ApprovalEvent::Voted);
 		let seated = || self.voters.iter().filter(|x| !unseated.contains(&x.user_id));
 		let fors = seated().filter(|x| x.vote == Vote::For).count();
-		// What could still carry it: seated FORs and seated votes not cast yet. Neither
-		// vote of someone who lost the seat counts, either way.
-		let reachable = seated().filter(|x| x.vote != Vote::Against).count();
+		// Rejected only by seated AGAINSTs, more than the roster could spare (review of
+		// #140): a seat lost is not a vote against, so what can no longer be carried for
+		// want of seats waits out its lifetime rather than being decided by a removal.
+		let againsts = seated().filter(|x| x.vote == Vote::Against).count();
 		let threshold = usize::try_from(self.threshold).unwrap_or(usize::MAX);
 		if fors >= threshold {
 			self.state = ApprovalState::Passed;
 			self.passed_at = Some(now);
 			self.executable_at = Some(now.saturating_add(self.delay_secs));
 			self.transition(ApprovalEvent::Passed);
-		} else if reachable < threshold {
+		} else if againsts > self.voters.len().saturating_sub(threshold) {
 			self.close(ApprovalState::Rejected, ApprovalEvent::Rejected, now);
 		}
 		Ok(())
@@ -1257,16 +1268,18 @@ mod tests {
 	}
 
 	#[test]
-	fn a_vote_that_can_no_longer_be_won_is_lost() {
+	fn only_seated_againsts_reject() {
 		let roster = [uid(), uid(), uid()];
 		let mut d = Decision::open(&roster, 2, 0, 1000);
 		d.vote(roster[0], Vote::For, 1, &[]).unwrap();
 		d.vote(roster[1], Vote::Against, 2, &[roster[0]]).unwrap();
-		assert_eq!(d.state, ApprovalState::Rejected, "one seated vote left of the two needed");
+		assert_eq!(d.state, ApprovalState::Open, "a lost seat is no vote against");
+		d.vote(roster[2], Vote::Against, 3, &[roster[0]]).unwrap();
+		assert_eq!(d.state, ApprovalState::Rejected, "two seated AGAINSTs of three");
 		let mut d = Decision::open(&roster, 2, 0, 1000);
 		d.vote(roster[0], Vote::Against, 1, &[]).unwrap();
-		d.vote(roster[1], Vote::For, 2, &[roster[0]]).unwrap();
-		assert_eq!(d.state, ApprovalState::Open, "the unseated AGAINST counts no more than a FOR would");
+		d.vote(roster[1], Vote::Against, 2, &[roster[0]]).unwrap();
+		assert_eq!(d.state, ApprovalState::Open, "an unseated AGAINST counts no more than a FOR would");
 	}
 
 	#[test]

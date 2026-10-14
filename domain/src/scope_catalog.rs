@@ -46,15 +46,17 @@ pub enum EscalationTest {
 	Rolling24hAmountAbove,
 	AbsBpsAbove,
 	FlagSet,
+	CountAbove,
 }
 
 impl EscalationTest {
 	/// The one field type each test reads.
-	fn tests(self) -> FieldType {
+	pub(crate) fn tests(self) -> FieldType {
 		match self {
 			Self::AmountAbove | Self::Rolling24hAmountAbove => FieldType::Amount,
 			Self::AbsBpsAbove => FieldType::Bps,
 			Self::FlagSet => FieldType::Flag,
+			Self::CountAbove => FieldType::Count,
 		}
 	}
 }
@@ -178,12 +180,13 @@ impl ApprovalKind {
 				EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => is_canonical_amount(threshold) && is_currency(&escalation.currency),
 				EscalationTest::AbsBpsAbove => is_unsigned_integer(threshold) && escalation.currency.is_empty(),
 				EscalationTest::FlagSet => threshold.is_empty() && escalation.currency.is_empty(),
+				EscalationTest::CountAbove => is_unsigned_integer(threshold) && escalation.currency.is_empty(),
 			};
 			if !shaped {
 				return Err(format!("approval kind `{name}` escalation `{parameter}` has a threshold or currency its test does not take"));
 			}
 		}
-		Ok(())
+		crate::floors::check(self)
 	}
 }
 
@@ -344,8 +347,34 @@ mod tests {
 			assert!(catalog(vec![kind], vec![]).check("bank", &[]).is_err(), "{field_key} {threshold} {currency}");
 		}
 		let mut kind = amount_kind();
-		kind.escalations[0].default_threshold = "1000.5".into();
+		kind.escalations[0].default_threshold = "999.5".into();
 		assert_eq!(catalog(vec![kind], vec![]).check("bank", &[]), Ok(()));
+		let mut kind = amount_kind();
+		kind.escalations[0].default_threshold = "1000.5".into();
+		assert!(catalog(vec![kind], vec![]).check("bank", &[]).is_err(), "above this plane's floor for a transfer");
+	}
+
+	#[test]
+	fn a_count_escalation_takes_an_integer_and_no_currency() {
+		let mut kind = amount_kind();
+		kind.name = "bank:headcount".into();
+		kind.fields[0] = FieldSpec {
+			key: "seats".into(),
+			label: "Seats".into(),
+			field_type: FieldType::Count,
+			required: true,
+			repeated: false,
+		};
+		kind.escalations[0] = Escalation {
+			parameter: "crowd".into(),
+			field_key: "seats".into(),
+			test: EscalationTest::CountAbove,
+			default_threshold: "3".into(),
+			currency: String::new(),
+		};
+		assert_eq!(catalog(vec![kind.clone()], vec![]).check("bank", &[]), Ok(()));
+		kind.escalations[0].currency = "USDT".into();
+		assert!(catalog(vec![kind], vec![]).check("bank", &[]).is_err());
 	}
 
 	#[test]
