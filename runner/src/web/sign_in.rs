@@ -60,11 +60,10 @@ pub(super) fn internal(context: &'static str, err: impl std::fmt::Display) -> Re
 }
 
 /// From this plane or a scope's host, and — when `turnstile` is given — a human. Only for
-/// the routes `origins::SIGN_IN_ROUTES` lists: a route acting on an open session must not
-/// widen its origin through this.
+/// the scope routes `router` lists: a route acting on an open session must not widen its
+/// origin through this.
 pub(super) async fn guard(st: &super::Inner, headers: &HeaderMap, turnstile: Option<&str>) -> Result<(), Refusal> {
-	let origin = headers.get("origin").and_then(|v| v.to_str().ok());
-	if !matches!(origin, Some(origin) if st.sign_in_origin(origin).await) {
+	if !headers.get("origin").and_then(|v| v.to_str().ok()).is_some_and(|origin| st.allowlist.admits(origin)) {
 		return Err(Refusal(StatusCode::FORBIDDEN, "origin"));
 	}
 	let Some(token) = turnstile else { return Ok(()) };

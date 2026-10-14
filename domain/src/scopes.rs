@@ -42,7 +42,6 @@ impl ScopeState {
 		}
 	}
 
-	/// Whether the scope's origins may still start a sign-in.
 	pub fn signs_in(self) -> bool {
 		match self {
 			Self::Active | Self::Frozen => true,

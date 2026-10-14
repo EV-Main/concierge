@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 
 use axum::{
 	Router,
@@ -236,7 +236,7 @@ async fn scope_registry_lists_main_first_and_reads_one_scope() {
 
 /// The web surface over the live registry, plus a CLOSED scope whose host must be
 /// treated like any stranger's.
-async fn sign_in_surface(pool: &PgPool) -> (Router, String) {
+async fn sign_in_surface(pool: &PgPool) -> (Router, String, Arc<SignInAllowlist>) {
 	let closed = tag();
 	let closed_origin = format!("https://{closed}.evinvest.ltd");
 	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, origins, return_paths, state) VALUES ($1, $1, FALSE, 0, ARRAY[$2], ARRAY['/'], 'closed')")
@@ -247,8 +247,9 @@ async fn sign_in_surface(pool: &PgPool) -> (Router, String) {
 		.unwrap();
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let mut sign_in = common::sign_in_with_turnstile(pool, &common::stub_turnstile().await);
-	// Re-read on every request, so a test sees the registry change it just made.
-	sign_in.allowlist = Arc::new(SignInAllowlist::live(Arc::new(PgScopes::new(pool.clone())), PUBLIC, Duration::ZERO).await.unwrap());
+	// Refreshed by the test itself (`refresh`), standing in for the background loop.
+	let allowlist = Arc::new(SignInAllowlist::live(Arc::new(PgScopes::new(pool.clone())), PUBLIC).await.unwrap());
+	sign_in.allowlist = allowlist.clone();
 	let state = web::WebState::try_new(
 		common::signing_auth(users.clone()).await,
 		PUBLIC.to_string(),
@@ -267,7 +268,7 @@ async fn sign_in_surface(pool: &PgPool) -> (Router, String) {
 	)
 	.await
 	.expect("build the web state");
-	(web::router(state), closed_origin)
+	(web::router(state), closed_origin, allowlist)
 }
 
 async fn preflight(router: &Router, path: &str, origin: &str, method: &str) -> (StatusCode, HeaderMap) {
@@ -313,25 +314,27 @@ fn varies_on_origin(headers: &HeaderMap) -> bool {
 #[tokio::test]
 async fn a_scope_host_passes_the_preflight_of_a_sign_in_route() {
 	let pool = pool!();
-	let (router, _) = sign_in_surface(&pool).await;
+	let (router, _, _) = sign_in_surface(&pool).await;
 
 	let (status, headers) = preflight(&router, "/auth/code/request", INVEST, "POST").await;
-	assert_eq!(status, StatusCode::NO_CONTENT);
+	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], INVEST, "exactly the origin, never `*`");
 	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_CREDENTIALS], "true");
 	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_METHODS], "POST");
 	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_HEADERS], "content-type");
+	assert_eq!(headers[header::ACCESS_CONTROL_MAX_AGE], "600");
 	assert!(varies_on_origin(&headers));
 
 	let (status, headers) = preflight(&router, "/auth/session", "https://sa.evinvest.ltd", "GET").await;
-	assert_eq!(status, StatusCode::NO_CONTENT);
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_METHODS], "GET");
 	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "https://sa.evinvest.ltd");
 }
 
 #[tokio::test]
 async fn nothing_but_a_registered_live_origin_passes_the_preflight() {
 	let pool = pool!();
-	let (router, closed_origin) = sign_in_surface(&pool).await;
+	let (router, closed_origin, _) = sign_in_surface(&pool).await;
 	for origin in [
 		"https://evil.example",
 		"null",
@@ -343,20 +346,22 @@ async fn nothing_but_a_registered_live_origin_passes_the_preflight() {
 		"https://INVEST.evinvest.ltd",
 		closed_origin.as_str(),
 	] {
-		let (status, headers) = preflight(&router, "/auth/code/request", origin, "POST").await;
-		assert_ne!(status, StatusCode::NO_CONTENT, "{origin}");
+		let (_, headers) = preflight(&router, "/auth/code/request", origin, "POST").await;
+		// The verdict is `Access-Control-Allow-Origin` alone: tower-http's layer sends the
+		// static `Allow-Credentials` on every answer, and without the origin a browser
+		// lets the page read nothing.
 		assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "{origin}");
-		assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS), "{origin}");
 	}
-	// A registered origin asking for a method the route does not take.
+	// A registered origin asking for a method the route does not take is offered only the
+	// one it does, which a browser then refuses to send.
 	let (_, headers) = preflight(&router, "/auth/session", INVEST, "DELETE").await;
-	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_METHODS], "GET");
 }
 
 #[tokio::test]
 async fn a_route_acting_on_an_open_session_answers_no_scope_host() {
 	let pool = pool!();
-	let (router, _) = sign_in_surface(&pool).await;
+	let (router, _, _) = sign_in_surface(&pool).await;
 	for path in [
 		"/auth/email/verify/request",
 		"/auth/email/verify/confirm",
@@ -378,7 +383,7 @@ async fn a_route_acting_on_an_open_session_answers_no_scope_host() {
 #[tokio::test]
 async fn a_scope_host_requests_a_code_and_reads_the_answer() {
 	let pool = pool!();
-	let (router, _) = sign_in_surface(&pool).await;
+	let (router, _, _) = sign_in_surface(&pool).await;
 	let email = format!("scope-{}@example.com", Uuid::new_v4().simple());
 	let (status, headers, body) = call(&router, Method::POST, "/auth/code/request", INVEST, Some(json!({ "email": email, "turnstileToken": "human" }))).await;
 	assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
@@ -392,7 +397,7 @@ async fn a_scope_host_requests_a_code_and_reads_the_answer() {
 #[tokio::test]
 async fn a_credential_post_from_any_other_origin_is_refused() {
 	let pool = pool!();
-	let (router, closed_origin) = sign_in_surface(&pool).await;
+	let (router, closed_origin, _) = sign_in_surface(&pool).await;
 	let body = json!({ "email": "x@example.com", "turnstileToken": "human" });
 	for origin in [
 		"https://evil.example",
@@ -416,7 +421,7 @@ async fn a_credential_post_from_any_other_origin_is_refused() {
 #[tokio::test]
 async fn the_session_read_from_a_scope_host_carries_no_token() {
 	let pool = pool!();
-	let (router, _) = sign_in_surface(&pool).await;
+	let (router, _, _) = sign_in_surface(&pool).await;
 	let (status, headers, body) = call(&router, Method::GET, "/auth/session", INVEST, None).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], INVEST);
@@ -589,31 +594,34 @@ async fn a_missing_bundle_directory_is_not_mounted() {
 #[tokio::test]
 async fn a_closed_scope_or_a_removed_origin_stops_signing_in_without_a_restart() {
 	let pool = pool!();
-	let (router, _) = sign_in_surface(&pool).await;
+	let (router, _, allowlist) = sign_in_surface(&pool).await;
 	let id = tag();
 	let origin = format!("https://{id}.evinvest.ltd");
+	let admitted = |headers: &HeaderMap| headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN);
 	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, origins, return_paths) VALUES ($1, $1, FALSE, 0, ARRAY[$2], ARRAY['/'])")
 		.bind(&id)
 		.bind(&origin)
 		.execute(&pool)
 		.await
 		.unwrap();
-	assert_eq!(
-		preflight(&router, "/auth/code/request", &origin, "POST").await.0,
-		StatusCode::NO_CONTENT,
+	assert!(
+		!admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1),
+		"nothing waits on the database: the snapshot in hand answers"
+	);
+	assert!(allowlist.refresh().await, "a new scope is a new snapshot");
+	assert!(
+		admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1),
 		"registered after the router was built"
 	);
+	assert!(!allowlist.refresh().await, "nothing changed, nothing is rebuilt");
 
 	sqlx::query("UPDATE tenants SET state = 'frozen' WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
-	assert_eq!(
-		preflight(&router, "/auth/code/request", &origin, "POST").await.0,
-		StatusCode::NO_CONTENT,
-		"a frozen scope still signs in"
-	);
+	allowlist.refresh().await;
+	assert!(admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1), "a frozen scope still signs in");
 
 	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
-	let (_, headers) = preflight(&router, "/auth/code/request", &origin, "POST").await;
-	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "closed");
+	assert!(allowlist.refresh().await);
+	assert!(!admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1), "closed");
 	let (status, _, body) = call(
 		&router,
 		Method::POST,
@@ -629,8 +637,8 @@ async fn a_closed_scope_or_a_removed_origin_stops_signing_in_without_a_restart()
 		.execute(&pool)
 		.await
 		.unwrap();
-	let (_, headers) = preflight(&router, "/auth/code/request", &origin, "POST").await;
-	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "removed");
+	allowlist.refresh().await;
+	assert!(!admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1), "removed");
 }
 
 /// A row that does not decode costs its own scope, never the plane's start. The CHECKs
@@ -660,8 +668,8 @@ async fn a_malformed_registry_row_is_left_out_not_fatal() {
 	assert_eq!(ids, vec!["invest", "sa"], "the two bad rows are left out");
 	assert!(repo.scope("nulls").await.unwrap().is_none());
 	assert!(repo.scope("invest").await.unwrap().is_some());
-	let allowlist = SignInAllowlist::live(repo, PUBLIC, Duration::ZERO).await.expect("the allowlist builds over a bad row");
-	assert!(allowlist.admits(INVEST).await);
+	let allowlist = SignInAllowlist::live(repo, PUBLIC).await.expect("the allowlist builds over a bad row");
+	assert!(allowlist.admits(INVEST));
 
 	scratch.drop_database().await;
 }

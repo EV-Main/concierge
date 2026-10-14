@@ -1,22 +1,22 @@
 //! The live sign-in allowlist: the scope origins the sign-in routes, the passkey verifier,
-//! OAuth `returnTo` and the MFE bundles answer, re-read from the registry at most
-//! [`REFRESH_EVERY`] apart.
+//! OAuth `returnTo` and the MFE bundles answer.
 //!
 //! Live and not a boot snapshot, because the answer must follow the registry: a scope
 //! that is CLOSED, or an origin that is removed, has to stop being let in without anyone
-//! restarting the plane. Cached and not read per request, because preflights are hot and
-//! the answer changes on the scale of migrations.
+//! restarting the plane. Refreshed in the background ([`run_refresh`]) and never on a
+//! request's path, so a slow or unreachable database costs a request nothing — it is
+//! answered from the snapshot in hand.
 
 use std::{
 	sync::{Arc, RwLock},
-	time::{Duration, Instant},
+	time::Duration,
 };
 
 use color_eyre::eyre::{Context, Result};
 use webauthn_rs::Webauthn;
 
 use crate::{
-	ports::ScopeRepository,
+	ports::{ScopeRecord, ScopeRepository},
 	web::{origins::ScopeOrigins, passkey},
 };
 
@@ -29,91 +29,101 @@ pub const REFRESH_EVERY: Duration = Duration::from_secs(30);
 pub struct Snapshot {
 	pub origins: ScopeOrigins,
 	pub webauthn: Arc<Webauthn>,
+	/// `(id, version)` of every scope it was built from. Every change to a scope bumps
+	/// its version (migration 0031's triggers), so an equal key means nothing to rebuild.
+	key: Vec<(String, u64)>,
 }
 
 pub struct SignInAllowlist {
 	public_origin: String,
-	/// `None` ⇒ a fixed allowlist that never refreshes (tests, a plane with no registry).
+	/// `None` ⇒ never refreshed: tests, and a plane with nothing to read it from.
 	source: Option<Arc<dyn ScopeRepository>>,
-	ttl: Duration,
-	current: RwLock<(Instant, Arc<Snapshot>)>,
-	/// One refresh at a time: the others keep answering from the snapshot they have.
-	refreshing: tokio::sync::Mutex<()>,
+	current: RwLock<Arc<Snapshot>>,
 }
 
 impl SignInAllowlist {
-	/// Read the registry now — a plane that cannot read it at boot does not start — and
-	/// again whenever the reading is older than `ttl`.
-	pub async fn live(repo: Arc<dyn ScopeRepository>, public_origin: &str, ttl: Duration) -> Result<Self> {
+	/// A plane that cannot read the registry at boot does not start: it would otherwise
+	/// begin by refusing every scope host it is meant to serve.
+	pub async fn live(repo: Arc<dyn ScopeRepository>, public_origin: &str) -> Result<Self> {
 		let scopes = repo.scopes().await.context("failed to read the scope registry")?;
-		let snapshot = snapshot(public_origin, ScopeOrigins::from_scopes(&scopes))?;
-		Ok(Self::new(public_origin, Some(repo), ttl, snapshot))
+		let snapshot = snapshot(public_origin, &scopes)?;
+		Ok(Self::new(public_origin, Some(repo), snapshot))
 	}
 
-	/// An allowlist that never changes.
 	pub fn fixed(public_origin: &str, origins: ScopeOrigins) -> Result<Self> {
-		let snapshot = snapshot(public_origin, origins)?;
-		Ok(Self::new(public_origin, None, Duration::ZERO, snapshot))
+		let webauthn = Arc::new(passkey::verifier(public_origin, origins.origins())?);
+		Ok(Self::new(public_origin, None, Snapshot { origins, webauthn, key: Vec::new() }))
 	}
 
-	fn new(public_origin: &str, source: Option<Arc<dyn ScopeRepository>>, ttl: Duration, snapshot: Snapshot) -> Self {
+	fn new(public_origin: &str, source: Option<Arc<dyn ScopeRepository>>, snapshot: Snapshot) -> Self {
 		Self {
 			public_origin: public_origin.trim_end_matches('/').to_owned(),
 			source,
-			ttl,
-			current: RwLock::new((Instant::now(), Arc::new(snapshot))),
-			refreshing: tokio::sync::Mutex::new(()),
+			current: RwLock::new(Arc::new(snapshot)),
 		}
 	}
 
-	/// The current reading, refreshed first when it is due. A failed refresh keeps the
-	/// previous reading — an outage of the registry must not sign everyone out of every
-	/// scope host — and is retried a `ttl` later.
-	pub async fn current(&self) -> Arc<Snapshot> {
+	pub fn current(&self) -> Arc<Snapshot> {
+		// The value is replaced in one assignment, so a lock poisoned by a panic elsewhere
+		// still guards a whole snapshot.
+		self.current.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+	}
+
+	pub fn admits(&self, origin: &str) -> bool {
+		origin == self.public_origin || self.current().origins.admits(origin)
+	}
+
+	/// Read the registry and swap the snapshot when a scope changed. Returns whether it
+	/// did. A failed read keeps the snapshot in hand: an outage of the registry must not
+	/// sign everyone out of every scope host.
+	pub async fn refresh(&self) -> bool {
 		let Some(repo) = &self.source else {
-			return self.read().1;
+			return false;
 		};
-		let (taken, previous) = self.read();
-		if taken.elapsed() < self.ttl {
-			return previous;
-		}
-		let _refresh = self.refreshing.lock().await;
-		let (taken, previous) = self.read();
-		if taken.elapsed() < self.ttl {
-			return previous;
-		}
-		let next = match repo.scopes().await {
-			Ok(scopes) => match snapshot(&self.public_origin, ScopeOrigins::from_scopes(&scopes)) {
-				Ok(next) => Arc::new(next),
-				Err(e) => {
-					tracing::error!(error = ?e, "sign-in allowlist not rebuilt; keeping the previous one");
-					previous
-				}
-			},
+		let scopes = match repo.scopes().await {
+			Ok(scopes) => scopes,
 			Err(e) => {
 				tracing::error!(error = %e, "scope registry unreadable; keeping the previous sign-in allowlist");
-				previous
+				return false;
 			}
 		};
-		*self.current.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = (Instant::now(), next.clone());
-		next
-	}
-
-	/// Whether a sign-in route may be called from `origin`: this plane's own, or a host of
-	/// a scope that signs people in.
-	pub async fn admits(&self, origin: &str) -> bool {
-		origin == self.public_origin || self.current().await.origins.admits(origin)
-	}
-
-	fn read(&self) -> (Instant, Arc<Snapshot>) {
-		// A panic while holding the lock leaves a whole value behind (it is replaced in
-		// one assignment), so a poisoned lock is still a good reading.
-		let guard = self.current.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-		(guard.0, guard.1.clone())
+		if key_of(&scopes) == self.current().key {
+			return false;
+		}
+		match snapshot(&self.public_origin, &scopes) {
+			Ok(next) => {
+				*self.current.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(next);
+				tracing::info!(scopes = scopes.len(), "sign-in allowlist rebuilt from the scope registry");
+				true
+			}
+			Err(e) => {
+				tracing::error!(error = ?e, "sign-in allowlist not rebuilt; keeping the previous one");
+				false
+			}
+		}
 	}
 }
 
-fn snapshot(public_origin: &str, origins: ScopeOrigins) -> Result<Snapshot> {
+pub async fn run_refresh(allowlist: Arc<SignInAllowlist>, every: Duration) {
+	let mut ticks = tokio::time::interval(every);
+	// A tick missed while a read was slow is not owed: one fresh read covers them all.
+	ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	loop {
+		ticks.tick().await;
+		allowlist.refresh().await;
+	}
+}
+
+fn key_of(scopes: &[ScopeRecord]) -> Vec<(String, u64)> {
+	scopes.iter().map(|s| (s.id.clone(), s.version)).collect()
+}
+
+fn snapshot(public_origin: &str, scopes: &[ScopeRecord]) -> Result<Snapshot> {
+	let origins = ScopeOrigins::from_scopes(scopes);
 	let webauthn = Arc::new(passkey::verifier(public_origin, origins.origins())?);
-	Ok(Snapshot { origins, webauthn })
+	Ok(Snapshot {
+		origins,
+		webauthn,
+		key: key_of(scopes),
+	})
 }

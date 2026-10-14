@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use webauthn_rs::{
 	Webauthn, WebauthnBuilder,
-	prelude::{DiscoverableAuthentication, DiscoverableKey, Passkey, PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential, Url},
+	prelude::{DiscoverableKey, Passkey, PublicKeyCredential, RegisterPublicKeyCredential, Url},
 };
 
 use crate::{
@@ -114,11 +114,8 @@ pub async fn register_options(State(st): State<WebState>, jar: CookieJar, header
 			.collect::<Result<Vec<_>, _>>()
 			.map_err(|e| internal("passkey: a stored passkey does not parse", e))?;
 		let label = user.username().map_or(user.email().as_str(), |u| u.as_str());
-		let (options, state) = st
-			.allowlist
-			.current()
-			.await
-			.webauthn
+		let webauthn = st.allowlist.current().webauthn.clone();
+		let (options, state) = webauthn
 			.start_passkey_registration(id.raw(), user.email().as_str(), label, Some(exclude))
 			.map_err(|e| internal("passkey: registration not begun", e))?;
 		let mut options = serde_json::to_value(options).map_err(|e| internal("passkey: options not serialized", e))?;
@@ -126,7 +123,7 @@ pub async fn register_options(State(st): State<WebState>, jar: CookieJar, header
 		// sign in to an account named first, which this flow never does.
 		options["publicKey"]["authenticatorSelection"]["residentKey"] = json!("required");
 		options["publicKey"]["authenticatorSelection"]["requireResidentKey"] = json!(true);
-		let ceremony = st.passkey_registrations.put((id, state)).await;
+		let ceremony = st.passkey_registrations.put((id, state, webauthn)).await;
 		Ok(Json(json!({ "ceremony": ceremony, "options": options })))
 	}
 	.await;
@@ -152,11 +149,11 @@ pub async fn register_verify(State(st): State<WebState>, jar: CookieJar, headers
 		if name.is_empty() || name.chars().count() > 64 {
 			return Err(Refusal::new(axum::http::StatusCode::BAD_REQUEST, "invalid_name"));
 		}
-		let (owner, state): (UserId, PasskeyRegistration) = st.passkey_registrations.take(&body.ceremony).await.ok_or_else(expired)?;
+		let (owner, state, webauthn) = st.passkey_registrations.take(&body.ceremony).await.ok_or_else(expired)?;
 		if owner != id {
 			return Err(expired());
 		}
-		let passkey = st.allowlist.current().await.webauthn.finish_passkey_registration(&body.credential, &state).map_err(|e| {
+		let passkey = webauthn.finish_passkey_registration(&body.credential, &state).map_err(|e| {
 			tracing::info!(error = %e, "passkey: registration refused");
 			rejected()
 		})?;
@@ -180,14 +177,9 @@ pub async fn register_verify(State(st): State<WebState>, jar: CookieJar, headers
 pub async fn signin_options(State(st): State<WebState>, headers: HeaderMap) -> Result<Json<Value>, Refusal> {
 	let st = &st.inner;
 	guard(st, &headers, None).await?;
-	let (options, state) = st
-		.allowlist
-		.current()
-		.await
-		.webauthn
-		.start_discoverable_authentication()
-		.map_err(|e| internal("passkey: sign-in not begun", e))?;
-	let ceremony = st.passkey_sign_ins.put(state).await;
+	let webauthn = st.allowlist.current().webauthn.clone();
+	let (options, state) = webauthn.start_discoverable_authentication().map_err(|e| internal("passkey: sign-in not begun", e))?;
+	let ceremony = st.passkey_sign_ins.put((state, webauthn)).await;
 	Ok(Json(json!({ "ceremony": ceremony, "options": options })))
 }
 
@@ -202,8 +194,8 @@ pub struct SigninVerify {
 pub async fn signin_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<SigninVerify>) -> Result<(CookieJar, Json<Value>), Refusal> {
 	let st = &st.inner;
 	guard(st, &headers, None).await?;
-	let state: DiscoverableAuthentication = st.passkey_sign_ins.take(&body.ceremony).await.ok_or_else(expired)?;
-	let (account, credential_id) = st.allowlist.current().await.webauthn.identify_discoverable_authentication(&body.credential).map_err(|e| {
+	let (state, webauthn) = st.passkey_sign_ins.take(&body.ceremony).await.ok_or_else(expired)?;
+	let (account, credential_id) = webauthn.identify_discoverable_authentication(&body.credential).map_err(|e| {
 		tracing::info!(error = %e, "passkey: assertion names no account");
 		rejected()
 	})?;
@@ -212,11 +204,7 @@ pub async fn signin_verify(State(st): State<WebState>, jar: CookieJar, headers: 
 	let stored = st.credentials.passkeys(account).await.map_err(|e| internal("passkey: credentials not read", e))?;
 	let row = stored.into_iter().find(|row| row.credential_id == credential_id).ok_or_else(rejected)?;
 	let mut passkey: Passkey = serde_json::from_value(row.passkey).map_err(|e| internal("passkey: a stored passkey does not parse", e))?;
-	let result = st
-		.allowlist
-		.current()
-		.await
-		.webauthn
+	let result = webauthn
 		.finish_discoverable_authentication(&body.credential, state, &[DiscoverableKey::from(&passkey)])
 		.map_err(|e| {
 			tracing::info!(error = %e, "passkey: assertion refused");

@@ -34,7 +34,8 @@ mod turnstile;
 use std::sync::Arc;
 
 use axum::{
-	Router, middleware,
+	Router,
+	http::Method,
 	routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
@@ -48,7 +49,10 @@ pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
 use tokio::sync::Notify;
 pub use turnstile::{SITEVERIFY, Turnstile};
-use webauthn_rs::prelude::{DiscoverableAuthentication, PasskeyRegistration};
+use webauthn_rs::{
+	Webauthn,
+	prelude::{DiscoverableAuthentication, PasskeyRegistration},
+};
 
 use crate::{
 	ports::{CredentialRepository, GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
@@ -184,27 +188,42 @@ pub struct KycDeps {
 /// The auth surface, mounted behind the conductor's `/api` prefix rewrites:
 /// `/api/auth/:rest*` → `/auth/:rest*`, `/api/callback/auth/*` → `/callback/auth/*`.
 pub fn router(state: WebState) -> Router {
+	// The routes a scope's host may call — closed on purpose (`docs/SCOPES-AND-APPROVALS.md`
+	// §3.1). Everything acting on an open session (email verification, password set,
+	// passkey register/remove, sessions, username, logout, `/kyc/*`) stays off this list:
+	// those carry the CSRF double-submit, whose cookie a scope host cannot read, and a
+	// script there must be able to start a sign-in but never act for the account. A scope
+	// host proves a mailbox by signing in with a code.
+	//
+	// `.layer` on these sub-routers and not `route_layer`: a route layer runs only for a
+	// method the route has, so the OPTIONS preflight of a POST route would never reach
+	// the CORS layer.
+	let allowlist = state.inner.allowlist.clone();
+	let scope_posts = Router::new()
+		.route("/auth/code/request", post(sign_in::request_code))
+		.route("/auth/code/verify", post(sign_in::verify_code))
+		.route("/auth/password/signup", post(sign_in::sign_up))
+		.route("/auth/password/signin", post(sign_in::sign_in))
+		.route("/auth/passkey/signin/options", post(passkey::signin_options))
+		.route("/auth/passkey/signin/verify", post(passkey::signin_verify))
+		.layer(cors::layer(allowlist.clone(), Method::POST));
+	let scope_reads = Router::new().route("/auth/session", get(routes::session)).layer(cors::layer(allowlist, Method::GET));
 	Router::new()
+		.merge(scope_posts)
+		.merge(scope_reads)
 		// k8s liveness/readiness probe target — the only unauthenticated route.
 		.route("/health", get(|| async { "ok" }))
 		.route("/auth/login", get(routes::login))
 		.route("/callback/auth/{provider}", get(routes::callback))
-		.route("/auth/session", get(routes::session))
 		.route("/auth/logout", post(routes::logout))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
-		.route("/auth/code/request", post(sign_in::request_code))
-		.route("/auth/code/verify", post(sign_in::verify_code))
 		.route("/auth/email/verify/request", post(sign_in::request_verification))
 		.route("/auth/email/verify/confirm", post(sign_in::confirm_verification))
-		.route("/auth/password/signup", post(sign_in::sign_up))
-		.route("/auth/password/signin", post(sign_in::sign_in))
 		.route("/auth/password/set", post(sign_in::set_password))
 		.route("/auth/username", post(sign_in::set_username))
 		.route("/auth/methods", get(sign_in::methods))
 		.route("/auth/passkey/register/options", post(passkey::register_options))
 		.route("/auth/passkey/register/verify", post(passkey::register_verify))
-		.route("/auth/passkey/signin/options", post(passkey::signin_options))
-		.route("/auth/passkey/signin/verify", post(passkey::signin_verify))
 		.route("/auth/passkey/remove", post(passkey::remove))
 		// The relying-party code flow's front door. It needs no CSRF token: it changes
 		// nothing a cross-site request could exploit — it only ever redirects to an
@@ -219,17 +238,7 @@ pub fn router(state: WebState) -> Router {
 		// facts of THIS plane, and the cabinet needs them even while Didit is down.
 		.route("/kyc/status", get(kyc::status))
 		.route("/kyc/callback/didit", post(kyc::callback))
-		.layer(middleware::from_fn_with_state(state.clone(), cors::sign_in))
 		.with_state(state)
-}
-impl Inner {
-	/// Whether a sign-in route may be called from `origin`: this plane's own, or a host of
-	/// a scope that still signs people in. Only the routes in `origins::SIGN_IN_ROUTES`
-	/// may ask; everything acting on an open session compares against `PUBLIC_ORIGIN`
-	/// alone.
-	async fn sign_in_origin(&self, origin: &str) -> bool {
-		origin == self.public_origin || self.allowlist.admits(origin).await
-	}
 }
 
 /// An opaque identifier: `n` bytes of CSPRNG entropy, base64url-encoded (no padding).
@@ -259,8 +268,10 @@ struct Inner {
 	credentials: Arc<dyn CredentialRepository>,
 	mail_wake: Arc<Notify>,
 	allowlist: Arc<SignInAllowlist>,
-	passkey_registrations: Ceremonies<(UserId, PasskeyRegistration)>,
-	passkey_sign_ins: Ceremonies<DiscoverableAuthentication>,
+	/// Each ceremony keeps the verifier that began it, so both halves check against one
+	/// reading of the allowlist even if it is rebuilt in between.
+	passkey_registrations: Ceremonies<(UserId, PasskeyRegistration, Arc<Webauthn>)>,
+	passkey_sign_ins: Ceremonies<(DiscoverableAuthentication, Arc<Webauthn>)>,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
 	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/<provider>`.
 	public_origin: String,

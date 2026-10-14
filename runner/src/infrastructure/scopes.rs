@@ -62,8 +62,7 @@ impl TryFrom<ScopeRow> for ScopeRecord {
 }
 
 impl PgScopes {
-	/// Every scope, or the one `id` names. One statement, so a scope and its clients are
-	/// read from the same snapshot.
+	/// One statement, so a scope and its clients are read from the same snapshot.
 	///
 	/// A row that does not decode is skipped at `error!`, never returned as an error: the
 	/// registry is read at boot and on every refresh of the sign-in allowlist, and one bad

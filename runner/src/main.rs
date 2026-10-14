@@ -179,11 +179,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.await
 		.context("failed to load the relying-party registry")?;
 	// The scope registry. Its origins widen the sign-in routes' CORS and `Origin` check,
-	// the passkey verifier, OAuth `returnTo` and the MFE bundles' CORS; the allowlist
-	// re-reads it at most `REFRESH_EVERY` apart, so closing a scope needs no restart.
+	// the passkey verifier, OAuth `returnTo` and the MFE bundles' CORS; the allowlist is
+	// refreshed in the background (below, beside the dispatch loops), so closing a scope
+	// needs no restart.
 	let scope_repo: Arc<dyn concierge::ports::ScopeRepository> = Arc::new(infrastructure::scopes::PgScopes::new(pool.clone()));
 	let allowlist = Arc::new(
-		web::allowlist::SignInAllowlist::live(scope_repo.clone(), &config.public_origin, web::allowlist::REFRESH_EVERY)
+		web::allowlist::SignInAllowlist::live(scope_repo.clone(), &config.public_origin)
 			.await
 			.context("failed to build the sign-in allowlist")?,
 	);
@@ -312,6 +313,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// running for a stale proposal to be unusable — a hold's lapse must be a WRITE: the
 	// money plane learns an account is unfrozen only from a `user_outbox` row. If this
 	// loop stops, one operator's 24h brake quietly becomes indefinite.
+	tokio::spawn(web::allowlist::run_refresh(allowlist.clone(), web::allowlist::REFRESH_EVERY));
 	tokio::spawn(concierge::dispatch::run_hold_sweep(
 		users.clone(),
 		std::time::Duration::from_secs(config.hold_sweep_interval_secs),

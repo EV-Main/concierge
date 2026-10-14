@@ -47,7 +47,7 @@ pub struct MfeAssets {
 }
 
 impl MfeAssets {
-	/// The directory, resolved once so every request is checked against its real path.
+	// Resolved once, so every request is checked against the directory's real path.
 	pub fn open(dir: &Path, allowlist: Arc<SignInAllowlist>) -> Result<Self> {
 		let root = std::fs::canonicalize(dir).with_context(|| format!("WEB_MFE_DIR {} cannot be resolved", dir.display()))?;
 		ensure!(root.is_dir(), "WEB_MFE_DIR {} is not a directory", root.display());
@@ -56,7 +56,6 @@ impl MfeAssets {
 	}
 }
 
-/// Add `/auth/mfe/{*path}` to the auth surface.
 pub fn mount(router: Router, assets: MfeAssets) -> Router {
 	router.merge(Router::new().route("/auth/mfe/{*path}", get(serve)).with_state(Arc::new(assets)))
 }
@@ -84,14 +83,13 @@ async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<Stri
 	headers.append(VARY, HeaderValue::from_static("Origin"));
 	if let Some(origin) = origin
 		&& let Ok(raw) = origin.to_str()
-		&& assets.allowlist.current().await.origins.admits(raw)
+		&& assets.allowlist.current().origins.admits(raw)
 	{
 		headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
 	}
 	response
 }
 
-/// Lifetime and type for what `ServeDir` answered about `name`.
 fn describe(mut response: Response, name: &str) -> Response {
 	let status = response.status();
 	let headers = response.headers_mut();
@@ -105,8 +103,6 @@ fn describe(mut response: Response, name: &str) -> Response {
 	response
 }
 
-/// The file name `path` names under `root`, or `None` for anything that is not a regular
-/// file inside it.
 async fn serveable(root: &Path, path: &str) -> Option<String> {
 	let segments: Vec<&str> = path.split('/').collect();
 	if !segments.iter().all(|s| is_plain_segment(s)) {

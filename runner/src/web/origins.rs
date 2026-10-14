@@ -1,54 +1,12 @@
 //! Sign-in from a scope's hosts (`docs/SCOPES-AND-APPROVALS.md` §3.1): which foreign
 //! origins the sign-in routes answer, and where an OAuth sign-in may land on them.
 //!
-//! Kept current by `allowlist::SignInAllowlist`, which rebuilds a [`ScopeOrigins`] from
-//! the registry.
+//! Which routes they may call is the router's structure (`web::router`); keeping it
+//! current against the registry is `allowlist::SignInAllowlist`'s.
 
 use domain::scopes::{is_return_path, is_sign_in_origin};
 
 use crate::ports::ScopeRecord;
-
-/// Exact path + method of every route a scope origin may call. Closed on purpose: a
-/// route acting on an open session (email verification, password set, passkey
-/// register/remove, sessions, username, logout, `/kyc/*`) answers `PUBLIC_ORIGIN` alone,
-/// so a script on a scope's host can start a sign-in but never act for the account it
-/// signed in. Those routes carry the CSRF double-submit, whose cookie a scope host cannot
-/// read anyway; listing them would only promise a flow that cannot complete. A scope host
-/// proves a mailbox by signing in with a code (`/auth/code/request` + `verify`).
-pub(super) const SIGN_IN_ROUTES: &[SignInRoute] = &[
-	SignInRoute::post("/auth/code/request"),
-	SignInRoute::post("/auth/code/verify"),
-	SignInRoute::post("/auth/password/signin"),
-	SignInRoute::post("/auth/password/signup"),
-	SignInRoute::post("/auth/passkey/signin/options"),
-	SignInRoute::post("/auth/passkey/signin/verify"),
-	SignInRoute {
-		path: "/auth/session",
-		method: "GET",
-		request_headers: "",
-	},
-];
-
-pub(super) struct SignInRoute {
-	pub(super) path: &'static str,
-	pub(super) method: &'static str,
-	/// What a preflight may announce in `Access-Control-Request-Headers`.
-	pub(super) request_headers: &'static str,
-}
-
-impl SignInRoute {
-	const fn post(path: &'static str) -> Self {
-		Self {
-			path,
-			method: "POST",
-			request_headers: "content-type",
-		}
-	}
-}
-
-pub(super) fn sign_in_route(path: &str) -> Option<&'static SignInRoute> {
-	SIGN_IN_ROUTES.iter().find(|route| route.path == path)
-}
 
 /// The origins of every scope that still signs people in, each with the paths an OAuth
 /// sign-in may land on there.
@@ -64,7 +22,6 @@ struct ScopeHosts {
 }
 
 impl ScopeOrigins {
-	/// Nothing but `PUBLIC_ORIGIN` is answered.
 	pub fn none() -> Self {
 		Self::default()
 	}
@@ -93,7 +50,7 @@ impl ScopeOrigins {
 		Self { scopes }
 	}
 
-	/// Whether `origin` is, byte for byte, one of a signing-in scope's origins.
+	/// Byte for byte: no case folding, no default-port normalisation, no prefix.
 	pub fn admits(&self, origin: &str) -> bool {
 		self.origins().any(|o| o == origin)
 	}
@@ -184,27 +141,6 @@ mod tests {
 			"https://invest.evinvest.ltd",
 		] {
 			assert!(!o.is_return_target(bad), "{bad}");
-		}
-	}
-
-	#[test]
-	fn the_route_list_is_closed() {
-		assert!(sign_in_route("/auth/session").is_some_and(|r| r.method == "GET"));
-		for acting in [
-			"/auth/email/verify/request",
-			"/auth/email/verify/confirm",
-			"/auth/password/set",
-			"/auth/passkey/register/options",
-			"/auth/passkey/remove",
-			"/auth/sessions",
-			"/auth/username",
-			"/auth/logout",
-			"/auth/methods",
-			"/kyc/start",
-			"/kyc/status",
-			"/auth/login",
-		] {
-			assert!(sign_in_route(acting).is_none(), "{acting}");
 		}
 	}
 }
