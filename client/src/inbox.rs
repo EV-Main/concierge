@@ -15,6 +15,9 @@
 //!   the user's say, because following a topic turns on mail to their address: they take
 //!   the access token this client was issued for the user, and concierge takes the user
 //!   from it. A non-member is [`ConciergeError::Rejected`] with FAILED_PRECONDITION.
+//! - [`emit_scope_notification`](ConciergeClient::emit_scope_notification) is this client's
+//!   services writing into the inbox, on a topic of its own namespace that its scope catalog
+//!   publishes. A non-member is not an error: nothing is written and `delivered` is false.
 
 use tonic::{Request, metadata::MetadataValue};
 use uuid::Uuid;
@@ -22,8 +25,8 @@ use uuid::Uuid;
 use super::{
 	ConciergeClient, ConciergeError,
 	proto::{
-		GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, ListNotificationsResponse, ListScopeNotificationsRequest, MarkReadResponse, MarkScopeNotificationsReadRequest,
-		NotificationSettings, SetScopeTopicSubscriptionRequest,
+		EmitRequest, EmitResponse, GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, ListNotificationsResponse, ListScopeNotificationsRequest, MarkReadResponse,
+		MarkScopeNotificationsReadRequest, NotificationSettings, SetScopeTopicSubscriptionRequest,
 	},
 };
 
@@ -119,6 +122,14 @@ impl ConciergeClient {
 			},
 		)?;
 		Ok(self.inbox.clone().set_scope_topic_subscription(request).await?.into_inner())
+	}
+
+	/// One notification for `notification.user_id`, idempotent on its `dedupe_key`. Another
+	/// namespace's topic is [`ConciergeError::Rejected`] with PERMISSION_DENIED, one the
+	/// catalog in force does not publish with INVALID_ARGUMENT.
+	pub async fn emit_scope_notification(&self, notification: EmitRequest) -> Result<EmitResponse, ConciergeError> {
+		let request = self.with_credential(notification);
+		Ok(self.inbox.clone().emit_scope_notification(request).await?.into_inner())
 	}
 
 	/// The client credential plus the user's token. `user_id` stays empty: concierge takes

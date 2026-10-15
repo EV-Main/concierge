@@ -35,6 +35,7 @@ use std::{
 use domain::{
 	authz::Notifications as NotificationPermission,
 	error::DomainError,
+	scope_catalog::NotificationTopic,
 	users::{Email, User},
 };
 use evconcierge_auth::{Claims, claims_of};
@@ -182,6 +183,73 @@ impl InboxView {
 /// [`topic_known`] within one inbox: what that inbox offers to follow and to filter on.
 pub async fn topic_offered(notifications: &dyn NotificationRepository, view: &InboxView, key: &str) -> Result<bool, DomainError> {
 	Ok(view.shows(key) && topic_known(notifications, key).await?)
+}
+
+/// The topic a scope's catalog in force publishes under `key`, if any. A key's namespace is
+/// its publisher's (the catalog check holds every topic to it), so the key alone names it.
+pub async fn scope_topic(notifications: &dyn NotificationRepository, key: &str) -> Result<Option<NotificationTopic>, DomainError> {
+	Ok(notifications.scope_topics().await?.into_iter().find(|t| t.topic == key))
+}
+
+/// Where an emit lands once the caller has been settled: the key it is stored under and
+/// the scope whose ACTIVE members alone it reaches (`None`: every account — this plane's
+/// own topics and `bank:`, which the platform inbox shows to everyone).
+pub(crate) struct EmitTarget {
+	pub topic: String,
+	pub scope: Option<String>,
+}
+
+/// The checks every emit makes on the message itself, whoever sends it. Checked here as
+/// well as by the CHECK constraints, so an over-long title is a clear invalid_argument
+/// rather than a constraint violation surfacing as the opaque `unavailable` that
+/// `DomainError::Repository` maps to.
+pub(crate) fn emit_fields(req: &EmitRequest) -> Result<Uuid, Status> {
+	let user_id = Uuid::parse_str(&req.user_id).map_err(|_| Status::invalid_argument("user_id must be a UUID"))?;
+	if req.title.is_empty() || req.title.chars().count() > 200 {
+		return Err(Status::invalid_argument("title must be 1-200 characters"));
+	}
+	if req.body.chars().count() > 2000 {
+		return Err(Status::invalid_argument("body must be at most 2000 characters"));
+	}
+	if req.link.chars().count() > 512 {
+		return Err(Status::invalid_argument("link must be at most 512 characters"));
+	}
+	if req.dedupe_key.is_empty() || req.dedupe_key.chars().count() > 128 {
+		return Err(Status::invalid_argument("dedupe_key must be 1-128 characters"));
+	}
+	if req.kind.is_empty() || req.kind.chars().count() > 64 {
+		return Err(Status::invalid_argument("kind must be 1-64 characters"));
+	}
+	Ok(user_id)
+}
+
+/// The write behind both emit RPCs. A scope's topic for someone who is not an active member
+/// of the scope writes nothing: its inbox is shown to members only, and the mail copy must
+/// not reach further than the inbox does.
+pub(crate) async fn emit_to(notifications: &dyn NotificationRepository, target: &EmitTarget, req: &EmitRequest) -> Result<EmitResponse, Status> {
+	let user_id = emit_fields(req)?;
+	if let Some(scope) = &target.scope
+		&& !notifications.is_active_scope_member(scope, user_id).await.map_err(domain_to_status)?
+	{
+		return Ok(EmitResponse::default());
+	}
+	let occurred_at = if req.occurred_at > 0 { req.occurred_at } else { now_secs() };
+	let outcome = notifications
+		.emit(user_id, &target.topic, &req.kind, &req.title, &req.body, &req.link, &req.dedupe_key, occurred_at)
+		.await
+		.map_err(domain_to_status)?;
+	let mut channels = Vec::new();
+	if outcome.in_app {
+		channels.push(Channel::InApp as i32);
+	}
+	if outcome.email {
+		channels.push(Channel::Email as i32);
+	}
+	Ok(EmitResponse {
+		notification_id: outcome.notification_id.map(|id| id.to_string()).unwrap_or_default(),
+		delivered: !channels.is_empty(),
+		channels,
+	})
 }
 
 /// Fixed-window request counter keyed by caller-supplied identity (an IP).
@@ -481,55 +549,22 @@ impl NotificationService for Notifications {
 	async fn emit(&self, request: Request<EmitRequest>) -> Result<Response<EmitResponse>, Status> {
 		Self::require_service(&request)?;
 		let req = request.into_inner();
-
-		let user_id = Uuid::parse_str(&req.user_id).map_err(|_| Status::invalid_argument("user_id must be a UUID"))?;
+		emit_fields(&req)?;
 		if topic(&req.topic).is_none() {
-			// A scope's topic is emitted only by its own namespace, and a `typ=service`
-			// token names no namespace yet: refused rather than open to every service.
+			// A `typ=service` token names no namespace, so a scope's topic is emitted only
+			// through `ScopeInboxService.EmitScopeNotification`, where the credential does.
 			if topic_known(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)? {
-				return Err(Status::permission_denied("a scope's topic is emitted only by its own namespace's service"));
+				return Err(Status::permission_denied(
+					"a scope's topic is emitted by its own namespace, through ScopeInboxService.EmitScopeNotification",
+				));
 			}
 			return Err(Status::invalid_argument("unknown topic"));
 		}
-		// Checked here as well as by the CHECK constraints, so an over-long title is a
-		// clear invalid_argument rather than a constraint violation surfacing as the
-		// opaque `unavailable` that `DomainError::Repository` maps to.
-		if req.title.is_empty() || req.title.chars().count() > 200 {
-			return Err(Status::invalid_argument("title must be 1-200 characters"));
-		}
-		if req.body.chars().count() > 2000 {
-			return Err(Status::invalid_argument("body must be at most 2000 characters"));
-		}
-		if req.link.chars().count() > 512 {
-			return Err(Status::invalid_argument("link must be at most 512 characters"));
-		}
-		if req.dedupe_key.is_empty() || req.dedupe_key.chars().count() > 128 {
-			return Err(Status::invalid_argument("dedupe_key must be 1-128 characters"));
-		}
-		if req.kind.is_empty() || req.kind.chars().count() > 64 {
-			return Err(Status::invalid_argument("kind must be 1-64 characters"));
-		}
-
-		let occurred_at = if req.occurred_at > 0 { req.occurred_at } else { now_secs() };
-
-		let outcome = self
-			.notifications
-			.emit(user_id, &req.topic, &req.kind, &req.title, &req.body, &req.link, &req.dedupe_key, occurred_at)
-			.await
-			.map_err(domain_to_status)?;
-
-		let mut channels = Vec::new();
-		if outcome.in_app {
-			channels.push(Channel::InApp as i32);
-		}
-		if outcome.email {
-			channels.push(Channel::Email as i32);
-		}
-		Ok(Response::new(EmitResponse {
-			notification_id: outcome.notification_id.map(|id| id.to_string()).unwrap_or_default(),
-			delivered: !channels.is_empty(),
-			channels,
-		}))
+		let target = EmitTarget {
+			topic: req.topic.clone(),
+			scope: None,
+		};
+		Ok(Response::new(emit_to(self.notifications.as_ref(), &target, &req).await?))
 	}
 
 	async fn list_notifications(&self, request: Request<ListNotificationsRequest>) -> Result<Response<ListNotificationsResponse>, Status> {

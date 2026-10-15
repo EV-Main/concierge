@@ -12,7 +12,7 @@ mod common;
 
 use concierge::{
 	infrastructure::{db, grants::PgGrants, notifications::PgNotifications, relying_parties::PgRelyingParties, scope_catalogs::PgScopeCatalogs, users::PgUsers},
-	notification::{MAX_MARK_IDS, TOPICS},
+	notification::{MAX_MARK_IDS, Notifications, RateLimiter, TOPICS},
 	ports::{NotificationRepository, RelyingPartyRepository, ScopeCatalogRepository, UserDirectoryRepository},
 	relying_party::{Admission, ClientTokenAuthenticator, RelyingParties, Requester, s256_challenge},
 	scope_inbox::{ScopeInbox, USER_TOKEN_HEADER},
@@ -22,10 +22,12 @@ use domain::{
 	scope_catalog::{NotificationTopic, ScopeCatalog},
 	users::UserId,
 };
-use evconcierge_auth::{AuthConfig, AuthService, SigningConfig, TokenType, Verifier, VerifierConfig, provisioner_channel};
+use evconcierge_auth::{AuthConfig, AuthService, Claims, SigningConfig, TokenType, Verifier, VerifierConfig, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
-	ExchangeCodeRequest, GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, ListScopeNotificationsRequest, MarkScopeNotificationsReadRequest, SetScopeTopicSubscriptionRequest,
+	EmitRequest, ExchangeCodeRequest, GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, ListScopeNotificationsRequest, MarkScopeNotificationsReadRequest,
+	SetScopeTopicSubscriptionRequest,
 	auth_service_server::{AuthService as AuthRpc, AuthServiceServer},
+	notification_service_server::NotificationService,
 	scope_inbox_service_server::ScopeInboxService,
 };
 use sha2::{Digest, Sha256};
@@ -552,4 +554,162 @@ async fn a_client_never_reaches_another_scope_s_inbox_even_as_its_observer() {
 
 	let own = inbox.list_scope_notifications(as_client(list(user), &b)).await.unwrap().into_inner();
 	assert_eq!(own.notifications.iter().map(|n| n.id.clone()).collect::<Vec<_>>(), vec![of_b.to_string()]);
+}
+
+fn emit(user: Uuid, topic: &str) -> EmitRequest {
+	EmitRequest {
+		user_id: user.to_string(),
+		topic: topic.to_owned(),
+		kind: "news".into(),
+		title: "Something happened".into(),
+		dedupe_key: Uuid::new_v4().to_string(),
+		..Default::default()
+	}
+}
+
+fn as_bridge<T>(body: T) -> Request<T> {
+	let mut request = Request::new(body);
+	request.metadata_mut().insert("authorization", MetadataValue::try_from(format!("Bearer {BRIDGE_TOKEN}")).unwrap());
+	request
+}
+
+impl Fx {
+	async fn follow(&self, user: Uuid, email: &str, topic: &str) {
+		let sub = self.notifications.subscriber_for_user(user, email, true).await.unwrap();
+		self.notifications.set_topic_subscription(sub.id, topic, true, true).await.unwrap();
+	}
+
+	async fn rows_on(&self, user: Uuid, topic: &str) -> i64 {
+		sqlx::query_scalar("SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.topic = $2")
+			.bind(user)
+			.bind(topic)
+			.fetch_one(&self.pool)
+			.await
+			.unwrap()
+	}
+
+	/// `topics` added to the bank's catalog in force, keeping what it already publishes: the
+	/// namespace is shared by every suite on the database.
+	async fn publish_bank(&self, topics: &[NotificationTopic]) {
+		let catalogs = PgScopeCatalogs::new(self.pool.clone());
+		loop {
+			let mut catalog = catalogs.current("bank").await.unwrap().unwrap_or(ScopeCatalog {
+				version: 0,
+				approval_kinds: Vec::new(),
+				notification_topics: Vec::new(),
+			});
+			catalog.notification_topics.retain(|t| topics.iter().all(|mine| mine.topic != t.topic));
+			catalog.notification_topics.extend(topics.iter().cloned());
+			catalog.version = catalog.version.max(now() as u64) + 1;
+			catalogs.publish("bank", "bridge", &catalog, now()).await.unwrap();
+			let current = catalogs.current("bank").await.unwrap().unwrap();
+			if topics.iter().all(|t| current.notification_topics.contains(t)) {
+				return;
+			}
+		}
+	}
+}
+
+/// A service emits on its own namespace's published topics only, and only to the scope's
+/// members: the client credential is what binds it to a namespace.
+#[tokio::test]
+async fn a_service_emits_only_its_own_namespace_s_published_topics_to_members() {
+	let Some(fx) = setup().await else { return };
+	let mine = fx.scope(&[]).await;
+	let other = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&mine, &other]);
+	let (member, email) = fx.user("emit-member").await;
+	fx.join(&mine, member).await;
+	fx.follow(member, &email, &mine.topic).await;
+	let (outsider, outsider_email) = fx.user("emit-outsider").await;
+	fx.follow(outsider, &outsider_email, &mine.topic).await;
+
+	let sent = inbox.emit_scope_notification(as_client(emit(member, &mine.topic), &mine)).await.unwrap().into_inner();
+	assert!(sent.delivered && !sent.notification_id.is_empty(), "{sent:?}");
+	assert_eq!(sent.channels, vec![1, 2], "in-app and the mail copy of a verified address");
+	assert_eq!(fx.rows_on(member, &mine.topic).await, 1);
+
+	let stranger = inbox.emit_scope_notification(as_client(emit(outsider, &mine.topic), &mine)).await.unwrap().into_inner();
+	assert!(
+		!stranger.delivered && stranger.notification_id.is_empty(),
+		"a follower outside the scope gets nothing: {stranger:?}"
+	);
+	assert_eq!(fx.rows_on(outsider, &mine.topic).await, 0, "and nothing is written for them");
+
+	for (topic, code) in [
+		(other.topic.as_str(), Code::PermissionDenied),
+		(TOPICS[0].key, Code::PermissionDenied),
+		("bank:anything", Code::PermissionDenied),
+		(&*format!("{}:unpublished", mine.id), Code::InvalidArgument),
+	] {
+		let refused = inbox.emit_scope_notification(as_client(emit(member, topic), &mine)).await.unwrap_err();
+		assert_eq!(refused.code(), code, "{topic}: {refused:?}");
+	}
+	let mut bad = emit(member, &mine.topic);
+	bad.title.clear();
+	assert_eq!(inbox.emit_scope_notification(as_client(bad, &mine)).await.unwrap_err().code(), Code::InvalidArgument);
+
+	let wrong = inbox
+		.emit_scope_notification(with_client(emit(member, &mine.topic), &mine.client, "not-the-secret"))
+		.await
+		.unwrap_err();
+	assert_eq!(wrong.code(), Code::Unauthenticated);
+	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1").bind(&mine.id).execute(&fx.pool).await.unwrap();
+	let closed = inbox.emit_scope_notification(as_client(emit(member, &mine.topic), &mine)).await.unwrap_err();
+	assert_eq!(closed.code(), Code::FailedPrecondition);
+	assert_eq!(fx.rows_on(member, &mine.topic).await, 1, "no refused emit wrote anything");
+
+	// A `typ=service` token names no namespace, so it reaches no scope's topic at all.
+	let service = Notifications::new(fx.notifications.clone(), fx.users.clone(), Arc::new(RateLimiter::new(Duration::from_secs(60), 10)));
+	let mut unbound = Request::new(emit(member, &other.topic));
+	unbound.extensions_mut().insert(Claims {
+		iss: ISSUER.into(),
+		sub: "some-service".into(),
+		aud: "concierge-services".into(),
+		exp: u64::MAX,
+		iat: 0,
+		typ: TokenType::Service,
+		jti: None,
+		token_version: 0,
+	});
+	assert_eq!(service.emit(unbound).await.unwrap_err().code(), Code::PermissionDenied);
+}
+
+/// The bridge token speaks for `bank`, whose topics the platform inbox shows to every
+/// account: no membership to hold it to.
+#[tokio::test]
+async fn the_bridge_emits_the_bank_s_published_topics_to_anyone_following_them() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&scope]);
+	let topic = "bank:emit_test".to_owned();
+	fx.publish_bank(&[NotificationTopic {
+		topic: topic.clone(),
+		label: "Money".into(),
+		description: String::new(),
+		default_subscribed: false,
+	}])
+	.await;
+	let (user, email) = fx.user("bank-follower").await;
+	fx.follow(user, &email, &topic).await;
+
+	let sent = inbox.emit_scope_notification(as_bridge(emit(user, &topic))).await.unwrap().into_inner();
+	assert!(sent.delivered, "{sent:?}");
+	assert_eq!(fx.rows_on(user, &topic).await, 1);
+
+	for foreign in [scope.topic.as_str(), "bank:not_published", TOPICS[0].key] {
+		let refused = inbox.emit_scope_notification(as_bridge(emit(user, foreign))).await.unwrap_err();
+		assert!(matches!(refused.code(), Code::PermissionDenied | Code::InvalidArgument), "{foreign}: {refused:?}");
+	}
+	assert_eq!(
+		inbox.emit_scope_notification(as_bridge(emit(user, &scope.topic))).await.unwrap_err().code(),
+		Code::PermissionDenied,
+		"a scope's topic is not the bank's"
+	);
+	assert_eq!(
+		inbox.emit_scope_notification(as_bridge(emit(user, "bank:not_published"))).await.unwrap_err().code(),
+		Code::InvalidArgument
+	);
+	// The bridge still reads no scope's inbox.
+	assert_eq!(inbox.list_scope_notifications(as_bridge(list(user))).await.unwrap_err().code(), Code::PermissionDenied);
 }
