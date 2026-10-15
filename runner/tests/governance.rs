@@ -763,7 +763,7 @@ async fn a_governance_mail_does_not_verify_the_subscriber_by_itself() {
 	let notifications = PgNotifications::new(fx.pool.clone());
 	notifications.set_topic_subscription(subscriber_id, "fund:quy-nhon", true, true).await.expect("follow");
 	let outcome = notifications
-		.emit(owner.raw(), "fund:quy-nhon", "nav", "NAV updated", "", "", &format!("nav:{}", Uuid::new_v4()), T0)
+		.emit(owner.raw(), "fund:quy-nhon", "nav", "NAV updated", "", "", &format!("nav:{}", Uuid::new_v4()), T0, false)
 		.await
 		.expect("emit");
 	assert!(outcome.in_app, "the in-app copy is unaffected");

@@ -197,6 +197,8 @@ pub async fn scope_topic(notifications: &dyn NotificationRepository, key: &str) 
 pub(crate) struct EmitTarget {
 	pub topic: String,
 	pub scope: Option<String>,
+	/// The catalog's `default_subscribed`: an account that never touched the topic follows it.
+	pub default_subscribed: bool,
 }
 
 /// The checks every emit makes on the message itself, whoever sends it. Checked here as
@@ -235,7 +237,17 @@ pub(crate) async fn emit_to(notifications: &dyn NotificationRepository, target: 
 	}
 	let occurred_at = if req.occurred_at > 0 { req.occurred_at } else { now_secs() };
 	let outcome = notifications
-		.emit(user_id, &target.topic, &req.kind, &req.title, &req.body, &req.link, &req.dedupe_key, occurred_at)
+		.emit(
+			user_id,
+			&target.topic,
+			&req.kind,
+			&req.title,
+			&req.body,
+			&req.link,
+			&req.dedupe_key,
+			occurred_at,
+			target.default_subscribed,
+		)
 		.await
 		.map_err(domain_to_status)?;
 	let mut channels = Vec::new();
@@ -407,21 +419,21 @@ pub async fn settings_of(
 	let scoped = notifications.scope_topics().await?;
 	let catalogue = TOPICS
 		.iter()
-		.map(|t| (t.key, t.label, t.description))
-		.chain(scoped.iter().map(|t| (t.topic.as_str(), t.label.as_str(), t.description.as_str())))
-		.filter(|(key, _, _)| view.shows(key));
-	// `default_subscribed` is not applied here: an unsubscribe deletes the row, so "never
-	// touched" cannot be told from "switched off", and showing a topic followed that the
-	// subscriber turned off would be the worse mistake.
+		.map(|t| (t.key, t.label, t.description, false))
+		.chain(scoped.iter().map(|t| (t.topic.as_str(), t.label.as_str(), t.description.as_str(), t.default_subscribed)))
+		.filter(|(key, ..)| view.shows(key));
+	// A topic the subscriber never touched reads as its catalog's default; one it switched
+	// off has a row saying so, which is what lets the default apply at all.
 	let topics = catalogue
-		.map(|(key, label, description)| {
+		.map(|(key, label, description, default_subscribed)| {
 			let row = held.iter().find(|s| s.topic == key);
+			let subscribed = row.map_or(default_subscribed, |r| r.subscribed);
 			TopicSubscription {
 				topic: key.to_owned(),
 				label: label.to_owned(),
 				description: description.to_owned(),
-				subscribed: row.is_some(),
-				email_enabled: row.map(|r| r.email_enabled).unwrap_or(true),
+				subscribed,
+				email_enabled: row.filter(|r| r.subscribed).is_none_or(|r| r.email_enabled),
 			}
 		})
 		.collect();
@@ -563,6 +575,7 @@ impl NotificationService for Notifications {
 		let target = EmitTarget {
 			topic: req.topic.clone(),
 			scope: None,
+			default_subscribed: false,
 		};
 		Ok(Response::new(emit_to(self.notifications.as_ref(), &target, &req).await?))
 	}

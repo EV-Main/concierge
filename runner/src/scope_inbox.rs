@@ -229,10 +229,14 @@ impl ScopeInboxService for ScopeInbox {
 		if !ours {
 			return Err(Status::permission_denied("a service emits only its own namespace's topics"));
 		}
-		if scope_topic(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)?.is_none() {
+		let Some(published) = scope_topic(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)? else {
 			return Err(Status::invalid_argument("unknown topic"));
-		}
-		let target = EmitTarget { topic: req.topic.clone(), scope };
+		};
+		let target = EmitTarget {
+			topic: req.topic.clone(),
+			scope,
+			default_subscribed: published.default_subscribed,
+		};
 		Ok(Response::new(emit_to(self.notifications.as_ref(), &target, &req).await?))
 	}
 }

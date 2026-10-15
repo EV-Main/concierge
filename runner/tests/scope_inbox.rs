@@ -25,7 +25,7 @@ use domain::{
 use evconcierge_auth::{AuthConfig, AuthService, Claims, SigningConfig, TokenType, Verifier, VerifierConfig, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
 	EmitRequest, ExchangeCodeRequest, GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, ListScopeNotificationsRequest, MarkScopeNotificationsReadRequest,
-	SetScopeTopicSubscriptionRequest,
+	NotificationSettings as NotificationSettingsMsg, SetScopeTopicSubscriptionRequest,
 	auth_service_server::{AuthService as AuthRpc, AuthServiceServer},
 	notification_service_server::NotificationService,
 	scope_inbox_service_server::ScopeInboxService,
@@ -189,6 +189,11 @@ impl Fx {
 	/// A scope with one client, its secret and one published topic. `observers` name the
 	/// clients that may read its stream.
 	async fn scope(&self, observers: &[&Scope]) -> Scope {
+		self.scope_publishing(observers, false).await
+	}
+
+	/// [`Self::scope`] whose topic an account that never touched it follows.
+	async fn scope_publishing(&self, observers: &[&Scope], default_subscribed: bool) -> Scope {
 		let tag = Uuid::new_v4().simple().to_string()[..12].to_string();
 		let scope = Scope {
 			id: format!("x_{tag}"),
@@ -222,7 +227,7 @@ impl Fx {
 				topic: scope.topic.clone(),
 				label: "News".into(),
 				description: String::new(),
-				default_subscribed: false,
+				default_subscribed,
 			}],
 		};
 		PgScopeCatalogs::new(self.pool.clone())
@@ -712,4 +717,58 @@ async fn the_bridge_emits_the_bank_s_published_topics_to_anyone_following_them()
 	);
 	// The bridge still reads no scope's inbox.
 	assert_eq!(inbox.list_scope_notifications(as_bridge(list(user))).await.unwrap_err().code(), Code::PermissionDenied);
+}
+
+fn unfollow(topic: &str) -> SetScopeTopicSubscriptionRequest {
+	SetScopeTopicSubscriptionRequest {
+		user_id: String::new(),
+		topic: topic.to_owned(),
+		subscribed: false,
+		email_enabled: false,
+	}
+}
+
+/// `default_subscribed` follows the topic for an account that never touched it, and an
+/// unsubscribe is remembered — a row of its own — so "switched off" stays off.
+#[tokio::test]
+async fn a_default_topic_reaches_members_who_never_touched_it_until_they_switch_it_off() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope_publishing(&[], true).await;
+	let quiet = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&scope, &quiet]);
+	let (user, _) = fx.user("default-topic").await;
+	let token = fx.token(&scope, user).await;
+	fx.join(&quiet, user).await;
+	let settings = |fx_scope: &Scope| as_client(GetScopeNotificationSettingsRequest { user_id: user.to_string() }, fx_scope);
+	let stance = |s: &NotificationSettingsMsg, topic: &str| s.topics.iter().find(|t| t.topic == topic).map(|t| (t.subscribed, t.email_enabled));
+
+	let before = inbox.get_scope_notification_settings(settings(&scope)).await.unwrap().into_inner();
+	assert_eq!(stance(&before, &scope.topic), Some((true, true)), "never touched: followed, mail on");
+	let sent = inbox.emit_scope_notification(as_client(emit(user, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert_eq!((sent.delivered, sent.channels.clone()), (true, vec![1, 2]), "{sent:?}");
+
+	let not_default = inbox.emit_scope_notification(as_client(emit(user, &quiet.topic), &quiet)).await.unwrap().into_inner();
+	assert!(!not_default.delivered, "a topic published without the default reaches only who follows it");
+
+	inbox.set_scope_topic_subscription(on_behalf(unfollow(&scope.topic), &scope, &token)).await.unwrap();
+	let (rows, optouts): (i64, i64) = sqlx::query_as(
+		"SELECT (SELECT count(*) FROM notification_subscriptions WHERE subscriber_id = s.id AND topic = $2), \
+		        (SELECT count(*) FROM notification_topic_optouts WHERE subscriber_id = s.id AND topic = $2) \
+		 FROM notification_subscribers s WHERE s.user_id = $1",
+	)
+	.bind(user)
+	.bind(&scope.topic)
+	.fetch_one(&fx.pool)
+	.await
+	.unwrap();
+	assert_eq!((rows, optouts), (0, 1), "switched off is a row of its own, not a missing one");
+	let after = inbox.get_scope_notification_settings(settings(&scope)).await.unwrap().into_inner();
+	assert_eq!(stance(&after, &scope.topic).map(|s| s.0), Some(false), "and reads as switched off");
+	let muted = inbox.emit_scope_notification(as_client(emit(user, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert!(!muted.delivered && muted.notification_id.is_empty(), "{muted:?}");
+
+	inbox.set_scope_topic_subscription(on_behalf(follow("", &scope.topic), &scope, &token)).await.unwrap();
+	let back = inbox.emit_scope_notification(as_client(emit(user, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert!(back.delivered, "following again lifts the opt-out");
+	assert_eq!(fx.rows_on(user, &scope.topic).await, 2);
 }
