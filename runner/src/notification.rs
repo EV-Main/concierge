@@ -646,7 +646,10 @@ impl NotificationService for Notifications {
 		Self::require_service(&request)?;
 		let req = request.into_inner();
 
-		if topic(&req.topic).is_none() {
+		// Any topic a catalog in force publishes, as well as this plane's own: the address
+		// asked for it by name and confirms it by mail, so `default_subscribed` — which is
+		// about accounts that never asked — has no say here.
+		if !topic_known(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)? {
 			return Err(Status::invalid_argument("unknown topic"));
 		}
 		// Parsed, not merely non-empty: everything downstream treats this as a real

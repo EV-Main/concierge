@@ -181,6 +181,9 @@ message SetTopicSubscriptionRequest {
 
 message SubscribeAnonymousRequest {
   string email = 1;
+  // One of this plane's topics or one a scope's catalog in force publishes; anything else
+  // is INVALID_ARGUMENT. A scope's `default_subscribed` does not apply: the address asks
+  // for the topic by name and confirms it by mail.
   string topic = 2;
   // Client IP as seen by the edge, for rate limiting. Empty ⇒ every such caller
   // shares one bucket, which is the conservative choice.
