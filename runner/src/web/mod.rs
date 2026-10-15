@@ -12,6 +12,11 @@
 //!     no zone-side OAuth. A zone signs a user in by linking to
 //!     `/api/auth/login?returnTo=<path>`; that is the entire zone-side contract.
 //!
+//! Besides the sessions, it is the account-less notification edge: the subscribe form
+//! (`POST /auth/notifications/subscribe`, Turnstile, scope hosts allowed) and the confirm
+//! and unsubscribe links every topic mail carries (`/auth/notifications/{confirm,
+//! unsubscribe}`, a page on GET, the change on POST) — `web::notifications`.
+//!
 //! Nothing banking lives here: the money-plane token pair is the cabinet's own concern,
 //! minted zone-side from the verified access token.
 
@@ -22,6 +27,7 @@ mod cors;
 mod kyc;
 mod logout;
 pub mod mfe;
+mod notifications;
 mod oauth;
 pub mod origins;
 mod passkey;
@@ -142,6 +148,7 @@ impl WebState {
 				passkey_registrations: Ceremonies::default(),
 				passkey_sign_ins: Ceremonies::default(),
 				passkey_sign_in_starts: RateLimiter::new(std::time::Duration::from_secs(60), passkey::SIGN_IN_STARTS_PER_MINUTE),
+				subscribe_limiter: sign_in.subscribe_limiter,
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
@@ -168,6 +175,9 @@ pub struct SignInDeps {
 	/// The scope hosts the sign-in routes answer besides `PUBLIC_ORIGIN`, and the passkey
 	/// verifier built over them — both following the registry.
 	pub allowlist: Arc<SignInAllowlist>,
+	/// The per-IP budget of the account-less subscribe: the SAME limiter
+	/// `NotificationService.SubscribeAnonymous` spends, so the two doors share one budget.
+	pub subscribe_limiter: Arc<RateLimiter>,
 }
 
 /// What the identity-verification routes need, gathered so the composition root hands
@@ -200,7 +210,9 @@ pub fn router(state: WebState) -> Router {
 	// settings, logout, `/kyc/*`) stays off this list: those carry the CSRF double-submit,
 	// or read the account, and a script on a scope host must be able to start a sign-in but
 	// never act for the account. A scope host proves a mailbox by signing in with a code,
-	// or confirms a password sign-up with its ticket (`signup`).
+	// or confirms a password sign-up with its ticket (`signup`). The account-less
+	// subscribe is on it because it acts for no account: it names an address, which only
+	// the confirmation mail it may queue can bind (`web::notifications`).
 	//
 	// `.layer` on these sub-routers and not `route_layer`: a route layer runs only for a
 	// method the route has, so the OPTIONS preflight of a POST route would never reach
@@ -215,6 +227,7 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/password/signup/resend", post(signup::resend))
 		.route("/auth/passkey/signin/options", post(passkey::signin_options))
 		.route("/auth/passkey/signin/verify", post(passkey::signin_verify))
+		.route("/auth/notifications/subscribe", post(notifications::subscribe))
 		.layer(cors::layer(allowlist.clone(), Method::POST));
 	let scope_reads = Router::new().route("/auth/session", get(routes::session)).layer(cors::layer(allowlist, Method::GET));
 	Router::new()
@@ -240,6 +253,11 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/notifications/settings", get(account::notification_settings))
 		.route("/auth/notifications/settings/channel", post(account::set_channel))
 		.route("/auth/notifications/settings/topic", post(account::set_topic))
+		// The links every topic mail carries: a page with a button on GET, the change on
+		// POST — and, for unsubscribe, RFC 8058's one-click POST. Authorised by the token
+		// alone, so no session, no CSRF, no CORS (`web::notifications`).
+		.route("/auth/notifications/confirm", get(notifications::confirm_page).post(notifications::confirm))
+		.route("/auth/notifications/unsubscribe", get(notifications::unsubscribe_page).post(notifications::unsubscribe))
 		.route("/auth/passkey/register/options", post(passkey::register_options))
 		.route("/auth/passkey/register/verify", post(passkey::register_verify))
 		.route("/auth/passkey/remove", post(passkey::remove))
@@ -292,6 +310,7 @@ struct Inner {
 	passkey_sign_ins: Ceremonies<(DiscoverableAuthentication, Arc<Webauthn>)>,
 	/// Per client address, in process: a replica's own ceremony store is what it protects.
 	passkey_sign_in_starts: RateLimiter,
+	subscribe_limiter: Arc<RateLimiter>,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
 	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/<provider>`.
 	public_origin: String,

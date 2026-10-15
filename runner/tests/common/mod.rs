@@ -112,6 +112,10 @@ pub fn google_as(subject: &str, email: &str, verified: bool) -> domain::auth::Pr
 	}
 }
 
+/// The account-less subscribe budget of every suite's web state, per client address. Tests
+/// driving the router without a socket all share the empty address's bucket.
+pub const SUBSCRIBES_PER_HOUR: u32 = 50;
+
 /// The sign-in half of a web state that answers no credential request: the Turnstile it
 /// names refuses every connection.
 pub fn inert_sign_in(pool: &sqlx::PgPool) -> concierge::web::SignInDeps {
@@ -127,6 +131,7 @@ pub fn sign_in_with_turnstile(pool: &sqlx::PgPool, turnstile: &str) -> concierge
 		allowlist: std::sync::Arc::new(
 			concierge::web::allowlist::SignInAllowlist::fixed(WEBAUTHN_ORIGIN, concierge::web::origins::ScopeOrigins::none()).expect("a test origin is a relying party"),
 		),
+		subscribe_limiter: std::sync::Arc::new(concierge::notification::RateLimiter::new(std::time::Duration::from_secs(3600), SUBSCRIBES_PER_HOUR)),
 	}
 }
 

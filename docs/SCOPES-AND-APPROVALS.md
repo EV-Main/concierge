@@ -132,7 +132,7 @@ They widen CORS for a **closed list** of sign-in routes and nothing else:
 
 | Accepts a scope origin | `PUBLIC_ORIGIN` only |
 | ---------------------- | -------------------- |
-| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`, `/auth/password/signup/resend`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user, permissions}`, never a token) | everything acting on an open session or reading the account: `/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register/*`, `/auth/passkey/remove`, `/auth/sessions`, `/auth/username`, `/auth/methods`, `/auth/me`, `/auth/notifications/settings*`, `/auth/logout`, `/auth/logout/confirm`, `/kyc/*` |
+| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`, `/auth/password/signup/resend`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user, permissions}`, never a token), `POST /auth/notifications/subscribe` (account-less; acts for no account) | everything acting on an open session or reading the account: `/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register/*`, `/auth/passkey/remove`, `/auth/sessions`, `/auth/username`, `/auth/methods`, `/auth/me`, `/auth/notifications/settings*`, `/auth/logout`, `/auth/logout/confirm`, `/kyc/*` |
 
 Signing out on a scope host ends the `evinvest.ltd` session too when the host sends the
 browser — a top-level navigation, not a call — to
@@ -773,13 +773,26 @@ the offer when a later catalog withdraws them.
   and on emit, which creates the subscriber row as a trace does. Following again clears the
   opt-out. The subscription row is still deleted on unsubscribe, so the previous binary,
   which ignores the new table, keeps reading "not following".
-- **`SubscribeAnonymous` takes a scope's topic** that a catalog in force publishes, under the
-  same double opt-in; `default_subscribed` has no say there, the address asks by name.
+- **The account-less subscribe takes a scope's topic** that a catalog in force publishes,
+  under the same double opt-in; `default_subscribed` has no say there, the address asks by
+  name. Its working door is this plane's web surface, not the RPC: `SubscribeAnonymous`,
+  `ConfirmSubscription` and `Unsubscribe` want a `typ=service` token nothing mints yet.
+  `POST https://evinvest.ltd/api/auth/notifications/subscribe` (JSON `{email, topic,
+  turnstileToken}`) accepts `PUBLIC_ORIGIN` and a signing-in scope's origin (§3.1) — it acts
+  for no account, it names an address that only the confirmation mail can bind — checks
+  Turnstile, the per-IP budget the RPC spends and the per-address mail throttle, and answers
+  `{accepted: true}` whether a mail was queued or not (`400 invalid_email | unknown_topic`,
+  `429 throttled`, `403 origin | captcha`). The mail's links are
+  `/api/auth/notifications/confirm?token=` and `/api/auth/notifications/unsubscribe?token=`
+  on `PUBLIC_ORIGIN`: a page with one button on GET (mail scanners fetch links), the change
+  on POST; the unsubscribe URL is also the RFC 8058 one-click target (`POST` with
+  `List-Unsubscribe=One-Click`, 200, no redirect), and a token nobody holds answers as one
+  that worked.
 - **The move has happened.** `fund:quy-nhon` is `invest:fund:quy-nhon` (invest's members
   only) and `account:money-movement` is `bank:money-movement`; migration 0042 carried the
   subscriptions, account-less ones included, and the fund's inbox history. Until banking and
   invest publish those topics and emit on them, the old keys are aliases wherever a topic is
-  named — `Emit` (by `typ=service` token), following, `SubscribeAnonymous`, `Unsubscribe` —
+  named — `Emit` (by `typ=service` token), following, the account-less subscribe and unsubscribe —
   and stand for the new ones (`notification::MOVED_TOPICS`); the aliases go at the contract
   step. `account:money-movement` itself stays this plane's TRACE topic: the in-app trace of a
   payment consent, a fee notice, a payment outcome or a decision opened in someone's name is

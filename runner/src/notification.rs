@@ -9,9 +9,13 @@
 //! may do that. Everything else is self-service and acts strictly on the caller's own
 //! subscriber row, gated through the shared [`crate::authz`] live-record check — so a
 //! suspended or token-revoked principal loses access here exactly as everywhere else.
-//! The account-less subscribe/confirm/unsubscribe RPCs are also service-called (the
-//! public edge proxies them) and are protected by rate limits rather than by identity,
-//! since by definition there is no identity yet.
+//! The account-less subscribe/confirm/unsubscribe RPCs also want a `typ=service` token,
+//! which this plane neither mints nor admits yet (`MintServiceToken` is reserved), so
+//! today nothing reaches them. The account-less path that works is this plane's own HTTP
+//! edge (`web::notifications`: the subscribe form behind Turnstile, the confirm and
+//! unsubscribe links every mail carries), in process and over the same functions
+//! ([`subscribe_accountless`], [`unsubscribe_by_token`]). Both doors are protected by rate
+//! limits rather than by identity, since by definition there is no identity yet.
 //!
 //! SPAM RESISTANCE. An open "email me updates" endpoint is a mail cannon pointed at
 //! whoever an attacker names, so the protection is layered rather than one check:
@@ -376,6 +380,106 @@ impl RateLimiter {
 	}
 }
 
+/// Why an account-less subscribe was refused before anything was written.
+#[derive(Debug, Eq, PartialEq)]
+pub enum SubscribeRefusal {
+	UnknownTopic,
+	InvalidEmail,
+	/// The per-IP budget is spent.
+	TooMany,
+}
+
+/// Why an unsubscribe by token was refused before anything was written.
+#[derive(Debug, Eq, PartialEq)]
+pub enum UnsubscribeRefusal {
+	MissingToken,
+	UnknownTopic,
+}
+
+/// The account-less subscribe behind both doors — `SubscribeAnonymous` and the web surface's
+/// `POST /auth/notifications/subscribe` — so the two can never guard it differently. Accepted
+/// alike whether a confirmation was queued, the address was already confirmed or the
+/// database throttle held it back: an unauthenticated caller does not get to tell those apart.
+pub async fn subscribe_accountless(
+	notifications: &dyn NotificationRepository,
+	limiter: &RateLimiter,
+	email: &str,
+	topic: &str,
+	client_ip: &str,
+) -> Result<Result<AccountlessSubscribe, SubscribeRefusal>, DomainError> {
+	// Any topic a catalog in force publishes, as well as this plane's own: the address
+	// asked for it by name and confirms it by mail, so `default_subscribed` — which is
+	// about accounts that never asked — has no say here.
+	let key = current_key(topic);
+	if !topic_followable(notifications, key).await? {
+		return Ok(Err(SubscribeRefusal::UnknownTopic));
+	}
+	// Parsed, not merely non-empty: everything downstream treats this as a real
+	// mailbox, and a malformed address becomes a hard bounce charged against our
+	// sending reputation.
+	let Ok(email) = Email::parse(email) else {
+		return Ok(Err(SubscribeRefusal::InvalidEmail));
+	};
+
+	// The per-IP budget is the cheap gate. An empty client_ip shares one bucket, so
+	// a caller that declines to forward it throttles itself rather than everyone.
+	let bucket = if client_ip.is_empty() { "anonymous" } else { client_ip };
+	if !limiter.check(bucket) {
+		return Ok(Err(SubscribeRefusal::TooMany));
+	}
+
+	// The database throttle is what actually bounds mail: at most one confirmation
+	// per address per window, however many requests arrive and from wherever.
+	let queued = notifications.subscribe_anonymous(email.as_str(), key, CONFIRM_THROTTLE_SECS).await?;
+	if queued.is_none() {
+		tracing::debug!(topic = %key, "anonymous subscribe accepted without queueing confirmation (already confirmed, or throttled)");
+	}
+	Ok(Ok(AccountlessSubscribe { queued: queued.is_some() }))
+}
+
+/// An accepted account-less subscribe. Deliberately not a public field: whether mail was
+/// queued must reach the dispatcher's wake-up and never an answer.
+pub struct AccountlessSubscribe {
+	queued: bool,
+}
+
+impl AccountlessSubscribe {
+	pub fn queued(&self) -> bool {
+		self.queued
+	}
+}
+
+/// The one-click unsubscribe behind both doors (`Unsubscribe`, `POST
+/// /auth/notifications/unsubscribe`). An empty `topic` leaves every mail copy (the
+/// List-Unsubscribe behaviour); a moved key stands for its new one. `Ok(Ok(false))` for a
+/// token nobody holds.
+pub async fn unsubscribe_by_token(notifications: &dyn NotificationRepository, token: &str, topic: &str) -> Result<Result<bool, UnsubscribeRefusal>, DomainError> {
+	if token.is_empty() {
+		return Ok(Err(UnsubscribeRefusal::MissingToken));
+	}
+	let topic_filter = match current_key(topic) {
+		"" => None,
+		t if topic_known(notifications, t).await? => Some(t),
+		_ => return Ok(Err(UnsubscribeRefusal::UnknownTopic)),
+	};
+	Ok(Ok(notifications.unsubscribe(token, topic_filter).await?))
+}
+
+fn subscribe_status(refusal: SubscribeRefusal) -> Status {
+	match refusal {
+		SubscribeRefusal::UnknownTopic => Status::invalid_argument("unknown topic"),
+		SubscribeRefusal::InvalidEmail => Status::invalid_argument("email is not a valid address"),
+		SubscribeRefusal::TooMany => Status::resource_exhausted("too many subscription attempts"),
+	}
+}
+
+fn unsubscribe_status(refusal: UnsubscribeRefusal) -> Status {
+	match refusal {
+		UnsubscribeRefusal::MissingToken => Status::invalid_argument("token is required"),
+		UnsubscribeRefusal::UnknownTopic => Status::invalid_argument("unknown topic"),
+	}
+}
+
 /// How long an address waits before another confirmation mail can be generated.
 pub const CONFIRM_THROTTLE_SECS: i64 = 24 * 60 * 60;
 const DEFAULT_PAGE: u32 = 20;
@@ -708,39 +812,10 @@ impl NotificationService for Notifications {
 	async fn subscribe_anonymous(&self, request: Request<SubscribeAnonymousRequest>) -> Result<Response<SubscribeAnonymousResponse>, Status> {
 		Self::require_service(&request)?;
 		let req = request.into_inner();
-
-		// Any topic a catalog in force publishes, as well as this plane's own: the address
-		// asked for it by name and confirms it by mail, so `default_subscribed` — which is
-		// about accounts that never asked — has no say here.
-		let key = current_key(&req.topic);
-		if !topic_followable(self.notifications.as_ref(), key).await.map_err(domain_to_status)? {
-			return Err(Status::invalid_argument("unknown topic"));
-		}
-		// Parsed, not merely non-empty: everything downstream treats this as a real
-		// mailbox, and a malformed address becomes a hard bounce charged against our
-		// sending reputation.
-		let email = Email::parse(&req.email).map_err(|_| Status::invalid_argument("email is not a valid address"))?;
-
-		// The per-IP budget is the cheap gate. An empty client_ip shares one bucket, so
-		// a caller that declines to forward it throttles itself rather than everyone.
-		let bucket = if req.client_ip.is_empty() { "anonymous" } else { req.client_ip.as_str() };
-		if !self.limiter.check(bucket) {
-			return Err(Status::resource_exhausted("too many subscription attempts"));
-		}
-
-		// The database throttle is what actually bounds mail: at most one confirmation
-		// per address per window, however many requests arrive and from wherever.
-		let queued = self
-			.notifications
-			.subscribe_anonymous(email.as_str(), key, CONFIRM_THROTTLE_SECS)
+		subscribe_accountless(self.notifications.as_ref(), &self.limiter, &req.email, &req.topic, &req.client_ip)
 			.await
-			.map_err(domain_to_status)?;
-		if queued.is_none() {
-			tracing::debug!(topic = %key, "anonymous subscribe accepted without queueing confirmation (already confirmed, or throttled)");
-		}
-
-		// Always the same answer. Whether the address was new, already subscribed or
-		// throttled is not something an unauthenticated caller gets to learn.
+			.map_err(domain_to_status)?
+			.map_err(subscribe_status)?;
 		Ok(Response::new(SubscribeAnonymousResponse { accepted: true }))
 	}
 
@@ -757,15 +832,10 @@ impl NotificationService for Notifications {
 	async fn unsubscribe(&self, request: Request<UnsubscribeRequest>) -> Result<Response<UnsubscribeResponse>, Status> {
 		Self::require_service(&request)?;
 		let req = request.into_inner();
-		if req.token.is_empty() {
-			return Err(Status::invalid_argument("token is required"));
-		}
-		let topic_filter = match current_key(&req.topic) {
-			"" => None,
-			t if topic_known(self.notifications.as_ref(), t).await.map_err(domain_to_status)? => Some(t),
-			_ => return Err(Status::invalid_argument("unknown topic")),
-		};
-		let unsubscribed = self.notifications.unsubscribe(&req.token, topic_filter).await.map_err(domain_to_status)?;
+		let unsubscribed = unsubscribe_by_token(self.notifications.as_ref(), &req.token, &req.topic)
+			.await
+			.map_err(domain_to_status)?
+			.map_err(unsubscribe_status)?;
 		Ok(Response::new(UnsubscribeResponse { unsubscribed }))
 	}
 }

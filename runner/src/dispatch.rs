@@ -45,7 +45,7 @@ pub struct DispatcherConfig {
 	pub mail_from: String,
 	/// Origin the cabinet is served from; builds links inside emails.
 	pub cabinet_url: String,
-	/// Public origin serving the confirm/unsubscribe endpoints.
+	/// `PUBLIC_ORIGIN`: the confirm/unsubscribe links are its `/api/auth/notifications/*`.
 	pub public_origin: String,
 	/// The approvals page an approval mail links to, `<approvals_url>/<id>`.
 	pub approvals_url: String,
@@ -287,7 +287,10 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 	}
 
 	let origin = cfg.public_origin.trim_end_matches('/');
-	let unsubscribe_url = format!("{origin}/notifications/unsubscribe?token={}", job.unsubscribe_token.as_deref()?);
+	// This plane's own pages (`web::notifications`), under the conductor's `/api/auth/*`
+	// rewrite; the unsubscribe URL is also the RFC 8058 one-click target the transport puts in
+	// `List-Unsubscribe`.
+	let unsubscribe_url = format!("{origin}/api/auth/notifications/unsubscribe?token={}", job.unsubscribe_token.as_deref()?);
 
 	// Governance mail carries NO unsubscribe target, so the transport sets no
 	// List-Unsubscribe header: a security mail a recipient can switch off is not one.
@@ -309,7 +312,7 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 			// The topic label is cosmetic here; a confirmation for a since-retired topic
 			// should still be completable.
 			let label = job.topic.as_deref().and_then(topic).map(|t| t.label).unwrap_or("EV Investment");
-			templates::confirm_subscription(label, &format!("{origin}/notifications/confirm?token={token}"), &unsubscribe_url)
+			templates::confirm_subscription(label, &format!("{origin}/api/auth/notifications/confirm?token={token}"), &unsubscribe_url)
 		}
 		_ => {
 			let topic_key = job.topic.as_deref()?;
