@@ -680,8 +680,10 @@ in `domain::approvals`.
   (`over_scope_budget`) with a `FLAG_SET` escalation, which sends that proposal to the
   owners. A kind's own thresholds here are the backstop behind that budget, not the
   budget.
-- **Not yet**: a catalog already stored that delegates `<namespace>:admin` is not
-  re-checked; the next publication is.
+- **A catalog already stored that delegates `<namespace>:admin`** (published before
+  `Catalog::check` refused it) hands nobody the alias: `domain::iam::delegable` drops it
+  whatever the catalog says, so a holder of the delegating alias can neither grant nor
+  revoke it. The rest of that catalog's delegations still hold.
 
 ---
 

@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 
 pub use concierge_iam::Catalog;
-use concierge_iam::Pattern;
+use concierge_iam::{ADMIN_ALIAS, Pattern};
 
 use crate::{
 	authz::{Iam, Role},
@@ -75,8 +75,19 @@ pub fn resolve<'c>(seat: Role, granting_seats_hold_all: bool, targets: &[Target]
 }
 
 /// The aliases a holder of `targets` may grant and revoke in `catalog`'s namespace.
+///
+/// Never `<namespace>:admin`, whatever the catalog says: that alias is the scope's
+/// approval roster, and a holder able to revoke it could empty the roster of everyone but
+/// themselves and pass the scope's quorum alone. `Catalog::check` refuses such a
+/// delegation at publication; this is the same rule for a catalog stored before it.
 pub fn delegable<'c>(targets: &[Target], catalog: &'c Catalog) -> BTreeSet<&'c str> {
-	targets.iter().filter_map(|t| catalog.delegations.get(t.as_str())).flatten().map(String::as_str).collect()
+	targets
+		.iter()
+		.filter_map(|t| catalog.delegations.get(t.as_str()))
+		.flatten()
+		.map(String::as_str)
+		.filter(|alias| alias.split_once(':').is_none_or(|(_, name)| name != ADMIN_ALIAS))
+		.collect()
 }
 
 #[cfg(test)]
@@ -129,6 +140,19 @@ mod tests {
 			delegable(&targets(&["sa:operator", "sa:admin:*", "sa:*"]), &catalog).is_empty(),
 			"only the alias itself delegates"
 		);
+	}
+
+	#[test]
+	fn a_stored_catalog_never_delegates_the_admin_alias() {
+		let stored: Catalog = serde_json::from_value(serde_json::json!({
+			"version": 1,
+			"permissions": ["sa:work:leads:read"],
+			"aliases": { "sa:operator": ["sa:work:leads:read"], "sa:lead": ["sa:work:leads:read"], "sa:admin": ["sa:work:leads:read"] },
+			"delegations": { "sa:admin": ["sa:admin", "sa:operator"], "sa:lead": ["sa:admin"] },
+		}))
+		.unwrap();
+		assert_eq!(delegable(&targets(&["sa:admin"]), &stored), ["sa:operator"].into());
+		assert!(delegable(&targets(&["sa:lead"]), &stored).is_empty());
 	}
 
 	#[test]
