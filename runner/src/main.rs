@@ -351,6 +351,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			mail_from: config.mail_from.clone(),
 			cabinet_url: config.cabinet_url.clone(),
 			public_origin: config.public_origin.clone(),
+			approvals_url: config.approvals_url.clone(),
 			daily_budget: config.notification_daily_email_budget,
 			interval: std::time::Duration::from_secs(config.notification_dispatch_interval_secs),
 		},

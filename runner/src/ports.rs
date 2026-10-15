@@ -702,6 +702,13 @@ pub trait ApprovalRepository: Send + Sync {
 	/// Carry out one passed `concierge:*` proposal and record its outcome, in one
 	/// transaction. `None` when it is not (or no longer) this plane's to execute now.
 	async fn execute(&self, id: Uuid) -> Result<Option<Outcome>, DomainError>;
+
+	/// Queue the outcome mail of up to `limit` proposals whose effective state has moved
+	/// past what `requested_by` was last told (`approvals.mailed_state`), and record that
+	/// it was told; how many were settled. A sweep rather than the closing act, because an
+	/// expiry and a lapse are lazy and a void on a change of the owners is a trigger's:
+	/// no one code path sees every ending.
+	async fn mail_outcomes(&self, limit: i64) -> Result<usize, DomainError>;
 }
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).

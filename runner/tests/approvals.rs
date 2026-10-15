@@ -20,7 +20,7 @@ use concierge::{
 	approvals::{ApprovalExecution, Approvals},
 	authz::BreakGlass,
 	infrastructure::{approvals::PgApprovals, db, relying_parties::PgRelyingParties, scope_catalogs::PgScopeCatalogs, users::PgUsers},
-	ports::{RelyingPartyRepository, UserDirectoryRepository},
+	ports::{ApprovalRepository, RelyingPartyRepository, UserDirectoryRepository},
 	scope_catalog::ScopeCatalogs,
 	service_caller::ServiceCallers,
 };
@@ -2426,4 +2426,123 @@ async fn the_daily_floor_counts_the_live_transfers() {
 	}
 	let sixth = transfer_999().await.unwrap().into_inner();
 	assert_eq!((sixth.level, sixth.escalated_by), (ApprovalLevel::Platform as i32, vec!["floor_daily".to_owned()]));
+}
+
+impl Fx {
+	/// The approval mail queued under `prefix`, by dedupe key: (key, recipient, payload).
+	async fn mails(&self, prefix: &str) -> Vec<(String, String, serde_json::Value)> {
+		sqlx::query_as("SELECT dedupe_key, recipient, payload FROM notification_deliveries WHERE dedupe_key LIKE $1 || '%' ORDER BY dedupe_key")
+			.bind(prefix)
+			.fetch_all(&self.pool)
+			.await
+			.unwrap()
+	}
+
+	async fn email(&self, user: UserId) -> String {
+		sqlx::query_scalar("SELECT email FROM users WHERE id = $1").bind(user.raw()).fetch_one(&self.pool).await.unwrap()
+	}
+
+	/// Run the outcome sweep until it finds nothing: other suites' proposals share it.
+	async fn sweep(&self) {
+		while self.repo.mail_outcomes(500).await.expect("the outcome sweep") > 0 {}
+	}
+}
+
+/// §5.5: opening a proposal queues the request to every roster member who can act on it —
+/// an active account at a verified address — once, however often the proposer retries.
+#[tokio::test]
+async fn opening_mails_each_reachable_roster_member_once() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope().await;
+	let admins = fx.admins(&scope, 2).await;
+	let unproven = fx.users.resolve(common::google("unproven", false), 0).await.expect("provision").id();
+	sqlx::query("INSERT INTO grants (user_id, namespace, target, granted_by, granted_at) VALUES ($1, $2, $2 || ':admin', $3, 0)")
+		.bind(unproven.raw())
+		.bind(&scope.id)
+		.bind(admins[0].raw())
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	let requester = fx.user("requester").await;
+	fx.at(T0);
+	let request = ProposeRequest {
+		requested_by: fx.auth_subject(requester).await,
+		..transfer(&scope, "250.5")
+	};
+	let opened = fx.propose(&scope, request.clone()).await;
+	assert_eq!(opened.voters.len(), 3, "the unproven admin is on the roster");
+	fx.propose(&scope, request).await;
+
+	let mails = fx.mails(&format!("approval_request:{}:", opened.id)).await;
+	let mut expected = vec![fx.email(admins[0]).await, fx.email(admins[1]).await];
+	expected.sort();
+	let mut recipients: Vec<String> = mails.iter().map(|(_, to, _)| to.clone()).collect();
+	recipients.sort();
+	assert_eq!(recipients, expected, "each verified admin once; the unproven one never, the retry adds nothing");
+
+	let payload = &mails[0].2;
+	assert_eq!(payload["kind_label"], "Transfer between accounts", "labelled from the catalog");
+	assert_eq!(payload["requested_by"], fx.email(requester).await, "the requester by address");
+	assert_eq!(
+		payload["fields"][1],
+		serde_json::json!({"label": "amount", "value": {"type": "amount", "value": {"value": "250.5", "currency": "USDT"}}}),
+		"money stays typed until it is rendered"
+	);
+	assert!(!payload.to_string().contains("http"), "a row stores no link: the dispatcher builds it from APPROVALS_URL");
+}
+
+/// §5.5: the requester is told each outcome once — approved, then carried out — and an
+/// expiry nobody wrote is told too, by the sweep.
+#[tokio::test]
+async fn the_requester_is_told_each_outcome_once() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope().await;
+	let admins = fx.admins(&scope, 3).await;
+	let requester = fx.user("requester").await;
+	let subject = fx.auth_subject(requester).await;
+	fx.at(T0);
+	let decided = fx
+		.propose(
+			&scope,
+			ProposeRequest {
+				requested_by: subject.clone(),
+				..transfer(&scope, "250.5")
+			},
+		)
+		.await;
+	let left = fx
+		.propose(
+			&scope,
+			ProposeRequest {
+				requested_by: subject,
+				..transfer(&scope, "100")
+			},
+		)
+		.await;
+	let told = |id: &str| format!("approval_outcome:{id}:");
+
+	fx.sweep().await;
+	assert!(fx.mails(&told(&decided.id)).await.is_empty(), "an open proposal is no outcome");
+
+	fx.vote(admins[0], &decided.id, ApprovalVote::For).await.unwrap();
+	fx.vote(admins[1], &decided.id, ApprovalVote::For).await.unwrap();
+	fx.sweep().await;
+	fx.sweep().await;
+	let mails = fx.mails(&told(&decided.id)).await;
+	assert_eq!(mails.len(), 1, "approved is told once, however often the sweep runs");
+	assert_eq!((mails[0].1.as_str(), &mails[0].2["outcome"]), (fx.email(requester).await.as_str(), &serde_json::json!("passed")));
+
+	fx.at(T0 + HOUR + 1);
+	fx.report(&scope, &decided.id, ApprovalOutcome::Executed, "settled").await.expect("report");
+	fx.sweep().await;
+	let mails = fx.mails(&told(&decided.id)).await;
+	let keys: Vec<&str> = mails.iter().map(|(key, _, _)| key.as_str()).collect();
+	assert_eq!(keys, [format!("{}executed", told(&decided.id)), format!("{}passed", told(&decided.id))]);
+	assert_eq!(mails[0].2["note"], serde_json::json!({"by": "proposer", "text": "settled"}), "the report is the proposer's words");
+
+	fx.at(T0 + 73 * HOUR);
+	fx.sweep().await;
+	let mails = fx.mails(&told(&left.id)).await;
+	assert_eq!(mails.len(), 1, "a lazy expiry is told without anybody touching the proposal");
+	assert_eq!(mails[0].2["outcome"], "expired");
 }

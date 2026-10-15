@@ -969,6 +969,9 @@ impl ExecutorBackoff {
 	}
 }
 
+/// Outcome mails queued per executor pass.
+const MAIL_BATCH: i64 = 100;
+
 /// The executor loop (D23): what this plane's own approvals do once passed. A second loop
 /// beside the hold sweep, because a passed decision nobody carries out lapses unexecuted
 /// after its window — and unlike a service, this plane has nobody else to pull it.
@@ -976,7 +979,16 @@ pub async fn run_executor(approvals: Arc<dyn ApprovalRepository>, interval: Dura
 	tracing::info!(interval_secs = interval.as_secs(), "approval executor started");
 	let mut backoff = ExecutorBackoff::default();
 	loop {
-		match execute_due(approvals.as_ref(), &mut backoff, interval).await {
+		let pass = execute_due(approvals.as_ref(), &mut backoff, interval).await;
+		// The outcome mail rides this loop rather than a third one: it is the same kind of
+		// work — settling what the clock and the other acts moved — and needs no other
+		// cadence. Its failure is its own: it never stops a decision being carried out.
+		match approvals.mail_outcomes(MAIL_BATCH).await {
+			Ok(told) if told > 0 => tracing::info!(told, "approval outcomes queued for mail"),
+			Ok(_) => {}
+			Err(err) => tracing::error!(%err, "queueing approval outcome mail failed; requesters are not being told"),
+		}
+		match pass {
 			Ok(pass) if pass.failed == 0 && pass.deferred == 0 && usize::try_from(EXECUTOR_BATCH).is_ok_and(|batch| pass.closed >= batch) => continue,
 			Ok(_) => {}
 			Err(err) => tracing::error!(%err, "the approval executor failed; passed concierge:* decisions are not being carried out"),
