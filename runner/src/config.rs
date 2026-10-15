@@ -94,6 +94,10 @@ ev::settings! {
 		mail_from: String = "EV Investment <notifications@evinvest.ltd>",
 		/// Origin the cabinet is served from; builds the links inside emails.
 		cabinet_url: String = "https://evinvest.ltd/cabinet",
+		/// The approvals page of the admin console; an approval mail links to
+		/// `<APPROVALS_URL>/<id>`. Configuration and never the proposer's: no service
+		/// chooses where a mail asking people to decide sends them.
+		approvals_url: String = "https://evinvest.ltd/admin/approvals",
 		/// The HUMAN mailbox handed to a user whose verification cannot run right now.
 		///
 		/// Deliberately not `mail_from`: that address is a SENDER nobody reads, so

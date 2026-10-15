@@ -33,7 +33,7 @@ use domain::{
 		PULL_MARGIN_SECS, PlatformPolicy, ROLLING_WINDOW_SECS, ScopePolicy, Vote, Voter,
 	},
 	error::DomainError,
-	scope_catalog::ApprovalLevel,
+	scope_catalog::{ApprovalKind, ApprovalLevel},
 	scopes::{ROOT, ScopeState},
 	users::UserId,
 };
@@ -41,12 +41,15 @@ use sqlx::{PgConnection, PgPool, Row, postgres::PgRow};
 use uuid::Uuid;
 
 use super::{
+	email::templates::{ApprovalMail, ApprovalMailField, ApprovalMailValue, ApprovalNote, NoteAuthor},
 	grants::{ApprovedGrant, grant_by_approval, lock_accounts},
-	notifications::upsert_subscriber,
+	notifications::{enqueue_governance_mail, upsert_subscriber},
 	scope_catalogs,
 	users::{Named, account_named},
 };
-use crate::ports::{ApprovalActor, ApprovalFilter, ApprovalPerson, ApprovalRecord, ApprovalRepository, ApprovalViewer, NewApproval, PersonRef, Proposed, ProvenInitiator};
+use crate::ports::{
+	ApprovalActor, ApprovalFilter, ApprovalPerson, ApprovalRecord, ApprovalRepository, ApprovalViewer, GovernanceMailQueued, NewApproval, PersonRef, Proposed, ProvenInitiator,
+};
 
 fn repo_err(err: sqlx::Error) -> DomainError {
 	DomainError::Repository(err.to_string())
@@ -406,6 +409,124 @@ async fn tell_initiator(conn: &mut PgConnection, user: UserId, approval: Uuid, s
 	Ok(())
 }
 
+const MAIL_REQUEST: &str = "approval_request";
+const MAIL_OUTCOME: &str = "approval_outcome";
+
+/// The typed mail about `record`, labelled from `kind`. A kind its catalog no longer
+/// carries falls back to its name and the field keys: the mail still says what was
+/// decided, only less prettily.
+async fn mail_of(conn: &mut PgConnection, record: &ApprovalRecord, kind: Option<&ApprovalKind>) -> Result<ApprovalMail, DomainError> {
+	let mut fields = Vec::with_capacity(record.fields.len());
+	for field in &record.fields {
+		let label = kind
+			.and_then(|k| k.fields.iter().find(|spec| spec.key == field.key))
+			.map_or_else(|| field.key.clone(), |spec| spec.label.clone());
+		let value = match &field.value {
+			FieldValue::Text(text) => ApprovalMailValue::Text(text.clone()),
+			FieldValue::Amount(amount) => ApprovalMailValue::Amount {
+				value: amount.value.clone(),
+				currency: amount.currency.clone(),
+			},
+			FieldValue::Bps(bps) => ApprovalMailValue::Bps(*bps),
+			FieldValue::Flag(flag) => ApprovalMailValue::Flag(*flag),
+			FieldValue::Timestamp(ts) => ApprovalMailValue::Timestamp(*ts),
+			FieldValue::Count(count) => ApprovalMailValue::Count(*count),
+			// A person is shown by address: an `auth_subject` means nothing to a reader.
+			FieldValue::User(subject) => {
+				let email: Option<Option<String>> = sqlx::query_scalar("SELECT email FROM users WHERE auth_subject = $1")
+					.bind(subject)
+					.fetch_optional(&mut *conn)
+					.await
+					.map_err(repo_err)?;
+				ApprovalMailValue::User(email.flatten().unwrap_or_else(|| "an account with no address".to_owned()))
+			}
+		};
+		fields.push(ApprovalMailField { label, value });
+	}
+	Ok(ApprovalMail {
+		approval_id: record.id.to_string(),
+		kind: record.kind.clone(),
+		kind_label: kind.map_or_else(|| record.kind.clone(), |k| k.label.clone()),
+		proposer: record.proposer.clone(),
+		scope: record.scope.clone(),
+		level: record.level,
+		requested_by: record.requested_by.as_ref().map(|(_, who)| who.email.clone()).unwrap_or_default(),
+		reason: record.reason.clone(),
+		fields,
+		threshold: record.decision.threshold,
+		roster_size: u32::try_from(record.decision.voters.len()).map_err(|_| DomainError::Repository("roster overflows".into()))?,
+		expires_at: record.decision.expires_at,
+		outcome: None,
+		note: None,
+	})
+}
+
+/// Queue one approval mail; a key some other mail already holds is logged, not fatal —
+/// the decision stands whether or not one mail could be queued.
+async fn queue_mail(conn: &mut PgConnection, user: Uuid, email: &str, kind: &str, dedupe_key: &str, payload: &serde_json::Value) -> Result<(), DomainError> {
+	// `true` is the identity record's flag, read by the caller's filter: only a verified
+	// address is mailed, and the subscriber row must say what the record says (#65).
+	let subscriber = upsert_subscriber(conn, user, email, true).await?;
+	match enqueue_governance_mail(conn, subscriber.id, email, kind, dedupe_key, payload).await? {
+		GovernanceMailQueued::Inserted | GovernanceMailQueued::SameMail => {}
+		GovernanceMailQueued::Foreign => tracing::error!(dedupe_key, kind, "an approval mail's dedupe key names another mail; not queued"),
+	}
+	Ok(())
+}
+
+/// The request to every roster member who can act on it: an active account at a VERIFIED
+/// address (§5.5) — an unproven address hands the seat's say to whoever holds the mailbox,
+/// and a held owner has no vote to cast. In the opening transaction, so a proposal never
+/// exists without its mail queued, and keyed per proposal and member, so it is queued once.
+async fn mail_roster(conn: &mut PgConnection, record: &ApprovalRecord, kind: &ApprovalKind) -> Result<(), DomainError> {
+	let payload = serde_json::to_value(mail_of(conn, record, Some(kind)).await?).map_err(|e| DomainError::Repository(format!("approval mail does not encode: {e}")))?;
+	let roster: Vec<Uuid> = record.decision.voters.iter().map(|v| v.user_id.raw()).collect();
+	let reachable: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, email FROM users WHERE id = ANY($1) AND status = 'active' AND email_verified AND email IS NOT NULL ORDER BY id")
+		.bind(&roster)
+		.fetch_all(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	for (user, email) in reachable {
+		queue_mail(conn, user, &email, MAIL_REQUEST, &format!("{MAIL_REQUEST}:{}:{user}", record.id), &payload).await?;
+	}
+	Ok(())
+}
+
+/// Whose words close the outcome mail, if any.
+fn note_of(record: &ApprovalRecord, state: approvals::ApprovalState) -> Option<ApprovalNote> {
+	use approvals::ApprovalState as S;
+	let decision = &record.decision;
+	let (by, text) = match state {
+		S::Vetoed => (NoteAuthor::Vetoer, decision.veto_reason.clone()),
+		S::Executed | S::ExecutionFailed => (NoteAuthor::Proposer, decision.outcome_detail.clone()),
+		// A proposer's VOID report carries its own words; every other void is this plane's.
+		S::Void if decision.outcome == Some(Outcome::Void) => (NoteAuthor::Proposer, decision.outcome_detail.clone()),
+		// Stored `passed`: a lapse projected, not yet written, so the reason is not stored.
+		S::Void if decision.state == S::Passed => (NoteAuthor::Platform, approvals::LAPSED.to_owned()),
+		S::Void => (NoteAuthor::Platform, decision.void_reason.clone()),
+		S::Open | S::Passed | S::Rejected | S::Expired | S::Cancelled => return None,
+	};
+	(!text.is_empty()).then_some(ApprovalNote { by, text })
+}
+
+/// The outcome to the person the proposal names as `requested_by`, under the same rule as
+/// the request: an active account at a verified address. Keyed per proposal and state, so
+/// "approved" and then "carried out" are two mails and neither is queued twice.
+async fn mail_outcome(conn: &mut PgConnection, record: &ApprovalRecord, state: approvals::ApprovalState, kind: Option<&ApprovalKind>) -> Result<(), DomainError> {
+	let Some((user, _)) = &record.requested_by else { return Ok(()) };
+	let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1 AND status = 'active' AND email_verified AND email IS NOT NULL")
+		.bind(user.raw())
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	let Some(email) = email else { return Ok(()) };
+	let mut mail = mail_of(conn, record, kind).await?;
+	mail.outcome = Some(state.as_str().to_owned());
+	mail.note = note_of(record, state);
+	let payload = serde_json::to_value(mail).map_err(|e| DomainError::Repository(format!("approval mail does not encode: {e}")))?;
+	queue_mail(conn, user.raw(), &email, MAIL_OUTCOME, &format!("{MAIL_OUTCOME}:{}:{}", record.id, state.as_str()), &payload).await
+}
+
 /// A persisted, active owner: the seat that vetoes anything (decided) and sees everything.
 async fn is_owner(conn: &mut PgConnection, user: UserId) -> Result<bool, DomainError> {
 	sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND role = 'owner' AND status = 'active')")
@@ -762,6 +883,7 @@ impl ApprovalRepository for PgApprovals {
 		});
 		write_events(&mut tx, new.id, &mut decision, Some(opener), &detail, now).await?;
 		let stored = load(&mut tx, new.id, false, now).await?.ok_or_else(|| not_found(new.id))?;
+		mail_roster(&mut tx, &stored, &new.kind).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(Proposed::Opened(stored))
 	}
@@ -922,6 +1044,46 @@ impl ApprovalRepository for PgApprovals {
 		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
 		let changed_at: i64 = sqlx::query_scalar("SELECT changed_at FROM platform_roster").fetch_one(&mut *conn).await.map_err(repo_err)?;
 		Ok((current_platform_policy(&mut conn).await?, changed_at))
+	}
+
+	async fn mail_outcomes(&self, limit: i64) -> Result<usize, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let now = self.instant(&mut tx).await?;
+		// The effective state as `Decision::effective_state` projects it. SKIP LOCKED: a
+		// proposal some act holds right now is told on the next pass, after that act.
+		let due: Vec<Uuid> = sqlx::query_scalar(
+			"SELECT id FROM approvals, LATERAL (SELECT CASE \
+			   WHEN state = 'open' AND expires_at <= $1 THEN 'expired' \
+			   WHEN state = 'passed' AND executable_at + $2 <= $1 THEN 'void' \
+			   ELSE state END AS effective) e \
+			 WHERE e.effective <> 'open' AND mailed_state IS DISTINCT FROM e.effective \
+			 ORDER BY created_at, id LIMIT $3 FOR UPDATE OF approvals SKIP LOCKED",
+		)
+		.bind(now)
+		.bind(EXECUTION_WINDOW_SECS)
+		.bind(limit)
+		.fetch_all(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+		if due.is_empty() {
+			return Ok(0);
+		}
+		let kinds: Vec<ApprovalKind> = approvals::builtin_kinds().into_iter().chain(scope_catalogs::current_kinds(&mut *tx).await?).collect();
+		for id in &due {
+			let record = load(&mut tx, *id, false, now).await?.ok_or_else(|| not_found(*id))?;
+			let state = record.decision.effective_state(now);
+			if state != approvals::ApprovalState::Open {
+				mail_outcome(&mut tx, &record, state, kinds.iter().find(|k| k.name == record.kind)).await?;
+			}
+			sqlx::query("UPDATE approvals SET mailed_state = $2 WHERE id = $1")
+				.bind(id)
+				.bind(state.as_str())
+				.execute(&mut *tx)
+				.await
+				.map_err(repo_err)?;
+		}
+		tx.commit().await.map_err(repo_err)?;
+		Ok(due.len())
 	}
 
 	async fn execute(&self, id: Uuid) -> Result<Option<Outcome>, DomainError> {

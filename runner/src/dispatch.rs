@@ -47,6 +47,8 @@ pub struct DispatcherConfig {
 	pub cabinet_url: String,
 	/// Public origin serving the confirm/unsubscribe endpoints.
 	pub public_origin: String,
+	/// The approvals page an approval mail links to, `<approvals_url>/<id>`.
+	pub approvals_url: String,
 	/// Trailing-24h send ceiling. Reaching it pauses sending, not queueing.
 	pub daily_budget: i64,
 	pub interval: Duration,
@@ -248,6 +250,18 @@ pub(crate) fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_u
 	}
 }
 
+/// Render an approval mail (`approval_request`, `approval_outcome`) from its stored
+/// payload. `None` for any other kind, and for a payload that does not read as an
+/// [`templates::ApprovalMail`] — permanent, so the caller parks it.
+pub(crate) fn approval_mail(kind: &str, payload: &serde_json::Value, approvals_url: &str) -> Option<templates::RenderedEmail> {
+	let read = || serde_json::from_value::<templates::ApprovalMail>(payload.clone());
+	match kind {
+		"approval_request" => read().ok().map(|mail| templates::approval_request(&mail, approvals_url)),
+		"approval_outcome" => read().ok().and_then(|mail| templates::approval_outcome(&mail, approvals_url)),
+		_ => None,
+	}
+}
+
 /// Render one claimed job. `None` when the row references data that has since gone,
 /// which is treated as a permanent failure rather than retried forever.
 fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &DispatcherConfig) -> Option<OutgoingEmail> {
@@ -278,7 +292,7 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 	// Governance mail carries NO unsubscribe target, so the transport sets no
 	// List-Unsubscribe header: a security mail a recipient can switch off is not one.
 	if let Some(payload) = job.payload.as_ref()
-		&& let Some(rendered) = governance_mail(&job.kind, payload, &cfg.cabinet_url)
+		&& let Some(rendered) = governance_mail(&job.kind, payload, &cfg.cabinet_url).or_else(|| approval_mail(&job.kind, payload, &cfg.approvals_url))
 	{
 		return Some(OutgoingEmail {
 			to: job.recipient.clone(),
@@ -623,6 +637,26 @@ mod tests {
 		let mut no_reader = row("subject", "TOKEN_BURNED", "WRONG_CODES");
 		no_reader.as_object_mut().expect("object").remove("audience");
 		assert!(governance_mail("payment_outcome", &no_reader, "https://cabinet.example").is_none(), "no reader at all");
+	}
+
+	#[test]
+	fn an_approval_row_renders_against_the_configured_page_or_parks() {
+		let row = serde_json::json!({
+			"approval_id": "0b6f3c2e-1111-4222-8333-444455556666", "kind": "bank:payment", "kind_label": "Payment", "proposer": "bank",
+			"scope": "main", "level": "platform", "requested_by": "", "reason": "", "threshold": 2, "roster_size": 3, "expires_at": 0,
+			"fields": [{"label": "Amount", "value": {"type": "amount", "value": {"value": "5000", "currency": "USDT"}}}],
+		});
+		let mail = approval_mail("approval_request", &row, "https://admin.example/approvals").expect("renderable");
+		assert!(mail.html.contains("https://admin.example/approvals/0b6f3c2e-1111-4222-8333-444455556666") && mail.text.contains("5,000 USDT"));
+		assert!(
+			approval_mail("approval_outcome", &row, "https://admin.example/approvals").is_none(),
+			"an outcome row naming no outcome parks"
+		);
+		assert!(
+			approval_mail("approval_request", &serde_json::json!({"approval_id": "x"}), "https://admin.example").is_none(),
+			"a drifted row parks"
+		);
+		assert!(approval_mail("payout_outcome", &row, "https://admin.example").is_none(), "not an approval kind");
 	}
 
 	#[test]

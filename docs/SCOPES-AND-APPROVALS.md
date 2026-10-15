@@ -12,7 +12,7 @@ bundles under `/auth/mfe/*` (§3.1), the relying-party streams (§4: `ScopeEvent
 (§5.7: both approval services, this plane's own `concierge:*` kinds and their executor,
 stored scope policies, the proven initiator and the pause after the owners change (D24(1),
 (2)), the floor on the known money kinds and `ESCALATION_TEST_COUNT_ABOVE` (§5.3);
-migrations 0036–0038). Not yet: the approval mail (§5.7). Banking, the `lib` projections, invest and admin build against this document.
+migrations 0036–0038) and the approval mail (§5.5, migration 0039). Banking, the `lib` projections, invest and admin build against this document.
 
 Source decisions: the owner's D1–D20 and the approval levels and thresholds of the
 organisation plan (2026-10-14). Where this document departs from the plan's wording it
@@ -553,12 +553,29 @@ OPEN ──(threshold met)──▶ PASSED ──(executable_at passes; proposer
 
 ### 5.5 Mail
 
-On open, every roster member at a VERIFIED address gets the approval mail; on the
-terminal state, the roster and the person named in `requested_by` get the outcome. Both
-are rendered here by one template per purpose from the kind's spec, bypass notification
-preferences (an approval nobody can switch off, like the governance mails), and link
-only to this plane's own approvals page on `PUBLIC_ORIGIN`. They carry no code: voting
-happens over a session, not from a mailbox.
+On open, every roster member with an ACTIVE account at a VERIFIED address gets the
+request (`approval_request`), queued in the opening transaction and keyed
+`approval_request:<id>:<user>`, so a retried `Propose` queues nothing new. The person named
+in `requested_by` (same rule) gets the outcome (`approval_outcome`) when the proposal is
+approved (`passed`) and again when it ends — executed, failed, rejected, vetoed, expired,
+withdrawn or void — keyed `approval_outcome:<id>:<state>`. ⚠️ Narrower than first
+written here (the roster was to get the outcome too): the deciders see it on the approvals
+page, and one mail per decider per outcome is noise that teaches people to skip the
+request. The outcome is queued by a sweep in the executor loop (`mail_outcomes`, every
+pass), not by the act that ends a proposal: an expiry and a lapse are lazy and a void on a
+change of the owners is written by a trigger, so no single path sees every ending;
+`approvals.mailed_state` records the last state told.
+
+Both are rendered here, by one template per purpose, from a TYPED row: the kind's label
+and field labels from the catalog in force, the typed values (an `AMOUNT` grouped by
+thousands and never rounded, `BPS` as a percentage, a `USER` as the account's address),
+the scope, the level, the requester, the threshold and the deadline. The values sit under
+"Submitted by <proposer>", the reason, a veto reason and a proposer's report under labels
+saying whose words they are; every value is folded to one line and escaped. They bypass
+notification preferences (an approval nobody can switch off, like the governance mails),
+carry no code — voting happens over a session, not from a mailbox — and link only to
+`<APPROVALS_URL>/<id>` (default `https://evinvest.ltd/admin/approvals`), built at send
+time: no row stores a link.
 
 ### 5.6 Scope admins (decided)
 
@@ -661,10 +678,8 @@ in `domain::approvals`.
   (`over_scope_budget`) with a `FLAG_SET` escalation, which sends that proposal to the
   owners. A kind's own thresholds here are the backstop behind that budget, not the
   budget.
-- **Not yet**: the mail of §5.5. A catalog already
-  stored that delegates `<namespace>:admin` is not re-checked; the next publication is.
-  Until the mail exists a roster member learns of a proposal by
-  `ListApprovals { awaiting_my_vote }`.
+- **Not yet**: a catalog already stored that delegates `<namespace>:admin` is not
+  re-checked; the next publication is.
 
 ---
 
