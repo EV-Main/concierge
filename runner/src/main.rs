@@ -109,6 +109,55 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// subject authorize as an owner. Shared by every service that resolves or reports a
 	// role, so the rule is stated once.
 	let break_glass = Arc::new(concierge::authz::BreakGlass::new(config.owner_subjects.clone()));
+	// Every configuration refusal comes BEFORE the first side effect — the database
+	// connection, the migrations, genesis. A pod that is going to exit over its config must
+	// not have upgraded the schema on its way out (#132).
+	let auth_config = AuthConfig::from_env().context("failed to load auth configuration")?;
+	// The auth crate's optional seams (absent ⇒ inert plane) are a dev/CI
+	// affordance; production must never boot inert. Same for the session/refresh
+	// stores' in-process fallback — restart-lossy, dev-only.
+	if config.app_env == "production" {
+		ensure!(
+			auth_config.signing.is_some(),
+			"production requires the auth signing triple (AUTH_SIGNING_KEY_PEM/AUTH_SIGNING_KID/AUTH_JWKS_JSON)"
+		);
+		ensure!(auth_config.google.is_some(), "production requires GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET");
+		ensure!(
+			std::env::var("REDIS_URL").is_ok_and(|v| !v.is_empty()),
+			"production requires REDIS_URL (web sessions + refresh state must survive restarts)"
+		);
+		// A test secret passes (or fails) every token without a person behind it, so in
+		// production it would quietly switch the check off.
+		ensure!(
+			!web::is_test_secret(&config.turnstile_secret),
+			"production requires a real TURNSTILE_SECRET, not one of Cloudflare's test secrets"
+		);
+	}
+	let dev_redirects = relying_party::parse_dev_redirects(&std::env::var("RP_DEV_REDIRECT_URIS").unwrap_or_default(), config.app_env == "production")?;
+	let kyc_provider = build_kyc_provider(&config)?;
+	// Fail the BOOT, not the first start. A provider that cannot say where its session
+	// URLs live turns the redirect check into a no-op, and the whole point of that check
+	// is that the plane stops trusting any `https:` the vendor happens to return. A
+	// process that has quietly lost a defence is worse than one that refuses to come up,
+	// because nothing about it looks wrong — the same reasoning that makes `KYC_STUB` in
+	// production an `ensure!` below rather than a warning.
+	if let Some(provider) = kyc_provider.as_ref() {
+		ensure!(
+			!provider.session_origins().is_empty(),
+			"the {} KYC provider declares no session origin — check DIDIT_BASE_URL (or CABINET_URL under KYC_STUB): it must parse as an absolute URL with a host",
+			provider.name()
+		);
+	}
+	// Also the BOOT and not the first start. A non-positive TTL makes every case stale
+	// the instant it is written, so each `/kyc/start` would buy a new BILLED vendor
+	// session and the user would spend `START_MAX_PER_WINDOW` in five clicks — a
+	// misconfiguration that costs money and looks, from the outside, like verification
+	// simply never working.
+	ensure!(
+		config.kyc_case_ttl_secs > 0,
+		"KYC_CASE_TTL_SECS must be positive (got {}): a non-positive value abandons every case as soon as it is opened",
+		config.kyc_case_ttl_secs
+	);
 	// The plane applies pending control-plane migrations on boot (idempotent). New
 	// migration FILES are authored with the sqlx CLI (`sqlx migrate add …`), never
 	// hand-written.
@@ -145,27 +194,6 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// provisioner channel is the auth → directory seam: auth holds the `Provisioner`
 	// (called from `Exchange`/`Refresh`), and the directory keeps the receiver and
 	// drains it against Postgres — provisioning/looking-up/revoking the matching user.
-	let auth_config = AuthConfig::from_env().context("failed to load auth configuration")?;
-	// The auth crate's optional seams (absent ⇒ inert plane) are a dev/CI
-	// affordance; production must never boot inert. Same for the session/refresh
-	// stores' in-process fallback — restart-lossy, dev-only.
-	if config.app_env == "production" {
-		ensure!(
-			auth_config.signing.is_some(),
-			"production requires the auth signing triple (AUTH_SIGNING_KEY_PEM/AUTH_SIGNING_KID/AUTH_JWKS_JSON)"
-		);
-		ensure!(auth_config.google.is_some(), "production requires GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET");
-		ensure!(
-			std::env::var("REDIS_URL").is_ok_and(|v| !v.is_empty()),
-			"production requires REDIS_URL (web sessions + refresh state must survive restarts)"
-		);
-		// A test secret passes (or fails) every token without a person behind it, so in
-		// production it would quietly switch the check off.
-		ensure!(
-			!web::is_test_secret(&config.turnstile_secret),
-			"production requires a real TURNSTILE_SECRET, not one of Cloudflare's test secrets"
-		);
-	}
 	// The inbound verifier must expect exactly what issuance stamps, so read the
 	// issuer/audience off the loaded (env-resolved, plane-asserted) `auth_config`
 	// before it moves into the service — never re-read the env with copied defaults.
@@ -184,7 +212,6 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// a digest here, so a rotation is an env change and a restart. Dev-only loopback
 	// redirect targets come from `RP_DEV_REDIRECT_URIS`, refused in production.
 	let grants: Arc<dyn concierge::ports::GrantRepository> = Arc::new(infrastructure::grants::PgGrants::new(pool.clone()));
-	let dev_redirects = relying_party::parse_dev_redirects(&std::env::var("RP_DEV_REDIRECT_URIS").unwrap_or_default(), config.app_env == "production")?;
 	let relying_parties = Arc::new(RelyingParties::new(
 		Arc::new(infrastructure::relying_parties::PgRelyingParties::new(pool.clone())),
 		users.clone(),
@@ -389,30 +416,6 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// the outbox row and the money plane's mirror are identical either way, and banking
 	// never learns a vendor exists.
 	let kyc_cases: Arc<dyn concierge::ports::KycCaseRepository> = Arc::new(infrastructure::kyc::cases::PgKycCases::new(pool.clone()));
-	let kyc_provider = build_kyc_provider(&config)?;
-	// Fail the BOOT, not the first start. A provider that cannot say where its session
-	// URLs live turns the redirect check into a no-op, and the whole point of that check
-	// is that the plane stops trusting any `https:` the vendor happens to return. A
-	// process that has quietly lost a defence is worse than one that refuses to come up,
-	// because nothing about it looks wrong — the same reasoning that makes `KYC_STUB` in
-	// production an `ensure!` below rather than a warning.
-	if let Some(provider) = kyc_provider.as_ref() {
-		ensure!(
-			!provider.session_origins().is_empty(),
-			"the {} KYC provider declares no session origin — check DIDIT_BASE_URL (or CABINET_URL under KYC_STUB): it must parse as an absolute URL with a host",
-			provider.name()
-		);
-	}
-	// Also the BOOT and not the first start. A non-positive TTL makes every case stale
-	// the instant it is written, so each `/kyc/start` would buy a new BILLED vendor
-	// session and the user would spend `START_MAX_PER_WINDOW` in five clicks — a
-	// misconfiguration that costs money and looks, from the outside, like verification
-	// simply never working.
-	ensure!(
-		config.kyc_case_ttl_secs > 0,
-		"KYC_CASE_TTL_SECS must be positive (got {}): a non-positive value abandons every case as soon as it is opened",
-		config.kyc_case_ttl_secs
-	);
 	let web_state = web::WebState::try_new(
 		auth_service.clone(),
 		config.public_origin.clone(),

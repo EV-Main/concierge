@@ -210,11 +210,14 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   ten failures lock the PASSWORD for 15 minutes and never the code path, so nobody locks an
   owner out of their account by guessing at it. Setting a password spends a verification
   code, so a stolen session cannot plant a credential that outlives its revocation; "forgot
-  password" is a code sign-in. Every signed-in mutation is gated as `authz::caller_gate` is
-  (`web::sign_in::gate`): a disabled account or a session minted under an older
-  `token_version` is refused and its session ended, cookies cleared; the ones that plant a
-  credential (password set, passkey registration) also check the refresh family first-hand,
-  as `/auth/authorize` does. An account handle is an email OR a username, through one
+  password" is a code sign-in. Every signed-in route, mutation and read alike, is gated as
+  `authz::caller_gate` is (`web::sign_in::gate`): a disabled account or a session minted
+  under an older `token_version` (a takeover, a revoke-all) is refused — 403 `disabled`,
+  401 `unauthenticated` — and its session ended, cookies cleared; `/auth/session` answers
+  such a session `authenticated: false` instead of refusing, and ends it the same way. The
+  ones that plant a credential or buy a vendor session (password set, passkey
+  registration, `/kyc/start`) also check the refresh family first-hand, as
+  `/auth/authorize` does. An account handle is an email OR a username, through one
   resolver (`infrastructure::users::account_named`): an email names the accounts it is
   verified on or backs a password of, and only when it names none is the handle read as a
   username — a chosen username matches `[a-z0-9_.-]{3,32}` and never contains `@`, a
@@ -276,7 +279,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   "created_at", "resumable"}}` — `status` is the PERSISTED vocabulary (`pending`,
   `in_progress`, `in_review`, `resubmitted`), `created_at` is unix seconds, and a DECIDED
   case is history and leaves the answer. Refusals are JSON too
-  (`{"error":"unauthenticated"|"internal"}`); the names are pinned field for field by an
+  (`{"error":"unauthenticated"|"disabled"|"internal"}`); the names are pinned field for field by an
   integration test, because a rename here surfaces as a user charged for a duplicate case
   rather than as a red test. Unlike `/kyc/start` it stays 200 with `DIDIT_*` unset: the
   level a user holds and the case they opened are facts of THIS plane, and a screen that
@@ -467,8 +470,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   probing for an ABSENT body (`403` with no code meant "stale token, reload"; `403` with
   one meant "failed"), which is a client reading tea leaves about which half of a refusal
   it is in (banking#193). One format now, one key, one closed vocabulary:
-  `unauthenticated` · `csrf` · `throttled` · `internal` · `email_unverified` (403, checked
-  before the gate: a level above 0 needs a verified email), plus the pre-existing
+  `unauthenticated` · `csrf` · `disabled` · `throttled` · `internal` · `email_unverified`
+  (403, checked before the gate: a level above 0 needs a verified email), plus the pre-existing
   `kyc_unavailable`, which keeps its second `contact` field and is the only one that has
   one. `unauthenticated` has to stay REACHABLE: the CSRF check still runs before any
   session state is touched, but it answers "nobody is signed in" for an absent or lapsed
@@ -812,7 +815,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   beside `to` and is the same number: rows written before this carried only that key.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
-  hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
+  hit a REAL Postgres (no DB mocks); the binary applies migrations on boot, and refuses
+  its configuration BEFORE it connects to the database (`runner/tests/boot_config.rs`).
 - A DB-backed suite takes its URL from `common::database_url()`, never from
   `std::env::var("DATABASE_URL")` directly. Without `DATABASE_URL` a suite skips
   and still reports "N passed" — libtest prints nothing for a passing test — so

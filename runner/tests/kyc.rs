@@ -223,6 +223,9 @@ fn unavailable_body() -> Value {
 
 struct Harness {
 	router: Router,
+	/// The issuer the router signs with, so a test opens sessions the gate admits: a
+	/// real access token minted under the account's `token_version`, a live family.
+	auth: AuthService,
 	users: Arc<PgUsers>,
 	cases: Arc<PgKycCases>,
 	notifications: Arc<PgNotifications>,
@@ -252,8 +255,9 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let cases = Arc::new(PgKycCases::new(pool.clone()));
 	let notifications = Arc::new(PgNotifications::new(pool.clone()));
+	let auth = common::signing_auth(users.clone()).await;
 	let state = web::WebState::try_new(
-		AuthService::unconfigured(),
+		auth.clone(),
 		"https://evinvest.test".to_string(),
 		false,
 		common::inert_sign_in(&pool),
@@ -273,6 +277,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 
 	Some(Harness {
 		router: web::router(state),
+		auth,
 		users,
 		cases,
 		notifications,
@@ -903,28 +908,38 @@ async fn the_webhook_needs_no_cookie_and_no_csrf_token() {
 	assert_eq!(h.kyc_level(user).await, 1);
 }
 
-/// Opens a REAL session in the locker the router reads, and returns the cookie header
-/// plus the CSRF token to pair with it.
+/// The same, with the stored user id written verbatim and a token nobody signed — so a
+/// test can open a session the CSRF check accepts and the user lookup then cannot resolve.
 ///
 /// `None` when Redis is absent: the in-process fallback is per-instance by design (see
 /// `web_sessions.rs`), so a session opened here would be invisible to the router.
-async fn signed_in(user: UserId) -> Option<(String, String)> {
-	signed_in_with(&user.to_string(), 900).await
-}
-
-/// The same, with the stored user id written verbatim — so a test can open a session the
-/// CSRF check accepts and the user lookup then cannot resolve.
 async fn signed_in_as(user_id: &str) -> Option<(String, String)> {
 	signed_in_with(user_id, 900).await
 }
 
-/// The same, with the access token's remaining lifetime chosen by the caller.
-///
-/// A value inside `ACCESS_SKEW_SECS` (30) is what puts `WebSessions::fresh` on its
-/// REFRESH path — the one that rotates the pair and saves it — which is the only way a
-/// test can observe whether a handler hands the new token back to the browser.
-async fn signed_in_for(user: UserId, access_ttl_secs: i64) -> Option<(String, String)> {
-	signed_in_with(&user.to_string(), access_ttl_secs).await
+impl Harness {
+	/// Opens a REAL session in the locker the router reads — issued by the router's own
+	/// signer, so the live-account gate admits it — and returns the cookie header plus the
+	/// CSRF token to pair with it. `None` when Redis is absent (see [`signed_in_as`]).
+	async fn signed_in(&self, user: UserId) -> Option<(String, String)> {
+		self.signed_in_for(user, None).await
+	}
+
+	/// The same, with the access token's remaining lifetime chosen by the caller.
+	///
+	/// A value inside `ACCESS_SKEW_SECS` (30) is what puts `WebSessions::fresh` on its
+	/// REFRESH path — the one that rotates the pair and saves it — which is the only way a
+	/// test can observe whether a handler hands the new token back to the browser.
+	async fn signed_in_for(&self, user: UserId, access_ttl_secs: Option<i64>) -> Option<(String, String)> {
+		std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty())?;
+		let mut tokens = self.auth.open_session(&user.to_string(), "itest".into(), String::new()).await.expect("open a session");
+		if let Some(ttl) = access_ttl_secs {
+			tokens.access_expires_at = now() + ttl;
+		}
+		let sessions = web::WebSessions::from_env().await.expect("session store");
+		let (session_id, csrf, _) = sessions.put(tokens).await.expect("open session").expect("token pair carries a user");
+		Some((format!("ev_session={session_id}; ev_csrf={csrf}"), csrf))
+	}
 }
 
 async fn signed_in_with(user_id: &str, access_ttl_secs: i64) -> Option<(String, String)> {
@@ -961,7 +976,7 @@ async fn signed_in_with(user_id: &str, access_ttl_secs: i64) -> Option<(String, 
 async fn start_opens_a_case_and_hands_back_a_redirect() {
 	let h = harness!();
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -995,7 +1010,7 @@ async fn start_opens_a_case_and_hands_back_a_redirect() {
 async fn a_csrf_token_that_is_merely_close_is_still_refused() {
 	let h = harness!();
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -1041,7 +1056,7 @@ async fn a_csrf_token_that_is_merely_close_is_still_refused() {
 async fn a_tier_in_the_body_is_ignored_and_the_case_opens_at_the_entry_tier() {
 	let h = harness!();
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -1089,7 +1104,7 @@ async fn a_second_start_reuses_the_live_case_and_never_calls_the_vendor() {
 		return;
 	};
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -1115,7 +1130,7 @@ async fn an_unverified_email_starts_no_verification() {
 		return;
 	};
 	let user = h.users.resolve(common::google("kyc-unverified", false), 0).await.expect("provision").id();
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -1142,7 +1157,7 @@ async fn two_simultaneous_starts_buy_one_session_and_share_the_case() {
 		return;
 	};
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -1205,7 +1220,7 @@ async fn the_window_cap_refuses_a_start_without_calling_the_vendor() {
 		return;
 	};
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -1269,7 +1284,7 @@ async fn a_vendor_that_refuses_a_session_degrades_exactly_like_an_unconfigured_o
 		return;
 	};
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2295,7 +2310,7 @@ async fn a_superseded_verdict_tells_nobody_anything() {
 async fn every_start_refusal_carries_a_machine_readable_code() {
 	let h = harness!();
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2354,7 +2369,7 @@ async fn the_unavailable_body_is_not_flattened_into_the_new_vocabulary() {
 		return;
 	};
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset");
 		return;
 	};
@@ -2380,7 +2395,7 @@ async fn a_redirect_the_vendor_should_not_have_sent_is_refused_like_an_outage() 
 			return;
 		};
 		let user = h.user().await;
-		let Some((cookie, csrf)) = signed_in(user).await else {
+		let Some((cookie, csrf)) = h.signed_in(user).await else {
 			eprintln!("skipped: REDIS_URL unset");
 			return;
 		};
@@ -2409,7 +2424,7 @@ async fn a_redirect_the_vendor_should_not_have_sent_is_refused_like_an_outage() 
 async fn a_stored_redirect_the_plane_would_not_send_a_browser_to_is_not_handed_back() {
 	let h = harness!();
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2452,7 +2467,7 @@ async fn a_stored_redirect_the_plane_would_not_send_a_browser_to_is_not_handed_b
 async fn the_status_route_publishes_the_pinned_shape() {
 	let h = harness!();
 	let user = h.user().await;
-	let Some((cookie, _csrf)) = signed_in(user).await else {
+	let Some((cookie, _csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2516,7 +2531,7 @@ async fn status_answers_while_verification_itself_is_unavailable() {
 		return;
 	};
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2546,7 +2561,7 @@ async fn reading_the_session_hands_the_refreshed_access_cookie_back() {
 	let h = harness!();
 	let user = h.user().await;
 	// Inside the 30-second skew, so `fresh` takes its refresh path.
-	let Some((cookie, csrf)) = signed_in_for(user, 10).await else {
+	let Some((cookie, csrf)) = h.signed_in_for(user, Some(10)).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2577,7 +2592,7 @@ async fn reading_the_session_hands_the_refreshed_access_cookie_back() {
 async fn status_is_never_cacheable() {
 	let h = harness!();
 	let user = h.user().await;
-	let Some((cookie, _csrf)) = signed_in(user).await else {
+	let Some((cookie, _csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2606,7 +2621,7 @@ async fn a_running_case_is_not_resumable_while_the_vendor_is_unconfigured() {
 		return;
 	};
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2631,7 +2646,7 @@ async fn a_running_case_is_not_resumable_while_the_vendor_is_unconfigured() {
 async fn a_pending_case_inside_the_ttl_is_still_the_caller_s_running_attempt() {
 	let h = harness!();
 	let user = h.user().await;
-	let Some((cookie, _csrf)) = signed_in(user).await else {
+	let Some((cookie, _csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2666,7 +2681,7 @@ async fn a_pending_case_past_the_ttl_is_dropped_and_start_opens_a_fresh_one() {
 		return;
 	};
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2707,7 +2722,7 @@ async fn an_in_review_case_never_ages_out() {
 		return;
 	};
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2786,7 +2801,7 @@ async fn a_case_the_vendor_moved_is_live_however_old_the_row_is() {
 		return;
 	};
 	let user = h.user().await;
-	let Some((cookie, csrf)) = signed_in(user).await else {
+	let Some((cookie, csrf)) = h.signed_in(user).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -2882,4 +2897,39 @@ async fn only_a_case_this_plane_retired_carries_the_mark_that_ignores_its_verdic
 	assert_eq!(answer["ignored"], "superseded");
 	assert_eq!(h.kyc_level(user).await, 0);
 	assert_eq!(h.case_row(stale_id).await.2["retired_by_ttl"], json!(true), "and the mark survives the delivery it refused");
+}
+
+/// A blocked account's session buys no vendor session (#132): `/kyc/start` refuses it as
+/// every gated route does, before the gate that would bill a case, and ends the session.
+/// So does a session minted under an older `token_version` — a takeover, a revoke-all.
+#[tokio::test]
+async fn a_dead_account_starts_nothing_and_its_session_ends() {
+	let h = harness!();
+	for (bump, refusal) in [
+		("UPDATE users SET status = 'disabled' WHERE id = $1", (StatusCode::FORBIDDEN, json!({ "error": "disabled" }))),
+		(
+			"UPDATE users SET token_version = token_version + 1 WHERE id = $1",
+			(StatusCode::UNAUTHORIZED, json!({ "error": "unauthenticated" })),
+		),
+	] {
+		let user = h.user().await;
+		let Some((cookie, csrf)) = h.signed_in(user).await else {
+			eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+			return;
+		};
+		sqlx::query(bump).bind(user.raw()).execute(&h.pool).await.unwrap();
+
+		let (status, headers, answer) = h.start_response(&cookie, Some(&csrf), "").await;
+		assert_eq!((status, answer), refusal, "{bump}");
+		assert!(
+			headers.get_all("set-cookie").iter().any(|c| c.to_str().unwrap().starts_with("ev_session=;")),
+			"{bump}: the session's cookies are cleared"
+		);
+		let cases: i64 = sqlx::query_scalar("SELECT count(*) FROM kyc_cases WHERE user_id = $1")
+			.bind(user.raw())
+			.fetch_one(&h.pool)
+			.await
+			.unwrap();
+		assert_eq!(cases, 0, "{bump}: no case is opened");
+	}
 }
