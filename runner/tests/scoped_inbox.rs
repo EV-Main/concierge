@@ -225,7 +225,7 @@ async fn the_platform_inbox_holds_the_built_ins_and_the_bank_and_no_scope() {
 		let body: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
 		let shown = topics(&body);
 		for t in TOPICS {
-			assert!(shown.iter().any(|s| s == t.key), "{origin:?}: built-in {} is shown", t.key);
+			assert_eq!(shown.iter().any(|s| s == t.key), t.followable, "{origin:?}: built-in {} is offered iff followable", t.key);
 		}
 		assert!(shown.contains(&bank), "{origin:?}: the money plane's topics are everyone's");
 		assert!(
