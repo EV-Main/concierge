@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use color_eyre::{
 	Result,
-	eyre::{Context, ensure},
+	eyre::{Context, ensure, eyre},
 };
 use concierge::{
 	bridge, bridge_tls, config, directory, governance,
@@ -99,6 +99,11 @@ fn main() -> Result<()> {
 }
 
 async fn run(config: config::AppConfig) -> Result<()> {
+	// Before anything can measure a proposal: an unparsable cap must stop the boot rather
+	// than leave the floor at a value nobody chose.
+	let floor_caps = domain::floors::MoneyCaps::new(&config.approval_floor_per_operation_usdt, &config.approval_floor_daily_usdt).map_err(|e| eyre!(e))?;
+	tracing::info!(per_operation_usdt = floor_caps.per_operation(), daily_usdt = floor_caps.daily(), "approval money floors in force");
+	domain::floors::configure(floor_caps).map_err(|e| eyre!(e))?;
 	// `OWNER_SUBJECTS`, pre-loaded from env. It does two things and then retires: it seeds
 	// the genesis roster below, and until the registry is populated it lets a listed
 	// subject authorize as an owner. Shared by every service that resolves or reports a

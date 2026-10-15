@@ -195,6 +195,14 @@ ev::settings! {
 		/// little too long, while a boot that refuses over an unset knob takes sign-in
 		/// down for the whole platform.
 		kyc_case_ttl_secs: i64 = "86400",
+		/// The floor's money caps (`domain::floors`) on `bank:account_transfer` and
+		/// `bank:scope_payout`: above this many USDT in one operation, and in a trailing day,
+		/// a scope's proposal goes to the platform owners. One pair for both kinds (owners'
+		/// decision). Environment and not the database, because the floor guards against a
+		/// compromised catalog publisher; the boot refuses anything but a positive canonical
+		/// amount.
+		approval_floor_per_operation_usdt: String = "1000",
+		approval_floor_daily_usdt: String = "5000",
 		/// Cloudflare Turnstile secret for the credential endpoints. Required everywhere:
 		/// development uses Cloudflare's always-pass test secret, so no arm skips the check.
 		#[secret]

@@ -8,11 +8,88 @@
 //! table, and bind twice: a publication that is looser is refused, and a proposal is
 //! measured against the stricter of the table and the catalog in force — which also covers
 //! a catalog stored before this table existed.
+//!
+//! The two money caps of the scope kinds — per operation and per trailing day — are read
+//! from the runner's environment (`APPROVAL_FLOOR_PER_OPERATION_USDT`,
+//! `APPROVAL_FLOOR_DAILY_USDT`) and installed once at boot with [`configure`]; unset, they
+//! are [`MoneyCaps::DEFAULT`]. Environment and not the database, because the floor exists
+//! to hold against a compromised publisher, and anything a running service can write is
+//! within that publisher's reach: the environment is set in the devops repo by a reviewed
+//! PR, so moving a cap stays a decision of the platform owners and still needs no release
+//! of this code. Every other cap is a constant on purpose.
+
+use std::sync::OnceLock;
 
 use crate::{
 	approvals::amount_above,
-	scope_catalog::{ApprovalKind, ApprovalLevel, Escalation, EscalationTest},
+	scope_catalog::{ApprovalKind, ApprovalLevel, Escalation, EscalationTest, is_canonical_amount},
 };
+
+/// The money caps of the scope kinds, in USDT, as canonical amounts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoneyCaps {
+	per_operation: String,
+	daily: String,
+}
+
+impl MoneyCaps {
+	/// §4.4 of the organisation plan.
+	pub const DEFAULT: (&'static str, &'static str) = ("1000", "5000");
+
+	/// Both caps must be positive canonical amounts — the spelling a threshold is compared
+	/// in, so `1000.0` or `1e3` is refused rather than compared wrongly.
+	pub fn new(per_operation: &str, daily: &str) -> Result<Self, String> {
+		let valid = |name: &str, raw: &str| {
+			if is_canonical_amount(raw) && raw != "0" {
+				Ok(raw.to_owned())
+			} else {
+				Err(format!(
+					"{name} must be a positive decimal amount without leading or trailing zeros (e.g. `1000` or `2500.5`), got `{raw}`"
+				))
+			}
+		};
+		Ok(Self {
+			per_operation: valid("APPROVAL_FLOOR_PER_OPERATION_USDT", per_operation)?,
+			daily: valid("APPROVAL_FLOOR_DAILY_USDT", daily)?,
+		})
+	}
+
+	pub fn per_operation(&self) -> &str {
+		&self.per_operation
+	}
+
+	pub fn daily(&self) -> &str {
+		&self.daily
+	}
+}
+
+static MONEY_CAPS: OnceLock<MoneyCaps> = OnceLock::new();
+
+/// Installs the caps for the life of the process. Refused once caps are installed: two
+/// values in one process would measure proposals against two different floors.
+pub fn configure(caps: MoneyCaps) -> Result<(), String> {
+	MONEY_CAPS.set(caps).map_err(|_| "the money floor caps are already configured".to_owned())
+}
+
+/// A floor's highest threshold allowed.
+#[derive(Clone, Copy, Debug)]
+pub enum Cap {
+	Fixed(&'static str),
+	/// [`MoneyCaps::per_operation`].
+	PerOperation,
+	/// [`MoneyCaps::daily`].
+	Daily,
+}
+
+impl Cap {
+	pub fn value(self) -> &'static str {
+		match self {
+			Cap::Fixed(cap) => cap,
+			Cap::PerOperation => MONEY_CAPS.get().map_or(MoneyCaps::DEFAULT.0, |c| c.per_operation.as_str()),
+			Cap::Daily => MONEY_CAPS.get().map_or(MoneyCaps::DEFAULT.1, |c| c.daily.as_str()),
+		}
+	}
+}
 
 /// One escalation the table holds a kind to. `parameter` is what `escalated_by` names
 /// when the table, not the catalog, sent the proposal to the owners.
@@ -21,8 +98,8 @@ pub struct Floor {
 	pub parameter: &'static str,
 	pub field_key: &'static str,
 	pub test: EscalationTest,
-	/// The highest threshold allowed; empty for FLAG_SET.
-	pub cap: &'static str,
+	/// Empty for FLAG_SET.
+	pub cap: Cap,
 	pub currency: &'static str,
 }
 
@@ -38,7 +115,7 @@ pub enum KindFloor {
 	Unbounded,
 }
 
-const fn floor(parameter: &'static str, field_key: &'static str, test: EscalationTest, cap: &'static str, currency: &'static str) -> Floor {
+const fn floor(parameter: &'static str, field_key: &'static str, test: EscalationTest, cap: Cap, currency: &'static str) -> Floor {
 	Floor {
 		parameter,
 		field_key,
@@ -50,7 +127,8 @@ const fn floor(parameter: &'static str, field_key: &'static str, test: Escalatio
 
 /// §4.4 of the organisation plan: what leaves the platform, crosses scopes, seeds or
 /// sweeps capital, sets a compartment's limits or grants holdings is always the owners';
-/// inside a scope, 1000 USDT per operation and 5000 USDT a day, a payout to one recipient
+/// inside a scope, [`MoneyCaps`] per operation and a day (1000 and 5000 USDT unless
+/// configured), a payout to one recipient
 /// a day, a valuation within 10 % and a fee change within its ceiling.
 const TABLE: &[(&str, KindFloor)] = &[
 	("bank:payment", KindFloor::Platform),
@@ -62,30 +140,30 @@ const TABLE: &[(&str, KindFloor)] = &[
 	(
 		"bank:account_transfer",
 		KindFloor::Scope(&[
-			floor("floor_per_operation", "amount", EscalationTest::AmountAbove, "1000", "USDT"),
-			floor("floor_daily", "amount", EscalationTest::Rolling24hAmountAbove, "5000", "USDT"),
+			floor("floor_per_operation", "amount", EscalationTest::AmountAbove, Cap::PerOperation, "USDT"),
+			floor("floor_daily", "amount", EscalationTest::Rolling24hAmountAbove, Cap::Daily, "USDT"),
 		]),
 	),
 	(
 		"bank:scope_payout",
 		KindFloor::Scope(&[
-			floor("floor_per_operation", "total", EscalationTest::AmountAbove, "1000", "USDT"),
-			floor("floor_daily", "total", EscalationTest::Rolling24hAmountAbove, "5000", "USDT"),
-			floor("floor_recipients", "recipients", EscalationTest::CountAbove, "1", ""),
+			floor("floor_per_operation", "total", EscalationTest::AmountAbove, Cap::PerOperation, "USDT"),
+			floor("floor_daily", "total", EscalationTest::Rolling24hAmountAbove, Cap::Daily, "USDT"),
+			floor("floor_recipients", "recipients", EscalationTest::CountAbove, Cap::Fixed("1"), ""),
 			// One recipient a day in a scope: a payout split into single-recipient ones must
 			// not pass as many small decisions what is one distribution (decided by the session).
-			floor("floor_daily_recipients", "recipients", EscalationTest::Rolling24hCountAbove, "1", ""),
+			floor("floor_daily_recipients", "recipients", EscalationTest::Rolling24hCountAbove, Cap::Fixed("1"), ""),
 			// A distribution to every holder is a dividend: the owners' (D24).
-			floor("floor_distribution", "distribution", EscalationTest::FlagSet, "", ""),
+			floor("floor_distribution", "distribution", EscalationTest::FlagSet, Cap::Fixed(""), ""),
 		]),
 	),
 	(
 		"invest:valuation_override",
-		KindFloor::Scope(&[floor("floor_deviation", "deviation", EscalationTest::AbsBpsAbove, "1000", "")]),
+		KindFloor::Scope(&[floor("floor_deviation", "deviation", EscalationTest::AbsBpsAbove, Cap::Fixed("1000"), "")]),
 	),
 	(
 		"invest:fee_policy",
-		KindFloor::Scope(&[floor("floor_ceiling", "raises_ceiling", EscalationTest::FlagSet, "", "")]),
+		KindFloor::Scope(&[floor("floor_ceiling", "raises_ceiling", EscalationTest::FlagSet, Cap::Fixed(""), "")]),
 	),
 ];
 
@@ -119,8 +197,8 @@ pub fn stricter(test: EscalationTest, a: &str, b: &str) -> Option<String> {
 /// Whether `threshold` is looser than the floor's cap.
 fn looser(floor: &Floor, threshold: &str) -> bool {
 	match floor.test {
-		EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => amount_above(threshold, floor.cap),
-		EscalationTest::AbsBpsAbove | EscalationTest::CountAbove | EscalationTest::Rolling24hCountAbove => match (threshold.parse::<u64>(), floor.cap.parse::<u64>()) {
+		EscalationTest::AmountAbove | EscalationTest::Rolling24hAmountAbove => amount_above(threshold, floor.cap.value()),
+		EscalationTest::AbsBpsAbove | EscalationTest::CountAbove | EscalationTest::Rolling24hCountAbove => match (threshold.parse::<u64>(), floor.cap.value().parse::<u64>()) {
 			(Ok(value), Ok(cap)) => value > cap,
 			_ => true,
 		},
@@ -152,7 +230,9 @@ pub fn check(kind: &ApprovalKind) -> Result<(), String> {
 					if looser(floor, &e.default_threshold) || e.currency != floor.currency {
 						return Err(format!(
 							"approval kind `{name}` escalation `{}` is looser than this plane's floor: at most {} {}",
-							e.parameter, floor.cap, floor.currency
+							e.parameter,
+							floor.cap.value(),
+							floor.currency
 						));
 					}
 				}
@@ -185,7 +265,7 @@ pub fn floored(kind: &ApprovalKind) -> ApprovalKind {
 					.iter_mut()
 					.filter(|e| e.test == floor.test && e.field_key == floor.field_key && e.currency == floor.currency)
 				{
-					if let Some(stricter) = stricter(floor.test, &e.default_threshold, floor.cap) {
+					if let Some(stricter) = stricter(floor.test, &e.default_threshold, floor.cap.value()) {
 						e.default_threshold = stricter;
 					}
 				}
@@ -194,7 +274,7 @@ pub fn floored(kind: &ApprovalKind) -> ApprovalKind {
 					parameter: floor.parameter.to_owned(),
 					field_key: floor.field_key.to_owned(),
 					test: floor.test,
-					default_threshold: floor.cap.to_owned(),
+					default_threshold: floor.cap.value().to_owned(),
 					currency: floor.currency.to_owned(),
 				});
 			}
@@ -323,6 +403,28 @@ mod tests {
 		}];
 		assert_eq!(special_fired("bank:scope_payout", &fields), vec!["floor_no_recipients".to_owned()]);
 		assert!(special_fired("bank:account_transfer", &fields).is_empty());
+	}
+
+	#[test]
+	fn money_caps_take_positive_canonical_amounts_only() {
+		let caps = MoneyCaps::new("2500.5", "10000").expect("valid caps");
+		assert_eq!((caps.per_operation(), caps.daily()), ("2500.5", "10000"));
+		for bad in ["0", "", "-1", "1000.0", "01000", "1e3", " 1000", "1000 USDT"] {
+			let error = MoneyCaps::new(bad, "5000").expect_err(bad);
+			assert!(error.contains("APPROVAL_FLOOR_PER_OPERATION_USDT"), "{error}");
+		}
+		assert!(MoneyCaps::new("1000", "0").unwrap_err().contains("APPROVAL_FLOOR_DAILY_USDT"));
+		let (per_operation, daily) = MoneyCaps::DEFAULT;
+		assert!(MoneyCaps::new(per_operation, daily).is_ok(), "the defaults pass their own check");
+	}
+
+	/// Nothing in this binary installs caps — that would leak into every other test of the
+	/// process — so the configured path has a test binary of its own
+	/// (`tests/configured_floors.rs`).
+	#[test]
+	fn unconfigured_money_caps_are_the_plans() {
+		assert_eq!(Cap::PerOperation.value(), "1000");
+		assert_eq!(Cap::Daily.value(), "5000");
 	}
 
 	#[test]

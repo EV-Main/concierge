@@ -424,6 +424,12 @@ table). Whatever a publisher's catalog says:
 - `invest:valuation_override` escalates above 10 % (`deviation`, 1000 bps);
   `invest:fee_policy` when `raises_ceiling` is set.
 
+The two money caps — 1000 USDT per operation and 5000 USDT a day, one pair for both kinds —
+are defaults: the runner reads them at boot from `APPROVAL_FLOOR_PER_OPERATION_USDT` and
+`APPROVAL_FLOOR_DAILY_USDT` and refuses to start on anything but a positive canonical amount.
+They are environment and not data because the table guards against a compromised publisher:
+moving them is a reviewed change in the devops repo, by the platform owners, with no release.
+
 It binds twice. A publication of such a kind at scope level without a field the floor
 tests, or with an escalation of that test and field above the cap or in another currency,
 is refused; at the platform level it is stricter and accepted as it is. A proposal is
