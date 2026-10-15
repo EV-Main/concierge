@@ -8,7 +8,9 @@ user auth layer; a CLOSED scope's clients are refused), sign-in from a scope's h
 origins, OAuth `returnTo`, the sign-up ticket of migration 0032), the micro-frontend
 bundles under `/auth/mfe/*` (§3.1), the relying-party streams (§4: `ScopeEvents` and
 `UserEvents` read by a client credential, migration 0034), the scope catalog's storage
-(`ScopeCatalogService`, §5.1, §6) and the approvals of the kinds a namespace publishes
+(`ScopeCatalogService`, §5.1, §6), the scope topics in every inbox (§6: emit by namespace,
+`default_subscribed`, the account-less subscribe, the move of the fund and money topics;
+migrations 0041–0042) and the approvals of the kinds a namespace publishes
 (§5.7: both approval services, this plane's own `concierge:*` kinds and their executor,
 stored scope policies, the proven initiator and the pause after the owners change (D24(1),
 (2)), the floor on the known money kinds and `ESCALATION_TEST_COUNT_ABOVE` (§5.3);
@@ -27,7 +29,7 @@ says so and why.
 | `ScopeRegistry` | scopes.proto | first-party session, `typ=service` token | inside the user auth layer | served (`runner/src/scopes.rs`) |
 | `ScopeCatalogService` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_catalog.rs`) |
 | `ScopeEvents` | scopes.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_events.rs`) |
-| `ScopeInboxService` | scope_inbox.proto | a relying party's client credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_inbox.rs`, §6) |
+| `ScopeInboxService` | scope_inbox.proto | a relying party's client credential (§2); the bridge token on `EmitScopeNotification` only | outside the layer, `BIND` and the TLS listener | served (`runner/src/scope_inbox.rs`, §6) |
 | `ApprovalService` | approvals.proto | first-party session | inside the user auth layer | served (`runner/src/approvals.rs`) |
 | `ApprovalExecutionService` | approvals.proto | service credential (§2) | outside the layer, `BIND` and the TLS listener | served (`runner/src/approvals.rs`) |
 | `UserEvents.PullUserLifecycle` | events.proto (unchanged wire) | bridge token, **and** a relying party's client credential | as today | served for both |
@@ -688,7 +690,7 @@ in `domain::approvals`.
 Topics a direction emits on are published with its scope catalog
 (`NotificationTopicSpec`): `<namespace>:<segment>…`, a label and a description in plain
 text, and whether an account that never touched the topic receives it (default no). A
-service may `Emit` only its own namespace's topics. Topics a user cannot be without (the
+service may emit only its own namespace's topics (`ScopeInboxService.EmitScopeNotification`). Topics a user cannot be without (the
 payment-consent trace, security notices) stay this plane's own. Today's
 `fund:quy-nhon` and `account:money-movement` move to `invest:` and `bank:`; carrying the
 existing subscriptions across is the implementation's migration.
@@ -750,12 +752,37 @@ client's secret, never a credential on its own.
 
 As implemented: a scope catalog's topics are offered in the inbox of their scope (gRPC and
 `/auth/notifications/settings`), may be followed and filtered on there, and disappear from
-the offer when a later catalog withdraws them. Not yet: `Emit` refuses a scope topic, because a
-`typ=service` token names no namespace to hold "only its own topics" against;
-`default_subscribed` is stored but not applied (an unsubscribe deletes the subscription
-row, so "never touched" cannot be told from "switched off"); `SubscribeAnonymous` takes
-built-in topics only; and the move of `fund:quy-nhon` / `account:money-movement` to
-`invest:` / `bank:` has not happened.
+the offer when a later catalog withdraws them.
+
+- **Emit is bound to the caller's namespace.** A service emits on a scope topic through
+  `ScopeInboxService.EmitScopeNotification` with the credential of §2: a relying party for
+  its scope's namespace, the bridge token for `bank` (the one RPC of that service the bridge
+  opens). The topic must be the caller's namespace's and published in its catalog in force:
+  another namespace's or this plane's own is `PERMISSION_DENIED`, an unpublished one
+  `INVALID_ARGUMENT`. A scope's topic reaches only an ACTIVE member of the scope — for anyone
+  else nothing is written and `delivered` is false — while a `bank:` topic reaches any
+  account, as the platform inbox shows it to everyone. `NotificationService.Emit` with a
+  `typ=service` token keeps this plane's own topics and refuses a scope's
+  (`PERMISSION_DENIED`): that token names no namespace.
+- **`default_subscribed` applies.** Switching a topic off writes a row to
+  `notification_topic_optouts` (migration 0041) beside deleting the subscription, so "never
+  touched" and "switched off" read differently. A default topic is followed — with its mail
+  copy on — by every account in its inbox that never touched it, in the settings snapshot
+  and on emit, which creates the subscriber row as a trace does. Following again clears the
+  opt-out. The subscription row is still deleted on unsubscribe, so the previous binary,
+  which ignores the new table, keeps reading "not following".
+- **`SubscribeAnonymous` takes a scope's topic** that a catalog in force publishes, under the
+  same double opt-in; `default_subscribed` has no say there, the address asks by name.
+- **The move has happened.** `fund:quy-nhon` is `invest:fund:quy-nhon` (invest's members
+  only) and `account:money-movement` is `bank:money-movement`; migration 0042 carried the
+  subscriptions, account-less ones included, and the fund's inbox history. Until banking and
+  invest publish those topics and emit on them, the old keys are aliases wherever a topic is
+  named — `Emit` (by `typ=service` token), following, `SubscribeAnonymous`, `Unsubscribe` —
+  and stand for the new ones (`notification::MOVED_TOPICS`); the aliases go at the contract
+  step. `account:money-movement` itself stays this plane's TRACE topic: the in-app trace of a
+  payment consent, a fee notice, a payment outcome or a decision opened in someone's name is
+  filed there whatever they follow, so it is shown and filterable in the platform inbox but
+  neither offered to follow nor emitted on.
 
 ---
 
