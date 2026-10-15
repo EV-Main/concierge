@@ -7,10 +7,10 @@ use evconcierge_client::{
 	Authorize, ClientConfig, ClientTokens, ConciergeClient, ConciergeError, DEFAULT_INBOX_LIMIT, InboxQuery, MarkRead, Me, PkceVerifier, Prompt, ScopeCatalog, proto, random_state,
 };
 use proto::{
-	ClientTokenResponse, ExchangeCodeRequest, GetScopeCatalogRequest, GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, GetUnreadCountResponse, JwksRequest, JwksResponse,
-	ListNotificationsResponse, ListScopeNotificationsRequest, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse, MarkReadResponse, MarkScopeNotificationsReadRequest,
-	NotificationSettings, PublishCatalogRequest, PublishCatalogResponse, PublishScopeCatalogRequest, PublishScopeCatalogResponse, RefreshClientTokenRequest, RefreshRequest,
-	RevokeSessionRequest, RevokeSessionResponse, SetScopeTopicSubscriptionRequest, TokenResponse, UserProfile,
+	ClientTokenResponse, EmitRequest, EmitResponse, ExchangeCodeRequest, GetScopeCatalogRequest, GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, GetUnreadCountResponse,
+	JwksRequest, JwksResponse, ListNotificationsResponse, ListScopeNotificationsRequest, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse, MarkReadResponse,
+	MarkScopeNotificationsReadRequest, NotificationSettings, PublishCatalogRequest, PublishCatalogResponse, PublishScopeCatalogRequest, PublishScopeCatalogResponse,
+	RefreshClientTokenRequest, RefreshRequest, RevokeSessionRequest, RevokeSessionResponse, SetScopeTopicSubscriptionRequest, TokenResponse, UserProfile,
 	auth_service_server::{AuthService, AuthServiceServer},
 	scope_catalog_service_server::{ScopeCatalogService, ScopeCatalogServiceServer},
 	scope_inbox_service_server::{ScopeInboxService, ScopeInboxServiceServer},
@@ -509,6 +509,15 @@ impl ScopeInboxService for FakeConcierge {
 		self.inbox_call("subscribe", &request)?;
 		Ok(Response::new(NotificationSettings::default()))
 	}
+
+	async fn emit_scope_notification(&self, request: Request<EmitRequest>) -> Result<Response<EmitResponse>, Status> {
+		self.inbox_call("emit", &request)?;
+		Ok(Response::new(EmitResponse {
+			notification_id: "n-1".into(),
+			delivered: true,
+			channels: vec![1],
+		}))
+	}
 }
 
 fn ann() -> Uuid {
@@ -617,6 +626,33 @@ async fn scope_reads_should_carry_the_client_credential_and_no_user_token() {
 		assert_eq!(call.user_token, None, "{call:?}");
 		assert!(call.message.contains(ANN), "{call:?}");
 	}
+}
+
+#[tokio::test]
+async fn emit_scope_notification_should_carry_the_client_credential_and_no_user_token() {
+	let fake = FakeConcierge::default();
+	let client = serve(fake.clone()).await;
+
+	let emitted = client
+		.emit_scope_notification(EmitRequest {
+			user_id: ANN.into(),
+			topic: "sa:leads:new".into(),
+			kind: "lead".into(),
+			title: "A new lead".into(),
+			dedupe_key: "lead-1".into(),
+			..EmitRequest::default()
+		})
+		.await
+		.unwrap();
+
+	assert!(emitted.delivered);
+	let calls = fake.inbox_calls();
+	assert_eq!(calls.len(), 1);
+	assert_eq!(calls[0].rpc, "emit");
+	assert_eq!(calls[0].client_id.as_deref(), Some("sa"));
+	assert_eq!(calls[0].authorization.as_deref(), Some("Bearer client-SECRET"));
+	assert_eq!(calls[0].user_token, None, "an emit acts for the service, not for a user");
+	assert!(calls[0].message.contains("sa:leads:new") && calls[0].message.contains(ANN), "{:?}", calls[0]);
 }
 
 #[tokio::test]

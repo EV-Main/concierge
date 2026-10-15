@@ -11,7 +11,8 @@ import "concierge/v1/notification.proto";
 // `x-ev-client-id: <client_id>` + `authorization: Bearer <client_secret>`. An unknown,
 // disabled or secretless client and a wrong secret are one UNAUTHENTICATED; a client
 // whose scope is CLOSED is FAILED_PRECONDITION; the bridge token is PERMISSION_DENIED —
-// the money plane's topics live in the platform inbox, not in a scope's. Mounted outside
+// the money plane's topics live in the platform inbox, not in a scope's — on every RPC but
+// EmitScopeNotification, where it speaks for namespace `bank`. Mounted outside
 // the user auth layer, on BIND and on the bridge TLS listener. A relying party's USER
 // token still opens only UserDirectory.GetMe.
 //
@@ -45,6 +46,17 @@ service ScopeInboxService {
   rpc GetScopeNotificationSettings(GetScopeNotificationSettingsRequest) returns (NotificationSettings);
   // A topic outside this namespace's catalog in force is INVALID_ARGUMENT, as an unknown one.
   rpc SetScopeTopicSubscription(SetScopeTopicSubscriptionRequest) returns (NotificationSettings);
+
+  // Emit one notification for one user on a topic of the CALLER's namespace — the client's
+  // scope's, or `bank` for the bridge token — that its catalog in force publishes
+  // (ScopeCatalogService). Another namespace's topic and this plane's own are
+  // PERMISSION_DENIED; a topic of the namespace its catalog does not publish is
+  // INVALID_ARGUMENT, as an unknown one. Validation, `dedupe_key` and the answer are
+  // NotificationService.Emit's. A scope's topic reaches only an ACTIVE member of the scope:
+  // for anyone else nothing is written and `delivered` is false, as for a user who does not
+  // follow the topic. A topic published with `default_subscribed` reaches every account
+  // that never touched it, until the user switches it off.
+  rpc EmitScopeNotification(EmitRequest) returns (EmitResponse);
 }
 
 message ListScopeNotificationsRequest {

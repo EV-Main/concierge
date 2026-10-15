@@ -1406,6 +1406,7 @@ pub trait NotificationRepository: Send + Sync {
 	/// create state.
 	async fn subscriber_of_user(&self, user_id: Uuid) -> Result<Option<SubscriberRow>, DomainError>;
 
+	/// Every topic the subscriber touched: the ones it follows and the ones it switched off.
 	async fn subscriptions(&self, subscriber_id: Uuid) -> Result<Vec<SubscriptionRow>, DomainError>;
 
 	/// Flip one or both master channel switches. `None` leaves a channel untouched.
@@ -1415,15 +1416,28 @@ pub trait NotificationRepository: Send + Sync {
 	async fn set_topic_subscription(&self, subscriber_id: Uuid, topic: &str, subscribed: bool, email_enabled: bool) -> Result<(), DomainError>;
 
 	/// Record a notification and queue its email copy if every gate allows it.
-	/// Idempotent on `(subscriber, dedupe_key)`.
+	/// Idempotent on `(subscriber, dedupe_key)`. `default_subscribed` follows the topic for
+	/// an account that never touched it (no subscription, no opt-out), creating its
+	/// subscriber row if need be.
 	#[allow(clippy::too_many_arguments)]
-	async fn emit(&self, user_id: Uuid, topic: &str, kind: &str, title: &str, body: &str, link: &str, dedupe_key: &str, occurred_at: i64) -> Result<EmitOutcome, DomainError>;
+	async fn emit(
+		&self,
+		user_id: Uuid,
+		topic: &str,
+		kind: &str,
+		title: &str,
+		body: &str,
+		link: &str,
+		dedupe_key: &str,
+		occurred_at: i64,
+		default_subscribed: bool,
+	) -> Result<EmitOutcome, DomainError>;
 
 	/// Write an inbox entry REGARDLESS of what the user follows, and queue no email copy.
 	///
 	/// [`Self::emit`] is opt-in per topic, which is right for fund news and wrong for a
 	/// notice that somebody is asking to move this person's own money: nobody subscribes
-	/// to that, and there is no topic every user follows by default. The mail itself has
+	/// to that, and no topic of this plane's is followed by default. The mail itself has
 	/// already gone down the governance queue, which bypasses preferences for the same
 	/// reason — this is its in-app trace. The subscriber row is created on first touch, as
 	/// [`Self::subscriber_for_user`] does. False when `dedupe_key` had already been used

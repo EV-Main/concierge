@@ -758,12 +758,20 @@ async fn linkable(conn: &mut PgConnection, identity: &ProvenIdentity, now: i64) 
 }
 
 /// Back to the state an account that never opened its settings reads: both channels on,
-/// no topic followed. A squatter who switched mail off would otherwise silence the owner's
-/// own account. The row is kept rather than deleted — the inbox and the delivery queue
-/// refer to it.
+/// no topic followed or switched off. A squatter who switched mail off would otherwise
+/// silence the owner's own account. The row is kept rather than deleted — the inbox and
+/// the delivery queue refer to it.
 async fn reset_notification_settings(conn: &mut PgConnection, user: UserId) -> Result<(), DomainError> {
 	sqlx::query(
 		"DELETE FROM notification_subscriptions WHERE subscriber_id IN \
+		 (SELECT id FROM notification_subscribers WHERE user_id = $1)",
+	)
+	.bind(user.raw())
+	.execute(&mut *conn)
+	.await
+	.map_err(repo_err)?;
+	sqlx::query(
+		"DELETE FROM notification_topic_optouts WHERE subscriber_id IN \
 		 (SELECT id FROM notification_subscribers WHERE user_id = $1)",
 	)
 	.bind(user.raw())

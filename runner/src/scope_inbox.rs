@@ -16,6 +16,11 @@
 //! was issued for that user ([`USER_TOKEN_HEADER`]), and the user is taken from it. A
 //! leaked client secret alone then reads a scope's own notifications and changes nothing.
 //!
+//! EMIT is the namespace's own service writing into its users' inboxes, and the one RPC
+//! here the bridge token also opens, for `bank`: a `typ=service` token on
+//! `NotificationService.Emit` names no namespace, so this credential is what binds an
+//! emitter to "only its own topics". A scope's topic reaches its active members only.
+//!
 //! `Result<_, Status>` is tonic's mandated handler signature; `Status` is a large type
 //! we don't control, so the large-err lint does not apply in this module.
 #![allow(clippy::result_large_err)]
@@ -25,14 +30,15 @@ use std::sync::Arc;
 use domain::users::UserId;
 use evconcierge_auth::{AuthError, Authenticate};
 use evconcierge_contracts::concierge::v1::{
-	GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, GetUnreadCountResponse, ListNotificationsRequest, ListNotificationsResponse, ListScopeNotificationsRequest,
-	MarkReadResponse, MarkScopeNotificationsReadRequest, NotificationSettings, SetScopeTopicSubscriptionRequest, scope_inbox_service_server::ScopeInboxService,
+	EmitRequest, EmitResponse, GetScopeNotificationSettingsRequest, GetScopeUnreadCountRequest, GetUnreadCountResponse, ListNotificationsRequest, ListNotificationsResponse,
+	ListScopeNotificationsRequest, MarkReadResponse, MarkScopeNotificationsReadRequest, NotificationSettings, SetScopeTopicSubscriptionRequest,
+	scope_inbox_service_server::ScopeInboxService,
 };
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
-	notification::{InboxView, inbox_mark_read, inbox_page, inbox_unread, settings_of, subscriber_of, topic_offered},
+	notification::{EmitTarget, InboxView, emit_to, follow_offered, inbox_mark_read, inbox_page, inbox_unread, scope_topic, settings_of, subscriber_of, topic},
 	ports::{NotificationRepository, UserDirectoryRepository},
 	relying_party::ClientTokenAuthenticator,
 	service_caller::{ClientCaller, ServiceCaller, ServiceCallers},
@@ -194,7 +200,7 @@ impl ScopeInboxService for ScopeInbox {
 	async fn set_scope_topic_subscription(&self, request: Request<SetScopeTopicSubscriptionRequest>) -> Result<Response<NotificationSettings>, Status> {
 		let (view, user) = self.writer(&request, &request.get_ref().user_id).await?;
 		let req = request.get_ref();
-		if !topic_offered(self.notifications.as_ref(), &view, &req.topic).await.map_err(domain_to_status)? {
+		if !follow_offered(self.notifications.as_ref(), &view, &req.topic).await.map_err(domain_to_status)? {
 			return Err(Status::invalid_argument("unknown topic"));
 		}
 		let account = self
@@ -209,5 +215,28 @@ impl ScopeInboxService for ScopeInbox {
 			.await
 			.map_err(domain_to_status)?;
 		Ok(Response::new(self.settings(&view, user).await?))
+	}
+
+	async fn emit_scope_notification(&self, request: Request<EmitRequest>) -> Result<Response<EmitResponse>, Status> {
+		let caller = self.callers.authenticate(&request, SEAM).await?;
+		let scope = match &caller {
+			ServiceCaller::Bridge => None,
+			ServiceCaller::Client(client) if client.scope_closed => return Err(Status::failed_precondition("the scope is closed")),
+			ServiceCaller::Client(client) => Some(client.scope.clone()),
+		};
+		let req = request.into_inner();
+		let ours = topic(&req.topic).is_none() && req.topic.split_once(':').is_some_and(|(namespace, _)| namespace == caller.namespace());
+		if !ours {
+			return Err(Status::permission_denied("a service emits only its own namespace's topics"));
+		}
+		let Some(published) = scope_topic(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)? else {
+			return Err(Status::invalid_argument("unknown topic"));
+		};
+		let target = EmitTarget {
+			topic: req.topic.clone(),
+			scope,
+			default_subscribed: published.default_subscribed,
+		};
+		Ok(Response::new(emit_to(self.notifications.as_ref(), &target, &req).await?))
 	}
 }

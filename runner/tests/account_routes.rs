@@ -57,12 +57,10 @@ async fn settings_read_every_topic_with_the_callers_choice() {
 	assert_eq!(read.body["email_verified"], true);
 	assert_eq!(read.body["in_app_enabled"], true);
 	let topics = read.body["topics"].as_array().unwrap();
-	// The built-ins lead, in their order; whatever scope catalogs are in force on a shared
-	// database follow them.
-	assert_eq!(
-		topics.iter().take(TOPICS.len()).map(|t| t["topic"].as_str().unwrap()).collect::<Vec<_>>(),
-		TOPICS.iter().map(|t| t.key).collect::<Vec<_>>()
-	);
+	// The followable built-ins lead, in their order; whatever scope catalogs are in force on
+	// a shared database follow them. A trace topic is not offered.
+	let followable: Vec<&str> = TOPICS.iter().filter(|t| t.followable).map(|t| t.key).collect();
+	assert_eq!(topics.iter().take(followable.len()).map(|t| t["topic"].as_str().unwrap()).collect::<Vec<_>>(), followable);
 	let first = topics[0].as_object().unwrap();
 	let mut keys: Vec<&str> = first.keys().map(String::as_str).collect();
 	keys.sort_unstable();
@@ -83,7 +81,10 @@ async fn a_channel_and_a_topic_are_set_and_answered_whole() {
 	assert_eq!(channel.status, StatusCode::OK, "{:?}", channel.body);
 	assert_eq!(channel.body["in_app_enabled"], false);
 	assert_eq!(channel.body["email_enabled"], true);
-	assert!(channel.body["topics"].as_array().is_some_and(|t| t.len() >= TOPICS.len()), "the whole snapshot");
+	assert!(
+		channel.body["topics"].as_array().is_some_and(|t| t.len() >= TOPICS.iter().filter(|t| t.followable).count()),
+		"the whole snapshot"
+	);
 
 	let key = TOPICS[0].key;
 	let topic = fx

@@ -64,9 +64,12 @@ message EmitRequest {
   // Target subscriber, by concierge canonical user id (a UUID). Account-less
   // subscribers are not addressable by Emit — they receive topic broadcasts only.
   string user_id = 1;
-  // Topic key, e.g. "fund:quy-nhon". Must be in the server-side allowlist; scope-owned
-  // topics (`invest:fund:quy-nhon`) are published through ScopeCatalogService, and a
-  // caller may emit only its own namespace's.
+  // Topic key, e.g. "platform:announcements". Must be one of this plane's own; a scope's
+  // topics (`invest:fund:quy-nhon`) are published through ScopeCatalogService and emitted
+  // by their own namespace through ScopeInboxService.EmitScopeNotification — here they are
+  // PERMISSION_DENIED. A key that moved to a scope (`fund:quy-nhon`,
+  // `account:money-movement`) is still accepted and stored under its new key until the
+  // emitters have moved (docs/SCOPES-AND-APPROVALS.md §6).
   string topic = 2;
   // Machine-readable event kind within the topic, e.g. "nav_updated".
   string kind = 3;
@@ -178,6 +181,9 @@ message SetTopicSubscriptionRequest {
 
 message SubscribeAnonymousRequest {
   string email = 1;
+  // One of this plane's topics or one a scope's catalog in force publishes; anything else
+  // is INVALID_ARGUMENT. A scope's `default_subscribed` does not apply: the address asks
+  // for the topic by name and confirms it by mail.
   string topic = 2;
   // Client IP as seen by the edge, for rate limiting. Empty ⇒ every such caller
   // shares one bucket, which is the conservative choice.

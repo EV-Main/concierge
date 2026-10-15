@@ -45,7 +45,7 @@ never calls `banking`:
    decision to whoever holds the mailbox (#64 closed the payout kinds' exemption).
    A consent also leaves an in-app trace in the subject's inbox
    — written regardless of what they follow, because nobody subscribes to being
-   asked about their own money and no topic is followed by default — so the
+   asked about their own money and none of this plane's topics is followed by default — so the
    request is findable in the cabinet when the mail is late or lost; the link and
    the code stay in the mail. The fee policy pair follows the same split:
    `FEE_POLICY_APPROVAL` is a consilium kind (a seated owner, verified address,
@@ -660,8 +660,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   older binary changed beside this one; between boots such a change is not on the stream.
   `ScopeCatalogService` stores approval kinds and notification topics per namespace (the
   bridge token publishes `bank`), versioned like `PublishCatalog`, and executes nothing;
-  a scope's topics are offered only in that scope's inbox, while `Emit` still refuses
-  them: a `typ=service` token names no namespace to check against.
+  a scope's topics are offered only in that scope's inbox and emitted only by their own
+  namespace, through `ScopeInboxService.EmitScopeNotification` under the same credential
+  (`NotificationService.Emit`'s `typ=service` token names no namespace and refuses them).
 - **An approval is decided by a roster frozen at open and executed only by the namespace
   that proposed it** (`approvals`, `docs/SCOPES-AND-APPROVALS.md` §5). A kind's namespace
   alone proposes, pulls and reports on it, a relying party in its own scope only (the
@@ -722,6 +723,11 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `FAILED_PRECONDITION`. A WRITE also needs the user's access token issued to that client
   (`x-ev-user-token`, `aud` = its audience, live session) and takes the user from it:
   following a topic turns on mail, and a client secret alone must not do that to anyone.
+  An emit on a scope's topic reaches its active members only, and a topic published with
+  `default_subscribed` follows every account that never touched it — which is why switching
+  a topic off is a row of its own (`notification_topic_optouts`), not a missing one. The
+  old `fund:quy-nhon` / `account:money-movement` keys are aliases of their `invest:` / `bank:`
+  successors until the contract step; `account:money-movement` stays this plane's trace topic.
   So the client credential opens `ScopeEvents`, `UserEvents`, `ScopeCatalogService` and
   `ScopeInboxService`, while a client's USER token is admitted by the auth layer on `GetMe`
   alone and is otherwise only that second proof on a scope-inbox write. The gRPC summary
