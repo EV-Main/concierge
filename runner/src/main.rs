@@ -426,6 +426,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			credentials: Arc::new(infrastructure::credentials::PgCredentials::new(pool.clone())),
 			mail_wake,
 			allowlist: allowlist.clone(),
+			subscribe_limiter: subscribe_limiter.clone(),
 		},
 		web::KycDeps {
 			users: users.clone(),

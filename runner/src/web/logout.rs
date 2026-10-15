@@ -165,7 +165,7 @@ fn refused(status: StatusCode, message: &'static str) -> Response {
 }
 
 /// Text for a double-quoted HTML attribute.
-fn escape(raw: &str) -> String {
+pub(super) fn escape(raw: &str) -> String {
 	let mut out = String::with_capacity(raw.len());
 	for c in raw.chars() {
 		match c {
