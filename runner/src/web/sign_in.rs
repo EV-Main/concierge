@@ -40,6 +40,11 @@ impl Refusal {
 	pub(super) fn new(status: StatusCode, code: &'static str) -> Self {
 		Self(status, code)
 	}
+
+	/// Something on our side failed: no verdict about the caller was reached.
+	pub(super) fn is_internal(&self) -> bool {
+		self.0.is_server_error()
+	}
 }
 
 impl IntoResponse for Refusal {
@@ -187,6 +192,13 @@ pub(super) async fn signed_in(st: &super::Inner, jar: &CookieJar, headers: &Head
 		CsrfOutcome::NoSession => return Err(unauthenticated().into()),
 		CsrfOutcome::Mismatch => return Err(Refusal(StatusCode::FORBIDDEN, "csrf").into()),
 	}
+	signed_in_read(st, jar).await
+}
+
+/// [`signed_in`] for a read: no double-submit (on a GET it could only ever be wrong), the
+/// same [`gate`]. A blocked or taken-over account's session must not keep reading until it
+/// happens to reach a mutation (#132).
+pub(super) async fn signed_in_read(st: &super::Inner, jar: &CookieJar) -> Result<Signed, Halt> {
 	let caller = session_user(st, jar).await.map_err(|_| INTERNAL)?.ok_or_else(unauthenticated)?;
 	match gate(st, &caller).await {
 		Ok(user) => Ok(Signed { caller, user }),
@@ -523,11 +535,10 @@ pub async fn set_username(State(st): State<WebState>, jar: CookieJar, headers: H
 /// `GET /auth/methods` — how the signed-in account can sign in, for its settings.
 pub async fn methods(State(st): State<WebState>, jar: CookieJar) -> Answered {
 	let st = &st.inner;
-	let caller = session_user(st, &jar).await.map_err(|_| INTERNAL)?.ok_or(Refusal(StatusCode::UNAUTHORIZED, "unauthenticated"))?;
-	let id = caller.id;
+	let Signed { caller, user } = signed_in_read(st, &jar).await?;
 	let jar = caller.refreshed(st, jar);
-	let answer = match (st.credentials.methods(id).await, st.users.find_by_id(id).await) {
-		(Ok(methods), Ok(Some(user))) => Ok(Json(json!({
+	let answer = match st.credentials.methods(user.id()).await {
+		Ok(methods) => Ok(Json(json!({
 			"email": user.email().as_str(),
 			"emailVerified": user.email_verified(),
 			"username": user.username().map(Username::as_str),
@@ -535,8 +546,7 @@ pub async fn methods(State(st): State<WebState>, jar: CookieJar) -> Answered {
 			"providers": methods.providers,
 			"passkeys": methods.passkeys.iter().map(|p| json!({ "id": p.credential_id, "name": p.name, "createdAt": p.created_at, "lastUsedAt": p.last_used_at })).collect::<Vec<_>>(),
 		}))),
-		(Ok(_), Ok(None)) => Err(Refusal(StatusCode::UNAUTHORIZED, "unauthenticated")),
-		(Err(e), _) | (_, Err(e)) => Err(internal("sign-in methods not read", e)),
+		Err(e) => Err(internal("sign-in methods not read", e)),
 	};
 	Ok((jar, answer))
 }

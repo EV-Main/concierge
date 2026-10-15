@@ -26,6 +26,8 @@ use uuid::Uuid;
 use crate::web::{
 	WebState, now_secs,
 	oauth::{Challenge, OAUTH_TX_TTL, safe_return_to},
+	session::Fresh,
+	sign_in::{Answered, Denied, Refusal, Signed, end_session, gate, internal, signed_in_read},
 };
 
 #[derive(Deserialize)]
@@ -214,6 +216,11 @@ pub(super) async fn open_session(st: &super::Inner, jar: CookieJar, headers: &He
 /// call, not served from the login-time copy in the session: a role granted from the
 /// console is visible on the next page load, with no wait for the refresh rotation
 /// and no re-login. Only when the directory is down does the stored copy answer.
+///
+/// The session is gated as every signed-in route's is ([`gate`]), but a who-am-I every
+/// zone asks must not answer a refusal: a blocked account or a session minted before the
+/// account's `token_version` moved reads as nobody signed in, and the session is ended
+/// as a sign-out ends it (#132).
 pub async fn session(State(st): State<WebState>, jar: CookieJar) -> Result<(CookieJar, Json<SessionInfo>), (StatusCode, &'static str)> {
 	let st = &st.inner;
 	let fresh = match jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
@@ -222,15 +229,26 @@ pub async fn session(State(st): State<WebState>, jar: CookieJar) -> Result<(Cook
 		Some(id) => st.sessions.fresh(&id, &st.auth).await.map_err(store_err)?,
 		None => None,
 	};
-	Ok(match fresh {
-		Some(fresh) => {
-			let jar = jar.add(st.cookies.server_cookie(st.cookies.access.clone(), fresh.access_token, fresh.remaining_secs));
-			(jar, Json(SessionInfo::authenticated(fresh.user)))
-		}
+	let Some(fresh) = fresh else {
 		// The session is gone but the browser may still hold the cookies — clear them
 		// so zone middlewares stop treating requests as signed-in.
-		None => (clear_session(st, jar), Json(SessionInfo::anonymous())),
-	})
+		return Ok((clear_session(st, jar), Json(SessionInfo::anonymous())));
+	};
+	let live = match Caller::of(&fresh) {
+		Some(caller) => match gate(st, &caller).await {
+			Ok(_) => true,
+			Err(Denied::SessionOver(_)) => false,
+			// The directory could not be read: the stored copy answers, as it does when
+			// `fresh` cannot reach it. Every route that acts still refuses.
+			Err(Denied::Other(refusal)) => refusal.is_internal(),
+		},
+		None => false,
+	};
+	if !live {
+		return Ok((end_session(st, jar).await, Json(SessionInfo::anonymous())));
+	}
+	let jar = jar.add(st.cookies.server_cookie(st.cookies.access.clone(), fresh.access_token, fresh.remaining_secs));
+	Ok((jar, Json(SessionInfo::authenticated(fresh.user))))
 }
 /// `POST /auth/logout` — CSRF-checked: drop the session, revoke the refresh family
 /// upstream (best-effort), and clear the cookies.
@@ -287,27 +305,38 @@ pub(super) async fn close(st: &super::Inner, id: &str) -> color_eyre::Result<()>
 	Ok(())
 }
 /// `GET /auth/sessions` — the caller's active sessions (refresh-token families),
-/// proven by the server-side refresh token (never exposed to the browser).
-pub async fn list_sessions(State(st): State<WebState>, jar: CookieJar) -> Result<Json<Value>, (StatusCode, &'static str)> {
+/// proven by the server-side refresh token (never exposed to the browser). Gated as
+/// every signed-in read is (`sign_in::signed_in_read`); refusals are JSON as there.
+pub async fn list_sessions(State(st): State<WebState>, jar: CookieJar) -> Answered {
 	let st = &st.inner;
-	let refresh = refresh_of(st, &jar).await?.ok_or((StatusCode::UNAUTHORIZED, "unauthenticated"))?;
-	let response = AuthRpc::list_sessions(&st.auth, tonic::Request::new(cc::ListSessionsRequest { refresh_token: refresh }))
-		.await
-		.map_err(|_| (StatusCode::BAD_GATEWAY, "session listing failed"))?
-		.into_inner();
-	let sessions: Vec<SessionEntry> = response
-		.sessions
-		.into_iter()
-		.map(|s| SessionEntry {
-			id: s.id,
-			user_agent: s.user_agent,
-			ip: s.ip,
-			created_at: s.created_at.to_string(),
-			last_seen: s.last_seen.to_string(),
-			current: s.current,
-		})
-		.collect();
-	Ok(Json(json!({ "sessions": sessions })))
+	let Signed { caller, .. } = signed_in_read(st, &jar).await?;
+	let jar = caller.refreshed(st, jar);
+	let answer = async {
+		// Read after the gate: reading the session may have rotated the refresh token.
+		let refresh = refresh_of(st, &jar)
+			.await
+			.map_err(|_| internal("session listing: store failed", "unavailable"))?
+			.ok_or_else(|| Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated"))?;
+		let response = AuthRpc::list_sessions(&st.auth, tonic::Request::new(cc::ListSessionsRequest { refresh_token: refresh }))
+			.await
+			.map_err(|e| internal("session listing failed", e.message().to_owned()))?
+			.into_inner();
+		let sessions: Vec<SessionEntry> = response
+			.sessions
+			.into_iter()
+			.map(|s| SessionEntry {
+				id: s.id,
+				user_agent: s.user_agent,
+				ip: s.ip,
+				created_at: s.created_at.to_string(),
+				last_seen: s.last_seen.to_string(),
+				current: s.current,
+			})
+			.collect();
+		Ok(Json(json!({ "sessions": sessions })))
+	}
+	.await;
+	Ok((jar, answer))
 }
 /// `DELETE /auth/sessions` — CSRF-checked: revoke one session by id (must belong to
 /// the caller; revoking the current one acts like a sign-out of this device).
@@ -481,6 +510,20 @@ pub(super) struct Caller {
 }
 
 impl Caller {
+	/// A cookie whose stored pair no longer carries a parsable user is the same answer as
+	/// no cookie at all: there is nobody to act for.
+	fn of(fresh: &Fresh) -> Option<Self> {
+		let id = Uuid::parse_str(&fresh.user.user_id).map(UserId::from_raw).ok()?;
+		Some(Self {
+			id,
+			role: fresh.user.role.clone(),
+			role_is_break_glass: fresh.user.role_is_break_glass,
+			minted_token_version: minted_token_version(&fresh.access_token),
+			access_token: fresh.access_token.clone(),
+			remaining_secs: fresh.remaining_secs,
+		})
+	}
+
 	/// Put the refreshed access token back in the browser, the way `/auth/session` does.
 	pub(super) fn refreshed(self, st: &super::Inner, jar: CookieJar) -> CookieJar {
 		jar.add(st.cookies.server_cookie(st.cookies.access.clone(), self.access_token, self.remaining_secs))
@@ -509,18 +552,7 @@ pub(super) async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<O
 		tracing::error!(error = ?e, "web session store failed");
 		SessionStoreDown
 	})?;
-	// A cookie whose stored pair no longer carries a parsable user is the same answer as
-	// no cookie at all: there is nobody to act for.
-	Ok(fresh.and_then(|f| {
-		Uuid::parse_str(&f.user.user_id).map(UserId::from_raw).ok().map(|id| Caller {
-			id,
-			role: f.user.role,
-			role_is_break_glass: f.user.role_is_break_glass,
-			minted_token_version: minted_token_version(&f.access_token),
-			access_token: f.access_token,
-			remaining_secs: f.remaining_secs,
-		})
-	}))
+	Ok(fresh.as_ref().and_then(Caller::of))
 }
 
 /// Read as the gRPC verifier reads it — into [`evconcierge_auth::Claims`], an absent claim
