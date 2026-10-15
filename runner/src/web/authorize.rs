@@ -28,8 +28,9 @@ use crate::{
 	relying_party::{Admission, Requester, is_s256_challenge},
 	web::{
 		WebState,
-		routes::{ClientIp, live_family_of},
+		routes::{ClientIp, live_family_of, minted_token_version},
 		session::Fresh,
+		sign_in::end_session,
 	},
 };
 
@@ -121,22 +122,33 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 		}
 		return redirect(&login_url(client_id, redirect_uri, state, code_challenge));
 	};
+	let minted = minted_token_version(&fresh.access_token);
 	// The session view may have rotated the access token; the browser gets the new one
 	// exactly as `/auth/session` hands it out, whatever this route answers.
-	let jar = jar.add(st.cookies.server_cookie(st.cookies.access.clone(), fresh.access_token, fresh.remaining_secs));
+	let refreshed = jar.clone().add(st.cookies.server_cookie(st.cookies.access.clone(), fresh.access_token, fresh.remaining_secs));
 
 	let Ok(user) = Uuid::parse_str(&fresh.user.user_id).map(UserId::from_raw) else {
-		return (jar, back.error("access_denied")).into_response();
+		return (refreshed, back.error("access_denied")).into_response();
 	};
 	let token_version = match relying_parties.admit(user).await {
+		// A takeover or a revoke-all bumps `token_version` but leaves the family in place
+		// until its next refresh, so the family check above still passes for as long as
+		// the cached access token lives. Refused as `sign_in::gate` refuses it: the
+		// session is over, and a code minted at the CURRENT version would hand the old
+		// session's holder (a squatter) the account it lost.
+		Ok(Admission::Admitted { token_version }) if minted.is_none_or(|minted| minted < token_version) => {
+			tracing::info!(client_id = %client.client_id, user_id = %user, "relying party: authorize refused a session minted before the account's token_version");
+			let cleared = end_session(st, jar).await;
+			return (cleared, page(StatusCode::UNAUTHORIZED, "Your session has ended. Sign in again.")).into_response();
+		}
 		Ok(Admission::Admitted { token_version }) => token_version,
 		Ok(Admission::Denied) => {
 			tracing::info!(client_id = %client.client_id, user_id = %user, "relying party: authorize denied, the account is not active");
-			return (jar, back.error("access_denied")).into_response();
+			return (refreshed, back.error("access_denied")).into_response();
 		}
 		Err(err) => {
 			tracing::error!(%err, "relying party: account unreadable at authorize");
-			return (jar, back.error("temporarily_unavailable")).into_response();
+			return (refreshed, back.error("temporarily_unavailable")).into_response();
 		}
 	};
 	let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
@@ -152,7 +164,7 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 			back.error("temporarily_unavailable")
 		}
 	};
-	(jar, answer).into_response()
+	(refreshed, answer).into_response()
 }
 
 /// The browser's `evinvest.ltd` session and the refresh family behind it, or `None` when

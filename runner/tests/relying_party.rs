@@ -31,7 +31,7 @@ use concierge::{
 	web::{self, KycDeps},
 };
 use domain::users::UserId;
-use evconcierge_auth::{AuthConfig, AuthService, SigningConfig, TokenType, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
+use evconcierge_auth::{AuthConfig, AuthService, Claims, SigningConfig, TokenType, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
 	ClientTokenResponse, ExchangeCodeRequest, GetMeRequest, GetPlatformConfigRequest, RefreshClientTokenRequest, TokenResponse, UpdateProfileRequest, UserSummary,
 	auth_service_server::{AuthService as AuthRpc, AuthServiceServer},
@@ -685,17 +685,36 @@ fn params(location: &str) -> std::collections::HashMap<String, String> {
 	form_urlencoded::parse(query.as_bytes()).into_owned().collect()
 }
 
+/// The access token a session minted under `token_version` carries. Unsigned: the route
+/// reads the claim from its own session store and never verifies it, so only the claims
+/// matter here.
+fn access_token_at(user: UserId, token_version: u64, exp: u64) -> String {
+	let claims = Claims {
+		sub: user.to_string(),
+		iss: ISSUER.into(),
+		aud: PLANE_AUDIENCE.into(),
+		exp,
+		iat: 0,
+		typ: TokenType::Access,
+		jti: None,
+		token_version,
+	};
+	let encode = |json: &str| URL_SAFE_NO_PAD.encode(json.as_bytes());
+	format!("{}.{}.unsigned", encode(r#"{"alg":"EdDSA","typ":"JWT"}"#), encode(&serde_json::to_string(&claims).unwrap()))
+}
+
 /// A REAL `evinvest.ltd` session: a refresh family in the fixture's issuance store and a
 /// locker entry pointing at it, as a Google sign-in leaves them. Returns the cookie and
 /// the refresh token.
 async fn signed_in_browser(fx: &Fx, user: UserId) -> Option<(String, String)> {
 	std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty())?;
-	let refresh_token = fx.auth.open_family_for_tests(&user.to_string(), 0).await.expect("open a refresh family");
+	let token_version = fx.users.find_by_id(user).await.unwrap().expect("user exists").token_version();
+	let refresh_token = fx.auth.open_family_for_tests(&user.to_string(), token_version).await.expect("open a refresh family");
 	let sessions = web::WebSessions::from_env().await.expect("session store");
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 	let (id, ..) = sessions
 		.put(TokenResponse {
-			access_token: "access".into(),
+			access_token: access_token_at(user, token_version, now as u64 + 900),
 			access_expires_at: now + 900,
 			refresh_token: refresh_token.clone(),
 			refresh_expires_at: now + 3600,
@@ -703,7 +722,7 @@ async fn signed_in_browser(fx: &Fx, user: UserId) -> Option<(String, String)> {
 				user_id: user.to_string(),
 				email: "rp@example.com".into(),
 				status: "active".into(),
-				token_version: 0,
+				token_version,
 				role: "investor".into(),
 				role_is_break_glass: false,
 				email_verified: true,
@@ -847,6 +866,43 @@ async fn authorize_issues_a_code_only_to_an_active_account() {
 	assert_eq!(back["state"], "st-123");
 	let tokens = fx.exchange(&back["code"], &verifier).await.expect("the issued code redeems with its verifier");
 	assert_eq!(tokens.user_id, user.to_string());
+}
+
+/// A takeover (or a revoke-all) bumps `token_version` and leaves the squatter's refresh
+/// family in Redis until its next refresh, so the family check alone admits the session
+/// for as long as its cached access token lives. It must be refused here the way every
+/// signed-in route refuses it: 401, session closed, no code for the client.
+#[tokio::test]
+async fn a_session_minted_before_a_token_version_bump_gets_no_code_and_ends() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let squatted = fx.user().await;
+	let Some((cookie, refresh_token)) = signed_in_browser(&fx, squatted).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	fx.bump_token_version(squatted).await;
+	assert!(
+		fx.auth.live_family(&refresh_token).await.unwrap().is_some(),
+		"the precondition: the family is still live, so only token_version can refuse"
+	);
+
+	let answer = get(&router, &authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48))), Some(&cookie)).await;
+	assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+	assert_eq!(answer.location, None, "no code travels to the client");
+	assert!(
+		answer.headers.get_all(header::SET_COOKIE).iter().any(|c| c.to_str().unwrap().starts_with("ev_session=;")),
+		"the session cookies are cleared"
+	);
+	let session_id = cookie.trim_start_matches("ev_session=");
+	assert!(web::WebSessions::from_env().await.unwrap().csrf(session_id).await.unwrap().is_none(), "the locker entry is gone");
+	assert!(fx.auth.live_family(&refresh_token).await.unwrap().is_none(), "the family is revoked upstream");
+	let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM rp_codes WHERE user_id = $1")
+		.bind(squatted.raw())
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(codes, 0);
 }
 
 // ─── Security follow-ups (PR #100 review) ────────────────────────────────────────
