@@ -175,6 +175,43 @@ impl Fixture {
 		delegate
 	}
 
+	/// A fresh account holding `target`, written as the row a grant leaves.
+	async fn holding(&self, target: &str) -> UserId {
+		let granter = self.seated("owner", Role::Owner).await;
+		let holder = self.user("holder").await;
+		sqlx::query("INSERT INTO grants (user_id, namespace, target, granted_by, granted_at) VALUES ($1, split_part($2, ':', 1), $2, $3, 0)")
+			.bind(holder.raw())
+			.bind(target)
+			.bind(granter.raw())
+			.execute(&self.pool)
+			.await
+			.expect("grant the target");
+		holder
+	}
+
+	/// A catalog `Catalog::check` would refuse today, stored as one published before the
+	/// check existed: `operator`, `lead` and `admin` with `delegations` as given.
+	async fn plant_catalog(&self, version: i64, delegations: serde_json::Value) {
+		let all: Vec<String> = PERMISSIONS.iter().map(|p| self.p(p)).collect();
+		let catalog = serde_json::json!({
+			"version": version,
+			"permissions": all,
+			"aliases": {
+				self.p("operator"): [self.p("work:leads:read"), self.p("work:leads:edit")],
+				self.p("lead"): [self.p("work:leads:read")],
+				self.p("admin"): all,
+			},
+			"delegations": delegations,
+		});
+		sqlx::query("INSERT INTO catalogs (tenant_id, version, catalog, published_at) VALUES ($1, $2, $3, 0)")
+			.bind(&self.ns)
+			.bind(version)
+			.bind(catalog)
+			.execute(&self.pool)
+			.await
+			.expect("plant the catalog");
+	}
+
 	async fn email_of(&self, user: UserId) -> String {
 		self.users.find_by_id(user).await.unwrap().unwrap().email().as_str().to_owned()
 	}
@@ -637,6 +674,53 @@ async fn nobody_grants_the_admin_alias_outside_an_approval() {
 
 	let delegate = fx.delegate().await;
 	fx.revoke(admin, delegate, &fx.p("admin")).await.expect("taking it away stays one act of any granting seat");
+}
+
+/// `<ns>:admin` is the scope's approval roster, so whoever may revoke it may empty the
+/// roster of everyone but themselves and pass the scope's quorum alone (§5.6: removing a
+/// scope admin is a seat's act). A publication that delegates it is refused; a catalog
+/// stored before that rule existed must hand nobody the alias either.
+#[tokio::test]
+async fn no_catalog_hands_anyone_the_admin_alias() {
+	let Some(fx) = setup().await else { return };
+	let invalid = |result: Result<(), ClientGrantError>| matches!(result, Err(ClientGrantError::InvalidCatalog(_)));
+	let leads = &PERMISSIONS[..2];
+	assert!(
+		invalid(fx.publish(5, &PERMISSIONS, &[("operator", leads, &[]), ("admin", &PERMISSIONS, &["admin", "operator"])]).await),
+		"admin delegating itself"
+	);
+	assert!(
+		invalid(
+			fx.publish(5, &PERMISSIONS, &[("operator", leads, &[]), ("lead", leads, &["admin"]), ("admin", &PERMISSIONS, &["operator"])])
+				.await
+		),
+		"another alias delegating admin"
+	);
+
+	for (version, holder_alias, delegations) in [
+		(2, "admin", serde_json::json!({ fx.p("admin"): [fx.p("admin"), fx.p("operator")] })),
+		(
+			3,
+			"lead",
+			serde_json::json!({ fx.p("lead"): [fx.p("admin"), fx.p("operator")], fx.p("admin"): [fx.p("operator")] }),
+		),
+	] {
+		fx.plant_catalog(version, delegations).await;
+		let holder = match holder_alias {
+			"admin" => fx.delegate().await,
+			_ => fx.holding(&fx.p("lead")).await,
+		};
+		let peer = fx.delegate().await;
+		assert_eq!(
+			code(fx.revoke(holder, peer, &fx.p("admin")).await),
+			Code::PermissionDenied,
+			"a stored `{holder_alias}` delegation of admin removes no peer"
+		);
+		assert_eq!(fx.active_grants(peer).await, [fx.p("admin")]);
+		let member = fx.user("member").await;
+		assert_eq!(code(fx.grant_by_email(holder, member, &fx.p("admin")).await), Code::PermissionDenied);
+		fx.grant_by_email(holder, member, &fx.p("operator")).await.expect("the rest of the stored delegation still holds");
+	}
 }
 
 #[tokio::test]

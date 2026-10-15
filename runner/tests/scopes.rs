@@ -179,6 +179,36 @@ async fn the_registry_refuses_what_could_widen_sign_in() {
 	assert!(main.is_err(), "`main` is the implicit root and never a row");
 }
 
+/// `Scope.namespace` equals `id` for every scope but `main` (scopes.proto), and `main` is
+/// never a row. Catalogs and clients are keyed by the id while grants and the catalog
+/// check are keyed by the namespace: a row where the two differ lets one name be checked
+/// and the other enforced.
+#[tokio::test]
+async fn a_tenant_is_its_own_namespace() {
+	let pool = pool!();
+	for (id, namespace) in [(tag(), tag()), (tag(), "sa".to_owned())] {
+		let refused = sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $2, FALSE, 0)")
+			.bind(&id)
+			.bind(&namespace)
+			.execute(&pool)
+			.await
+			.expect_err("a tenant whose namespace is not its id");
+		assert_eq!(
+			refused.as_database_error().and_then(|e| e.constraint()),
+			Some("tenants_id_is_namespace"),
+			"{id} / {namespace}: {refused}"
+		);
+	}
+	let id = tag();
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, FALSE, 0)")
+		.bind(&id)
+		.execute(&pool)
+		.await
+		.unwrap();
+	let renamed = sqlx::query("UPDATE tenants SET namespace = $2 WHERE id = $1").bind(&id).bind(tag()).execute(&pool).await;
+	assert!(renamed.is_err(), "nor may an update split them");
+}
+
 fn signed_in<T>(inner: T) -> RpcRequest<T> {
 	let mut request = RpcRequest::new(inner);
 	request.extensions_mut().insert(Claims {

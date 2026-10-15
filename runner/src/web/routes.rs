@@ -559,7 +559,7 @@ pub(super) async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<O
 /// being 0 — but without a signature check, which is sound only because of where the
 /// token comes from: the server-side session store, never the browser. `None` for a
 /// token that does not parse, which the caller refuses.
-fn minted_token_version(token: &str) -> Option<u64> {
+pub(super) fn minted_token_version(token: &str) -> Option<u64> {
 	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 	let payload = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
 	serde_json::from_slice::<evconcierge_auth::Claims>(&payload).ok().map(|claims| claims.token_version)
