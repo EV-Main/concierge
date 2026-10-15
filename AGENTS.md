@@ -811,7 +811,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   beside `to` and is the same number: rows written before this carried only that key.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
-  hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
+  hit a REAL Postgres (no DB mocks); the binary applies migrations on boot, and refuses
+  its configuration BEFORE it connects to the database (`runner/tests/boot_config.rs`).
 - A DB-backed suite takes its URL from `common::database_url()`, never from
   `std::env::var("DATABASE_URL")` directly. Without `DATABASE_URL` a suite skips
   and still reports "N passed" — libtest prints nothing for a passing test — so
