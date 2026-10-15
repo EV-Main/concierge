@@ -25,7 +25,7 @@ async fn setup() -> Option<Arc<PgNotifications>> {
 	Some(Arc::new(PgNotifications::new(pool)))
 }
 
-const TOPIC: &str = "fund:quy-nhon";
+const TOPIC: &str = "platform:announcements";
 
 #[tokio::test]
 async fn subscriber_is_idempotent_and_tracks_the_address() {

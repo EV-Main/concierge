@@ -56,34 +56,38 @@ use crate::{
 	support::domain_to_status,
 };
 
-/// A subscribable topic. Server-owned so every client renders identical wording, and
-/// closed so an emitter cannot invent topics nobody can find or unsubscribe from.
+/// One of this plane's own topics. Server-owned so every client renders identical wording,
+/// and closed so an emitter cannot invent topics nobody can find or unsubscribe from.
 pub struct Topic {
 	pub key: &'static str,
 	pub label: &'static str,
 	pub description: &'static str,
+	/// False for a trace topic: written by this plane whatever anyone follows
+	/// (`NotificationRepository::record`), shown and filtered on in the platform inbox, but
+	/// neither offered to follow nor emitted on.
+	pub followable: bool,
 }
 
 pub const TOPICS: &[Topic] = &[
 	Topic {
-		key: "fund:quy-nhon",
-		label: "Quy Nhon Fund",
-		description: "NAV updates, distributions, research notes",
-	},
-	Topic {
-		key: "account:money-movement",
-		label: "Money movement",
-		description: "Deposits, withdrawals, redemptions",
-	},
-	Topic {
 		key: "account:verification",
 		label: "Identity verification",
 		description: "Decisions on your KYC submissions",
+		followable: true,
 	},
 	Topic {
 		key: "platform:announcements",
 		label: "Platform & product",
 		description: "Maintenance windows, new features",
+		followable: true,
+	},
+	// The key predates the move of the money topic to `bank:`; the traces of mail about the
+	// user's own money kept it, and the previous binary writes them under it too.
+	Topic {
+		key: "account:money-movement",
+		label: "Your money",
+		description: "Requests and notices about your own money",
+		followable: false,
 	},
 ];
 
@@ -91,14 +95,54 @@ pub fn topic(key: &str) -> Option<&'static Topic> {
 	TOPICS.iter().find(|t| t.key == key)
 }
 
-/// Whether `key` is a topic a subscriber may follow: one of this plane's own, or one a
-/// scope's catalog in force publishes. A withdrawn scope topic stops being offered; the
+/// A key this plane used to own that moved to the scope emitting on it (§6). Until the
+/// emitters and pages have moved, the old key is taken wherever a topic is named — an emit,
+/// a follow, the account-less subscribe and unsubscribe — and stands for the new one.
+/// Dropped at the contract step (ORG-RESTRUCTURE-PLAN §12 p.8); migration 0042 carried the
+/// subscriptions across.
+pub struct MovedTopic {
+	pub from: &'static str,
+	pub to: &'static str,
+	/// The scope whose members alone the new key reaches; `None` for `bank:`, which the
+	/// platform inbox shows to every account.
+	pub scope: Option<&'static str>,
+}
+
+pub const MOVED_TOPICS: &[MovedTopic] = &[
+	MovedTopic {
+		from: "fund:quy-nhon",
+		to: "invest:fund:quy-nhon",
+		scope: Some("invest"),
+	},
+	MovedTopic {
+		from: "account:money-movement",
+		to: "bank:money-movement",
+		scope: None,
+	},
+];
+
+/// The key `key` is stored under: its new one if it moved, else itself.
+pub fn current_key(key: &str) -> &str {
+	MOVED_TOPICS.iter().find(|m| m.from == key).map_or(key, |m| m.to)
+}
+
+/// Whether `key` names a topic at all: one of this plane's own, a moved key's new name
+/// (taken before its scope publishes it, so the alias works from the first day), or one a
+/// scope's catalog in force publishes. A withdrawn scope topic stops being known; the
 /// subscriptions and inbox rows under it stay.
 pub async fn topic_known(notifications: &dyn NotificationRepository, key: &str) -> Result<bool, DomainError> {
-	if topic(key).is_some() {
+	if topic(key).is_some() || MOVED_TOPICS.iter().any(|m| m.to == key) {
 		return Ok(true);
 	}
-	Ok(notifications.scope_topics().await?.iter().any(|t| t.topic == key))
+	Ok(scope_topic(notifications, key).await?.is_some())
+}
+
+/// [`topic_known`] less this plane's trace topics: what may be followed at all.
+pub async fn topic_followable(notifications: &dyn NotificationRepository, key: &str) -> Result<bool, DomainError> {
+	match topic(key) {
+		Some(t) => Ok(t.followable),
+		None => topic_known(notifications, key).await,
+	}
 }
 
 /// The gRPC metadata that asks for the summary inbox (value `all`). Metadata and not a
@@ -180,9 +224,14 @@ impl InboxView {
 	}
 }
 
-/// [`topic_known`] within one inbox: what that inbox offers to follow and to filter on.
+/// [`topic_known`] within one inbox: what that inbox offers to filter on.
 pub async fn topic_offered(notifications: &dyn NotificationRepository, view: &InboxView, key: &str) -> Result<bool, DomainError> {
 	Ok(view.shows(key) && topic_known(notifications, key).await?)
+}
+
+/// [`topic_followable`] within one inbox: what that inbox offers to follow.
+pub async fn follow_offered(notifications: &dyn NotificationRepository, view: &InboxView, key: &str) -> Result<bool, DomainError> {
+	Ok(view.shows(key) && topic_followable(notifications, key).await?)
 }
 
 /// The topic a scope's catalog in force publishes under `key`, if any. A key's namespace is
@@ -419,6 +468,7 @@ pub async fn settings_of(
 	let scoped = notifications.scope_topics().await?;
 	let catalogue = TOPICS
 		.iter()
+		.filter(|t| t.followable)
 		.map(|t| (t.key, t.label, t.description, false))
 		.chain(scoped.iter().map(|t| (t.topic.as_str(), t.label.as_str(), t.description.as_str(), t.default_subscribed)))
 		.filter(|(key, ..)| view.shows(key));
@@ -562,20 +612,32 @@ impl NotificationService for Notifications {
 		Self::require_service(&request)?;
 		let req = request.into_inner();
 		emit_fields(&req)?;
-		if topic(&req.topic).is_none() {
-			// A `typ=service` token names no namespace, so a scope's topic is emitted only
-			// through `ScopeInboxService.EmitScopeNotification`, where the credential does.
-			if topic_known(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)? {
-				return Err(Status::permission_denied(
-					"a scope's topic is emitted by its own namespace, through ScopeInboxService.EmitScopeNotification",
-				));
+		let target = if let Some(moved) = MOVED_TOPICS.iter().find(|m| m.from == req.topic) {
+			// The alias predates namespaced emitters, so a token that names no namespace may
+			// still use it; the new key's catalog decides the default once it is published.
+			let published = scope_topic(self.notifications.as_ref(), moved.to).await.map_err(domain_to_status)?;
+			EmitTarget {
+				topic: moved.to.to_owned(),
+				scope: moved.scope.map(str::to_owned),
+				default_subscribed: published.is_some_and(|t| t.default_subscribed),
 			}
-			return Err(Status::invalid_argument("unknown topic"));
-		}
-		let target = EmitTarget {
-			topic: req.topic.clone(),
-			scope: None,
-			default_subscribed: false,
+		} else {
+			match topic(&req.topic) {
+				Some(t) if t.followable => EmitTarget {
+					topic: req.topic.clone(),
+					scope: None,
+					default_subscribed: false,
+				},
+				Some(_) => return Err(Status::permission_denied("a trace topic is written by this plane alone")),
+				// A `typ=service` token names no namespace, so a scope's topic is emitted only
+				// through `ScopeInboxService.EmitScopeNotification`, where the credential does.
+				None if topic_known(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)? => {
+					return Err(Status::permission_denied(
+						"a scope's topic is emitted by its own namespace, through ScopeInboxService.EmitScopeNotification",
+					));
+				}
+				None => return Err(Status::invalid_argument("unknown topic")),
+			}
 		};
 		Ok(Response::new(emit_to(self.notifications.as_ref(), &target, &req).await?))
 	}
@@ -632,11 +694,12 @@ impl NotificationService for Notifications {
 		let view = self.view(&request).await?;
 		let sub = self.caller(&request).await?;
 		let req = request.get_ref();
-		if !topic_offered(self.notifications.as_ref(), &view, &req.topic).await.map_err(domain_to_status)? {
+		let key = current_key(&req.topic);
+		if !follow_offered(self.notifications.as_ref(), &view, key).await.map_err(domain_to_status)? {
 			return Err(Status::invalid_argument("unknown topic"));
 		}
 		self.notifications
-			.set_topic_subscription(sub.id, &req.topic, req.subscribed, req.email_enabled)
+			.set_topic_subscription(sub.id, key, req.subscribed, req.email_enabled)
 			.await
 			.map_err(domain_to_status)?;
 		Ok(Response::new(self.settings_snapshot(&view, &sub).await?))
@@ -649,7 +712,8 @@ impl NotificationService for Notifications {
 		// Any topic a catalog in force publishes, as well as this plane's own: the address
 		// asked for it by name and confirms it by mail, so `default_subscribed` — which is
 		// about accounts that never asked — has no say here.
-		if !topic_known(self.notifications.as_ref(), &req.topic).await.map_err(domain_to_status)? {
+		let key = current_key(&req.topic);
+		if !topic_followable(self.notifications.as_ref(), key).await.map_err(domain_to_status)? {
 			return Err(Status::invalid_argument("unknown topic"));
 		}
 		// Parsed, not merely non-empty: everything downstream treats this as a real
@@ -668,11 +732,11 @@ impl NotificationService for Notifications {
 		// per address per window, however many requests arrive and from wherever.
 		let queued = self
 			.notifications
-			.subscribe_anonymous(email.as_str(), &req.topic, CONFIRM_THROTTLE_SECS)
+			.subscribe_anonymous(email.as_str(), key, CONFIRM_THROTTLE_SECS)
 			.await
 			.map_err(domain_to_status)?;
 		if queued.is_none() {
-			tracing::debug!(topic = %req.topic, "anonymous subscribe accepted without queueing confirmation (already confirmed, or throttled)");
+			tracing::debug!(topic = %key, "anonymous subscribe accepted without queueing confirmation (already confirmed, or throttled)");
 		}
 
 		// Always the same answer. Whether the address was new, already subscribed or
@@ -696,7 +760,7 @@ impl NotificationService for Notifications {
 		if req.token.is_empty() {
 			return Err(Status::invalid_argument("token is required"));
 		}
-		let topic_filter = match req.topic.as_str() {
+		let topic_filter = match current_key(&req.topic) {
 			"" => None,
 			t if topic_known(self.notifications.as_ref(), t).await.map_err(domain_to_status)? => Some(t),
 			_ => return Err(Status::invalid_argument("unknown topic")),
@@ -722,6 +786,20 @@ mod tests {
 			assert_eq!(TOPICS.iter().filter(|o| o.key == t.key).count(), 1, "duplicate topic key {}", t.key);
 		}
 		assert!(topic("fund:does-not-exist").is_none(), "the catalogue is closed — unknown topics are rejected, not created");
+	}
+
+	#[test]
+	fn a_moved_key_names_a_scope_s_topic_and_no_followable_built_in() {
+		for moved in MOVED_TOPICS {
+			assert!(topic(moved.from).is_none_or(|t| !t.followable), "{} is still offered under its old key", moved.from);
+			assert!(topic(moved.to).is_none(), "{} moved onto a built-in", moved.to);
+			let namespace = moved.to.split_once(':').map(|(ns, _)| ns);
+			assert_eq!(moved.scope.or(Some(BANK_NAMESPACE)), namespace, "{} reaches the scope it is named after", moved.to);
+			assert_eq!(current_key(moved.from), moved.to);
+			assert!(moved.to.len() <= 64, "the topic CHECK constraints");
+		}
+		assert_eq!(current_key("account:verification"), "account:verification");
+		assert!(InboxView::Platform.shows("account:money-movement"), "the trace topic stays in the platform inbox");
 	}
 
 	#[test]

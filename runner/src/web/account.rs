@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-	notification::{InboxView, settings_json, settings_of, subscriber_of, topic_offered},
+	notification::{InboxView, current_key, follow_offered, settings_json, settings_of, subscriber_of},
 	web::{
 		WebState,
 		routes::{Caller, session_user},
@@ -201,7 +201,8 @@ pub async fn set_topic(State(st): State<WebState>, Query(query): Query<ViewQuery
 	let Signed { caller, user } = signed_in(st, &jar, &headers).await?;
 	let answer = async {
 		let view = inbox_view(st, &headers, &query, &user).await?;
-		if !topic_offered(st.notifications.as_ref(), &view, &body.topic)
+		let key = current_key(&body.topic);
+		if !follow_offered(st.notifications.as_ref(), &view, key)
 			.await
 			.map_err(|e| internal("notification settings: topics not read", e))?
 		{
@@ -211,7 +212,7 @@ pub async fn set_topic(State(st): State<WebState>, Query(query): Query<ViewQuery
 			.await
 			.map_err(|e| internal("notification settings: subscriber not read", e))?;
 		st.notifications
-			.set_topic_subscription(sub.id, &body.topic, body.subscribed, body.email_enabled)
+			.set_topic_subscription(sub.id, key, body.subscribed, body.email_enabled)
 			.await
 			.map_err(|e| internal("notification settings: topic not set", e))?;
 		let settings = settings_of(st.notifications.as_ref(), &view, &sub.email, sub.email_verified, Some(&sub))

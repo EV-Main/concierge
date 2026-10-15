@@ -38,7 +38,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
-	notification::{EmitTarget, InboxView, emit_to, inbox_mark_read, inbox_page, inbox_unread, scope_topic, settings_of, subscriber_of, topic, topic_offered},
+	notification::{EmitTarget, InboxView, emit_to, follow_offered, inbox_mark_read, inbox_page, inbox_unread, scope_topic, settings_of, subscriber_of, topic},
 	ports::{NotificationRepository, UserDirectoryRepository},
 	relying_party::ClientTokenAuthenticator,
 	service_caller::{ClientCaller, ServiceCaller, ServiceCallers},
@@ -200,7 +200,7 @@ impl ScopeInboxService for ScopeInbox {
 	async fn set_scope_topic_subscription(&self, request: Request<SetScopeTopicSubscriptionRequest>) -> Result<Response<NotificationSettings>, Status> {
 		let (view, user) = self.writer(&request, &request.get_ref().user_id).await?;
 		let req = request.get_ref();
-		if !topic_offered(self.notifications.as_ref(), &view, &req.topic).await.map_err(domain_to_status)? {
+		if !follow_offered(self.notifications.as_ref(), &view, &req.topic).await.map_err(domain_to_status)? {
 			return Err(Status::invalid_argument("unknown topic"));
 		}
 		let account = self
