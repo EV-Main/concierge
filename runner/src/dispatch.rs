@@ -24,6 +24,8 @@
 
 use std::{sync::Arc, time::Duration};
 
+use domain::scope_catalog::NotificationTopic;
+
 use crate::{
 	infrastructure::email::{
 		templates,
@@ -262,9 +264,19 @@ pub(crate) fn approval_mail(kind: &str, payload: &serde_json::Value, approvals_u
 	}
 }
 
+/// The label a mail names a topic by: this plane's own catalogue first, then the scope
+/// catalogs in force. An empty published label counts as none, so the caller's fallback
+/// applies rather than a blank heading.
+fn topic_label<'a>(key: &str, scoped: &'a [NotificationTopic]) -> Option<&'a str> {
+	if let Some(built_in) = topic(key) {
+		return Some(built_in.label);
+	}
+	scoped.iter().find(|t| t.topic == key).map(|t| t.label.as_str()).filter(|l| !l.is_empty())
+}
+
 /// Render one claimed job. `None` when the row references data that has since gone,
 /// which is treated as a permanent failure rather than retried forever.
-fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &DispatcherConfig) -> Option<OutgoingEmail> {
+fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &DispatcherConfig, scoped: &[NotificationTopic]) -> Option<OutgoingEmail> {
 	if job.kind == "email_code" {
 		let payload = job.payload.as_ref()?;
 		let sign_in = match text_field(payload, "purpose").as_str() {
@@ -311,12 +323,12 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 			let token = job.confirm_token.as_deref()?;
 			// The topic label is cosmetic here; a confirmation for a since-retired topic
 			// should still be completable.
-			let label = job.topic.as_deref().and_then(topic).map(|t| t.label).unwrap_or("EV Investment");
+			let label = job.topic.as_deref().and_then(|key| topic_label(key, scoped)).unwrap_or("EV Investment");
 			templates::confirm_subscription(label, &format!("{origin}/api/auth/notifications/confirm?token={token}"), &unsubscribe_url)
 		}
 		_ => {
 			let topic_key = job.topic.as_deref()?;
-			let label = topic(topic_key).map(|t| t.label).unwrap_or(topic_key);
+			let label = topic_label(topic_key, scoped).unwrap_or(topic_key);
 			templates::notification(
 				label,
 				job.title.as_deref()?,
@@ -361,8 +373,19 @@ pub async fn drain_once(repo: &dyn NotificationDispatchRepository, transport: &d
 	};
 	let claimed = jobs.len();
 
+	// Read once per batch, and only when some job names a topic this plane does not own.
+	// Labels are cosmetic, so a failed read degrades to the key rather than holding mail back.
+	let scoped = if jobs.iter().any(|j| j.topic.as_deref().is_some_and(|key| topic(key).is_none())) {
+		repo.scope_topics().await.unwrap_or_else(|err| {
+			tracing::warn!(%err, "could not read scope topic labels — mailing with topic keys");
+			Vec::new()
+		})
+	} else {
+		Vec::new()
+	};
+
 	for job in jobs {
-		let Some(mail) = render(&job, cfg) else {
+		let Some(mail) = render(&job, cfg, &scoped) else {
 			// Unrenderable rows never become renderable, so park immediately rather
 			// than burning six attempts on them.
 			tracing::error!(delivery_id = job.id, kind = %job.kind, "delivery could not be rendered — parking");
@@ -660,6 +683,31 @@ mod tests {
 			"a drifted row parks"
 		);
 		assert!(approval_mail("payout_outcome", &row, "https://admin.example").is_none(), "not an approval kind");
+	}
+
+	fn published(topic: &str, label: &str) -> NotificationTopic {
+		NotificationTopic {
+			topic: topic.to_owned(),
+			label: label.to_owned(),
+			description: String::new(),
+			default_subscribed: false,
+		}
+	}
+
+	#[test]
+	fn topic_label_prefers_built_in_then_scope_catalog() {
+		let scoped = [
+			published("invest:digest", "Digest"),
+			published("invest:fund:quy-nhon", "Quy Nhon fund"),
+			published("invest:blank", ""),
+		];
+		assert_eq!(topic_label("invest:digest", &scoped), Some("Digest"));
+		assert_eq!(topic_label("invest:fund:quy-nhon", &scoped), Some("Quy Nhon fund"));
+		assert_eq!(topic_label("invest:blank", &scoped), None, "an empty label falls through to the caller's fallback");
+		assert_eq!(topic_label("invest:unknown", &scoped), None);
+		let built_in = crate::notification::TOPICS.first().expect("catalogue is not empty");
+		let shadow = [published(built_in.key, "Shadow")];
+		assert_eq!(topic_label(built_in.key, &shadow), Some(built_in.label), "a built-in topic keeps its own label");
 	}
 
 	#[test]
