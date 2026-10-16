@@ -296,6 +296,7 @@ fn as_user(id: Uuid) -> Claims {
 		typ: TokenType::Access,
 		jti: None,
 		token_version: 0,
+		auth_time: None,
 	}
 }
 

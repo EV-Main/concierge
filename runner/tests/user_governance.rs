@@ -245,6 +245,7 @@ fn as_user<T>(id: UserId, inner: T) -> Request<T> {
 		typ: TokenType::Access,
 		jti: None,
 		token_version: 0,
+		auth_time: None,
 	});
 	request
 }
