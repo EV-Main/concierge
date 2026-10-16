@@ -563,6 +563,10 @@ impl NotificationRepository for PgNotifications {
 
 #[async_trait]
 impl NotificationDispatchRepository for PgNotifications {
+	async fn scope_topics(&self) -> Result<Vec<domain::scope_catalog::NotificationTopic>, DomainError> {
+		super::scope_catalogs::current_topics(&self.pool).await
+	}
+
 	async fn claim_due(&self, limit: i64, lease_secs: i64) -> Result<Vec<DeliveryJob>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 

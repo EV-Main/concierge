@@ -1507,6 +1507,9 @@ pub trait NotificationDispatchRepository: Send + Sync {
 
 	/// Sends in the trailing 24h — the input to the daily send-budget breaker.
 	async fn sent_last_24h(&self) -> Result<i64, DomainError>;
+
+	/// The topics the scope catalogs in force publish — the labels a mail names them by.
+	async fn scope_topics(&self) -> Result<Vec<NotificationTopic>, DomainError>;
 }
 
 /// Persistence + read port for the ownership consilium (the `OwnerRemoval` aggregate
