@@ -676,6 +676,7 @@ async fn a_service_emits_only_its_own_namespace_s_published_topics_to_members() 
 		typ: TokenType::Service,
 		jti: None,
 		token_version: 0,
+		auth_time: None,
 	});
 	assert_eq!(service.emit(unbound).await.unwrap_err().code(), Code::PermissionDenied);
 }

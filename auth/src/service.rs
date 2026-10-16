@@ -138,8 +138,9 @@ impl AuthService {
 		if summary.is_disabled() {
 			return Err(Status::permission_denied("user is disabled"));
 		}
-		let (access_token, access_exp) = signer.mint_access(&summary.user_id, summary.token_version)?;
+		// Issue the family first: it stamps the sign-in time that the access token carries.
 		let refresh = engine.refresh.issue(&summary.user_id, summary.token_version, engine.session_bounds, user_agent, ip).await?;
+		let (access_token, access_exp) = signer.mint_access(&summary.user_id, summary.token_version, refresh.auth_time)?;
 		Ok(token_response(access_token, access_exp, refresh, &summary))
 	}
 
@@ -256,7 +257,8 @@ impl AuthServiceRpc for AuthService {
 			return Err(Status::unauthenticated("tokens revoked"));
 		}
 
-		let (access_token, access_exp) = signer.mint_access(&summary.user_id, summary.token_version)?;
+		// Refresh keeps the family's original sign-in time; only `iat` moves.
+		let (access_token, access_exp) = signer.mint_access(&summary.user_id, summary.token_version, rotated.refresh.auth_time)?;
 		Ok(Response::new(token_response(access_token, access_exp, rotated.refresh, &summary)))
 	}
 
@@ -467,7 +469,7 @@ mod tests {
 		assert_eq!(response.keys[0].kid, "test-kid");
 
 		let signer = service.engine.signer.as_ref().unwrap();
-		let (token, _) = signer.mint_access("00000000-0000-0000-0000-000000000001", 3).unwrap();
+		let (token, _) = signer.mint_access("00000000-0000-0000-0000-000000000001", 3, None).unwrap();
 		let (cache, _) = load_jwks(&test_config().signing.unwrap()).unwrap();
 
 		let access_policy = VerifyPolicy {

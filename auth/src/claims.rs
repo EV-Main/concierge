@@ -62,6 +62,13 @@ pub struct Claims {
 	/// Per-principal token version for coarse "revoke all" semantics.
 	#[serde(default)]
 	pub token_version: u64,
+	/// Unix seconds of the principal's last interactive authentication (password,
+	/// passkey, email code, OAuth). Unlike `iat` it survives a refresh, so a verifier
+	/// can ask "did the user just confirm?". Absent on tokens minted before the claim
+	/// existed and on relying-party/service tokens; absence means "no step-up signal",
+	/// never "authenticated at epoch".
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub auth_time: Option<u64>,
 }
 
 impl Claims {
@@ -95,6 +102,7 @@ mod parity {
 			typ: TokenType::Access,
 			jti: Some("00000000-0000-0000-0000-000000000000".into()),
 			token_version: 0,
+			auth_time: Some(1),
 		}
 	}
 
@@ -107,7 +115,7 @@ mod parity {
 	#[test]
 	fn claims_wire_field_set_is_canonical() {
 		let value = serde_json::to_value(full_claims()).unwrap();
-		assert_eq!(keys(&value), ["aud", "exp", "iat", "iss", "jti", "sub", "token_version", "typ"]);
+		assert_eq!(keys(&value), ["aud", "auth_time", "exp", "iat", "iss", "jti", "sub", "token_version", "typ"]);
 	}
 
 	#[test]
@@ -117,6 +125,17 @@ mod parity {
 		let value = serde_json::to_value(&claims).unwrap();
 		assert!(value.get("jti").is_none(), "jti must be skipped when None to stay byte-compatible");
 		assert_eq!(keys(&value), ["aud", "exp", "iat", "iss", "sub", "token_version", "typ"]);
+	}
+
+	#[test]
+	fn auth_time_is_omitted_when_absent_and_optional_on_the_wire() {
+		let mut claims = full_claims();
+		claims.auth_time = None;
+		let value = serde_json::to_value(&claims).unwrap();
+		assert!(value.get("auth_time").is_none());
+		// A token minted before the claim existed must still parse.
+		let old: Claims = serde_json::from_value(value).unwrap();
+		assert_eq!(old.auth_time, None);
 	}
 
 	#[test]

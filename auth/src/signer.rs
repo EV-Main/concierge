@@ -65,10 +65,10 @@ impl Signer {
 	}
 
 	fn mint(&self, sub: &str, audience: &str, typ: TokenType, ttl_secs: u64, token_version: u64) -> Result<(String, u64), AuthError> {
-		self.mint_with_jti(sub, audience, typ, ttl_secs, token_version, uuid::Uuid::new_v4().to_string())
+		self.mint_with_jti(sub, audience, typ, ttl_secs, token_version, uuid::Uuid::new_v4().to_string(), None)
 	}
 
-	fn mint_with_jti(&self, sub: &str, audience: &str, typ: TokenType, ttl_secs: u64, token_version: u64, jti: String) -> Result<(String, u64), AuthError> {
+	fn mint_with_jti(&self, sub: &str, audience: &str, typ: TokenType, ttl_secs: u64, token_version: u64, jti: String, auth_time: Option<u64>) -> Result<(String, u64), AuthError> {
 		let now = get_current_timestamp();
 		let exp = now + ttl_secs;
 		let claims = Claims {
@@ -80,14 +80,26 @@ impl Signer {
 			typ,
 			jti: Some(jti),
 			token_version,
+			auth_time,
 		};
 		let token = encode(&self.header(), &claims, &self.encoding).map_err(|_| AuthError::NotConfigured)?;
 		Ok((token, exp))
 	}
 
 	/// Mint a client access token for a user. Returns `(token, exp_unix_secs)`.
-	pub fn mint_access(&self, user_id: &str, token_version: u64) -> Result<(String, u64), AuthError> {
-		self.mint(user_id, &self.client_audience, TokenType::Access, self.access_ttl_secs, token_version)
+	///
+	/// `auth_time` is the session's last interactive authentication; it comes from the
+	/// server-side refresh family, never from the client.
+	pub fn mint_access(&self, user_id: &str, token_version: u64, auth_time: Option<u64>) -> Result<(String, u64), AuthError> {
+		self.mint_with_jti(
+			user_id,
+			&self.client_audience,
+			TokenType::Access,
+			self.access_ttl_secs,
+			token_version,
+			uuid::Uuid::new_v4().to_string(),
+			auth_time,
+		)
 	}
 
 	/// Mint a relying party's access token: `typ=access` under the CLIENT's audience, so
@@ -97,7 +109,7 @@ impl Signer {
 	/// moment that family is revoked rather than at its expiry.
 	pub fn mint_client_access(&self, user_id: &str, audience: &str, token_version: u64, session_id: &str) -> Result<(String, u64), AuthError> {
 		let ttl = self.access_ttl_secs.min(MAX_CLIENT_ACCESS_TTL_SECS);
-		self.mint_with_jti(user_id, audience, TokenType::Access, ttl, token_version, format!("{session_id}:{}", uuid::Uuid::new_v4()))
+		self.mint_with_jti(user_id, audience, TokenType::Access, ttl, token_version, format!("{session_id}:{}", uuid::Uuid::new_v4()), None)
 	}
 
 	/// Mint an inter-service token for `service_name`. Returns `(token, exp_unix_secs)`.
@@ -195,7 +207,7 @@ mod tests {
 		assert_eq!(wire.len(), 1);
 		assert_eq!(wire[0].kid, "test-kid");
 
-		let (token, exp) = signer.mint_access("user-123", 7).unwrap();
+		let (token, exp) = signer.mint_access("user-123", 7, None).unwrap();
 		assert!(exp > 0);
 
 		let claims = verify_token(&token, &cache, &policy("concierge", vec![TokenType::Access])).unwrap();
@@ -221,7 +233,7 @@ mod tests {
 		let banking_signer = Signer::try_new(&signing, &cfg).unwrap();
 		let (cache, _) = load_jwks(&signing).unwrap();
 
-		let (banking_token, _) = banking_signer.mint_access("user-123", 1).unwrap();
+		let (banking_token, _) = banking_signer.mint_access("user-123", 1, None).unwrap();
 
 		let concierge_policy = VerifyPolicy {
 			issuer: "https://auth.concierge.ev".into(),

@@ -111,6 +111,7 @@ fn access_claims(sub: &str, token_version: u64) -> Claims {
 		typ: TokenType::Access,
 		jti: None,
 		token_version,
+		auth_time: None,
 	}
 }
 

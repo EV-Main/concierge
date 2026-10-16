@@ -220,6 +220,7 @@ fn signed_in<T>(inner: T) -> RpcRequest<T> {
 		typ: TokenType::Access,
 		jti: None,
 		token_version: 0,
+		auth_time: None,
 	});
 	request
 }

@@ -61,6 +61,7 @@ fn with_claims<T>(body: T, sub: &str, typ: TokenType) -> Request<T> {
 		typ,
 		jti: None,
 		token_version: 0,
+		auth_time: None,
 	});
 	request
 }

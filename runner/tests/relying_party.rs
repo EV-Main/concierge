@@ -698,6 +698,7 @@ fn access_token_at(user: UserId, token_version: u64, exp: u64) -> String {
 		typ: TokenType::Access,
 		jti: None,
 		token_version,
+		auth_time: None,
 	};
 	let encode = |json: &str| URL_SAFE_NO_PAD.encode(json.as_bytes());
 	format!("{}.{}.unsigned", encode(r#"{"alg":"EdDSA","typ":"JWT"}"#), encode(&serde_json::to_string(&claims).unwrap()))
