@@ -422,7 +422,8 @@ table). Whatever a publisher's catalog says:
 - `bank:scope_payout` escalates above 1000 USDT on `total`, above 5000 USDT a day, above one
   `recipients` (COUNT), above one recipient a day (`ROLLING_24H_COUNT_ABOVE` — a payout
   split into single-recipient ones is still one distribution), when `distribution` (FLAG,
-  a dividend to every holder) is set, and when `recipients` is 0.
+  a dividend to every holder) is set, when `over_scope_budget` (FLAG, the single daily scope
+  budget) is set, and when `recipients` is 0.
 - `invest:valuation_override` escalates above 10 % (`deviation`, 1000 bps);
   `invest:fee_policy` when `raises_ceiling` is set.
 

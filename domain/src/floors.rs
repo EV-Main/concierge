@@ -155,6 +155,9 @@ const TABLE: &[(&str, KindFloor)] = &[
 			floor("floor_daily_recipients", "recipients", EscalationTest::Rolling24hCountAbove, Cap::Fixed("1"), ""),
 			// A distribution to every holder is a dividend: the owners' (D24).
 			floor("floor_distribution", "distribution", EscalationTest::FlagSet, Cap::Fixed(""), ""),
+			// The single daily scope budget (D24(4)) is banking's to measure; the escalation it
+			// raises must not live only in banking's catalog, or a wrong publication drops it.
+			floor("floor_scope_budget", "over_scope_budget", EscalationTest::FlagSet, Cap::Fixed(""), ""),
 		]),
 	),
 	(
@@ -392,6 +395,26 @@ mod tests {
 	#[test]
 	fn a_scope_kind_published_at_the_platform_needs_no_floor_field() {
 		assert_eq!(check(&kind("bank:account_transfer", ApprovalLevel::Platform, vec![], vec![])), Ok(()));
+	}
+
+	/// The catalog here escalates nothing, as one published without the budget escalation
+	/// would: the flag must still reach the owners.
+	#[test]
+	fn the_scope_budget_flag_escalates_without_the_catalog() {
+		use crate::approvals::{Field, FieldValue, ScopePolicy, fired_escalations, resolve_level};
+		let payout = kind("bank:scope_payout", ApprovalLevel::Scope, vec![field("over_scope_budget", FieldType::Flag)], vec![]);
+		let floored = floored(&payout);
+		let flag = |on| {
+			[Field {
+				key: "over_scope_budget".into(),
+				value: FieldValue::Flag(on),
+			}]
+		};
+		let fired = fired_escalations(&floored, &flag(true), &ScopePolicy::default(), &[]);
+		assert!(fired.contains(&"floor_scope_budget".to_owned()), "{fired:?}");
+		assert_eq!(resolve_level(floored.level, false, fired, 2).level, ApprovalLevel::Platform);
+		let unset = fired_escalations(&floored, &flag(false), &ScopePolicy::default(), &[]);
+		assert!(!unset.contains(&"floor_scope_budget".to_owned()), "{unset:?}");
 	}
 
 	#[test]
