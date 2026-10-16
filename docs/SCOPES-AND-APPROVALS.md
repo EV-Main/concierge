@@ -789,6 +789,10 @@ the offer when a later catalog withdraws them.
   on POST; the unsubscribe URL is also the RFC 8058 one-click target (`POST` with
   `List-Unsubscribe=One-Click`, 200, no redirect), and a token nobody holds answers as one
   that worked.
+- **Account-less subscribers get no broadcast (decided, #152).** A confirmed address with no
+  account is not mailed topic updates on its own: nothing fans a topic out to bare addresses.
+  Whoever later registers with that address picks up the subscription and receives topic mail
+  from then on. Do not add a bulk send for account-less rows.
 - **The move has happened.** `fund:quy-nhon` is `invest:fund:quy-nhon` (invest's members
   only) and `account:money-movement` is `bank:money-movement`; migration 0042 carried the
   subscriptions, account-less ones included, and the fund's inbox history. Until banking and
