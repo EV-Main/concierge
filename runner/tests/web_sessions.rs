@@ -152,10 +152,6 @@ impl AuthRpc for SlowRefresh {
 		Ok(Response::new(t))
 	}
 
-	async fn exchange(&self, _: Request<ExchangeRequest>) -> Result<Response<TokenResponse>, Status> {
-		unreachable!()
-	}
-
 	async fn logout(&self, _: Request<LogoutRequest>) -> Result<Response<LogoutResponse>, Status> {
 		unreachable!()
 	}
