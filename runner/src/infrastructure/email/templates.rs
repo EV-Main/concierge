@@ -1277,11 +1277,11 @@ fn level_words(level: domain::scope_catalog::ApprovalLevel) -> &'static str {
 
 /// The common head of both approval mails: the kind's own label as the heading's object,
 /// the values in a box captioned as the proposer's, then the frame this plane vouches for.
-fn approval_body(mail: &ApprovalMail, lead: &str) -> (String, String) {
+fn approval_body(mail: &ApprovalMail, lead: &str, show_expiry: bool) -> (String, String) {
 	let kind_label = one_line(&mail.kind_label);
 	let proposer = one_line(&mail.proposer);
 	let rows = approval_rows(mail);
-	let frame = [
+	let mut frame = vec![
 		("Kind".to_owned(), format!("{kind_label} ({})", one_line(&mail.kind))),
 		("Scope".to_owned(), one_line(&mail.scope)),
 		("Decided by".to_owned(), level_words(mail.level).to_owned()),
@@ -1290,9 +1290,12 @@ fn approval_body(mail: &ApprovalMail, lead: &str) -> (String, String) {
 			if mail.requested_by.is_empty() { "—".to_owned() } else { one_line(&mail.requested_by) },
 		),
 		("Approvals needed".to_owned(), format!("{} of {}", mail.threshold, mail.roster_size)),
-		("Expires".to_owned(), fmt_ts(mail.expires_at)),
-		("Proposal".to_owned(), one_line(&mail.approval_id)),
 	];
+	// A proposal that has passed can no longer lapse, so its voting deadline would mislead.
+	if show_expiry {
+		frame.push(("Expires".to_owned(), fmt_ts(mail.expires_at)));
+	}
+	frame.push(("Proposal".to_owned(), one_line(&mail.approval_id)));
 
 	let mut html = String::new();
 	html.push_str(&paragraph(lead));
@@ -1343,7 +1346,7 @@ pub fn approval_request(mail: &ApprovalMail, approvals_url: &str) -> RenderedEma
 		"A proposal of the kind \u{201c}{kind_label}\u{201d} is waiting for your vote. It passes once {} of {} deciders approve it.",
 		mail.threshold, mail.roster_size
 	);
-	let (body, text_body) = approval_body(mail, &lead);
+	let (body, text_body) = approval_body(mail, &lead, true);
 
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Approvals"));
@@ -1369,9 +1372,16 @@ pub fn approval_outcome(mail: &ApprovalMail, approvals_url: &str) -> Option<Rend
 	let (word, sentence) = approval_outcome_words(state)?;
 	let kind_label = one_line(&mail.kind_label);
 	let link = approval_link(approvals_url, &mail.approval_id);
-	let title = format!("Your proposal was {word}");
-	let lead = format!("The proposal of the kind \u{201c}{kind_label}\u{201d} you asked for was {word}. {sentence}");
-	let (body, text_body) = approval_body(mail, &lead);
+	// "was expired" reads as if somebody expired it; a lapse just happens.
+	let verb = if state == domain::approvals::ApprovalState::Expired { "has" } else { "was" };
+	let title = format!("Your proposal {verb} {word}");
+	let lead = format!("The proposal of the kind \u{201c}{kind_label}\u{201d} you asked for {verb} {word}. {sentence}");
+	// A veto only lands on a proposal that already passed, so it too is past its deadline.
+	let show_expiry = !matches!(
+		state,
+		domain::approvals::ApprovalState::Passed | domain::approvals::ApprovalState::Executed | domain::approvals::ApprovalState::ExecutionFailed | domain::approvals::ApprovalState::Vetoed
+	);
+	let (body, text_body) = approval_body(mail, &lead, show_expiry);
 	let note = mail.note.as_ref().map(|note| {
 		let label = match note.by {
 			NoteAuthor::Vetoer => NOTE_BY_VETOER,
@@ -2265,6 +2275,34 @@ mod tests {
 		assert_eq!(group_amount("12500.50"), "12,500.50");
 		assert_eq!(group_amount("-1000000"), "-1,000,000");
 		assert_eq!(group_amount("1e9"), "1e9", "not a canonical decimal: shown as stored");
+	}
+
+	#[test]
+	fn outcome_mails_word_the_lapse_and_drop_the_deadline_once_passed() {
+		let mut mail = approval_mail();
+		let url = "https://evinvest.ltd/admin/approvals";
+
+		mail.outcome = Some("expired".into());
+		let expired = approval_outcome(&mail, url).expect("renderable");
+		assert!(expired.text.contains("Your proposal has expired") && !expired.text.contains("was expired"));
+		assert!(expired.html.contains("Your proposal has expired"));
+		assert!(expired.text.contains("Expires: 27 July 2026"), "the lapsed deadline is still meaningful");
+
+		for state in ["passed", "executed", "execution_failed", "vetoed"] {
+			mail.outcome = Some(state.into());
+			let rendered = approval_outcome(&mail, url).expect("renderable");
+			assert!(!rendered.text.contains("Expires"), "{state}: text still shows a deadline");
+			assert!(!rendered.html.contains("Expires"), "{state}: html still shows a deadline");
+		}
+
+		mail.outcome = Some("executed".into());
+		let executed = approval_outcome(&mail, url).expect("renderable");
+		assert!(executed.text.contains("Your proposal was carried out"));
+
+		assert!(
+			approval_request(&approval_mail(), url).text.contains("Expires: 27 July 2026"),
+			"a request still shows its deadline"
+		);
 	}
 
 	#[test]
