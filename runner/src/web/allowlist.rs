@@ -17,7 +17,10 @@ use webauthn_rs::Webauthn;
 
 use crate::{
 	ports::{ScopeRecord, ScopeRepository},
-	web::{origins::ScopeOrigins, passkey},
+	web::{
+		origins::{DevOrigins, ScopeOrigins},
+		passkey,
+	},
 };
 
 /// How stale the allowlist may be. A closed scope's host keeps signing in for at most
@@ -39,27 +42,34 @@ pub struct SignInAllowlist {
 	/// `None` ⇒ never refreshed: tests, and a plane with nothing to read it from.
 	source: Option<Arc<dyn ScopeRepository>>,
 	current: RwLock<Arc<Snapshot>>,
+	/// Kept for every rebuild: a refresh must not drop the origins the boot admitted.
+	dev: DevOrigins,
 }
 
 impl SignInAllowlist {
 	/// A plane that cannot read the registry at boot does not start: it would otherwise
 	/// begin by refusing every scope host it is meant to serve.
 	pub async fn live(repo: Arc<dyn ScopeRepository>, public_origin: &str) -> Result<Self> {
+		Self::live_with(repo, public_origin, DevOrigins::default()).await
+	}
+
+	pub async fn live_with(repo: Arc<dyn ScopeRepository>, public_origin: &str, dev: DevOrigins) -> Result<Self> {
 		let scopes = repo.scopes().await.context("failed to read the scope registry")?;
-		let snapshot = snapshot(public_origin, &scopes)?;
-		Ok(Self::new(public_origin, Some(repo), snapshot))
+		let snapshot = snapshot(public_origin, &scopes, &dev)?;
+		Ok(Self::new(public_origin, Some(repo), snapshot, dev))
 	}
 
 	pub fn fixed(public_origin: &str, origins: ScopeOrigins) -> Result<Self> {
 		let webauthn = Arc::new(passkey::verifier(public_origin, origins.origins())?);
-		Ok(Self::new(public_origin, None, Snapshot { origins, webauthn, key: Vec::new() }))
+		Ok(Self::new(public_origin, None, Snapshot { origins, webauthn, key: Vec::new() }, DevOrigins::default()))
 	}
 
-	fn new(public_origin: &str, source: Option<Arc<dyn ScopeRepository>>, snapshot: Snapshot) -> Self {
+	fn new(public_origin: &str, source: Option<Arc<dyn ScopeRepository>>, snapshot: Snapshot, dev: DevOrigins) -> Self {
 		Self {
 			public_origin: public_origin.trim_end_matches('/').to_owned(),
 			source,
 			current: RwLock::new(Arc::new(snapshot)),
+			dev,
 		}
 	}
 
@@ -96,7 +106,7 @@ impl SignInAllowlist {
 		if key_of(&scopes) == self.current().key {
 			return false;
 		}
-		match snapshot(&self.public_origin, &scopes) {
+		match snapshot(&self.public_origin, &scopes, &self.dev) {
 			Ok(next) => {
 				*self.current.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(next);
 				tracing::info!(scopes = scopes.len(), "sign-in allowlist rebuilt from the scope registry");
@@ -130,8 +140,8 @@ fn key_of(scopes: &[ScopeRecord]) -> Vec<(String, u64)> {
 	scopes.iter().map(|s| (s.id.clone(), s.version)).collect()
 }
 
-fn snapshot(public_origin: &str, scopes: &[ScopeRecord]) -> Result<Snapshot> {
-	let origins = ScopeOrigins::from_scopes(scopes);
+fn snapshot(public_origin: &str, scopes: &[ScopeRecord], dev: &DevOrigins) -> Result<Snapshot> {
+	let origins = ScopeOrigins::from_scopes_with(scopes, dev);
 	let webauthn = Arc::new(passkey::verifier(public_origin, origins.origins())?);
 	Ok(Snapshot {
 		origins,
