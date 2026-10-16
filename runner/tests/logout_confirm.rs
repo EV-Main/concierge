@@ -178,3 +178,32 @@ async fn a_forged_press_signs_nobody_out() {
 	assert_eq!((forged.status, forged.location()), (StatusCode::FORBIDDEN, None));
 	assert!(authenticated(&fx, &mut browser).await);
 }
+
+async fn post_logout(fx: &Surface, csrf: Option<&str>, browser: &mut Browser) -> Page {
+	let mut request = Request::builder().method(Method::POST).uri("/auth/logout").header(header::ORIGIN, ORIGIN);
+	if let Some(csrf) = csrf {
+		request = request.header("x-ev-csrf", csrf);
+	}
+	send(fx, request, Body::empty(), browser).await
+}
+
+#[tokio::test]
+async fn api_logout_without_a_session_clears_cookies_and_answers_ok() {
+	let fx = fixture!();
+	let answer = post_logout(&fx, None, &mut Browser::default()).await;
+	assert_eq!(answer.status, StatusCode::OK, "{}", answer.html);
+	assert!(answer.headers.get_all(header::SET_COOKIE).iter().count() > 0, "the stale cookies are cleared");
+}
+
+#[tokio::test]
+async fn api_logout_with_a_session_and_a_bad_token_is_still_refused() {
+	let fx = fixture!();
+	let mut browser = signed_in(&fx).await;
+	let refused = post_logout(&fx, Some("not-the-token"), &mut browser).await;
+	assert_eq!(refused.status, StatusCode::FORBIDDEN);
+	assert!(authenticated(&fx, &mut browser).await, "a refused logout ends nothing");
+	let csrf = browser.get("ev_csrf").unwrap().to_owned();
+	let held = browser.clone();
+	assert_eq!(post_logout(&fx, Some(&csrf), &mut browser).await.status, StatusCode::OK);
+	assert!(!authenticated(&fx, &mut held.clone()).await);
+}

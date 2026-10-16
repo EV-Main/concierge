@@ -251,14 +251,19 @@ pub async fn session(State(st): State<WebState>, jar: CookieJar) -> Result<(Cook
 	Ok((jar, Json(SessionInfo::authenticated(fresh.user))))
 }
 /// `POST /auth/logout` — CSRF-checked: drop the session, revoke the refresh family
-/// upstream (best-effort), and clear the cookies.
+/// upstream (best-effort), and clear the cookies. Without a session it only clears the
+/// cookies and answers 200; a session with a bad token is still refused.
 pub async fn logout(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Result<(CookieJar, Json<Value>), (StatusCode, &'static str)> {
 	let st = &st.inner;
-	if !verify_csrf(st, &jar, &headers).await? {
-		return Err((StatusCode::FORBIDDEN, "csrf check failed"));
-	}
-	if let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
-		close(st, &id).await.map_err(store_err)?;
+	match csrf_outcome(st, &jar, &headers).await? {
+		CsrfOutcome::Ok =>
+			if let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
+				close(st, &id).await.map_err(store_err)?;
+			},
+		// Nothing to end and nothing for a forged request to protect; a retried or
+		// second-tab sign-out must succeed so the client can drop its stale cookies.
+		CsrfOutcome::NoSession => {}
+		CsrfOutcome::Mismatch => return Err((StatusCode::FORBIDDEN, "csrf check failed")),
 	}
 	Ok((clear_session(st, jar), Json(json!({ "ok": true }))))
 }
