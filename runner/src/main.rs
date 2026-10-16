@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use color_eyre::{
 	Result,
-	eyre::{Context, ensure},
+	eyre::{Context, ensure, eyre},
 };
 use concierge::{
 	bridge, bridge_tls, config, directory, governance,
@@ -27,9 +27,11 @@ use concierge::{
 	web,
 };
 use ev::error_monitoring::{self, Config as SentryConfig};
-use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
+use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, oauth::OAuthProvider, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
 	CheckRequest, CheckResponse,
+	approval_execution_service_server::ApprovalExecutionServiceServer,
+	approval_service_server::ApprovalServiceServer,
 	auth_service_server::AuthServiceServer,
 	governance_service_server::GovernanceServiceServer,
 	health_service_server::{HealthService, HealthServiceServer},
@@ -38,6 +40,10 @@ use evconcierge_contracts::concierge::v1::{
 	notification_service_server::NotificationServiceServer,
 	owner_removal_approval_service_server::OwnerRemovalApprovalServiceServer,
 	platform_service_server::PlatformServiceServer,
+	scope_catalog_service_server::ScopeCatalogServiceServer,
+	scope_events_server::ScopeEventsServer,
+	scope_inbox_service_server::ScopeInboxServiceServer,
+	scope_registry_server::ScopeRegistryServer,
 	user_directory_server::UserDirectoryServer,
 	user_events_server::UserEventsServer,
 };
@@ -93,11 +99,66 @@ fn main() -> Result<()> {
 }
 
 async fn run(config: config::AppConfig) -> Result<()> {
+	// Before anything can measure a proposal: an unparsable cap must stop the boot rather
+	// than leave the floor at a value nobody chose.
+	let floor_caps = domain::floors::MoneyCaps::new(&config.approval_floor_per_operation_usdt, &config.approval_floor_daily_usdt).map_err(|e| eyre!(e))?;
+	tracing::info!(per_operation_usdt = floor_caps.per_operation(), daily_usdt = floor_caps.daily(), "approval money floors in force");
+	domain::floors::configure(floor_caps).map_err(|e| eyre!(e))?;
 	// `OWNER_SUBJECTS`, pre-loaded from env. It does two things and then retires: it seeds
 	// the genesis roster below, and until the registry is populated it lets a listed
 	// subject authorize as an owner. Shared by every service that resolves or reports a
 	// role, so the rule is stated once.
 	let break_glass = Arc::new(concierge::authz::BreakGlass::new(config.owner_subjects.clone()));
+	// Every configuration refusal comes BEFORE the first side effect — the database
+	// connection, the migrations, genesis. A pod that is going to exit over its config must
+	// not have upgraded the schema on its way out (#132).
+	let auth_config = AuthConfig::from_env().context("failed to load auth configuration")?;
+	// The auth crate's optional seams (absent ⇒ inert plane) are a dev/CI
+	// affordance; production must never boot inert. Same for the session/refresh
+	// stores' in-process fallback — restart-lossy, dev-only.
+	if config.app_env == "production" {
+		ensure!(
+			auth_config.signing.is_some(),
+			"production requires the auth signing triple (AUTH_SIGNING_KEY_PEM/AUTH_SIGNING_KID/AUTH_JWKS_JSON)"
+		);
+		ensure!(auth_config.google.is_some(), "production requires GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET");
+		ensure!(
+			std::env::var("REDIS_URL").is_ok_and(|v| !v.is_empty()),
+			"production requires REDIS_URL (web sessions + refresh state must survive restarts)"
+		);
+		// A test secret passes (or fails) every token without a person behind it, so in
+		// production it would quietly switch the check off.
+		ensure!(
+			!web::is_test_secret(&config.turnstile_secret),
+			"production requires a real TURNSTILE_SECRET, not one of Cloudflare's test secrets"
+		);
+	}
+	let dev_redirects = relying_party::parse_dev_redirects(&std::env::var("RP_DEV_REDIRECT_URIS").unwrap_or_default(), config.app_env == "production")?;
+	let dev_origins = web::origins::DevOrigins::parse(&std::env::var("SCOPE_DEV_ORIGINS").unwrap_or_default(), config.app_env == "production")?;
+	let kyc_provider = build_kyc_provider(&config)?;
+	// Fail the BOOT, not the first start. A provider that cannot say where its session
+	// URLs live turns the redirect check into a no-op, and the whole point of that check
+	// is that the plane stops trusting any `https:` the vendor happens to return. A
+	// process that has quietly lost a defence is worse than one that refuses to come up,
+	// because nothing about it looks wrong — the same reasoning that makes `KYC_STUB` in
+	// production an `ensure!` below rather than a warning.
+	if let Some(provider) = kyc_provider.as_ref() {
+		ensure!(
+			!provider.session_origins().is_empty(),
+			"the {} KYC provider declares no session origin — check DIDIT_BASE_URL (or CABINET_URL under KYC_STUB): it must parse as an absolute URL with a host",
+			provider.name()
+		);
+	}
+	// Also the BOOT and not the first start. A non-positive TTL makes every case stale
+	// the instant it is written, so each `/kyc/start` would buy a new BILLED vendor
+	// session and the user would spend `START_MAX_PER_WINDOW` in five clicks — a
+	// misconfiguration that costs money and looks, from the outside, like verification
+	// simply never working.
+	ensure!(
+		config.kyc_case_ttl_secs > 0,
+		"KYC_CASE_TTL_SECS must be positive (got {}): a non-positive value abandons every case as soon as it is opened",
+		config.kyc_case_ttl_secs
+	);
 	// The plane applies pending control-plane migrations on boot (idempotent). New
 	// migration FILES are authored with the sqlx CLI (`sqlx migrate add …`), never
 	// hand-written.
@@ -134,21 +195,6 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// provisioner channel is the auth → directory seam: auth holds the `Provisioner`
 	// (called from `Exchange`/`Refresh`), and the directory keeps the receiver and
 	// drains it against Postgres — provisioning/looking-up/revoking the matching user.
-	let auth_config = AuthConfig::from_env().context("failed to load auth configuration")?;
-	// The auth crate's optional seams (absent ⇒ inert plane) are a dev/CI
-	// affordance; production must never boot inert. Same for the session/refresh
-	// stores' in-process fallback — restart-lossy, dev-only.
-	if config.app_env == "production" {
-		ensure!(
-			auth_config.signing.is_some(),
-			"production requires the auth signing triple (AUTH_SIGNING_KEY_PEM/AUTH_SIGNING_KID/AUTH_JWKS_JSON)"
-		);
-		ensure!(auth_config.google.is_some(), "production requires GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET");
-		ensure!(
-			std::env::var("REDIS_URL").is_ok_and(|v| !v.is_empty()),
-			"production requires REDIS_URL (web sessions + refresh state must survive restarts)"
-		);
-	}
 	// The inbound verifier must expect exactly what issuance stamps, so read the
 	// issuer/audience off the loaded (env-resolved, plane-asserted) `auth_config`
 	// before it moves into the service — never re-read the env with copied defaults.
@@ -161,12 +207,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	tokio::spawn(directory::run_provisioner(provision_rx, users.clone(), break_glass.clone()));
 
 	// Relying parties: first-party clients on other origins signing users in through this
-	// plane (`relying_party`). The registry is data (migration 0025 seeds `sa`); each
+	// plane (`relying_party`). The registry is data (migrations 0025 and 0031 seed `sa` and
+	// `invest`); each
 	// client's secret comes from `RP_CLIENT_SECRET_<ID>` and is written to the registry as
 	// a digest here, so a rotation is an env change and a restart. Dev-only loopback
 	// redirect targets come from `RP_DEV_REDIRECT_URIS`, refused in production.
 	let grants: Arc<dyn concierge::ports::GrantRepository> = Arc::new(infrastructure::grants::PgGrants::new(pool.clone()));
-	let dev_redirects = relying_party::parse_dev_redirects(&std::env::var("RP_DEV_REDIRECT_URIS").unwrap_or_default(), config.app_env == "production")?;
 	let relying_parties = Arc::new(RelyingParties::new(
 		Arc::new(infrastructure::relying_parties::PgRelyingParties::new(pool.clone())),
 		users.clone(),
@@ -177,6 +223,22 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.sync_registry(|var| std::env::var(var).ok())
 		.await
 		.context("failed to load the relying-party registry")?;
+	// The scope registry. Its origins widen the sign-in routes' CORS and `Origin` check,
+	// the passkey verifier, OAuth `returnTo` and the MFE bundles' CORS; the allowlist is
+	// refreshed in the background (below, beside the dispatch loops), so closing a scope
+	// needs no restart.
+	let scope_repo: Arc<dyn concierge::ports::ScopeRepository> = Arc::new(infrastructure::scopes::PgScopes::new(pool.clone()));
+	let allowlist = Arc::new(
+		web::allowlist::SignInAllowlist::live_with(scope_repo.clone(), &config.public_origin, dev_origins)
+			.await
+			.context("failed to build the sign-in allowlist")?,
+	);
+	let providers: Vec<OAuthProvider> = auth_config
+		.google
+		.iter()
+		.map(OAuthProvider::google)
+		.chain(auth_config.github.iter().map(OAuthProvider::github))
+		.collect();
 	let auth_service = AuthService::try_new(auth_config, provisioner)
 		.await
 		.context("failed to build the auth service")?
@@ -207,6 +269,9 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	verifier_config.assert_plane().context("verifier config carries a cross-plane identity")?;
 	let verifier_config_audiences = verifier_config.audiences.clone();
 	let verifier = Verifier::try_new(verifier_config).context("failed to build the inbound token verifier")?;
+	// The same verifier proves who asked for a money decision when its proposer presents
+	// that person's token (`approvals`, D24(1)).
+	let approval_user_tokens: Arc<dyn concierge::ports::UserTokenVerifier> = Arc::new(verifier.clone());
 
 	// `tonic-web` (`GrpcWebLayer` + `accept_http1`) lets browser/WASM clients reach
 	// the services over gRPC-Web with no separate proxy. `TraceLayer` emits a span
@@ -227,12 +292,20 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		client_verifier_config.audiences.iter().all(|aud| !verifier_config_audiences.contains(aud)),
 		"a relying party's audience collides with this plane's own — its tokens would open every RPC"
 	);
-	let auth = if client_verifier_config.audiences.is_empty() {
-		grpc_auth_layer(verifier)
+	// The same authenticator checks the user token a scope's backend presents to write in
+	// that user's scope inbox (`scope_inbox`).
+	let client_tokens = if client_verifier_config.audiences.is_empty() {
+		None
 	} else {
 		let client_verifier = Verifier::try_new(client_verifier_config).context("failed to build the relying-party token verifier")?;
-		let get_me = format!("/{}/GetMe", <UserDirectoryServer<directory::Directory> as NamedService>::NAME);
-		grpc_auth_layer(verifier).with_restricted(ClientTokenAuthenticator::new(client_verifier, relying_parties.clone()), [get_me])
+		Some(ClientTokenAuthenticator::new(client_verifier, relying_parties.clone()))
+	};
+	let auth = match &client_tokens {
+		None => grpc_auth_layer(verifier),
+		Some(client_tokens) => {
+			let get_me = format!("/{}/GetMe", <UserDirectoryServer<directory::Directory> as NamedService>::NAME);
+			grpc_auth_layer(verifier).with_restricted(client_tokens.clone(), [get_me])
+		}
 	};
 
 	// The cross-plane bridge producer: the one-way identity→money seam the banking
@@ -240,6 +313,24 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// service-to-service seam authenticated by its own shared bridge service token, not
 	// a user access token.
 	let bridge = bridge::Bridge::new(pool.clone(), Some(config.bridge_service_token.clone()));
+
+	// The relying-party streams and the scope catalog: service seams like the bridge,
+	// outside the user auth layer, opened by the bridge token or a client's own secret
+	// (`service_caller`).
+	let service_callers = concierge::service_caller::ServiceCallers::new(
+		Some(config.bridge_service_token.clone()),
+		Arc::new(infrastructure::relying_parties::PgRelyingParties::new(pool.clone())),
+	);
+	let scope_events = concierge::scope_events::ScopeEvents::new(service_callers.clone(), Arc::new(infrastructure::scope_events::PgScopeEvents::new(pool.clone())));
+	let catalog_repo: Arc<dyn concierge::ports::ScopeCatalogRepository> = Arc::new(infrastructure::scope_catalogs::PgScopeCatalogs::new(pool.clone()));
+	let scope_catalogs = concierge::scope_catalog::ScopeCatalogs::new(service_callers.clone(), catalog_repo.clone());
+	// Approvals (`docs/SCOPES-AND-APPROVALS.md` §5): the proposers' side is a service seam
+	// like the catalog it reads kinds from; the people's side sits inside the auth layer.
+	let approval_repo: Arc<dyn concierge::ports::ApprovalRepository> = Arc::new(infrastructure::approvals::PgApprovals::new(pool.clone()));
+	// This plane's own approvals (`concierge:*`) are carried out by this loop once passed:
+	// there is no other proposer to pull them.
+	tokio::spawn(concierge::approvals::run_executor(approval_repo.clone(), std::time::Duration::from_secs(30)));
+	let approval_execution = concierge::approvals::ApprovalExecution::new(service_callers.clone(), approval_repo.clone(), catalog_repo.clone()).with_user_tokens(approval_user_tokens);
 
 	// The TLS listener for the same seam (banking#199, phase 2). Validated and READ here,
 	// before anything is served: a half-configured listener or an unreadable PEM is a
@@ -259,6 +350,8 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	let pg_notifications = Arc::new(infrastructure::notifications::PgNotifications::new(pool.clone()));
 	let notification_repo: Arc<dyn concierge::ports::NotificationRepository> = pg_notifications.clone();
 	let dispatch_repo: Arc<dyn concierge::ports::NotificationDispatchRepository> = pg_notifications;
+	// A direction's own inbox, read by its backend with its client credential (D21).
+	let scope_inbox = concierge::scope_inbox::ScopeInbox::new(service_callers, notification_repo.clone(), users.clone(), client_tokens);
 
 	// The ownership consilium. The broadcast channel is only an immediacy optimisation
 	// for the live feed — each stream ALSO re-reads the revision from Postgres on an
@@ -278,6 +371,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		}
 	};
 
+	let mail_wake = Arc::new(tokio::sync::Notify::new());
 	tokio::spawn(concierge::dispatch::run_dispatcher(
 		dispatch_repo,
 		transport,
@@ -285,15 +379,18 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			mail_from: config.mail_from.clone(),
 			cabinet_url: config.cabinet_url.clone(),
 			public_origin: config.public_origin.clone(),
+			approvals_url: config.approvals_url.clone(),
 			daily_budget: config.notification_daily_email_budget,
 			interval: std::time::Duration::from_secs(config.notification_dispatch_interval_secs),
 		},
+		mail_wake.clone(),
 	));
 
 	// The hold sweep. Unlike consilium expiry — which is lazy, so nothing has to be
 	// running for a stale proposal to be unusable — a hold's lapse must be a WRITE: the
 	// money plane learns an account is unfrozen only from a `user_outbox` row. If this
 	// loop stops, one operator's 24h brake quietly becomes indefinite.
+	tokio::spawn(web::allowlist::run_refresh(allowlist.clone(), web::allowlist::REFRESH_EVERY));
 	tokio::spawn(concierge::dispatch::run_hold_sweep(
 		users.clone(),
 		std::time::Duration::from_secs(config.hold_sweep_interval_secs),
@@ -320,34 +417,18 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// the outbox row and the money plane's mirror are identical either way, and banking
 	// never learns a vendor exists.
 	let kyc_cases: Arc<dyn concierge::ports::KycCaseRepository> = Arc::new(infrastructure::kyc::cases::PgKycCases::new(pool.clone()));
-	let kyc_provider = build_kyc_provider(&config)?;
-	// Fail the BOOT, not the first start. A provider that cannot say where its session
-	// URLs live turns the redirect check into a no-op, and the whole point of that check
-	// is that the plane stops trusting any `https:` the vendor happens to return. A
-	// process that has quietly lost a defence is worse than one that refuses to come up,
-	// because nothing about it looks wrong — the same reasoning that makes `KYC_STUB` in
-	// production an `ensure!` below rather than a warning.
-	if let Some(provider) = kyc_provider.as_ref() {
-		ensure!(
-			!provider.session_origins().is_empty(),
-			"the {} KYC provider declares no session origin — check DIDIT_BASE_URL (or CABINET_URL under KYC_STUB): it must parse as an absolute URL with a host",
-			provider.name()
-		);
-	}
-	// Also the BOOT and not the first start. A non-positive TTL makes every case stale
-	// the instant it is written, so each `/kyc/start` would buy a new BILLED vendor
-	// session and the user would spend `START_MAX_PER_WINDOW` in five clicks — a
-	// misconfiguration that costs money and looks, from the outside, like verification
-	// simply never working.
-	ensure!(
-		config.kyc_case_ttl_secs > 0,
-		"KYC_CASE_TTL_SECS must be positive (got {}): a non-positive value abandons every case as soon as it is opened",
-		config.kyc_case_ttl_secs
-	);
 	let web_state = web::WebState::try_new(
 		auth_service.clone(),
 		config.public_origin.clone(),
 		config.app_env == "production",
+		web::SignInDeps {
+			providers,
+			turnstile: web::Turnstile::new(config.turnstile_secret.clone(), web::SITEVERIFY.to_string()),
+			credentials: Arc::new(infrastructure::credentials::PgCredentials::new(pool.clone())),
+			mail_wake,
+			allowlist: allowlist.clone(),
+			subscribe_limiter: subscribe_limiter.clone(),
+		},
 		web::KycDeps {
 			users: users.clone(),
 			cases: kyc_cases,
@@ -363,8 +444,14 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	.context("failed to build the auth web state")?;
 	let web_listener = tokio::net::TcpListener::bind(config.web_bind).await.context("failed to bind the auth web listener")?;
 	tracing::info!(bind = %config.web_bind, "auth web surface listening");
+	let web_router = match mfe_assets(config.web_mfe_dir.as_deref(), allowlist) {
+		Some(assets) => web::mfe::mount(web::router(web_state), assets),
+		None => web::router(web_state),
+	};
 	let web_server = async {
-		axum::serve(web_listener, web::router(web_state))
+		// The peer address is the per-address limits' fallback when Cloudflare names no
+		// client (`web::routes::ClientIp`).
+		axum::serve(web_listener, web_router.into_make_service_with_connect_info::<std::net::SocketAddr>())
 			.with_graceful_shutdown(await_signal())
 			.await
 			.context("concierge auth web server error")
@@ -385,13 +472,18 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		config.public_origin.clone(),
 	);
 
-	// The TLS listener serves ONLY what banking dials through `CONCIERGE_BRIDGE_ADDR`:
-	// the lifecycle pull and the mail push. No gRPC-Web, no `accept_http1` — nothing a
-	// browser reaches — and the same shared token checks inside the handlers, so TLS
+	// The TLS listener serves ONLY the service seams: the lifecycle pull and the mail push
+	// banking dials through `CONCIERGE_BRIDGE_ADDR`, and the scope stream, catalog and inbox
+	// (`docs/SCOPES-AND-APPROVALS.md` §1). No gRPC-Web, no `accept_http1` — nothing a
+	// browser reaches — and the credential checks stay inside the handlers, so TLS
 	// is added proof, not a replacement. Unconfigured ⇒ resolves at once and lets the
 	// `try_join!` below wait on the other two.
 	let tls_bridge = bridge.clone();
 	let tls_mail_relay = mail_relay.clone();
+	let tls_scope_events = scope_events.clone();
+	let tls_scope_catalogs = scope_catalogs.clone();
+	let tls_approval_execution = approval_execution.clone();
+	let tls_scope_inbox = scope_inbox.clone();
 	let bridge_tls_server = async {
 		let Some(listener) = bridge_tls else {
 			return Ok(());
@@ -407,6 +499,10 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.layer(TraceLayer::new_for_grpc())
 			.add_service(UserEventsServer::new(tls_bridge))
 			.add_service(MailRelayServiceServer::new(tls_mail_relay))
+			.add_service(ScopeEventsServer::new(tls_scope_events))
+			.add_service(ScopeCatalogServiceServer::new(tls_scope_catalogs))
+			.add_service(ApprovalExecutionServiceServer::new(tls_approval_execution))
+			.add_service(ScopeInboxServiceServer::new(tls_scope_inbox))
 			.serve_with_shutdown(listener.bind, await_signal())
 			.await
 			.context("concierge bridge TLS server error")
@@ -419,6 +515,10 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(HealthServiceServer::new(Health))
 			.add_service(AuthServiceServer::new(auth_service))
 			.add_service(UserEventsServer::new(bridge))
+			.add_service(ScopeEventsServer::new(scope_events))
+			.add_service(ScopeCatalogServiceServer::new(scope_catalogs))
+			.add_service(ApprovalExecutionServiceServer::new(approval_execution))
+			.add_service(ScopeInboxServiceServer::new(scope_inbox))
 			// Both governance seams are mounted OUTSIDE the user auth layer, for the two
 			// different reasons the layer exists to distinguish: the approval surface is
 			// reached by a person holding an emailed token who may not be signed in, and
@@ -436,9 +536,11 @@ async fn run(config: config::AppConfig) -> Result<()> {
 				governance_revisions,
 			))))
 			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), grants, break_glass.clone()).with_grant_write_limiter(grant_write_limiter))))
-			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass, platform_repo))))
-			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))
+			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass.clone(), platform_repo))))
+			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users.clone(), subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
+			.add_service(auth.layer(ScopeRegistryServer::new(concierge::scopes::ScopeRegistry::new(scope_repo))))
+			.add_service(auth.layer(ApprovalServiceServer::new(concierge::approvals::Approvals::new(users, break_glass, approval_repo, catalog_repo))))
 			.serve_with_shutdown(config.bind, await_signal())
 			.await
 			.context("concierge gRPC server error")
@@ -524,6 +626,21 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 /// account is one) can brute-force a hand-typed key offline and then recover the document
 /// number behind every stored row. That is precisely the PII `0010_kyc_cases.sql` promises
 /// this database does not hold, handed over by a weak secret rather than by the schema.
+/// The bundles to serve under `/auth/mfe/*`, or `None` — logged — when there are none.
+fn mfe_assets(dir: Option<&str>, allowlist: Arc<web::allowlist::SignInAllowlist>) -> Option<web::mfe::MfeAssets> {
+	let Some(dir) = dir else {
+		tracing::info!("WEB_MFE_DIR is unset: /auth/mfe/* is not served");
+		return None;
+	};
+	match web::mfe::MfeAssets::open(std::path::Path::new(dir), allowlist) {
+		Ok(assets) => Some(assets),
+		Err(e) => {
+			tracing::error!(error = ?e, "micro-frontend bundles unavailable: /auth/mfe/* is not served");
+			None
+		}
+	}
+}
+
 const MIN_IDENTITY_PEPPER_LEN: usize = 32;
 
 /// The configured identity pepper, or `None` — with the reason on the way out.

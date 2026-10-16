@@ -24,6 +24,8 @@
 
 use std::{sync::Arc, time::Duration};
 
+use domain::scope_catalog::NotificationTopic;
+
 use crate::{
 	infrastructure::email::{
 		templates,
@@ -45,8 +47,10 @@ pub struct DispatcherConfig {
 	pub mail_from: String,
 	/// Origin the cabinet is served from; builds links inside emails.
 	pub cabinet_url: String,
-	/// Public origin serving the confirm/unsubscribe endpoints.
+	/// `PUBLIC_ORIGIN`: the confirm/unsubscribe links are its `/api/auth/notifications/*`.
 	pub public_origin: String,
+	/// The approvals page an approval mail links to, `<approvals_url>/<id>`.
+	pub approvals_url: String,
 	/// Trailing-24h send ceiling. Reaching it pauses sending, not queueing.
 	pub daily_budget: i64,
 	pub interval: Duration,
@@ -248,16 +252,62 @@ pub(crate) fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_u
 	}
 }
 
+/// Render an approval mail (`approval_request`, `approval_outcome`) from its stored
+/// payload. `None` for any other kind, and for a payload that does not read as an
+/// [`templates::ApprovalMail`] — permanent, so the caller parks it.
+pub(crate) fn approval_mail(kind: &str, payload: &serde_json::Value, approvals_url: &str) -> Option<templates::RenderedEmail> {
+	let read = || serde_json::from_value::<templates::ApprovalMail>(payload.clone());
+	match kind {
+		"approval_request" => read().ok().map(|mail| templates::approval_request(&mail, approvals_url)),
+		"approval_outcome" => read().ok().and_then(|mail| templates::approval_outcome(&mail, approvals_url)),
+		_ => None,
+	}
+}
+
+/// The label a mail names a topic by: this plane's own catalogue first, then the scope
+/// catalogs in force. An empty published label counts as none, so the caller's fallback
+/// applies rather than a blank heading.
+fn topic_label<'a>(key: &str, scoped: &'a [NotificationTopic]) -> Option<&'a str> {
+	if let Some(built_in) = topic(key) {
+		return Some(built_in.label);
+	}
+	scoped.iter().find(|t| t.topic == key).map(|t| t.label.as_str()).filter(|l| !l.is_empty())
+}
+
 /// Render one claimed job. `None` when the row references data that has since gone,
 /// which is treated as a permanent failure rather than retried forever.
-fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &DispatcherConfig) -> Option<OutgoingEmail> {
+fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &DispatcherConfig, scoped: &[NotificationTopic]) -> Option<OutgoingEmail> {
+	if job.kind == "email_code" {
+		let payload = job.payload.as_ref()?;
+		let sign_in = match text_field(payload, "purpose").as_str() {
+			"login" => true,
+			"verify" => false,
+			_ => return None,
+		};
+		let code = text_field(payload, "code");
+		if code.is_empty() {
+			return None;
+		}
+		let rendered = templates::email_code(sign_in, &code, int_field(payload, "expires_at"));
+		return Some(OutgoingEmail {
+			to: job.recipient.clone(),
+			subject: rendered.subject,
+			html: rendered.html,
+			text: rendered.text,
+			unsubscribe_url: String::new(),
+		});
+	}
+
 	let origin = cfg.public_origin.trim_end_matches('/');
-	let unsubscribe_url = format!("{origin}/notifications/unsubscribe?token={}", job.unsubscribe_token);
+	// This plane's own pages (`web::notifications`), under the conductor's `/api/auth/*`
+	// rewrite; the unsubscribe URL is also the RFC 8058 one-click target the transport puts in
+	// `List-Unsubscribe`.
+	let unsubscribe_url = format!("{origin}/api/auth/notifications/unsubscribe?token={}", job.unsubscribe_token.as_deref()?);
 
 	// Governance mail carries NO unsubscribe target, so the transport sets no
 	// List-Unsubscribe header: a security mail a recipient can switch off is not one.
 	if let Some(payload) = job.payload.as_ref()
-		&& let Some(rendered) = governance_mail(&job.kind, payload, &cfg.cabinet_url)
+		&& let Some(rendered) = governance_mail(&job.kind, payload, &cfg.cabinet_url).or_else(|| approval_mail(&job.kind, payload, &cfg.approvals_url))
 	{
 		return Some(OutgoingEmail {
 			to: job.recipient.clone(),
@@ -273,12 +323,12 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 			let token = job.confirm_token.as_deref()?;
 			// The topic label is cosmetic here; a confirmation for a since-retired topic
 			// should still be completable.
-			let label = job.topic.as_deref().and_then(topic).map(|t| t.label).unwrap_or("EV Investment");
-			templates::confirm_subscription(label, &format!("{origin}/notifications/confirm?token={token}"), &unsubscribe_url)
+			let label = job.topic.as_deref().and_then(|key| topic_label(key, scoped)).unwrap_or("EV Investment");
+			templates::confirm_subscription(label, &format!("{origin}/api/auth/notifications/confirm?token={token}"), &unsubscribe_url)
 		}
 		_ => {
 			let topic_key = job.topic.as_deref()?;
-			let label = topic(topic_key).map(|t| t.label).unwrap_or(topic_key);
+			let label = topic_label(topic_key, scoped).unwrap_or(topic_key);
 			templates::notification(
 				label,
 				job.title.as_deref()?,
@@ -323,8 +373,19 @@ pub async fn drain_once(repo: &dyn NotificationDispatchRepository, transport: &d
 	};
 	let claimed = jobs.len();
 
+	// Read once per batch, and only when some job names a topic this plane does not own.
+	// Labels are cosmetic, so a failed read degrades to the key rather than holding mail back.
+	let scoped = if jobs.iter().any(|j| j.topic.as_deref().is_some_and(|key| topic(key).is_none())) {
+		repo.scope_topics().await.unwrap_or_else(|err| {
+			tracing::warn!(%err, "could not read scope topic labels — mailing with topic keys");
+			Vec::new()
+		})
+	} else {
+		Vec::new()
+	};
+
 	for job in jobs {
-		let Some(mail) = render(&job, cfg) else {
+		let Some(mail) = render(&job, cfg, &scoped) else {
 			// Unrenderable rows never become renderable, so park immediately rather
 			// than burning six attempts on them.
 			tracing::error!(delivery_id = job.id, kind = %job.kind, "delivery could not be rendered — parking");
@@ -355,14 +416,18 @@ pub async fn drain_once(repo: &dyn NotificationDispatchRepository, transport: &d
 }
 
 /// The dispatcher loop. Spawned by the composition root; runs until the process ends.
-pub async fn run_dispatcher(repo: Arc<dyn NotificationDispatchRepository>, transport: Arc<dyn EmailTransport>, cfg: DispatcherConfig) {
+/// `wake` cuts a sleep short: a sign-in code is waited on by somebody at a keyboard.
+pub async fn run_dispatcher(repo: Arc<dyn NotificationDispatchRepository>, transport: Arc<dyn EmailTransport>, cfg: DispatcherConfig, wake: Arc<tokio::sync::Notify>) {
 	tracing::info!(interval_secs = cfg.interval.as_secs(), daily_budget = cfg.daily_budget, "notification dispatcher started");
 	loop {
 		// A full batch means there is probably more behind it — keep going rather than
 		// sleeping a whole interval per 25 messages when a backlog is draining.
 		let claimed = drain_once(repo.as_ref(), transport.as_ref(), &cfg).await;
 		if claimed < BATCH as usize {
-			tokio::time::sleep(cfg.interval).await;
+			tokio::select! {
+				_ = tokio::time::sleep(cfg.interval) => {}
+				_ = wake.notified() => {}
+			}
 		}
 	}
 }
@@ -598,6 +663,51 @@ mod tests {
 		let mut no_reader = row("subject", "TOKEN_BURNED", "WRONG_CODES");
 		no_reader.as_object_mut().expect("object").remove("audience");
 		assert!(governance_mail("payment_outcome", &no_reader, "https://cabinet.example").is_none(), "no reader at all");
+	}
+
+	#[test]
+	fn an_approval_row_renders_against_the_configured_page_or_parks() {
+		let row = serde_json::json!({
+			"approval_id": "0b6f3c2e-1111-4222-8333-444455556666", "kind": "bank:payment", "kind_label": "Payment", "proposer": "bank",
+			"scope": "main", "level": "platform", "requested_by": "", "reason": "", "threshold": 2, "roster_size": 3, "expires_at": 0,
+			"fields": [{"label": "Amount", "value": {"type": "amount", "value": {"value": "5000", "currency": "USDT"}}}],
+		});
+		let mail = approval_mail("approval_request", &row, "https://admin.example/approvals").expect("renderable");
+		assert!(mail.html.contains("https://admin.example/approvals/0b6f3c2e-1111-4222-8333-444455556666") && mail.text.contains("5,000 USDT"));
+		assert!(
+			approval_mail("approval_outcome", &row, "https://admin.example/approvals").is_none(),
+			"an outcome row naming no outcome parks"
+		);
+		assert!(
+			approval_mail("approval_request", &serde_json::json!({"approval_id": "x"}), "https://admin.example").is_none(),
+			"a drifted row parks"
+		);
+		assert!(approval_mail("payout_outcome", &row, "https://admin.example").is_none(), "not an approval kind");
+	}
+
+	fn published(topic: &str, label: &str) -> NotificationTopic {
+		NotificationTopic {
+			topic: topic.to_owned(),
+			label: label.to_owned(),
+			description: String::new(),
+			default_subscribed: false,
+		}
+	}
+
+	#[test]
+	fn topic_label_prefers_built_in_then_scope_catalog() {
+		let scoped = [
+			published("invest:digest", "Digest"),
+			published("invest:fund:quy-nhon", "Quy Nhon fund"),
+			published("invest:blank", ""),
+		];
+		assert_eq!(topic_label("invest:digest", &scoped), Some("Digest"));
+		assert_eq!(topic_label("invest:fund:quy-nhon", &scoped), Some("Quy Nhon fund"));
+		assert_eq!(topic_label("invest:blank", &scoped), None, "an empty label falls through to the caller's fallback");
+		assert_eq!(topic_label("invest:unknown", &scoped), None);
+		let built_in = crate::notification::TOPICS.first().expect("catalogue is not empty");
+		let shadow = [published(built_in.key, "Shadow")];
+		assert_eq!(topic_label(built_in.key, &shadow), Some(built_in.label), "a built-in topic keeps its own label");
 	}
 
 	#[test]

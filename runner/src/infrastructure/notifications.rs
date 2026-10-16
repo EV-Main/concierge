@@ -26,7 +26,7 @@ use domain::error::DomainError;
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
-use crate::ports::{GovernanceMailQueued, NotificationDispatchRepository, NotificationRepository};
+use crate::ports::{GovernanceMailQueued, InboxTopics, NotificationDispatchRepository, NotificationRepository};
 
 pub struct PgNotifications {
 	pool: PgPool,
@@ -36,6 +36,27 @@ impl PgNotifications {
 	pub fn new(pool: PgPool) -> Self {
 		Self { pool }
 	}
+}
+
+/// [`InboxTopics`] as the four binds of `inbox_topics_sql`. `split_part` rather than
+/// `LIKE ns || ':%'`: a namespace may hold `_`, which `LIKE` reads as a wildcard. The
+/// `strpos` guard matches `InboxView::shows`: a key with no `:` has no namespace, where
+/// `split_part` alone would call the whole key one.
+fn inbox_topics(within: &InboxTopics) -> (bool, &[String], &[String], &[String]) {
+	match within {
+		InboxTopics::Every => (true, &[], &[], &[]),
+		InboxTopics::Within { keys, namespaces, except } => (false, keys, namespaces, except),
+	}
+}
+
+/// The predicate over `topic` for binds `$n`…`$n+3` in [`inbox_topics`]'s order.
+fn inbox_topics_sql(n: usize) -> String {
+	format!(
+		"(${n} OR ((topic = ANY(${k}) OR (strpos(topic, ':') > 0 AND split_part(topic, ':', 1) = ANY(${ns}))) AND NOT topic = ANY(${ex})))",
+		k = n + 1,
+		ns = n + 2,
+		ex = n + 3
+	)
 }
 
 /// A subscriber — signed-in (`user_id` set) or account-less (`user_id` NULL).
@@ -51,10 +72,13 @@ pub struct SubscriberRow {
 	pub unsubscribe_token: String,
 }
 
-/// One followed topic.
+/// A subscriber's stance on one topic it touched: followed (`subscribed`, with its mail
+/// copy), or switched off. A topic it never touched has no row at all.
 #[derive(Clone, sqlx::FromRow)]
 pub struct SubscriptionRow {
 	pub topic: String,
+	pub subscribed: bool,
+	/// The per-topic mail copy; meaningful only while `subscribed`.
 	pub email_enabled: bool,
 }
 
@@ -90,7 +114,8 @@ pub struct DeliveryJob {
 	pub kind: String,
 	pub recipient: String,
 	pub attempts: i32,
-	pub unsubscribe_token: String,
+	/// `None` for a code mail, which is addressed to a mailbox rather than a subscriber.
+	pub unsubscribe_token: Option<String>,
 	pub confirm_token: Option<String>,
 	pub topic: Option<String>,
 	pub title: Option<String>,
@@ -138,12 +163,31 @@ impl NotificationRepository for PgNotifications {
 		upsert_subscriber(&mut conn, user_id, email, email_verified).await
 	}
 
+	async fn subscriber_of_user(&self, user_id: Uuid) -> Result<Option<SubscriberRow>, DomainError> {
+		sqlx::query_as::<_, SubscriberRow>(
+			"SELECT id, user_id, email, email_verified, in_app_enabled, email_enabled, (confirmed_at IS NOT NULL) AS confirmed, unsubscribe_token \
+			 FROM notification_subscribers WHERE user_id = $1",
+		)
+		.bind(user_id)
+		.fetch_optional(&self.pool)
+		.await
+		.map_err(repo_err)
+	}
+
 	async fn subscriptions(&self, subscriber_id: Uuid) -> Result<Vec<SubscriptionRow>, DomainError> {
-		sqlx::query_as::<_, SubscriptionRow>("SELECT topic, email_enabled FROM notification_subscriptions WHERE subscriber_id = $1 ORDER BY topic ASC")
-			.bind(subscriber_id)
-			.fetch_all(&self.pool)
-			.await
-			.map_err(repo_err)
+		// A subscription wins over an opt-out of the same topic: the previous binary follows
+		// a topic without clearing the opt-out, and that is the newer word.
+		sqlx::query_as::<_, SubscriptionRow>(
+			"SELECT topic, TRUE AS subscribed, email_enabled FROM notification_subscriptions WHERE subscriber_id = $1 \
+			 UNION ALL \
+			 SELECT o.topic, FALSE, FALSE FROM notification_topic_optouts o WHERE o.subscriber_id = $1 \
+			   AND NOT EXISTS (SELECT 1 FROM notification_subscriptions s WHERE s.subscriber_id = o.subscriber_id AND s.topic = o.topic) \
+			 ORDER BY topic ASC",
+		)
+		.bind(subscriber_id)
+		.fetch_all(&self.pool)
+		.await
+		.map_err(repo_err)
 	}
 
 	async fn set_channel_enabled(&self, subscriber_id: Uuid, in_app: Option<bool>, email: Option<bool>) -> Result<(), DomainError> {
@@ -164,32 +208,26 @@ impl NotificationRepository for PgNotifications {
 	}
 
 	async fn set_topic_subscription(&self, subscriber_id: Uuid, topic: &str, subscribed: bool, email_enabled: bool) -> Result<(), DomainError> {
-		if subscribed {
-			sqlx::query(
-				"INSERT INTO notification_subscriptions (subscriber_id, topic, email_enabled) VALUES ($1, $2, $3) \
-				 ON CONFLICT (subscriber_id, topic) DO UPDATE SET email_enabled = EXCLUDED.email_enabled, updated_at = now()",
-			)
-			.bind(subscriber_id)
-			.bind(topic)
-			.bind(email_enabled)
-			.execute(&self.pool)
-			.await
-			.map_err(repo_err)?;
-		} else {
-			sqlx::query("DELETE FROM notification_subscriptions WHERE subscriber_id = $1 AND topic = $2")
-				.bind(subscriber_id)
-				.bind(topic)
-				.execute(&self.pool)
-				.await
-				.map_err(repo_err)?;
-		}
-		Ok(())
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		set_topic(&mut tx, subscriber_id, topic, subscribed, email_enabled).await?;
+		tx.commit().await.map_err(repo_err)
 	}
 
-	async fn emit(&self, user_id: Uuid, topic: &str, kind: &str, title: &str, body: &str, link: &str, dedupe_key: &str, occurred_at: i64) -> Result<EmitOutcome, DomainError> {
+	async fn emit(
+		&self,
+		user_id: Uuid,
+		topic: &str,
+		kind: &str,
+		title: &str,
+		body: &str,
+		link: &str,
+		dedupe_key: &str,
+		occurred_at: i64,
+		default_subscribed: bool,
+	) -> Result<EmitOutcome, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 
-		let Some(sub) = sqlx::query_as::<_, SubscriberRow>(
+		let found = sqlx::query_as::<_, SubscriberRow>(
 			"SELECT id, user_id, email, email_verified, in_app_enabled, email_enabled, \
 			        (confirmed_at IS NOT NULL) AS confirmed, unsubscribe_token \
 			 FROM notification_subscribers WHERE user_id = $1",
@@ -197,21 +235,43 @@ impl NotificationRepository for PgNotifications {
 		.bind(user_id)
 		.fetch_optional(&mut *tx)
 		.await
-		.map_err(repo_err)?
-		else {
-			// Never touched their notification settings ⇒ no subscriber row ⇒ nothing
-			// to deliver. Not an error: emitters fire for every user, not just followers.
-			return Ok(EmitOutcome::default());
+		.map_err(repo_err)?;
+		let sub = match found {
+			Some(sub) => sub,
+			// Never touched their notification settings ⇒ no subscriber row ⇒ nothing to
+			// deliver. Not an error: emitters fire for every user, not just followers.
+			None if !default_subscribed => return Ok(EmitOutcome::default()),
+			// A default topic follows them anyway; the row is made as `record` makes it.
+			None => {
+				let account: Option<(Option<String>, bool)> = sqlx::query_as("SELECT email, email_verified FROM users WHERE id = $1")
+					.bind(user_id)
+					.fetch_optional(&mut *tx)
+					.await
+					.map_err(repo_err)?;
+				let Some((email, verified)) = account else {
+					return Ok(EmitOutcome::default());
+				};
+				upsert_subscriber(&mut tx, user_id, email.as_deref().unwrap_or_default(), verified).await?
+			}
 		};
 
-		let Some(topic_sub) = sqlx::query_as::<_, SubscriptionRow>("SELECT topic, email_enabled FROM notification_subscriptions WHERE subscriber_id = $1 AND topic = $2")
-			.bind(sub.id)
-			.bind(topic)
-			.fetch_optional(&mut *tx)
-			.await
-			.map_err(repo_err)?
-		else {
-			return Ok(EmitOutcome::default());
+		let (followed_email, opted_out): (Option<bool>, bool) = sqlx::query_as(
+			"SELECT (SELECT email_enabled FROM notification_subscriptions WHERE subscriber_id = $1 AND topic = $2), \
+			        EXISTS (SELECT 1 FROM notification_topic_optouts WHERE subscriber_id = $1 AND topic = $2)",
+		)
+		.bind(sub.id)
+		.bind(topic)
+		.fetch_one(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+		let topic_email = match followed_email {
+			Some(email_enabled) => email_enabled,
+			// Followed by default, with its mail copy on as a fresh follow has it.
+			None if default_subscribed && !opted_out => true,
+			None => {
+				tx.commit().await.map_err(repo_err)?;
+				return Ok(EmitOutcome::default());
+			}
 		};
 
 		// The durable record is written regardless of channel state — see the module
@@ -244,7 +304,7 @@ impl NotificationRepository for PgNotifications {
 		let in_app = sub.in_app_enabled;
 		// Every one of these has to hold: the master switch, the per-topic copy, a
 		// confirmed opt-in, and an address we are actually allowed to mail.
-		let email = sub.email_enabled && topic_sub.email_enabled && sub.confirmed && sub.email_verified && !sub.email.is_empty();
+		let email = sub.email_enabled && topic_email && sub.confirmed && sub.email_verified && !sub.email.is_empty();
 
 		if email {
 			sqlx::query(
@@ -302,7 +362,7 @@ impl NotificationRepository for PgNotifications {
 		Ok(inserted.is_some())
 	}
 
-	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>) -> Result<Vec<NotificationRow>, DomainError> {
+	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>, within: &InboxTopics) -> Result<Vec<NotificationRow>, DomainError> {
 		// Keyset pagination on (created_at, id): the cursor row's own key is resolved in a
 		// subquery, so the caller never has to encode or trust a composite cursor.
 		//
@@ -313,52 +373,92 @@ impl NotificationRepository for PgNotifications {
 		// disagree, and rows repeat across pages whenever several notifications land in the
 		// same second, which a fan-out makes routine.
 		// `inbox_paginates_by_keyset_and_marks_read` reproduces it and pins the fix.
-		sqlx::query_as::<_, NotificationRow>(
+		let (every, keys, namespaces, except) = inbox_topics(within);
+		sqlx::query_as::<_, NotificationRow>(sqlx::AssertSqlSafe(format!(
 			"SELECT id, topic, kind, title, body, link, occurred_at, \
 			        EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at, \
 			        COALESCE(EXTRACT(EPOCH FROM read_at)::BIGINT, 0) AS read_at \
 			 FROM notifications \
 			 WHERE subscriber_id = $1 \
-			   AND ($2::UUID IS NULL OR (created_at, id) < ROW((SELECT created_at FROM notifications WHERE id = $2), $2)) \
+			   AND ($2::UUID IS NULL OR (created_at, id) < ROW((SELECT created_at FROM notifications WHERE id = $2 AND subscriber_id = $1), $2)) \
 			   AND (NOT $3 OR read_at IS NULL) \
 			   AND ($4::TEXT IS NULL OR topic = $4) \
+			   AND {} \
 			 ORDER BY notifications.created_at DESC, notifications.id DESC LIMIT $5",
-		)
+			inbox_topics_sql(6)
+		)))
 		.bind(subscriber_id)
 		.bind(cursor)
 		.bind(unread_only)
 		.bind(topic)
 		.bind(limit)
+		.bind(every)
+		.bind(keys)
+		.bind(namespaces)
+		.bind(except)
 		.fetch_all(&self.pool)
 		.await
 		.map_err(repo_err)
 	}
 
-	async fn unread_count(&self, subscriber_id: Uuid) -> Result<i64, DomainError> {
-		let row = sqlx::query("SELECT count(*) AS n FROM notifications WHERE subscriber_id = $1 AND read_at IS NULL")
-			.bind(subscriber_id)
-			.fetch_one(&self.pool)
-			.await
-			.map_err(repo_err)?;
+	async fn unread_count(&self, subscriber_id: Uuid, within: &InboxTopics) -> Result<i64, DomainError> {
+		let (every, keys, namespaces, except) = inbox_topics(within);
+		let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+			"SELECT count(*) AS n FROM notifications WHERE subscriber_id = $1 AND read_at IS NULL AND {}",
+			inbox_topics_sql(2)
+		)))
+		.bind(subscriber_id)
+		.bind(every)
+		.bind(keys)
+		.bind(namespaces)
+		.bind(except)
+		.fetch_one(&self.pool)
+		.await
+		.map_err(repo_err)?;
 		row.try_get::<i64, _>("n").map_err(repo_err)
 	}
 
-	async fn mark_read(&self, subscriber_id: Uuid, ids: &[Uuid], all: bool) -> Result<u64, DomainError> {
-		let result = if all {
-			sqlx::query("UPDATE notifications SET read_at = now() WHERE subscriber_id = $1 AND read_at IS NULL")
-				.bind(subscriber_id)
-				.execute(&self.pool)
-				.await
-		} else {
-			// Scoped by subscriber_id as well as id: an id from another subscriber's
-			// inbox must not be markable, even though ids are unguessable UUIDs.
-			sqlx::query("UPDATE notifications SET read_at = now() WHERE subscriber_id = $1 AND id = ANY($2) AND read_at IS NULL")
-				.bind(subscriber_id)
-				.bind(ids)
-				.execute(&self.pool)
-				.await
-		};
+	async fn mark_read(&self, subscriber_id: Uuid, ids: &[Uuid], all: bool, within: &InboxTopics) -> Result<u64, DomainError> {
+		let (every, keys, namespaces, except) = inbox_topics(within);
+		// Scoped by subscriber_id as well as id: an id from another subscriber's inbox must
+		// not be markable, even though ids are unguessable UUIDs. And by `within`, so
+		// "mark all read" in one inbox leaves another's unread.
+		let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+			"UPDATE notifications SET read_at = now() \
+			 WHERE subscriber_id = $1 AND ($2 OR id = ANY($3)) AND read_at IS NULL AND {}",
+			inbox_topics_sql(4)
+		)))
+		.bind(subscriber_id)
+		.bind(all)
+		.bind(ids)
+		.bind(every)
+		.bind(keys)
+		.bind(namespaces)
+		.bind(except)
+		.execute(&self.pool)
+		.await;
 		Ok(result.map_err(repo_err)?.rows_affected())
+	}
+
+	async fn is_active_scope_member(&self, scope: &str, user_id: Uuid) -> Result<bool, DomainError> {
+		sqlx::query_scalar(
+			"SELECT EXISTS (SELECT 1 FROM scope_members m JOIN users u ON u.id = m.user_id \
+			 WHERE m.scope = $1 AND m.user_id = $2 AND u.status = 'active')",
+		)
+		.bind(scope)
+		.bind(user_id)
+		.fetch_one(&self.pool)
+		.await
+		.map_err(repo_err)
+	}
+
+	async fn is_scope_member(&self, scope: &str, user_id: Uuid) -> Result<bool, DomainError> {
+		sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM scope_members WHERE scope = $1 AND user_id = $2)")
+			.bind(scope)
+			.bind(user_id)
+			.fetch_one(&self.pool)
+			.await
+			.map_err(repo_err)
 	}
 
 	async fn subscribe_anonymous(&self, email: &str, topic: &str, throttle_secs: i64) -> Result<Option<(Uuid, String)>, DomainError> {
@@ -387,15 +487,7 @@ impl NotificationRepository for PgNotifications {
 		let since_sent: i64 = row.try_get("since_sent").map_err(repo_err)?;
 		let confirm_token: Option<String> = row.try_get("confirm_token").map_err(repo_err)?;
 
-		sqlx::query(
-			"INSERT INTO notification_subscriptions (subscriber_id, topic, email_enabled) VALUES ($1, $2, TRUE) \
-			 ON CONFLICT (subscriber_id, topic) DO UPDATE SET email_enabled = TRUE, updated_at = now()",
-		)
-		.bind(subscriber_id)
-		.bind(topic)
-		.execute(&mut *tx)
-		.await
-		.map_err(repo_err)?;
+		set_topic(&mut tx, subscriber_id, topic, true, true).await?;
 
 		// Already confirmed ⇒ the subscription is simply added, silently, with no mail.
 		// Still inside the throttle window ⇒ no second confirmation mail either. Both
@@ -447,14 +539,7 @@ impl NotificationRepository for PgNotifications {
 		let subscriber_id: Uuid = row.try_get("id").map_err(repo_err)?;
 
 		match topic {
-			Some(t) => {
-				sqlx::query("DELETE FROM notification_subscriptions WHERE subscriber_id = $1 AND topic = $2")
-					.bind(subscriber_id)
-					.bind(t)
-					.execute(&mut *tx)
-					.await
-					.map_err(repo_err)?;
-			}
+			Some(t) => set_topic(&mut tx, subscriber_id, t, false, false).await?,
 			// The List-Unsubscribe contract is "stop mailing me", not "delete my
 			// account": the master email switch goes off and every topic copy with it,
 			// but the in-app channel and the inbox history are left untouched.
@@ -470,10 +555,18 @@ impl NotificationRepository for PgNotifications {
 		tx.commit().await.map_err(repo_err)?;
 		Ok(true)
 	}
+
+	async fn scope_topics(&self) -> Result<Vec<domain::scope_catalog::NotificationTopic>, DomainError> {
+		super::scope_catalogs::current_topics(&self.pool).await
+	}
 }
 
 #[async_trait]
 impl NotificationDispatchRepository for PgNotifications {
+	async fn scope_topics(&self) -> Result<Vec<domain::scope_catalog::NotificationTopic>, DomainError> {
+		super::scope_catalogs::current_topics(&self.pool).await
+	}
+
 	async fn claim_due(&self, limit: i64, lease_secs: i64) -> Result<Vec<DeliveryJob>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 
@@ -506,7 +599,7 @@ impl NotificationDispatchRepository for PgNotifications {
 			"SELECT d.id, d.kind, d.recipient, d.attempts, s.unsubscribe_token, s.confirm_token, \
 			        n.topic, n.title, n.body, n.link, n.occurred_at, d.payload \
 			 FROM notification_deliveries d \
-			 JOIN notification_subscribers s ON s.id = d.subscriber_id \
+			 LEFT JOIN notification_subscribers s ON s.id = d.subscriber_id \
 			 LEFT JOIN notifications n ON n.id = d.notification_id \
 			 WHERE d.id = ANY($1) ORDER BY d.id ASC",
 		)
@@ -569,12 +662,51 @@ impl NotificationDispatchRepository for PgNotifications {
 	}
 }
 
+/// Follow `topic` or switch it off, in the caller's transaction. Switching off deletes the
+/// subscription — what an older binary reads as "not following" — and writes the opt-out
+/// that tells it from a topic never touched; following clears that opt-out.
+async fn set_topic(conn: &mut PgConnection, subscriber_id: Uuid, topic: &str, subscribed: bool, email_enabled: bool) -> Result<(), DomainError> {
+	if subscribed {
+		sqlx::query("DELETE FROM notification_topic_optouts WHERE subscriber_id = $1 AND topic = $2")
+			.bind(subscriber_id)
+			.bind(topic)
+			.execute(&mut *conn)
+			.await
+			.map_err(repo_err)?;
+		sqlx::query(
+			"INSERT INTO notification_subscriptions (subscriber_id, topic, email_enabled) VALUES ($1, $2, $3) \
+			 ON CONFLICT (subscriber_id, topic) DO UPDATE SET email_enabled = EXCLUDED.email_enabled, updated_at = now()",
+		)
+		.bind(subscriber_id)
+		.bind(topic)
+		.bind(email_enabled)
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	} else {
+		sqlx::query("DELETE FROM notification_subscriptions WHERE subscriber_id = $1 AND topic = $2")
+			.bind(subscriber_id)
+			.bind(topic)
+			.execute(&mut *conn)
+			.await
+			.map_err(repo_err)?;
+		sqlx::query("INSERT INTO notification_topic_optouts (subscriber_id, topic) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+			.bind(subscriber_id)
+			.bind(topic)
+			.execute(&mut *conn)
+			.await
+			.map_err(repo_err)?;
+	}
+	Ok(())
+}
+
 /// Create-or-refresh the subscriber row behind a signed-in user on an open connection.
 ///
-/// A signed-in subscriber is confirmed on sight: the identity plane only ever holds an
-/// address Google already verified, so a second opt-in round trip would be friction
-/// with no security value. Shared with the governance adapter, which must resolve a
-/// recipient inside its own transaction.
+/// A signed-in subscriber is confirmed on sight: double opt-in guards the account-less
+/// path, where nobody has proved anything. Whether the address may be mailed is
+/// `email_verified`, copied from the account on every upsert and required by `emit` —
+/// an account made by password sign-up starts unverified. Shared with the governance
+/// adapter, which must resolve a recipient inside its own transaction.
 pub(crate) async fn upsert_subscriber(conn: &mut PgConnection, user_id: Uuid, email: &str, email_verified: bool) -> Result<SubscriberRow, DomainError> {
 	sqlx::query_as::<_, SubscriberRow>(
 		"INSERT INTO notification_subscribers (user_id, email, email_verified, confirmed_at, unsubscribe_token) \

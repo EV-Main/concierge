@@ -26,7 +26,12 @@ use uuid::Uuid;
 
 use crate::{
 	relying_party::{Admission, Requester, is_s256_challenge},
-	web::{WebState, routes::client_ip, session::Fresh},
+	web::{
+		WebState,
+		routes::{ClientIp, live_family_of, minted_token_version},
+		session::Fresh,
+		sign_in::end_session,
+	},
 };
 
 /// The public path of this route — what `returnTo` must name for the login to come back.
@@ -51,7 +56,7 @@ pub struct AuthorizeQuery {
 	auth_error: Option<String>,
 }
 
-pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Query(q): Query<AuthorizeQuery>) -> Response {
+pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ClientIp(ip): ClientIp, Query(q): Query<AuthorizeQuery>) -> Response {
 	let st = &st.inner;
 	let Some(relying_parties) = st.relying_parties.as_ref() else {
 		return page(StatusCode::SERVICE_UNAVAILABLE, "Sign-in for this application is not available right now.");
@@ -117,26 +122,36 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 		}
 		return redirect(&login_url(client_id, redirect_uri, state, code_challenge));
 	};
+	let minted = minted_token_version(&fresh.access_token);
 	// The session view may have rotated the access token; the browser gets the new one
 	// exactly as `/auth/session` hands it out, whatever this route answers.
-	let jar = jar.add(st.cookies.server_cookie(st.cookies.access.clone(), fresh.access_token, fresh.remaining_secs));
+	let refreshed = jar.clone().add(st.cookies.server_cookie(st.cookies.access.clone(), fresh.access_token, fresh.remaining_secs));
 
 	let Ok(user) = Uuid::parse_str(&fresh.user.user_id).map(UserId::from_raw) else {
-		return (jar, back.error("access_denied")).into_response();
+		return (refreshed, back.error("access_denied")).into_response();
 	};
 	let token_version = match relying_parties.admit(user).await {
+		// A takeover or a revoke-all bumps `token_version` but leaves the family in place
+		// until its next refresh, so the family check above still passes for as long as
+		// the cached access token lives. Refused as `sign_in::gate` refuses it: the
+		// session is over, and a code minted at the CURRENT version would hand the old
+		// session's holder (a squatter) the account it lost.
+		Ok(Admission::Admitted { token_version }) if minted.is_none_or(|minted| minted < token_version) => {
+			tracing::info!(client_id = %client.client_id, user_id = %user, "relying party: authorize refused a session minted before the account's token_version");
+			let cleared = end_session(st, jar).await;
+			return (cleared, page(StatusCode::UNAUTHORIZED, "Your session has ended. Sign in again.")).into_response();
+		}
 		Ok(Admission::Admitted { token_version }) => token_version,
 		Ok(Admission::Denied) => {
 			tracing::info!(client_id = %client.client_id, user_id = %user, "relying party: authorize denied, the account is not active");
-			return (jar, back.error("access_denied")).into_response();
+			return (refreshed, back.error("access_denied")).into_response();
 		}
 		Err(err) => {
 			tracing::error!(%err, "relying party: account unreadable at authorize");
-			return (jar, back.error("temporarily_unavailable")).into_response();
+			return (refreshed, back.error("temporarily_unavailable")).into_response();
 		}
 	};
 	let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
-	let ip = client_ip(&headers);
 	let requester = Requester {
 		upstream_family: &upstream_family,
 		client_ip: &ip,
@@ -149,37 +164,18 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 			back.error("temporarily_unavailable")
 		}
 	};
-	(jar, answer).into_response()
+	(refreshed, answer).into_response()
 }
 
 /// The browser's `evinvest.ltd` session and the refresh family behind it, or `None` when
-/// there is no session to act on.
-///
-/// `WebSessions::fresh` alone is not enough: it asks upstream only when the stored access
-/// token is about to lapse, so a session signed out from another device or revoked from
-/// the console still reads as live here for up to the access TTL. Handing out a new
-/// credential on that is exactly what the revocation was meant to stop, so the family is
-/// checked first-hand, and a dead one takes the locker entry with it.
+/// there is no session to act on. The family is checked first-hand (`live_family_of`):
+/// handing out a new credential on a session revoked elsewhere is exactly what the
+/// revocation was meant to stop.
 async fn live_session(st: &super::Inner, session_id: &str) -> color_eyre::Result<Option<(Fresh, String)>> {
 	let Some(fresh) = st.sessions.fresh(session_id, &st.auth).await? else {
 		return Ok(None);
 	};
-	// Read AFTER `fresh`, which may have rotated it.
-	let Some(refresh_token) = st.sessions.refresh_token(session_id).await? else {
-		return Ok(None);
-	};
-	match st
-		.auth
-		.live_family(&refresh_token)
-		.await
-		.map_err(|err| color_eyre::eyre::eyre!("refresh family unreadable: {err}"))?
-	{
-		Some(family) => Ok(Some((fresh, family))),
-		None => {
-			st.sessions.forget(session_id).await?;
-			Ok(None)
-		}
-	}
+	Ok(live_family_of(st, session_id).await?.map(|family| (fresh, family)))
 }
 
 /// The client's redirect_uri, once it is known to be registered.

@@ -29,7 +29,10 @@ use domain::{
 use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::users::{AdminAction, record_action};
+use super::{
+	scope_events,
+	users::{AdminAction, Named, account_named, record_action},
+};
 use crate::ports::{
 	GrantActor, GrantAuthority, GrantHolderRecord, GrantOutcome, GrantRecord, GrantRepository, GrantSubject, PublishOutcome, RevokeOutcome, TenantCatalog, UngrantableAddress,
 };
@@ -62,6 +65,7 @@ struct HolderRow {
 	#[sqlx(flatten)]
 	grant: GrantRow,
 	email: Option<String>,
+	username: Option<String>,
 	legal_name: Option<String>,
 	preferred_name: Option<String>,
 }
@@ -160,44 +164,14 @@ fn acting_role(actor: &GrantActor, standing: Option<Standing>) -> Option<Role> {
 	Some(if actor.elevated { Role::Owner } else { standing.role })
 }
 
-/// The id a subject names, if any account holds it. An email may belong to several
-/// accounts (`users.email` is deliberately not unique), and picking one of them would
-/// grant access to whichever sorted first.
-enum Resolved {
-	One(UserId),
-	None,
-	Ambiguous,
-}
-
-impl Resolved {
-	fn id(&self) -> Option<UserId> {
-		match self {
-			Self::One(id) => Some(*id),
-			Self::None | Self::Ambiguous => None,
-		}
-	}
-}
-
-async fn resolve_subject(conn: &mut PgConnection, subject: &GrantSubject) -> Result<Resolved, DomainError> {
+async fn resolve_subject(conn: &mut PgConnection, subject: &GrantSubject) -> Result<Named, DomainError> {
 	match subject {
-		GrantSubject::Id(id) => Ok(Resolved::One(*id)),
-		GrantSubject::Email(email) => {
-			// Stored normalized by `Email::parse`, so an equality is the case-insensitive match.
-			let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1 LIMIT 2")
-				.bind(email.as_str())
-				.fetch_all(&mut *conn)
-				.await
-				.map_err(repo_err)?;
-			Ok(match ids.as_slice() {
-				[] => Resolved::None,
-				[id] => Resolved::One(UserId::from_raw(*id)),
-				_ => Resolved::Ambiguous,
-			})
-		}
+		GrantSubject::Id(id) => Ok(Named::One(*id)),
+		GrantSubject::Account(handle) => account_named(conn, handle).await,
 	}
 }
 
-async fn current_catalog(conn: &mut PgConnection, namespace: &str) -> Result<Option<TenantCatalog>, DomainError> {
+pub(crate) async fn current_catalog(conn: &mut PgConnection, namespace: &str) -> Result<Option<TenantCatalog>, DomainError> {
 	sqlx::query_as::<_, CatalogRow>(AssertSqlSafe(format!("{CURRENT_CATALOGS} WHERE t.namespace = $1 ORDER BY c.tenant_id, c.version DESC")))
 		.bind(namespace)
 		.fetch_optional(&mut *conn)
@@ -289,6 +263,11 @@ impl GrantRepository for PgGrants {
 			GrantAuthority::Delegate if matches!(subject, GrantSubject::Id(_)) => return Ok(GrantOutcome::Denied),
 			GrantAuthority::Delegate | GrantAuthority::Seat => {}
 		}
+		// A seat granting `<ns>:admin` to accounts it controls would fill a scope's roster
+		// and pass its quorum with no owner asked; the owners decide it as an approval.
+		if target.as_str() == format!("{}:admin", target.namespace()) {
+			return Ok(GrantOutcome::ByApprovalOnly);
+		}
 		let Some(tenant) = tenant else {
 			return Ok(GrantOutcome::UnknownTenant);
 		};
@@ -301,9 +280,9 @@ impl GrantRepository for PgGrants {
 		let told_why = authority == GrantAuthority::Seat;
 		let subject_standing = resolved.id().and_then(|id| standing_in(&locked, id));
 		let (user_id, standing) = match (resolved, subject_standing) {
-			(Resolved::Ambiguous, _) if told_why => return Ok(GrantOutcome::AmbiguousEmail),
-			(Resolved::Ambiguous, _) => return Ok(GrantOutcome::Ungrantable(UngrantableAddress::SharedByAccounts)),
-			(Resolved::One(id), Some(standing)) => (id, standing),
+			(Named::Several, _) if told_why => return Ok(GrantOutcome::AmbiguousAccount),
+			(Named::Several, _) => return Ok(GrantOutcome::Ungrantable(UngrantableAddress::SharedByAccounts)),
+			(Named::One(id), Some(standing)) => (id, standing),
 			_ if told_why =>
 				return Err(DomainError::NotFound {
 					entity: "user",
@@ -349,6 +328,7 @@ impl GrantRepository for PgGrants {
 		let mut action = action.clone();
 		action.detail = Some(serde_json::json!({ "target": target.as_str(), "grant_id": row.id }));
 		record_action(&mut tx, user_id, &action, now).await?;
+		scope_events::grants_moved(&mut tx, target.namespace(), user_id).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(GrantOutcome::Granted(row.into()))
 	}
@@ -384,6 +364,7 @@ impl GrantRepository for PgGrants {
 		let mut action = action.clone();
 		action.detail = Some(serde_json::json!({ "target": target.as_str(), "grant_id": grant_id }));
 		record_action(&mut tx, user_id, &action, now).await?;
+		scope_events::grants_moved(&mut tx, target.namespace(), user_id).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(RevokeOutcome::Revoked)
 	}
@@ -399,7 +380,7 @@ impl GrantRepository for PgGrants {
 			return Ok(None);
 		}
 		let rows = sqlx::query_as::<_, HolderRow>(
-			"SELECT g.id, g.user_id, g.target, g.granted_by, g.granted_at, g.reason, u.email, u.legal_name, u.preferred_name \
+			"SELECT g.id, g.user_id, g.target, g.granted_by, g.granted_at, g.reason, u.email, u.username, u.legal_name, u.preferred_name \
 			 FROM grants g JOIN users u ON u.id = g.user_id \
 			 WHERE g.namespace = $1 AND g.revoked_at IS NULL \
 			 ORDER BY g.granted_at, g.id",
@@ -413,6 +394,7 @@ impl GrantRepository for PgGrants {
 				.map(|row| GrantHolderRecord {
 					grant: row.grant.into(),
 					email: row.email,
+					username: row.username,
 					legal_name: row.legal_name,
 					preferred_name: row.preferred_name,
 				})
@@ -484,7 +466,90 @@ impl GrantRepository for PgGrants {
 			.execute(&mut *tx)
 			.await
 			.map_err(repo_err)?;
+		scope_events::catalog_moved(&mut tx, &tenant).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(PublishOutcome::Published)
 	}
+}
+
+/// Lock the `users` rows of `ids` `FOR UPDATE`, in id order: for a writer that must take
+/// them before rows of its own, in the order every other writer here takes them.
+pub(crate) async fn lock_accounts(conn: &mut PgConnection, ids: &[UserId]) -> Result<(), DomainError> {
+	lock_users(conn, ids).await.map(drop)
+}
+
+/// What an executed `concierge:scope_admin_grant` did.
+pub(crate) enum ApprovedGrant {
+	Granted,
+	/// Already held: one decision, one execution, and a repeat writes nothing.
+	AlreadyHeld,
+	/// Cannot be carried out as approved; the proposal is void for this reason.
+	Inapplicable(&'static str),
+}
+
+/// Grant `<namespace>:admin` on the authority of an executed approval, inside the caller's
+/// transaction — the one that records the outcome, so the grant and the decision it
+/// executes commit together. The decision is the authority: no seat is consulted, and the
+/// grant names the person who opened the proposal as `granted_by`.
+pub(crate) async fn grant_by_approval(conn: &mut PgConnection, user: UserId, scope: &str, granted_by: UserId, approval: Uuid, now: i64) -> Result<ApprovedGrant, DomainError> {
+	let locked = lock_users(conn, &[user, granted_by]).await?;
+	if user == granted_by {
+		return Ok(ApprovedGrant::Inapplicable("the account is the one who asked for it"));
+	}
+	if !standing_in(&locked, user).is_some_and(|s| s.status == UserStatus::Active) {
+		return Ok(ApprovedGrant::Inapplicable("the account is no longer active"));
+	}
+	// A seat on a scope's roster is a mailbox the approvals reach; an address nobody proved
+	// hands that seat to whoever holds it. Re-read here: it can move after the owners voted.
+	let verified: bool = sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+		.bind(user.raw())
+		.fetch_one(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	if !verified {
+		return Ok(ApprovedGrant::Inapplicable("the account's address is not verified"));
+	}
+	if standing_in(&locked, granted_by).is_none() {
+		return Ok(ApprovedGrant::Inapplicable("the account that asked for it is gone"));
+	}
+	let tenant: Option<(String, String)> = sqlx::query_as("SELECT namespace, state FROM tenants WHERE id = $1 FOR SHARE")
+		.bind(scope)
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	let Some((namespace, state)) = tenant else {
+		return Ok(ApprovedGrant::Inapplicable("the scope is gone"));
+	};
+	if state != "active" {
+		return Ok(ApprovedGrant::Inapplicable("the scope is no longer active"));
+	}
+	let namespace = namespace.as_str();
+	let target = format!("{namespace}:admin");
+	let held: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM grants WHERE user_id = $1 AND target = $2 AND revoked_at IS NULL)")
+		.bind(user.raw())
+		.bind(&target)
+		.fetch_one(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	if held {
+		return Ok(ApprovedGrant::AlreadyHeld);
+	}
+	let id: i64 = sqlx::query_scalar("INSERT INTO grants (user_id, namespace, target, granted_by, granted_at) VALUES ($1, $2, $3, $4, $5) RETURNING id")
+		.bind(user.raw())
+		.bind(namespace)
+		.bind(&target)
+		.bind(granted_by.raw())
+		.bind(now)
+		.fetch_one(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	let action = AdminAction {
+		actor: Some(granted_by),
+		action: "permission_granted",
+		detail: Some(serde_json::json!({ "target": target, "grant_id": id, "approval_id": approval })),
+		..AdminAction::default()
+	};
+	record_action(conn, user, &action, now).await?;
+	scope_events::grants_moved(conn, namespace, user).await?;
+	Ok(ApprovedGrant::Granted)
 }

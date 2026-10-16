@@ -10,8 +10,11 @@
 //! architecture building blocks, and holds the live identity bounded contexts:
 //! [`auth`] (the IdP-asserted [`AuthSubject`](auth::AuthSubject)), [`authz`] (the
 //! role/permission RBAC matrix), [`users`] (the [`User`](users::User) aggregate and
-//! its cross-plane lifecycle events), and [`governance`] (the owner-removal
-//! consilium — an owner IS a `User` holding `Role::Owner`, never a second registry).
+//! its cross-plane lifecycle events), [`governance`] (the owner-removal
+//! consilium — an owner IS a `User` holding `Role::Owner`, never a second registry), and
+//! [`approvals`] (that consilium generalised to every scope).
+
+pub mod approvals;
 
 pub mod auth;
 
@@ -19,9 +22,15 @@ pub mod authz;
 
 pub mod error;
 
+pub mod floors;
+
 pub mod governance;
 
 pub mod iam;
+
+pub mod scope_catalog;
+
+pub mod scopes;
 
 pub mod users;
 

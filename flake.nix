@@ -30,7 +30,7 @@
           # Public repo → public Cachix (`ev-invest`); pull deps + push built paths.
           cache = { cachix = "ev-invest"; };
           lastSupportedVersion = "nightly-2026-05-12";
-          containerRelease = { registry = "ghcr.io/ev-invest"; };
+          containerRelease = { registry = "ghcr.io/ev-main"; };
           gitignore.extra = ''
             ## Local Postgres
             .pg/
@@ -54,8 +54,13 @@
           src = ./.;
           # .cargo holds dev-only accelerators (sccache rustc-wrapper) the hermetic
           # sandbox lacks — let nix's vendor config drive the build instead.
+          # web/ has a derivation of its own (webMfe below); left in here, every frontend
+          # edit would rebuild the binary. Matched as a path: `runner/src/web` is Rust.
+          # sdk/ (the npm package) ships through npm, never in the image.
           filter = path: _type:
-            ! builtins.elem (baseNameOf path) [ "target" ".direnv" ".git" ".cargo" "tmp" "result" ];
+            ! builtins.elem (baseNameOf path) [ "target" ".direnv" ".git" ".cargo" "tmp" "result" ]
+            && path != toString ./web
+            && path != toString ./sdk;
         };
         conciergeBin = rustPlatform.buildRustPackage {
           pname = runnerCargo.name;
@@ -73,11 +78,49 @@
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           doCheck = false;
         };
+        # ── the platform's micro-frontends (web/ → /auth/mfe/*) ──────────────
+        # Built only when web/ exists: it lands with EV-Main/concierge#128, and main must
+        # keep evaluating until then. Once it does exist, a missing lockfile is a hard
+        # error rather than an image quietly shipped without the bundles: importNpmLock
+        # builds node_modules from package-lock.json alone, with no hash to drift.
+        hasWeb = builtins.pathExists ./web/package.json;
+        webMfe =
+          if !(builtins.pathExists ./web/package-lock.json) then
+            throw "web/package-lock.json is missing: run `npm install` in web/ and commit the lockfile"
+          else
+            pkgs.buildNpmPackage {
+              pname = "concierge-web";
+              version = runnerCargo.version;
+              src = pkgs.lib.cleanSourceWith {
+                src = ./web;
+                filter = path: _type: ! builtins.elem (baseNameOf path) [ "node_modules" "dist" ".build" ];
+              };
+              npmDeps = pkgs.importNpmLock { npmRoot = ./web; };
+              npmConfigHook = pkgs.importNpmLock.npmConfigHook;
+              # Read by web/scripts/config.mjs and inlined into the bundles: build-time,
+              # public values only. The Turnstile site key is the public half of the widget
+              # banking's cabinet already serves on evinvest.ltd; the scope hosts must be
+              # added to that widget's hostnames in the Cloudflare console.
+              env = {
+                EV_PUBLIC_ORIGIN = "https://evinvest.ltd";
+                EV_TURNSTILE_SITEKEY = "0x4AAAAAAFSnp3-3WadT45qx";
+                EV_MFE_BASE_PATH = "/api/auth/mfe/";
+              };
+              installPhase = ''
+                runHook preInstall
+                mkdir -p $out/share/concierge
+                cp -r dist $out/share/concierge/web
+                runHook postInstall
+              '';
+            };
+        # Where the bundles sit inside the image; WEB_MFE_DIR below points here.
+        webMfeDir = "/share/concierge/web";
+
         # ONE container: the runner binary serves gRPC (:55670), the auth web
         # surface (:55671) AND the bridge seams over TLS (:55672) in-process. The
         # contract's port/healthPath describe the web surface (http probes); gitops
         # patches the Service to expose the others.
-        # Secret env (signing key, JWKS, Google OAuth, bridge token) arrives via
+        # Secret env (signing key, JWKS, Google/GitHub OAuth, bridge token, Turnstile) arrives via
         # the automatic optional `kubernetes-concierge` envFrom — never baked in.
         # Topology literals are set directly as contract env vars (read by
         # ev::settings! from_env). deploy/config.nix is kept for reference only.
@@ -88,7 +131,7 @@
             healthPath = "/health";
             criticality = "normal";
             entrypoint = [ "/bin/concierge" ];
-            contents = [ conciergeBin ];
+            contents = [ conciergeBin ] ++ pkgs.lib.optional hasWeb webMfe;
             env = {
               DATABASE_URL = "postgres://evinvest@10.42.0.1:5432/concierge";
               REDIS_URL = "redis://10.42.0.1:6379/1";
@@ -121,6 +164,9 @@
               # `concierge_smtp_password` is that mailbox's App Password.
               SMTP_HOST = "smtp.gmail.com";
               SMTP_USERNAME = "notifications@evinvest.ltd";
+            } // pkgs.lib.optionalAttrs hasWeb {
+              # Unset (no web/ yet) leaves /auth/mfe/* unmounted, which the binary allows.
+              WEB_MFE_DIR = webMfeDir;
             };
           };
         };
@@ -204,6 +250,8 @@
             # dev topology is owned here, deploy/config.nix kept for reference.
             export APP_ENV="''${APP_ENV:-development}"
             export PUBLIC_ORIGIN="''${PUBLIC_ORIGIN:-http://localhost:58843}"
+            # Cloudflare's always-pass test secret: the check still runs, against Cloudflare.
+            export TURNSTILE_SECRET="''${TURNSTILE_SECRET:-1x0000000000000000000000000000000AA}"
             export RUST_LOG="''${RUST_LOG:-info,concierge=debug,evconcierge_auth=debug}"
             exec cargo run -p concierge
           '';
@@ -321,7 +369,7 @@
         packages = {
           default = conciergeBin;
           concierge = conciergeBin;
-        } // containerStd.packages;
+        } // pkgs.lib.optionalAttrs hasWeb { web = webMfe; } // containerStd.packages;
 
         containers = containerStd.containers;
 

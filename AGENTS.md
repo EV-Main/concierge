@@ -45,7 +45,7 @@ never calls `banking`:
    decision to whoever holds the mailbox (#64 closed the payout kinds' exemption).
    A consent also leaves an in-app trace in the subject's inbox
    — written regardless of what they follow, because nobody subscribes to being
-   asked about their own money and no topic is followed by default — so the
+   asked about their own money and none of this plane's topics is followed by default — so the
    request is findable in the cabinet when the mail is late or lost; the link and
    the code stay in the mail. The fee policy pair follows the same split:
    `FEE_POLICY_APPROVAL` is a consilium kind (a seated owner, verified address,
@@ -86,11 +86,15 @@ retired in favour of `HoldUser` plus `GovernanceService.OpenUserSuspension`.
 | ----- | ------ |
 | Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
-| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `governance` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
-| `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation with reuse detection · `Exchange`/`Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party `ExchangeCode`/`RefreshClientToken` over the runner's `ClientGrants` port) provisioning users to the directory over an in-process `Provisioner` channel, **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
-| gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
+| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **approvals** (the consilium generalised to every scope), **log**. `directory` + `bridge` + `governance` + `platform` + `notification` + `approvals` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
+| `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Redis-backed refresh rotation with reuse detection · `Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party `ExchangeCode`/`RefreshClientToken` over the runner's `ClientGrants` port, plus `open_session` for the web surface's sign-ins) reading accounts from the directory over an in-process `Provisioner` channel, the closed `oauth::OAuthProvider` set (Google, GitHub — code + PKCE), **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
+| gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-prost-build` (protoc from `PROTOC`, else the vendored one). `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
+| Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams; also which consumer-built messages and services must never grow. Implemented so far: the registry (`tenants`, migration 0031; `ScopeRegistry`, `scopes` module), sign-in from a scope's hosts (`web::origins`, `web::cors`, the live allowlist `web::allowlist`), the MFE bundles under `/auth/mfe/*` (`web::mfe`, `WEB_MFE_DIR`), the sign-up ticket that confirms an address from a scope's host (`web::signup`, migration 0032), the relying-party streams (`ScopeEvents`, `UserEvents` by client credential; `scope_events`, `service_caller`, migration 0034) the stored scope catalog (`ScopeCatalogService`, `scope_catalog`) each direction's own inbox (`notification::InboxView`; `ScopeInboxService`, `scope_inbox`, §6) and approvals of the published kinds (`ApprovalService`, `ApprovalExecutionService`; `approvals`, migrations 0036–0039, §5.7; the approval mail, §5.5) | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
+| `web/` — the plane's microfrontends (`mfe-concierge-sign-in`, `-account`, `-account-chip`): React + `@evinvest/uikit` custom elements built to `web/dist/` with `registry.json`, served under `/auth/mfe/*`; which actions work on a scope host and which link to the platform | [`web/README.md`](./web/README.md) |
 | `concierge_iam` (+ `_derive`) — permission scopes: `#[derive(Permission)]` enums, `alias!`, the concrete `PermissionSet` a service asks `may` of, `Pattern` containment, the `Catalog` a tenant publishes. I/O-free, wasm-safe, published to crates.io so consumers need no protoc | [`iam/`](./iam) |
+| `evconcierge_client` — a relying party's calls into this plane: code + PKCE (authorize URL, `ExchangeCode`, `RefreshClientToken`), `GetMe`, `PublishCatalog` / `PublishScopeCatalog` under the client credential, the direction's inbox (`ScopeInboxService`: reads by `user_id`, writes with the user's token in `x-ev-user-token`); errors as values. `evconcierge_projection` — the pull engine a direction keeps its users with: `ScopeEvents` + `UserEvents` by client credential (cursor = `next_position`, explicit `limit`), dedupe, per-key ordering, parking and replay; the bookkeeping store on Postgres (feature `pg`) or SQLite (`sqlite`). Clients of this service live here (D22), not in `lib`. Published to crates.io in order `evconcierge_contracts` → `evconcierge_client`, `evconcierge_projection` (they depend on contracts by `version` + `path`), so consumers need no protoc and no git dependency. A proto change that reaches these crates is a minor bump of all three on 0.x: an added prost field breaks consumers' struct literals; the projection's README is the integration guide | [`client/`](./client) · [`projection/`](./projection) |
+| `@evinvest/concierge` — the npm package hosts mount the concierge MFEs with (`SignInDialog`, `AccountChip`, `AccountPage`, `useSignInRequired`, the session reader, platform sign-out; peer `@evinvest/mfe`). Lives here, not in `EV-Main/lib`, because lib carries no service's logic: a change to the elements' contract and to their host wrappers lands in one PR. Published by `.github/workflows/npm-publish.yml` (hand-written, not flake-generated; OIDC trusted publishing) on a tag `@evinvest/concierge-v<version>` matching `sdk/package.json`; that tag does not trip the container release (`v*`). Release steps in the package README | [`sdk/`](./sdk) |
 | **Design** — operator (admin) surface over this plane | [§ Design](#design) |
 
 ---
@@ -150,9 +154,83 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   those rows to banking over `UserEvents.PullUserLifecycle` (read-only; shared bridge
   token; mounted outside the user auth layer). The **platform** module is the
   operator console's platform/cabinet config surface (maintenance mode, announcement
-  banner, feature flags) behind the shared RBAC gate (`authz`). `notification` and
-  `log` stay DEFERRED stubs (`tonic::Status::unimplemented`); their application
-  layers are placeholders to grow into. Health returns `"ok"`.
+  banner, feature flags) behind the shared RBAC gate (`authz`). `log` stays a
+  DEFERRED stub (`tonic::Status::unimplemented`); its application layer is a
+  placeholder to grow into. Health returns `"ok"`.
+- **Every sign-in method lands in ONE rule, and a proven mailbox is the link.** The web
+  surface signs in by Google or GitHub (`/auth/login?provider=`, `/callback/auth/{provider}`),
+  by an emailed code (`/auth/code/{request,verify}`) or by a password
+  (`/auth/password/{signup,signin}`); there is no sign-in RPC (`Exchange` is gone). Every
+  method but the password produces a `ProvenIdentity` and `UserDirectoryRepository::resolve`
+  turns it into an account under advisory locks on the subject and the mailbox: a linked
+  provider subject (`user_identities`) opens its account; else a PROVEN mailbox opens the
+  account it is verified on; else it TAKES OVER the account that registered it unverified
+  with a password — sessions revoked; password and passkeys dropped; handle, profile and
+  notification settings reset; audited `taken_over_by_mailbox` with the passkeys counted —
+  because that registration may be a squat waiting for the owner (pre-hijack); else a new
+  account, verified iff the mailbox was proven. A provider address never moves onto a
+  mailbox another account proved. This is why `users_verified_email_idx` makes a VERIFIED
+  address unique (0029 reversed 0001's "email is NOT unique" for verified rows only;
+  unverified duplicates stay legal). `users.auth_subject` is now the account's opaque,
+  immutable cross-plane subject — a Google `sub` on accounts made before 0029, the account
+  id on later ones — and is never parsed; banking keys on it unchanged. The previous binary
+  provisions by `auth_subject`, so 0029's `users_mirror_google_subject` trigger mirrors its
+  inserts into `user_identities` and refuses one whose sub this binary already linked; it is
+  dropped once no older binary runs. The credential POSTs carry no session to double-submit
+  against, so they check `Origin` against `PUBLIC_ORIGIN` or an origin of a scope that still
+  signs people in (login CSRF; `web::allowlist`, `docs/SCOPES-AND-APPROVALS.md` §3.1), and the ones that
+  cost a mail or test a password check a Cloudflare Turnstile token server-side
+  (`TURNSTILE_SECRET`, required in every environment — development runs Cloudflare's
+  always-pass test secret, production refuses to boot with any of Cloudflare's test
+  secrets, and there is no arm that skips the check), including the session-bound
+  `/auth/email/verify/request`; a verdict counts only for a challenge solved on
+  `PUBLIC_ORIGIN`'s host or a signing-in scope's. The client address behind `remoteip`, the
+  session's device record and the per-address limits is `Cf-Connecting-IP`, else the TCP
+  peer — never a client-written `X-Forwarded-For` hop (`web::routes::ClientIp`). Codes are six digits,
+  SHA-256 bound to their row at rest, ten minutes, attempts counted before the
+  constant-time compare and burned on the fifth wrong guess, superseded by a newer one,
+  and capped at five sends per address AND purpose per 15 minutes counted IN THE TABLE
+  (replicas share it), so verification codes never spend the sign-in budget; one account
+  is sent at most ten verification codes and may present at most twenty wrong ones a day,
+  past which no code is issued or accepted (`attempts_exceeded`); the plaintext rides only
+  the `email_code` delivery's payload. Asking for a code
+  answers alike for every address: whether an account exists is decided once the code
+  proves the mailbox. A password (argon2id) signs up an UNVERIFIED account that works at
+  once ("verify my email now" mails a code; `/auth/email/verify/{request,confirm}` later).
+  That mail comes with a SIGN-UP TICKET (`signup_tickets`, 0032: 256 bits, a digest at rest,
+  spent once, alive a day while its code lives ten minutes — `/auth/password/signup/resend`
+  mails a new one under it — and dead once `token_version` or the password moves), and
+  `/auth/password/signup/confirm {ticket, code}` verifies the address WITHOUT the CSRF
+  token — the one confirmation a scope's host can make — and keeps the password: a ticket
+  is what tells the person who just signed up from a squatter's mailbox owner, so the
+  takeover above applies to every path but this one;
+  sign-up refuses an address that backs a password or is verified somewhere, which tells
+  the caller an account exists and is accepted. Sign-in answers one `invalid_credentials`
+  for a wrong password and a missing account alike (a decoy hash keeps the timing equal);
+  ten failures lock the PASSWORD for 15 minutes and never the code path, so nobody locks an
+  owner out of their account by guessing at it. Setting a password spends a verification
+  code, so a stolen session cannot plant a credential that outlives its revocation; "forgot
+  password" is a code sign-in. Every signed-in route, mutation and read alike, is gated as
+  `authz::caller_gate` is (`web::sign_in::gate`): a disabled account or a session minted
+  under an older `token_version` (a takeover, a revoke-all) is refused — 403 `disabled`,
+  401 `unauthenticated` — and its session ended, cookies cleared; `/auth/session` answers
+  such a session `authenticated: false` instead of refusing, and ends it the same way. The
+  ones that plant a credential or buy a vendor session (password set, passkey
+  registration, `/kyc/start`) also check the refresh family first-hand, as
+  `/auth/authorize` does. An account handle is an email OR a username, through one
+  resolver (`infrastructure::users::account_named`): an email names the accounts it is
+  verified on or backs a password of, and only when it names none is the handle read as a
+  username — a chosen username matches `[a-z0-9_.-]{3,32}` and never contains `@`, a
+  default one is the local part, else the whole address, else none. Nothing ever requires
+  the username. A PASSKEY (WebAuthn, `web::passkey`, `passkey_credentials`) is registered by a
+  signed-in account with a VERIFIED address (else `email_unverified`) and signs in without an
+  account named first; starting that sign-in is budgeted per client address. It must be discoverable
+  (`residentKey: required`), its user handle is the account id, the relying party is
+  `PUBLIC_ORIGIN`'s host, and the origins accepted are that one plus the registered scope
+  origins under it — exact origins, never any subdomain. A credential this plane
+  checks itself, like the password — not a provider subject and not a `user_identities`
+  row. Its ceremony state lives in process between the two requests, as the OAuth
+  transaction's does.
 - **KYC has exactly one writer**: the `User` aggregate's `set_kyc_level` and the
   `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
   banking's mirror). Two ENTRY POINTS reach it, and they differ in what they
@@ -171,7 +249,10 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   downgrade of it need a second seated holder. It is NOT unconditional in RANGE: the aggregate refuses anything above
   `domain::users::MAX_KYC_LEVEL` (3), and the `users_kyc_level_range` CHECK refuses it
   again at the column — the range belongs to the record, not to the one handler that
-  happened to check it. `user_outbox.kyc_level` carries the same CHECK, `NOT VALID` on
+  happened to check it. A level above 0 needs a VERIFIED email the same way — the aggregate
+  refuses (`FAILED_PRECONDITION`) and `users_kyc_needs_verified_email` refuses it again —
+  because a tier is granted to a person and an unproven address hands it to whoever holds
+  the mailbox. `user_outbox.kyc_level` carries the same CHECK, `NOT VALID` on
   purpose: it is the copy banking mirrors, so future appends are bounded while the log
   keeps reporting what it reported. `users.raise_kyc_level_to` is the vendor path: it is MONOTONIC, and the
   "is this actually a raise?" comparison is taken inside the write transaction from
@@ -198,7 +279,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   "created_at", "resumable"}}` — `status` is the PERSISTED vocabulary (`pending`,
   `in_progress`, `in_review`, `resubmitted`), `created_at` is unix seconds, and a DECIDED
   case is history and leaves the answer. Refusals are JSON too
-  (`{"error":"unauthenticated"|"internal"}`); the names are pinned field for field by an
+  (`{"error":"unauthenticated"|"disabled"|"internal"}`); the names are pinned field for field by an
   integration test, because a rename here surfaces as a user charged for a duplicate case
   rather than as a red test. Unlike `/kyc/start` it stays 200 with `DIDIT_*` unset: the
   level a user holds and the case they opened are facts of THIS plane, and a screen that
@@ -389,7 +470,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   probing for an ABSENT body (`403` with no code meant "stale token, reload"; `403` with
   one meant "failed"), which is a client reading tea leaves about which half of a refusal
   it is in (banking#193). One format now, one key, one closed vocabulary:
-  `unauthenticated` · `csrf` · `throttled` · `internal`, plus the pre-existing
+  `unauthenticated` · `csrf` · `disabled` · `throttled` · `internal` · `email_unverified`
+  (403, checked before the gate: a level above 0 needs a verified email), plus the pre-existing
   `kyc_unavailable`, which keeps its second `contact` field and is the only one that has
   one. `unauthenticated` has to stay REACHABLE: the CSRF check still runs before any
   session state is touched, but it answers "nobody is signed in" for an absent or lapsed
@@ -432,7 +514,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   (`support::authenticate_service`), the Didit webhook HMAC (`infrastructure::kyc::didit`),
   the consilium self-decision code (`infrastructure::governance`), the refresh-token secret
   (`evconcierge_auth::management`), a relying party's client secret and refresh secret
-  (`relying_party`, both compared as fixed-width digests) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
+  (`relying_party` and, for the service seams, `service_caller`; compared as fixed-width digests), an emailed sign-in or verification
+  code (`infrastructure::credentials`) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
   Whether any one of them is a practical timing oracle is not the test — a plane that
   states this discipline and then has one check quietly doing `!=` (#52) is a plane whose
   next reader takes the exception for the rule. The CSRF check is also the STRICTER of the
@@ -462,7 +545,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   verdict (naming `OpenUserReinstatement`), or the consilium would be advisory. A disabled row with `suspended_by IS NULL` predates
   the column and deliberately keeps the OLD semantics — one-act, never lapsing — because
   that is the rule those accounts were suspended under; there is no backfill.
-- **The hold sweep is the ONE thing in this plane that sweeps.** Consilium expiry is
+- **The hold sweep is load-bearing.** Consilium expiry is
   lazy on purpose (a write path expires a due proposal before acting, read paths project
   it as expired), so nothing has to be running for a stale proposal to be unusable. A
   hold cannot work that way: its whole purpose is the frozen flag the money plane
@@ -482,7 +565,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   permission is `<namespace>:<resource…>:<action>` (`concierge_iam`), an alias a named set
   of them. What a SEAT means is code (`domain::authz`, `SEAT_*` over `concierge:*`, `iam:*`,
   `bank:*`) and who holds one is still only governance's to say; nothing compares seats by
-  rank. A TENANT (`tenants`, migration 0026) owns one namespace, and its relying party
+  rank. A TENANT (`tenants`, migration 0026) owns one namespace (seen as a direction it is a
+  SCOPE — migration 0031, `docs/SCOPES-AND-APPROVALS.md` §3), and its relying party
   publishes the catalog over it (`AuthService.PublishCatalog`, client secret, everything
   inside the namespace, at most 1024 permissions and 128 aliases of at most 128 characters —
   every `GetMe` loads it). `version` is the unix seconds of the client's build COMMIT, never
@@ -495,7 +579,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   nothing. Nothing grants anything in `iam`/`concierge`/`bank`/`seat`, so no grant can reach a
   seat's permissions, and NOBODY grants to their own account (`grants_not_to_self`, the rule
   `HoldUser` and `SetKycLevel` carry) — a grant made to oneself would outlive the seat that
-  made it. Seats holding `iam:tenants:grant` grant any target; a tenant decides whether such a
+  made it. Every seat is an account first and holds its own record (`concierge:self:*`,
+  `bank:self:*`, one per cabinet section), so "needs an account" is a permission and not a
+  special case: a GUEST is a principal too — `SEAT_GUEST`, never persisted and not a `Role`
+  (that word crosses the bridge) — and holds what that alias lists. `/auth/session` answers
+  `permissions` for both, the guest's when nobody is signed in. A guest carries no token: it
+  owns nothing server-side, and a zone backend keeps refusing it 401 exactly as before, which
+  is what keeps a guest from ever being handed a money token. Seats holding `iam:tenants:grant` grant any target; a tenant decides whether such a
   seat also HOLDS every permission of its namespace without a row
   (`tenants.granting_seats_hold_all`: `sa` says yes, keeping "the global admin is the panel's
   admin"; a tenant with PII to protect says no and its admins are granted like anyone). The
@@ -522,12 +612,12 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   (`sa:admin` → `sa:operator`), and an alias that is delegated may delegate nothing itself:
   a holder can never mint a peer, nor someone who could. Delegated grants are access to one
   tenant's surface and never money — rights over an allocation's MONEY are banking's own.
-  A delegate names the subject only by EMAIL, never by user id: ids are visible to them
-  (`granted_by`), and granting a bare id then reading the roster would make them a lookup
-  service for anyone's address. Revoking takes either form — the answer depends only on a
-  grant they can list — and the roster they see (`ListGrants`) carries email and grant
-  only: no `legal_name`, no `preferred_name`. An email held by several accounts names
-  nobody, and a disabled or held account is not granted. A seat hears which (`NOT_FOUND`
+  A delegate names the subject only by ACCOUNT HANDLE (an email or a username, resolved by
+  `account_named`), never by user id: ids are visible to them (`granted_by`), and granting a
+  bare id then reading the roster would make them a lookup service for anyone's address.
+  Revoking takes either form — the answer depends only on a grant they can list — and the
+  roster they see (`ListGrants`) carries email, username and grant only: no `legal_name`,
+  no `preferred_name`. A handle naming several accounts names nobody, and a disabled or held account is not granted. A seat hears which (`NOT_FOUND`
   for no account, `FAILED_PRECONDITION` with the reason otherwise); a delegate hears ONE
   `FAILED_PRECONDITION("this address cannot be granted access")` for all three, and a
   revoke answers one `NOT_FOUND` for everything — otherwise a grant is an oracle for
@@ -546,9 +636,105 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   and the delegate's own grants are held `FOR SHARE`. A caller with no authority is denied
   before learning whether the subject exists; a refusal is logged at `warn!` (ids and
   target, and for an ungrantable address its category — never the address).
+- **A relying party reads this plane's streams with its client secret, and sees only whom its
+  scopes can see.** `ScopeEvents.PullScopeEvents` and `UserEvents.PullUserLifecycle` take
+  either the bridge token (everything, unredacted — banking's page is unchanged) or
+  `x-ev-client-id` + `Bearer <client_secret>` (`service_caller`: an unknown, disabled or
+  secretless client and a wrong secret are one `UNAUTHENTICATED`). A client reads its own
+  scope and every scope whose `observers` name it. A user becomes VISIBLE to a scope
+  (`scope_members`, only ever inserted) on their first relying-party session with one of its
+  clients or their first grant in its namespace, and MEMBER_JOINED carries the identity
+  snapshot as of the user's `row_version`, taken under the `users` row `FOR SHARE` so no
+  lifecycle row can commit between the two. The lifecycle stream then serves a client only
+  rows past that snapshot, with `seat_permissions` absent and `permissions` empty;
+  `kyc_level` is carried (D5). GRANTS_CHANGED re-states the concrete set `GetMe` would
+  answer that tenant's client (persisted seat, never break-glass), written in the SAME
+  transaction as the grant, the revocation, the catalog publication or the ROLE_CHANGED
+  that moved it; SCOPE_CHANGED is written by a trigger on `tenants`, because the registry
+  has no writer in this binary. Every `scope_outbox` append goes through
+  `scope_outbox_append`, which takes the stream's advisory lock, so position order is
+  commit order — the same argument as `user_outbox`. Locks are always taken users →
+  tenants (`FOR SHARE`) → `scope_members` → the stream lock. A filtered reader's
+  `next_position` is the maximum position scanned (`support::filtered_page`). The boot
+  (`db::migrate` → `scope_events::reconcile`) backfills members and re-states sets an
+  older binary changed beside this one; between boots such a change is not on the stream.
+  `ScopeCatalogService` stores approval kinds and notification topics per namespace (the
+  bridge token publishes `bank`), versioned like `PublishCatalog`, and executes nothing;
+  a scope's topics are offered only in that scope's inbox and emitted only by their own
+  namespace, through `ScopeInboxService.EmitScopeNotification` under the same credential
+  (`NotificationService.Emit`'s `typ=service` token names no namespace and refuses them).
+- **An approval is decided by a roster frozen at open and executed only by the namespace
+  that proposed it** (`approvals`, `docs/SCOPES-AND-APPROVALS.md` §5). A kind's namespace
+  alone proposes, pulls and reports on it, a relying party in its own scope only (the
+  bridge in any); another namespace's proposal answers exactly as an unknown id, and a
+  service never reads the deciders' emails or subjects. The level, the escalations and the
+  roster are decided in the opening transaction, opens are serialised per proposer
+  namespace by an advisory lock (the rolling 24h limit sums LIVE proposals and executions
+  of the last day; a namespace holds at most 200 live per scope), and every instant is the
+  database's `clock_timestamp()` read after the act's locks, never a replica's. Nobody is
+  excluded from a service's roster (`requested_by` is what a service says, not a proof);
+  the opener of this plane's own `concierge:*` proposal, proven by the session, is (D23),
+  and so is a money decision's initiator whose own access token the proposer presents —
+  minted within 120 s and spent once, so it proves the service held a fresh session of
+  theirs, nothing more — from a PLATFORM roster, with two other ACTIVE owners still
+  required and the initiator told in their inbox (D24(1)). Any change of the
+  owner roster — a seat granted or taken, an owner suspended by the consilium's verdict or
+  reinstated from one, never a temporary hold — voids every live platform decision in its
+  own transaction (a trigger on `users`; a second one on `approvals` refuses a platform row
+  inside the pause, whatever binary writes it) and pauses new ones for the platform policy's cool-down (D24(2)).
+  What keeps one person from acting alone is the threshold over the whole roster,
+  `sole_admin` escalation, the two-owner floor — and that `<ns>:admin`, the scope roster,
+  is granted ONLY by an executed `concierge:scope_admin_grant` (`GrantPermission` refuses
+  it to everyone), never delegated, and only to an account with a verified address. A vote
+  counts only while its voter holds the seat (a suspended owner holds none); a proposal is
+  rejected only by seated AGAINSTs beyond what the roster can spare — one that can no longer
+  pass for want of seats waits out its lifetime; a scope's policy only tightens a kind's
+  thresholds, and binds by test and field, not by name;
+  any owner vetoes any proposal inside its delay; a scope's delay is never under an hour.
+  The known money kinds are held to one table in `domain::floors` (platform level, or caps
+  on their scope escalations) at publication AND at every proposal, whatever the catalog
+  says; it is an allow-list for `bank` and `invest` — a kind it does not name is the owners'.
+  Expiry, executability and the 72 h lapse to `void` are time predicates and nothing sweeps
+  to WRITE them; every transition writes its `approval_events` row in the same transaction.
+  Only the outcome MAIL sweeps (§5.5): it reads the effective state and writes nothing but
+  `approvals.mailed_state` and the queued mail.
+- **Two loops act on their own: the hold sweep and the approval executor.** Everything
+  else in this plane is lazy (a write path settles a due proposal before acting, read
+  paths project it). The hold sweep exists because a lapse the money plane must MIRROR has
+  to be a written `user_outbox` row; the executor (`approvals::run_executor`, D23) exists
+  because this plane is the proposer of its own `concierge:*` kinds and nobody else will
+  pull them — it carries each passed decision out with its outcome in one transaction. Each
+  executor pass also queues the approval outcome mail (`mail_outcomes`), which needs no
+  cadence of its own. A third loop needs the same kind of reason; "it would be convenient"
+  is not one.
+- **Each direction has its own inbox, and the server picks it (D21).** The notification
+  routes (`/auth/notifications/settings*`) resolve `notification::InboxView` from the
+  `Origin`: `PUBLIC_ORIGIN` or none → the platform inbox (built-in topics and `bank:*`), a
+  signing-in scope's origin → that scope's catalog topics for its MEMBERS only
+  (`scope_members`; anyone else reads an empty inbox), any other origin → 403. gRPC
+  `NotificationService` with a user's token reads the platform inbox. The summary of every
+  namespace (`?all=1` / metadata `x-ev-inbox-view: all`) is `PUBLIC_ORIGIN` only and needs
+  `concierge:notifications:read_all` (seats `admin`, `owner`). A topic outside the inbox is
+  refused as unknown; the master channel switches are set only from the platform inbox.
+  A direction's frontend reaches its inbox through its OWN backend, which calls
+  `ScopeInboxService` (outside the user auth layer, `BIND` and the TLS listener) with its
+  client credential and the user's concierge id: the client's own scope's namespace only
+  (never an observed scope's), active members only — anyone else reads empty and writes
+  `FAILED_PRECONDITION`. A WRITE also needs the user's access token issued to that client
+  (`x-ev-user-token`, `aud` = its audience, live session) and takes the user from it:
+  following a topic turns on mail, and a client secret alone must not do that to anyone.
+  An emit on a scope's topic reaches its active members only, and a topic published with
+  `default_subscribed` follows every account that never touched it — which is why switching
+  a topic off is a row of its own (`notification_topic_optouts`), not a missing one. The
+  old `fund:quy-nhon` / `account:money-movement` keys are aliases of their `invest:` / `bank:`
+  successors until the contract step; `account:money-movement` stays this plane's trace topic.
+  So the client credential opens `ScopeEvents`, `UserEvents`, `ScopeCatalogService` and
+  `ScopeInboxService`, while a client's USER token is admitted by the auth layer on `GetMe`
+  alone and is otherwise only that second proof on a scope-inbox write. The gRPC summary
+  reads the persisted seat; break-glass does not open it. `docs/SCOPES-AND-APPROVALS.md` §6.
 - **This plane is the identity provider of first-party clients on OTHER origins, and a
   client's token opens exactly one RPC.** A relying party (`relying_party`, registry
-  `rp_clients` from `0025`; the Service-Arb panel `sa` is seeded) runs authorization code +
+  `rp_clients` from `0025`; the Service-Arb panel `sa` (0025) and the invest cabinet `invest` (0031) are seeded) runs authorization code +
   PKCE S256: `GET /auth/authorize` (publicly `/api/auth/authorize`, under the conductor's
   existing `/api/auth/*` rewrite) → `AuthService.ExchangeCode` / `RefreshClientToken`,
   called by the client's backend with its secret. `/auth/authorize` settles the client and
@@ -563,7 +749,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `CODE_TTL_SECS` (60), is bound to client, redirect_uri, PKCE challenge, user and
   `token_version`, and is BURNED on its first presentation, matching or not; a second
   presentation marks it replayed and revokes every session it opened. Every client signs
-  in any ACTIVE account — part of a client's surface is open to everyone, and what a user
+  in any ACTIVE account — unless its scope is CLOSED: such a client is refused like a
+  disabled one, `GetMe` stops honouring its tokens at once and its sessions end at the
+  next refresh (`scope_closed`) — part of a client's surface is open to everyone, and what a user
   may do there is `GetMe.permissions`, which the client gates on. The account is re-read at
   authorize, at the exchange and on EVERY refresh, and a refusal on refresh revokes the
   session. Every client is a tenant (`rp_clients.tenant_id`). Client refresh families live in
@@ -590,10 +778,16 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   revoke-all path (`revoke_all`, refresh reuse, a suspension, a `token_version` bump)
   call `ClientGrants::upstream_revoked`, which expires the codes and revokes the sessions
   (`upstream_revoked`) in one transaction, codes first. Best-effort: a failure there is
-  reported to Sentry, not returned. A wrong refresh secret presented by the right client
+  reported to Sentry, not returned. A scope's host signs the browser out of THIS origin by
+  sending it to `GET /auth/logout/confirm?return_to=<absolute returnTo>` (`web::logout`): a
+  page with one button whose form posts back the session's CSRF token, rendered from the
+  session and never from the query; the POST closes the session as `/auth/logout` does and
+  answers 303 to `return_to`. A plain GET never signs anybody out. A wrong refresh secret presented by the right client
   for a live session revokes it (`refresh_reuse`), not only a rotated-out one.
   `RP_DEV_REDIRECT_URIS` (`client=http://localhost:<port>/…`, loopback only) adds dev
-  redirect targets and refuses to boot in production. Sign-ins are recorded by
+  redirect targets and refuses to boot in production.
+  `SCOPE_DEV_ORIGINS` (`scope=http://localhost:<port>`, loopback only) likewise admits a dev
+  origin for a registered scope's sign-in and refuses to boot in production. Sign-ins are recorded by
   `rp_codes`/`rp_sessions` and `tracing`, not `admin_action` (nobody acted on anyone); a
   replay or a reused refresh token is `error!` → Sentry.
 - **The USER consilia pass on a MAJORITY, the OWNER consilia on unanimity**, and the
@@ -629,7 +823,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   beside `to` and is the same number: rows written before this carried only that key.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
-  hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
+  hit a REAL Postgres (no DB mocks); the binary applies migrations on boot, and refuses
+  its configuration BEFORE it connects to the database (`runner/tests/boot_config.rs`).
 - A DB-backed suite takes its URL from `common::database_url()`, never from
   `std::env::var("DATABASE_URL")` directly. Without `DATABASE_URL` a suite skips
   and still reports "N passed" — libtest prints nothing for a passing test — so
@@ -655,7 +850,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   re-exports it as `domain::architecture`, and stays wasm-safe — so the
   wasm-unsafe `evconcierge_auth` must never be a dependency of `domain`.
 - `evconcierge_contracts` (vendoring `proto/`) is the single dependency other
-  service repos import by git — it gives them the gRPC stubs and, via
+  service repos import by git or from crates.io (it vendors protoc, so a consumer needs none) — it gives them the gRPC stubs and, via
   `evconcierge_auth`, the standard token-verification flow.
 - This is the **identity/platform** plane — no TigerBeetle, no money ledger, no
   money-operation authorization. Those belong to the `banking` repo.

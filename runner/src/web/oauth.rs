@@ -1,6 +1,6 @@
-//! The browser-facing half of the Google OAuth handshake (PKCE/state/nonce),
-//! ported from the cabinet BFF — the confidential code→token exchange stays in
-//! `evconcierge_auth::service` (called in-process by the callback route).
+//! The browser-facing half of an OAuth handshake (PKCE/state/nonce): the transaction
+//! between the redirect out and the callback. The provider's own half — its URLs and the
+//! code→identity exchange — is `evconcierge_auth::oauth::OAuthProvider`.
 
 use std::collections::HashMap;
 
@@ -9,8 +9,6 @@ use tokio::sync::Mutex;
 
 use crate::web::{now_secs, random_token};
 
-const AUTHORIZE_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const SCOPE: &str = "openid email profile";
 /// The OAuth handshake (PKCE/state/nonce) lives at most this long between authorize and callback.
 pub const OAUTH_TX_TTL: i64 = 600;
 /// Hard cap on in-flight OAuth txns. The unauthenticated login route feeds this map,
@@ -44,26 +42,20 @@ impl Challenge {
 	}
 }
 
-/// Build the Google authorize URL to redirect the browser to.
-pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str, nonce: &str, code_challenge: &str) -> String {
-	let query = form_urlencoded::Serializer::new(String::new())
-		.append_pair("client_id", client_id)
-		.append_pair("redirect_uri", redirect_uri)
-		.append_pair("response_type", "code")
-		.append_pair("scope", SCOPE)
-		.append_pair("state", state)
-		.append_pair("nonce", nonce)
-		.append_pair("code_challenge", code_challenge)
-		.append_pair("code_challenge_method", "S256")
-		.append_pair("access_type", "online")
-		.append_pair("prompt", "select_account")
-		.finish();
-	format!("{AUTHORIZE_ENDPOINT}?{query}")
-}
+/// The longest `returnTo` kept. A landing path is short; anything longer is a payload.
+const MAX_RETURN_TO: usize = 2048;
 
 /// Keep a post-login redirect target same-origin to defeat open-redirects.
+///
+/// Browsers strip TAB, CR and LF from a URL before parsing it, so `/\t/evil.example` is
+/// followed as `//evil.example` — another host — while every byte check below still sees
+/// a path. Whitespace, control bytes and anything outside ASCII are refused before those
+/// checks rather than taught to them one quirk at a time.
 pub fn safe_return_to(raw: Option<&str>) -> String {
 	let Some(raw) = raw else { return "/".to_string() };
+	if raw.len() > MAX_RETURN_TO || raw.bytes().any(|b| b <= 0x20 || b >= 0x7f) {
+		return "/".to_string();
+	}
 	if !raw.starts_with('/') {
 		return "/".to_string();
 	}
@@ -78,6 +70,8 @@ pub fn safe_return_to(raw: Option<&str>) -> String {
 /// One in-flight OAuth login transaction, bound to the `ev_oauth_tx` cookie.
 #[derive(Clone)]
 pub struct OAuthTx {
+	/// The provider the browser was sent to; its callback must be the one answering.
+	pub provider: &'static str,
 	pub state: String,
 	pub nonce: String,
 	pub code_verifier: String,
@@ -99,10 +93,11 @@ impl OAuthTxStore {
 	/// Store a transaction, returning its id (the `ev_oauth_tx` cookie value). Evicts on
 	/// write: abandoned logins never replay their cookie, so `take` never frees them — drop
 	/// every expired entry here, and if the cap is still hit, drop the oldest.
-	pub async fn put(&self, state: String, nonce: String, code_verifier: String, return_to: String) -> String {
+	pub async fn put(&self, provider: &'static str, state: String, nonce: String, code_verifier: String, return_to: String) -> String {
 		let id = random_token(32);
 		let now = now_secs();
 		let tx = OAuthTx {
+			provider,
 			state,
 			nonce,
 			code_verifier,
@@ -124,5 +119,27 @@ impl OAuthTxStore {
 	pub async fn take(&self, id: &str) -> Option<OAuthTx> {
 		let tx = self.txns.lock().await.remove(id)?;
 		(now_secs() - tx.created_at <= OAUTH_TX_TTL).then_some(tx)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn a_path_a_browser_would_read_as_another_host_lands_home() {
+		for raw in [
+			"/\t/evil.example", "/\t\t/evil", "/\n/evil", "/\r/evil", "/ /evil", "/\x7f/evil", "/\u{a0}/evil", "//evil", "/\\evil",
+		] {
+			assert_eq!(safe_return_to(Some(raw)), "/", "{raw:?}");
+		}
+		assert_eq!(safe_return_to(Some(&format!("/{}", "a".repeat(MAX_RETURN_TO)))), "/");
+	}
+
+	#[test]
+	fn an_ordinary_path_is_kept() {
+		for raw in ["/", "/cabinet", "/api/auth/authorize?client_id=sa&state=x%20y"] {
+			assert_eq!(safe_return_to(Some(raw)), raw);
+		}
 	}
 }

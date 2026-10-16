@@ -1,5 +1,5 @@
 //! The relying-party flow: this plane as the identity provider of first-party clients on
-//! other origins (the Service-Arb panel on `sa.evinvest.ltd`).
+//! other origins (`rp_clients`: the Service-Arb panel `sa`, the invest cabinet `invest`).
 //!
 //! ```text
 //! browser → evinvest.ltd/api/auth/authorize?client_id&redirect_uri&state&code_challenge  (web::authorize)
@@ -10,8 +10,8 @@
 //! client backend → UserDirectory.GetMe with that JWT — the ONE RPC it opens
 //! ```
 //!
-//! Every client signs in any ACTIVE account; what the user may do there is their tenant
-//! permissions, which GetMe hands the client fresh on every call — its own copy is never
+//! Every client of a scope that is not CLOSED signs in any ACTIVE account; what the user
+//! may do there is their tenant permissions, which GetMe hands the client fresh on every call — its own copy is never
 //! trusted. The account is re-read at authorize, again at the exchange (a code does not
 //! outlive a suspension, even inside its 60s), and again on every refresh.
 //!
@@ -94,12 +94,12 @@ pub fn parse_dev_redirects(raw: &str, production: bool) -> Result<HashMap<String
 
 /// A redirect URI this plane will ever send a code to: absolute, no fragment (a code in a
 /// fragment is where the client cannot read it and scripts can), no whitespace, no
-/// userinfo.
+/// userinfo, no backslash (browsers read it as `/`, which moves the host).
 fn valid_redirect_shape(uri: &str) -> bool {
 	let rest = uri.strip_prefix("https://").or_else(|| uri.strip_prefix("http://"));
 	let Some(rest) = rest else { return false };
 	let authority = rest.split(['/', '?']).next().unwrap_or("");
-	!authority.is_empty() && !authority.contains('@') && !uri.contains('#') && !uri.chars().any(char::is_whitespace)
+	!authority.is_empty() && !authority.contains('@') && !uri.contains('#') && !uri.contains('\\') && !uri.chars().any(char::is_whitespace)
 }
 
 /// Refuse to serve a registry row that would redirect somewhere it should not.
@@ -208,8 +208,8 @@ impl RelyingParties {
 		Ok(audiences)
 	}
 
-	/// The client, when `client_id` names an enabled one and `redirect_uri` is one of its
-	/// URIs byte for byte. `None` is the ONLY answer for anything else, so the caller has
+	/// The client, when `client_id` names an enabled one of a scope that is not closed and
+	/// `redirect_uri` is one of its URIs byte for byte. `None` is the ONLY answer for anything else, so the caller has
 	/// no way to redirect to an address nobody registered.
 	pub async fn resolve(&self, client_id: &str, redirect_uri: &str) -> Result<Option<ClientRecord>, DomainError> {
 		let Some(client) = self.repo.client(client_id).await? else {
@@ -220,7 +220,7 @@ impl RelyingParties {
 			.iter()
 			.chain(self.dev_redirects.get(client_id).into_iter().flatten())
 			.any(|uri| uri == redirect_uri);
-		Ok((registered && !client.disabled).then_some(client))
+		Ok((registered && !client.disabled && !client.scope_closed).then_some(client))
 	}
 
 	/// Whether `user` may be signed into a client right now: an active account.
@@ -262,8 +262,20 @@ impl RelyingParties {
 		self.repo.session_live(session_id, audience, now_secs()).await
 	}
 
-	/// The client, when it exists, is enabled and `secret` is its secret.
+	/// The client, when it exists, is enabled, its scope is not closed and `secret` is its
+	/// secret.
 	async fn authenticate_client(&self, client_id: &str, secret: &str) -> Result<ClientRecord, ClientGrantError> {
+		let client = self.authenticate_client_of_any_scope(client_id, secret).await?;
+		if client.scope_closed {
+			tracing::warn!(client_id = %client.client_id, "relying party: its scope is closed");
+			return Err(ClientGrantError::InvalidClient);
+		}
+		Ok(client)
+	}
+
+	/// The client's credential, whatever its scope's state. Only the refresh path asks
+	/// this way: it must know the caller is the client before it ends the client's session.
+	async fn authenticate_client_of_any_scope(&self, client_id: &str, secret: &str) -> Result<ClientRecord, ClientGrantError> {
 		let client = self.repo.client(client_id).await.map_err(unavailable)?.ok_or(ClientGrantError::InvalidClient)?;
 		let Some(stored) = client.secret_hash.as_deref() else {
 			return Err(ClientGrantError::InvalidClient);
@@ -394,13 +406,20 @@ impl RelyingParties {
 	}
 
 	async fn rotate_refresh(&self, refresh: ClientRefresh) -> Result<ClientGrant, ClientGrantError> {
-		let client = self.authenticate_client(&refresh.client_id, &refresh.client_secret).await?;
+		let client = self.authenticate_client_of_any_scope(&refresh.client_id, &refresh.client_secret).await?;
 		let (session_id, secret) = refresh.refresh_token.split_once('.').ok_or(ClientGrantError::InvalidGrant)?;
 		let session_id = Uuid::parse_str(session_id).map_err(|_| ClientGrantError::InvalidGrant)?;
 		let session = self.repo.session(session_id).await.map_err(unavailable)?.ok_or(ClientGrantError::InvalidGrant)?;
 		let now = now_secs();
 		if session.client_id != client.client_id || session.revoked || now >= session.expires_at || now >= session.absolute_expires_at {
 			return Err(ClientGrantError::InvalidGrant);
+		}
+		// Ended, not merely refused: a closed scope does not reopen, and a family left live
+		// would keep its access token answering `GetMe` were the check there ever dropped.
+		if client.scope_closed {
+			self.repo.revoke_session(session_id, SessionRevocation::ScopeClosed, now).await.map_err(unavailable)?;
+			tracing::info!(client_id = %client.client_id, user_id = %session.user, %session_id, "relying party: scope closed — session ended");
+			return Err(ClientGrantError::InvalidClient);
 		}
 
 		let presented = sha256(secret.as_bytes());
@@ -583,9 +602,18 @@ mod tests {
 			secret_hash: None,
 			disabled: false,
 			namespace: "sa".into(),
+			scope: "sa".into(),
+			scope_closed: false,
 		};
 		assert!(check_registered_redirects(&client("https://sa.evinvest.ltd/auth/callback")).is_ok());
-		for bad in ["http://sa.evinvest.ltd/cb", "https://sa.evinvest.ltd/cb#x", "https://u@sa.evinvest.ltd/cb", "https:///cb"] {
+		for bad in [
+			"http://sa.evinvest.ltd/cb",
+			"https://sa.evinvest.ltd/cb#x",
+			"https://u@sa.evinvest.ltd/cb",
+			"https:///cb",
+			"https://evil.example\\sa.evinvest.ltd/cb",
+			"https://sa.evinvest.ltd\\cb",
+		] {
 			assert!(check_registered_redirects(&client(bad)).is_err(), "{bad:?} must be refused");
 		}
 	}

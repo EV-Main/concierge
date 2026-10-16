@@ -12,6 +12,12 @@
 //! - `evconcierge_auth` uses the `AuthService` stubs to serve its issuance routes.
 //! - Other service repos add this crate as a git dependency for the **client**
 //!   stubs, and `evconcierge_auth` for the verification flow.
+//!
+//! Wire changes stay additive in Rust SOURCE, not only on the wire: consumers build
+//! some messages with struct literals and implement some services' server traits in
+//! their fakes, so a field on such a message or an RPC on such a service breaks their
+//! build at the next pin bump. New surface goes into new messages and new services;
+//! `docs/SCOPES-AND-APPROVALS.md` lists what consumers construct today.
 
 /// Generated tonic code for the `concierge.v1` proto package (clients + servers +
 /// message types), pulled in via `tonic::include_proto!("concierge.v1")`.

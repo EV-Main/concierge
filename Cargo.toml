@@ -5,8 +5,11 @@ cargo-features = ["codegen-backend"]
 # notification/log modules); `auth` (verification flow + AuthService skeleton) and
 # `contracts` (proto → tonic stubs) are the crates downstream service repos import
 # by git; `domain` is the wasm-safe shared identity source of truth; `iam` (+ its derive)
-# is the permission-scope vocabulary every tenant service links from crates.io.
-members = ["auth", "contracts", "domain", "iam", "iam_derive", "runner"]
+# is the permission-scope vocabulary every tenant service links from crates.io;
+# `client` (`evconcierge_client`) and `projection` (`evconcierge_projection`) are what a
+# relying party calls this plane with and keeps its users with, published to crates.io
+# on top of `contracts`.
+members = ["auth", "client", "contracts", "domain", "iam", "iam_derive", "projection", "runner"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -28,7 +31,13 @@ domain = { path = "domain" }
 dotenvy = "0.15.7"
 ev = { version = "0.24.2", package = "ev_lib", default-features = false, features = ["architecture", "types"] }
 evconcierge_auth = { path = "auth" }
-evconcierge_contracts = { path = "contracts" }
+# `version` too: the published `evconcierge_client` and `evconcierge_projection` resolve it
+# from crates.io, where a bare path dependency cannot go.
+evconcierge_contracts = { version = "0.3.0", path = "contracts" }
+# argon2id for the passwords this plane checks itself.
+argon2 = { version = "0.5", features = ["std"] }
+# Passkeys (WebAuthn): discoverable sign-in needs `conditional-ui`.
+webauthn-rs = { version = "0.5", features = ["conditional-ui"] }
 form_urlencoded = "1"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 heck = "0.5"
@@ -46,6 +55,10 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1-rustls-tls"] }
 proc-macro2 = "1"
 prost = "0.14"
+# `evconcierge_contracts`' build script hands tonic a protoc of its own choosing.
+prost-build = "0.14"
+# A protoc for a crates.io consumer of `evconcierge_contracts`, who has none on PATH.
+protoc-bin-vendored = "3"
 quote = "1"
 # rustls-only Redis for the issuing-side refresh-token state, matching the rustls
 # stance (no native-tls). No-op until `REDIS_URL` is set (in-process fallback).

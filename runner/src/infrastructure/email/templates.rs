@@ -885,6 +885,44 @@ pub fn kyc_verdict_alert(subject_email: &str, case_id: &str, verdict: &str, held
 // ── building blocks ────────────────────────────────────────────────────────
 
 /// Why a governance mail has no unsubscribe link, said out loud.
+/// A sign-in code or an email-verification code. No link on purpose: a link would sign
+/// in whoever's mail gateway follows it, and the code is only worth anything typed into
+/// the page that asked for it.
+pub fn email_code(sign_in: bool, code: &str, expires_at: i64) -> RenderedEmail {
+	let (title, ask, subject) = if sign_in {
+		(
+			"Your sign-in code",
+			"Enter this code on the page where you asked to sign in.",
+			format!("{code} is your EV Investment sign-in code"),
+		)
+	} else {
+		(
+			"Confirm your email",
+			"Enter this code in your EV Investment settings to confirm this address is yours.",
+			format!("{code} is your EV Investment verification code"),
+		)
+	};
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Account"));
+	inner.push_str(&heading(title));
+	inner.push_str(&paragraph(ask));
+	inner.push_str(&code_panel(code));
+	inner.push_str(&paragraph(&format!(
+		"It works once, until {}. If you did not ask for it, ignore this message: without the code nothing happens.",
+		fmt_ts(expires_at)
+	)));
+	RenderedEmail {
+		subject,
+		html: shell(title, &card(&inner), FOOTER_CODE, "", "Account"),
+		text: format!(
+			"{title}\n\n{ask}\n\nYour code: {code}\n\nIt works once, until {}. If you did not ask for it, ignore this message: without the code nothing happens.\n\n—\n{FOOTER_CODE}\n",
+			fmt_ts(expires_at)
+		),
+	}
+}
+
+const FOOTER_CODE: &str = "You received this because this address was entered on evinvest.ltd. EV Investment never asks for this code by phone, chat or email.";
+
 const FOOTER_SECURITY: &str =
 	"You are receiving this because you hold an owner seat. Security mail cannot be switched off — if it could, muting it would be the first thing an attacker did.";
 
@@ -1070,6 +1108,310 @@ fn shell(preheader: &str, body: &str, footer_context: &str, unsubscribe_url: &st
 </table>
 </td></tr></table></body></html>"##
 	)
+}
+
+/// One approval mail as it sits in the queue (`approval_request`, `approval_outcome`;
+/// `docs/SCOPES-AND-APPROVALS.md` §5.5).
+///
+/// TYPED, never markup: a proposer's catalog names the kind and labels its fields, and the
+/// proposal carries typed values, so everything a mail says is either this plane's own
+/// words or a value set apart as somebody else's. A `USER` value is already the account's
+/// address, resolved when the row was queued; a link is never stored — it is built at send
+/// time from `APPROVALS_URL` and the id, so no row can point anywhere else.
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+pub struct ApprovalMail {
+	pub approval_id: String,
+	pub kind: String,
+	pub kind_label: String,
+	/// The namespace that opened it: whose words the field values are.
+	pub proposer: String,
+	pub scope: String,
+	pub level: domain::scope_catalog::ApprovalLevel,
+	/// The address of `requested_by`; empty when the proposal names nobody.
+	pub requested_by: String,
+	pub reason: String,
+	pub fields: Vec<ApprovalMailField>,
+	pub threshold: u32,
+	pub roster_size: u32,
+	pub expires_at: i64,
+	/// Outcome mails only: the state being told, as `ApprovalState::as_str` spells it.
+	#[serde(default)]
+	pub outcome: Option<String>,
+	/// Outcome mails only: words this plane did not write, and whose they are.
+	#[serde(default)]
+	pub note: Option<ApprovalNote>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+pub struct ApprovalMailField {
+	pub label: String,
+	pub value: ApprovalMailValue,
+}
+
+/// `domain::approvals::FieldValue` with a `USER` resolved to an address: the mail never
+/// shows an `auth_subject`, which means nothing to a person.
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum ApprovalMailValue {
+	Text(String),
+	Amount { value: String, currency: String },
+	Bps(i64),
+	Flag(bool),
+	User(String),
+	Timestamp(i64),
+	Count(u64),
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+pub struct ApprovalNote {
+	pub by: NoteAuthor,
+	pub text: String,
+}
+
+/// Whose words a note is. Closed, so the label above a note is always this plane's.
+#[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteAuthor {
+	/// The roster member or owner who vetoed it.
+	Vetoer,
+	/// The proposing service, reporting how execution went.
+	Proposer,
+	/// This plane, saying why a decision no longer applies (a lapse, a change of owners).
+	Platform,
+}
+
+/// A canonical decimal grouped by thousands — `12500.5` → `12,500.5`. Grouping only: the
+/// digits are the ones the proposer stored, so nothing is rounded on the way to a person
+/// deciding about it.
+fn group_amount(value: &str) -> String {
+	let (sign, digits) = value.strip_prefix('-').map_or(("", value), |rest| ("-", rest));
+	let (whole, frac) = digits.split_once('.').map_or((digits, None), |(w, f)| (w, Some(f)));
+	if !whole.bytes().all(|b| b.is_ascii_digit()) {
+		return value.to_owned();
+	}
+	let mut grouped = String::with_capacity(whole.len() + whole.len() / 3);
+	for (i, c) in whole.chars().enumerate() {
+		if i > 0 && (whole.len() - i) % 3 == 0 {
+			grouped.push(',');
+		}
+		grouped.push(c);
+	}
+	match frac {
+		Some(frac) => format!("{sign}{grouped}.{frac}"),
+		None => format!("{sign}{grouped}"),
+	}
+}
+
+/// Signed basis points as a percentage; a deviation may be below the mark.
+fn signed_pct(bps: i64) -> String {
+	let sign = if bps < 0 { "-" } else { "" };
+	match u32::try_from(bps.unsigned_abs()) {
+		Ok(abs) => format!("{sign}{}", pct(abs)),
+		Err(_) => format!("{bps} bps"),
+	}
+}
+
+fn approval_value(value: &ApprovalMailValue) -> String {
+	match value {
+		ApprovalMailValue::Text(text) | ApprovalMailValue::User(text) => one_line(text),
+		ApprovalMailValue::Amount { value, currency } => format!("{} {}", group_amount(&one_line(value)), one_line(currency)),
+		ApprovalMailValue::Bps(bps) => signed_pct(*bps),
+		ApprovalMailValue::Flag(true) => "Yes".to_owned(),
+		ApprovalMailValue::Flag(false) => "No".to_owned(),
+		ApprovalMailValue::Timestamp(ts) => fmt_ts(*ts),
+		ApprovalMailValue::Count(n) => n.to_string(),
+	}
+}
+
+/// What a state is called in a sentence to the person who asked. `None` for `open`,
+/// which is no outcome — a row naming it reached the queue some other way.
+fn approval_outcome_words(state: domain::approvals::ApprovalState) -> Option<(&'static str, &'static str)> {
+	use domain::approvals::ApprovalState as S;
+	Some(match state {
+		S::Open => return None,
+		S::Passed => (
+			"approved",
+			"The deciders approved it. It can still be vetoed until its delay runs out; after that the service that proposed it carries it out.",
+		),
+		S::Executed => ("carried out", "It was approved and the service that proposed it has carried it out."),
+		S::ExecutionFailed => (
+			"not carried out",
+			"It was approved, but carrying it out failed. Nothing is retried under this decision: a new attempt is a new proposal.",
+		),
+		S::Rejected => ("rejected", "The deciders voted against it. Nothing will be done under it."),
+		S::Vetoed => ("vetoed", "It was vetoed inside its delay. Nothing will be done under it."),
+		S::Expired => ("expired", "Not enough deciders approved it before it expired. Nothing will be done under it."),
+		S::Cancelled => ("withdrawn", "It was withdrawn before it took effect. Nothing will be done under it."),
+		S::Void => ("void", "It no longer applies and nothing was done under it."),
+	})
+}
+
+const NOTE_BY_VETOER: &str = "Reason given for the veto (not written by EV Investment)";
+const NOTE_BY_PROPOSER: &str = "Report from the proposing service (not written by EV Investment)";
+const NOTE_BY_PLATFORM: &str = "Why it no longer applies";
+
+/// Words somebody else wrote, under a label of ours that says whose they are.
+fn attributed(label: &str, text: &str) -> String {
+	format!(
+		r#"<p style="margin:0 0 4px;font-family:{SANS};font-size:11px;line-height:15px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:{MUTED};">{}</p><p style="margin:0 0 14px;padding:12px 14px;background:{BLACK};border-left:3px solid {HAIR};border-radius:0 8px 8px 0;font-family:{SANS};font-size:14px;line-height:22px;color:{MIST};">{}</p>"#,
+		esc(label),
+		esc(text)
+	)
+}
+
+const FOOTER_APPROVAL_ROSTER: &str = "You are receiving this because you hold a seat that decides this proposal. Approval mail cannot be switched off — if it could, muting it would be the first thing an attacker did. Voting happens only over a signed-in session: this mail carries no code, and nobody from EV Investment will ask you for one.";
+
+const FOOTER_APPROVAL_REQUESTER: &str = "You are receiving this because the proposal names you as the person who asked for it. Approval mail cannot be switched off.";
+
+/// The rows both approval mails show: what is being decided, in the proposer's words.
+fn approval_rows(mail: &ApprovalMail) -> Vec<(String, String)> {
+	mail.fields.iter().map(|field| (one_line(&field.label), approval_value(&field.value))).collect()
+}
+
+fn level_words(level: domain::scope_catalog::ApprovalLevel) -> &'static str {
+	match level {
+		domain::scope_catalog::ApprovalLevel::Platform => "Platform owners",
+		domain::scope_catalog::ApprovalLevel::Scope => "Scope admins",
+	}
+}
+
+/// The common head of both approval mails: the kind's own label as the heading's object,
+/// the values in a box captioned as the proposer's, then the frame this plane vouches for.
+fn approval_body(mail: &ApprovalMail, lead: &str, show_expiry: bool) -> (String, String) {
+	let kind_label = one_line(&mail.kind_label);
+	let proposer = one_line(&mail.proposer);
+	let rows = approval_rows(mail);
+	let mut frame = vec![
+		("Kind".to_owned(), format!("{kind_label} ({})", one_line(&mail.kind))),
+		("Scope".to_owned(), one_line(&mail.scope)),
+		("Decided by".to_owned(), level_words(mail.level).to_owned()),
+		(
+			"Requested by".to_owned(),
+			if mail.requested_by.is_empty() { "—".to_owned() } else { one_line(&mail.requested_by) },
+		),
+		("Approvals needed".to_owned(), format!("{} of {}", mail.threshold, mail.roster_size)),
+	];
+	// A proposal that has passed can no longer lapse, so its voting deadline would mislead.
+	if show_expiry {
+		frame.push(("Expires".to_owned(), fmt_ts(mail.expires_at)));
+	}
+	frame.push(("Proposal".to_owned(), one_line(&mail.approval_id)));
+
+	let mut html = String::new();
+	html.push_str(&paragraph(lead));
+	if !rows.is_empty() {
+		let caption = format!("Submitted by {proposer} (not written by EV Investment)");
+		html.push_str(&format!(
+			r#"<p style="margin:0 0 4px;font-family:{SANS};font-size:11px;line-height:15px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:{MUTED};">{}</p>"#,
+			esc(&caption)
+		));
+		let borrowed: Vec<(&str, String)> = rows.iter().map(|(l, v)| (l.as_str(), v.clone())).collect();
+		html.push_str(&detail_box(&borrowed));
+	}
+	let borrowed: Vec<(&str, String)> = frame.iter().map(|(l, v)| (l.as_str(), v.clone())).collect();
+	html.push_str(&detail_box(&borrowed));
+	let reason = one_line(&mail.reason);
+	if !reason.is_empty() {
+		html.push_str(&initiator_note(&reason));
+	}
+
+	let mut text = format!("{lead}\n\n");
+	if !rows.is_empty() {
+		text.push_str(&format!("Submitted by {proposer} (not written by EV Investment):\n"));
+		for (label, value) in &rows {
+			text.push_str(&format!("  {label}: {value}\n"));
+		}
+		text.push('\n');
+	}
+	for (label, value) in &frame {
+		text.push_str(&format!("{label}: {value}\n"));
+	}
+	if !reason.is_empty() {
+		text.push_str(&format!("\n{INITIATOR_NOTE_LABEL}\n  {reason}\n"));
+	}
+	(html, text)
+}
+
+fn approval_link(approvals_url: &str, id: &str) -> String {
+	format!("{}/{}", approvals_url.trim_end_matches('/'), one_line(id))
+}
+
+/// The mail to each roster member when a proposal opens. No code and no vote by link:
+/// the button opens the approvals page, where the vote is cast over a session.
+pub fn approval_request(mail: &ApprovalMail, approvals_url: &str) -> RenderedEmail {
+	let kind_label = one_line(&mail.kind_label);
+	let link = approval_link(approvals_url, &mail.approval_id);
+	let title = "A proposal needs your decision";
+	let lead = format!(
+		"A proposal of the kind \u{201c}{kind_label}\u{201d} is waiting for your vote. It passes once {} of {} deciders approve it.",
+		mail.threshold, mail.roster_size
+	);
+	let (body, text_body) = approval_body(mail, &lead, true);
+
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Approvals"));
+	inner.push_str(&heading(title));
+	inner.push_str(&body);
+	inner.push_str(&button("Review and decide", &link));
+	inner.push_str(&paragraph("Opening the link decides nothing. Check every value above against what you expect before you vote."));
+
+	RenderedEmail {
+		// The requester's reason never reaches the subject line: it is their words.
+		subject: format!("Decision needed: {kind_label} in {}", one_line(&mail.scope)),
+		html: shell(title, &card(&inner), FOOTER_APPROVAL_ROSTER, "", "Approvals"),
+		text: format!(
+			"{title}\n\n{text_body}\nReview and decide: {link}\n\nOpening the link decides nothing. Check every value above against what you expect before you vote.\n\n—\n{FOOTER_APPROVAL_ROSTER}\n"
+		),
+	}
+}
+
+/// The mail to `requested_by` when the proposal is approved or ends. `None` when the row
+/// names no outcome this plane can phrase — the caller parks it rather than guess.
+pub fn approval_outcome(mail: &ApprovalMail, approvals_url: &str) -> Option<RenderedEmail> {
+	let state = domain::approvals::ApprovalState::parse(mail.outcome.as_deref()?).ok()?;
+	let (word, sentence) = approval_outcome_words(state)?;
+	let kind_label = one_line(&mail.kind_label);
+	let link = approval_link(approvals_url, &mail.approval_id);
+	// "was expired" reads as if somebody expired it; a lapse just happens.
+	let verb = if state == domain::approvals::ApprovalState::Expired { "has" } else { "was" };
+	let title = format!("Your proposal {verb} {word}");
+	let lead = format!("The proposal of the kind \u{201c}{kind_label}\u{201d} you asked for {verb} {word}. {sentence}");
+	// A veto only lands on a proposal that already passed, so it too is past its deadline.
+	let show_expiry = !matches!(
+		state,
+		domain::approvals::ApprovalState::Passed | domain::approvals::ApprovalState::Executed | domain::approvals::ApprovalState::ExecutionFailed | domain::approvals::ApprovalState::Vetoed
+	);
+	let (body, text_body) = approval_body(mail, &lead, show_expiry);
+	let note = mail.note.as_ref().map(|note| {
+		let label = match note.by {
+			NoteAuthor::Vetoer => NOTE_BY_VETOER,
+			NoteAuthor::Proposer => NOTE_BY_PROPOSER,
+			NoteAuthor::Platform => NOTE_BY_PLATFORM,
+		};
+		(note.by, label, one_line(&note.text))
+	});
+
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Approvals"));
+	inner.push_str(&heading(&title));
+	inner.push_str(&body);
+	match note.as_ref().filter(|(_, _, text)| !text.is_empty()) {
+		// Our own words go in our own voice; only somebody else's are set apart as theirs.
+		Some((NoteAuthor::Platform, label, text)) => inner.push_str(&detail_box(&[(label, text.clone())])),
+		Some((NoteAuthor::Vetoer | NoteAuthor::Proposer, label, text)) => inner.push_str(&attributed(label, text)),
+		None => {}
+	}
+	inner.push_str(&button("Open the proposal", &link));
+	let note_text = match note.as_ref().filter(|(_, _, text)| !text.is_empty()) {
+		Some((_, label, text)) => format!("\n{label}\n  {text}\n"),
+		None => String::new(),
+	};
+
+	Some(RenderedEmail {
+		subject: format!("{kind_label} in {}: {word}", one_line(&mail.scope)),
+		html: shell(&title, &card(&inner), FOOTER_APPROVAL_REQUESTER, "", "Approvals"),
+		text: format!("{title}\n\n{text_body}{note_text}\nOpen the proposal: {link}\n\n—\n{FOOTER_APPROVAL_REQUESTER}\n"),
+	})
 }
 
 /// Unix seconds → "27 July 2026". Hand-rolled rather than pulling in `time`'s
@@ -1841,5 +2183,160 @@ mod tests {
 	fn timestamp_formats_and_survives_garbage() {
 		assert_eq!(fmt_ts(1_785_143_640), "27 July 2026");
 		assert_eq!(fmt_ts(i64::MAX), "—", "an out-of-range timestamp degrades instead of panicking the dispatcher");
+	}
+
+	fn approval_mail() -> ApprovalMail {
+		ApprovalMail {
+			approval_id: "0b6f3c2e-1111-4222-8333-444455556666".into(),
+			kind: "bank:scope_payout".into(),
+			kind_label: "Payout <script>".into(),
+			proposer: "bank".into(),
+			scope: "invest".into(),
+			level: domain::scope_catalog::ApprovalLevel::Platform,
+			requested_by: "ada@example.com".into(),
+			reason: "Q3 <b>dividend</b>".into(),
+			fields: vec![
+				ApprovalMailField {
+					label: "Total".into(),
+					value: ApprovalMailValue::Amount {
+						value: "1234567.5".into(),
+						currency: "USDT".into(),
+					},
+				},
+				ApprovalMailField {
+					label: "Deviation".into(),
+					value: ApprovalMailValue::Bps(-250),
+				},
+				ApprovalMailField {
+					label: "Recipient".into(),
+					value: ApprovalMailValue::User("bob@example.com".into()),
+				},
+				ApprovalMailField {
+					label: "Distribution".into(),
+					value: ApprovalMailValue::Flag(true),
+				},
+				ApprovalMailField {
+					label: "From \"account\"".into(),
+					value: ApprovalMailValue::Text("ops & <treasury>".into()),
+				},
+			],
+			threshold: 2,
+			roster_size: 3,
+			expires_at: 1_785_143_640,
+			outcome: None,
+			note: None,
+		}
+	}
+
+	#[test]
+	fn an_approval_request_renders_money_and_escapes_every_field() {
+		let mail = approval_request(&approval_mail(), "https://evinvest.ltd/admin/approvals/");
+		for expected in [
+			"1,234,567.5 USDT", "-2.5%", "bob@example.com", "ada@example.com", "2 of 3", "27 July 2026", "Platform owners", "invest",
+		] {
+			assert!(mail.html.contains(expected) && mail.text.contains(expected), "both parts must show {expected}");
+		}
+		assert!(
+			mail.html.contains("https://evinvest.ltd/admin/approvals/0b6f3c2e-1111-4222-8333-444455556666"),
+			"one slash, the id appended"
+		);
+		for raw in ["<script>", "<b>", "<treasury>", "\"account\""] {
+			assert!(!mail.html.contains(raw), "{raw} reached the HTML unescaped");
+		}
+		for escaped in [
+			"Payout &lt;script&gt;",
+			"Q3 &lt;b&gt;dividend&lt;/b&gt;",
+			"ops &amp; &lt;treasury&gt;",
+			"From &quot;account&quot;",
+		] {
+			assert!(mail.html.contains(escaped), "expected {escaped}");
+		}
+		assert!(mail.html.contains("Submitted by bank (not written by EV Investment)"), "the values are the proposer's");
+		assert!(mail.html.contains(INITIATOR_NOTE_LABEL), "the reason is set apart as the requester's");
+		assert!(!mail.subject.contains("dividend"), "the requester's words never reach the subject");
+		assert!(!mail.html.contains("Unsubscribe"), "there is no opting out of being asked to decide");
+	}
+
+	#[test]
+	fn a_field_cannot_break_out_of_its_line() {
+		let mut mail = approval_mail();
+		mail.kind_label = "Payout\nApproved by EV".into();
+		mail.fields[4].value = ApprovalMailValue::Text("ops\u{202E}lanigiro".into());
+		let rendered = approval_request(&mail, "https://evinvest.ltd/admin/approvals");
+		assert!(!rendered.subject.contains('\n') && rendered.subject.contains("Payout Approved by EV"));
+		assert!(!rendered.text.contains('\u{202E}'), "a bidi override is folded");
+	}
+
+	#[test]
+	fn amounts_are_grouped_and_never_rounded() {
+		assert_eq!(group_amount("0.000001"), "0.000001");
+		assert_eq!(group_amount("999"), "999");
+		assert_eq!(group_amount("1000"), "1,000");
+		assert_eq!(group_amount("12500.50"), "12,500.50");
+		assert_eq!(group_amount("-1000000"), "-1,000,000");
+		assert_eq!(group_amount("1e9"), "1e9", "not a canonical decimal: shown as stored");
+	}
+
+	#[test]
+	fn outcome_mails_word_the_lapse_and_drop_the_deadline_once_passed() {
+		let mut mail = approval_mail();
+		let url = "https://evinvest.ltd/admin/approvals";
+
+		mail.outcome = Some("expired".into());
+		let expired = approval_outcome(&mail, url).expect("renderable");
+		assert!(expired.text.contains("Your proposal has expired") && !expired.text.contains("was expired"));
+		assert!(expired.html.contains("Your proposal has expired"));
+		assert!(expired.text.contains("Expires: 27 July 2026"), "the lapsed deadline is still meaningful");
+
+		for state in ["passed", "executed", "execution_failed", "vetoed"] {
+			mail.outcome = Some(state.into());
+			let rendered = approval_outcome(&mail, url).expect("renderable");
+			assert!(!rendered.text.contains("Expires"), "{state}: text still shows a deadline");
+			assert!(!rendered.html.contains("Expires"), "{state}: html still shows a deadline");
+		}
+
+		mail.outcome = Some("executed".into());
+		let executed = approval_outcome(&mail, url).expect("renderable");
+		assert!(executed.text.contains("Your proposal was carried out"));
+
+		assert!(
+			approval_request(&approval_mail(), url).text.contains("Expires: 27 July 2026"),
+			"a request still shows its deadline"
+		);
+	}
+
+	#[test]
+	fn an_outcome_names_whose_words_close_it() {
+		let mut mail = approval_mail();
+		mail.outcome = Some("vetoed".into());
+		mail.note = Some(ApprovalNote {
+			by: NoteAuthor::Vetoer,
+			text: "wrong <address>".into(),
+		});
+		let vetoed = approval_outcome(&mail, "https://evinvest.ltd/admin/approvals").expect("renderable");
+		assert!(vetoed.subject.ends_with("vetoed"));
+		assert!(vetoed.html.contains(NOTE_BY_VETOER) && vetoed.html.contains("wrong &lt;address&gt;"));
+
+		mail.outcome = Some("void".into());
+		mail.note = Some(ApprovalNote {
+			by: NoteAuthor::Platform,
+			text: "the platform owners changed while it was live".into(),
+		});
+		let void = approval_outcome(&mail, "https://evinvest.ltd/admin/approvals").expect("renderable");
+		assert!(void.html.contains(NOTE_BY_PLATFORM) && void.html.contains("the platform owners changed while it was live"));
+		assert_eq!(
+			void.html.matches("not written by EV Investment").count(),
+			vetoed.html.matches("not written by EV Investment").count() - 1,
+			"our own reason is not set apart as somebody else's"
+		);
+
+		for state in ["passed", "executed", "execution_failed", "rejected", "expired", "cancelled"] {
+			mail.outcome = Some(state.into());
+			assert!(approval_outcome(&mail, "https://x.test").is_some(), "{state} is an outcome");
+		}
+		for unknown in [None, Some("open"), Some("approved")] {
+			mail.outcome = unknown.map(str::to_owned);
+			assert!(approval_outcome(&mail, "https://x.test").is_none(), "{unknown:?} is parked, not guessed at");
+		}
 	}
 }

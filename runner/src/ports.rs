@@ -25,12 +25,15 @@
 
 use async_trait::async_trait;
 use domain::{
+	approvals::{Action, ApprovalState, Decision, Field, Outcome, PlatformPolicy, ScopePolicy, Vote as ApprovalVote},
 	architecture::{Reader, Repository},
+	auth::ProvenIdentity,
 	authz::Role,
 	error::DomainError,
 	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
 	iam::{Catalog, Target},
-	users::{AuthSubject, Email, ProfileFields, User, UserId},
+	scope_catalog::{ApprovalKind, ApprovalLevel, NotificationTopic, ScopeCatalog},
+	users::{Email, ProfileFields, User, UserId, Username},
 };
 use uuid::Uuid;
 
@@ -73,11 +76,11 @@ pub struct GrantActor {
 	pub elevated: bool,
 }
 
-/// Whose grant: by id, or by the address a delegate already knows. A delegate may not
-/// grant by id.
+/// Whose grant: by id, or by a handle a delegate already knows — an email or a username,
+/// resolved by `infrastructure::users::account_named`. A delegate may not grant by id.
 pub enum GrantSubject {
 	Id(UserId),
-	Email(Email),
+	Account(String),
 }
 
 impl GrantSubject {
@@ -85,7 +88,7 @@ impl GrantSubject {
 	pub fn describe(&self) -> String {
 		match self {
 			Self::Id(id) => id.to_string(),
-			Self::Email(email) => email.as_str().to_owned(),
+			Self::Account(handle) => handle.clone(),
 		}
 	}
 }
@@ -107,6 +110,10 @@ pub enum GrantOutcome {
 	Granted(GrantRecord),
 	/// The actor may not grant this target, or addressed the subject by id as a delegate.
 	Denied,
+	/// `<namespace>:admin` seats its holder on the scope's approval roster
+	/// (`docs/SCOPES-AND-APPROVALS.md` §5.6), so it is granted only by an executed
+	/// `concierge:scope_admin_grant` — never by a seat, whatever it holds.
+	ByApprovalOnly,
 	/// The subject is the actor.
 	ToSelf,
 	/// No tenant owns the target's namespace. Said only to a seat.
@@ -116,8 +123,8 @@ pub enum GrantOutcome {
 	/// The account is disabled; a grant to it would wake up on reinstatement without
 	/// anyone having decided that. Said only to a seat.
 	TargetDisabled,
-	/// Said only to a seat.
-	AmbiguousEmail,
+	/// The handle names several accounts. Said only to a seat.
+	AmbiguousAccount,
 	/// A delegate's address cannot be granted, for a reason they are not told: telling
 	/// "nobody holds it" from "several accounts do" from "that account is disabled" would
 	/// let anyone with a delegating alias ask the plane about any address (banking#447).
@@ -185,6 +192,7 @@ pub struct GrantRecord {
 pub struct GrantHolderRecord {
 	pub grant: GrantRecord,
 	pub email: Option<String>,
+	pub username: Option<String>,
 	pub legal_name: Option<String>,
 	pub preferred_name: Option<String>,
 }
@@ -256,6 +264,12 @@ pub struct ClientRecord {
 	pub disabled: bool,
 	/// The tenant namespace whose catalog it publishes and whose permissions its tokens read.
 	pub namespace: String,
+	/// The scope (tenant id) the client signs people in for.
+	pub scope: String,
+	/// Its scope is CLOSED: the client signs nobody in and its sessions end at their next
+	/// refresh, as if disabled. A FROZEN scope's client keeps working — a direction has to
+	/// learn it was frozen.
+	pub scope_closed: bool,
 }
 
 /// A one-time authorization code to store (`rp_codes`). Only its digest is persisted.
@@ -340,6 +354,8 @@ pub enum SessionRevocation {
 	TokensRevoked,
 	/// The `evinvest.ltd` session it was authorized by ended — single logout.
 	UpstreamRevoked,
+	/// The client's scope was closed.
+	ScopeClosed,
 }
 
 impl SessionRevocation {
@@ -349,6 +365,7 @@ impl SessionRevocation {
 			Self::AccessDenied => "access_denied",
 			Self::TokensRevoked => "tokens_revoked",
 			Self::UpstreamRevoked => "upstream_revoked",
+			Self::ScopeClosed => "scope_closed",
 		}
 	}
 }
@@ -394,15 +411,327 @@ pub trait RelyingPartyRepository: Send + Sync {
 	async fn session_live(&self, id: Uuid, audience: &str, now: i64) -> Result<bool, DomainError>;
 }
 
+/// A registered scope (`tenants`, migration 0031). `main` is implicit and never one.
+#[derive(Clone, Debug)]
+pub struct ScopeRecord {
+	pub id: String,
+	pub namespace: String,
+	pub parent: String,
+	pub display_name: String,
+	pub origins: Vec<String>,
+	pub return_paths: Vec<String>,
+	pub observers: Vec<String>,
+	pub clients: Vec<ScopeClientRecord>,
+	pub created_at: i64,
+	pub version: u64,
+	pub state: domain::scopes::ScopeState,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScopeClientRecord {
+	pub client_id: String,
+	pub audience: String,
+	pub disabled: bool,
+}
+
+/// The scope registry. Read-only: scopes are written by migration and configuration.
+#[async_trait]
+pub trait ScopeRepository: Send + Sync {
+	/// Every registered scope with its clients, by id. A row that does not decode is
+	/// left out (and reported), not an error.
+	async fn scopes(&self) -> Result<Vec<ScopeRecord>, DomainError>;
+
+	/// One scope by id; `None` when there is none or its row does not decode.
+	async fn scope(&self, id: &str) -> Result<Option<ScopeRecord>, DomainError>;
+}
+
+/// What a direction may hold about a person it can see (`ScopeMember`): never the
+/// identity document fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberSnapshot {
+	pub email: String,
+	pub email_verified: bool,
+	pub username: String,
+	pub preferred_name: String,
+	pub status: String,
+	pub kyc_level: u32,
+	pub token_version: u64,
+	/// The `user_outbox.sequence` (the user's `row_version`) this snapshot is as of.
+	pub lifecycle_sequence: u64,
+}
+
+/// The body of one `scope_outbox` row, decoded.
+#[derive(Clone, Debug)]
+pub enum ScopeEventBody {
+	ScopeChanged(ScopeRecord),
+	GrantsChanged(Vec<String>),
+	MemberJoined(MemberSnapshot),
+	/// A kind a newer binary wrote.
+	Unknown(String),
+}
+
+/// One scanned row of the scope stream. `visible` says whether the caller may see it; the
+/// position still moves the cursor when it may not.
+#[derive(Clone, Debug)]
+pub struct ScopeEventRecord {
+	pub position: i64,
+	pub visible: bool,
+	pub event_id: Uuid,
+	pub scope: String,
+	pub occurred_at: i64,
+	pub sequence: u64,
+	/// The user and their `auth_subject`, under every kind but SCOPE_CHANGED.
+	pub user: Option<(Uuid, String)>,
+	pub body: ScopeEventBody,
+}
+
+/// The read side of the relying-party streams (`scope_outbox`, `scope_members`). The
+/// writes happen inside the transactions that change what they describe, in the adapters
+/// that own those transactions.
+#[async_trait]
+pub trait ScopeEventRepository: Send + Sync {
+	/// The scopes `client_id` of scope `own` reads: its own, and every scope naming it an
+	/// observer.
+	async fn observed_by(&self, client_id: &str, own: &str) -> Result<Vec<String>, DomainError>;
+
+	/// Up to `scan` rows past `after`, oldest first; `visible = None` sees every row.
+	async fn scan(&self, after: i64, scan: i64, visible: Option<&[String]>) -> Result<Vec<ScopeEventRecord>, DomainError>;
+}
+
+/// Every scope catalog ever published (`scope_catalogs`), one row per version.
+#[async_trait]
+pub trait ScopeCatalogRepository: Send + Sync {
+	/// Store `catalog` as `namespace`'s newest, unless it is what is stored already
+	/// (`Unchanged`) or does not supersede it (`Stale`). Serialised per namespace.
+	async fn publish(&self, namespace: &str, published_by: &str, catalog: &ScopeCatalog, now: i64) -> Result<PublishOutcome, DomainError>;
+
+	/// The catalog in force for `namespace`; `None` before its first publication.
+	async fn current(&self, namespace: &str) -> Result<Option<ScopeCatalog>, DomainError>;
+
+	/// The catalog in force for every namespace that has published one, by namespace.
+	async fn all_current(&self) -> Result<Vec<(String, ScopeCatalog)>, DomainError>;
+}
+
+/// A proposal as `ApprovalExecutionService.Propose` opens it. The kind is the spec in
+/// force when the proposer asked; level, roster and threshold are resolved by the adapter
+/// inside the opening transaction, from that spec and the registry as it stands there.
+#[derive(Clone, Debug)]
+pub struct NewApproval {
+	pub id: Uuid,
+	pub kind: ApprovalKind,
+	pub proposer: String,
+	pub scope: String,
+	pub subject_ref: String,
+	/// Checked against `kind` and in its display order.
+	pub fields: Vec<Field>,
+	pub payload_hash: String,
+	/// An `auth_subject`, resolved to an account by the adapter.
+	pub requested_by: Option<String>,
+	pub reason: String,
+	pub dedupe_key: String,
+	/// The opening client; empty for the bridge token and for this plane's own kinds.
+	pub client: String,
+	/// Kept off the roster: the person who opened a `concierge:*` proposal over a session,
+	/// proven by it, so they do not vote on what they asked for (D23) — first, as the one
+	/// its history names — and anyone it would seat, who does not vote on their own seat.
+	pub exclude: Vec<UserId>,
+	/// What this plane's executor does once it passes; `concierge:*` kinds only.
+	pub action: Option<Action>,
+	/// The account a service proved asked for it, when it presented that account's fresh
+	/// token. The adapter holds it against `requested_by`, spends the token, and for a
+	/// platform decision keeps them off the roster and tells them (D24(1)).
+	pub proven: Option<ProvenInitiator>,
+}
+
+/// What a user token presented with a proposal proves: whose it is, the `token_version` it
+/// was minted under, and its digest — one token proves one request.
+#[derive(Clone, Debug)]
+pub struct ProvenInitiator {
+	pub user: UserId,
+	pub token_version: u64,
+	/// SHA-256 of the token, lowercase hex: the token itself is never stored.
+	pub token_digest: String,
+}
+
+/// This plane's own token verifier as an approval sees it: whose access token a proposer
+/// presented beside `requested_by` (D24(1)). A port, so the rule can be exercised without a
+/// signing key; production mounts `evconcierge_auth::Verifier`.
+#[async_trait]
+pub trait UserTokenVerifier: Send + Sync {
+	async fn verify(&self, token: &str) -> Result<evconcierge_auth::Claims, evconcierge_auth::AuthError>;
+}
+
+#[async_trait]
+impl UserTokenVerifier for evconcierge_auth::Verifier {
+	async fn verify(&self, token: &str) -> Result<evconcierge_auth::Claims, evconcierge_auth::AuthError> {
+		evconcierge_auth::Verifier::verify(self, token).await
+	}
+}
+
+/// Whom a person-facing RPC names: by id, or by a handle resolved as
+/// `GrantPermissionRequest.account` is.
+#[derive(Clone, Copy, Debug)]
+pub enum PersonRef<'a> {
+	Id(UserId),
+	Handle(&'a str),
+}
+
+#[derive(Clone, Debug)]
+pub enum Proposed {
+	Opened(ApprovalRecord),
+	/// The same `dedupe_key` with the same content: the proposal already open under it.
+	Existing(ApprovalRecord),
+	/// The proposer already holds `MAX_LIVE_PER_PROPOSER` live proposals.
+	Saturated,
+}
+
+/// An account as a reader of a proposal sees it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalPerson {
+	pub auth_subject: String,
+	pub email: String,
+}
+
+/// One proposal. `decision` holds the STORED state: a reader projects it through
+/// `Decision::effective_state`, so an overdue open proposal reads as expired.
+#[derive(Clone, Debug)]
+pub struct ApprovalRecord {
+	pub id: Uuid,
+	pub kind: String,
+	pub proposer: String,
+	pub scope: String,
+	pub level: ApprovalLevel,
+	pub escalated_by: Vec<String>,
+	pub subject_ref: String,
+	pub fields: Vec<Field>,
+	pub payload_hash: String,
+	pub requested_by: Option<(UserId, ApprovalPerson)>,
+	pub reason: String,
+	/// Aligned with `decision.voters`.
+	pub voters: Vec<ApprovalPerson>,
+	pub vetoed_by: Option<ApprovalPerson>,
+	pub policy_version: u64,
+	pub created_at: i64,
+	pub requested_by_client: String,
+	pub decision: Decision,
+	/// What this plane's executor does with it; `concierge:*` kinds only.
+	pub action: Option<Action>,
+	/// The proposer presented `requested_by`'s own fresh token with it.
+	pub requested_by_proven: bool,
+	/// The instant this record was read at, on the store's clock: what a reader projects
+	/// `decision` through.
+	pub as_of: i64,
+}
+
+/// What a signed-in person may see (§5, `ListApprovals`): everything as a persisted
+/// owner, their scopes' proposals as a scope admin, and anything that names them.
+#[derive(Clone, Debug)]
+pub struct ApprovalViewer {
+	pub user: UserId,
+	pub owner: bool,
+	/// Scope ids whose `<namespace>:admin` they actively hold.
+	pub admin_of: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ApprovalFilter {
+	pub scope: Option<String>,
+	pub state: Option<ApprovalState>,
+	pub awaiting_my_vote: bool,
+	pub limit: i64,
+	/// `(created_at, id)` of the last row of the previous page.
+	pub before: Option<(i64, Uuid)>,
+}
+
+/// Who moved a proposal, for its history.
+#[derive(Clone, Copy, Debug)]
+pub enum ApprovalActor<'a> {
+	Person(UserId),
+	/// A client id, or `bridge`.
+	Service(&'a str),
+}
+
+/// Approvals (`approvals`, migration 0036). Every write is one transaction holding the
+/// proposal row `FOR UPDATE`, and writes the lazy expiry or lapse it finds due even when
+/// the act it was asked for is then refused. Time is the STORE's, not a replica's: every
+/// deadline is compared on one clock however many replicas write.
+#[async_trait]
+pub trait ApprovalRepository: Send + Sync {
+	/// The store's clock now.
+	async fn now(&self) -> Result<i64, DomainError>;
+
+	/// Open a proposal: resolve its level, freeze the roster, refuse a second live one
+	/// about the same subject, answer an idempotent repeat with the stored proposal.
+	async fn propose(&self, new: NewApproval) -> Result<Proposed, DomainError>;
+
+	async fn viewer(&self, user: UserId) -> Result<ApprovalViewer, DomainError>;
+
+	async fn find(&self, id: Uuid) -> Result<Option<ApprovalRecord>, DomainError>;
+
+	/// Newest first, under `viewer`'s visibility.
+	async fn list(&self, viewer: &ApprovalViewer, filter: &ApprovalFilter) -> Result<Vec<ApprovalRecord>, DomainError>;
+
+	/// A roster member's vote; refused when they no longer hold the seat the roster was
+	/// drawn from.
+	async fn vote(&self, id: Uuid, voter: UserId, vote: ApprovalVote) -> Result<ApprovalRecord, DomainError>;
+
+	/// A roster member who still holds the seat, or any persisted owner.
+	async fn veto(&self, id: Uuid, by: UserId, reason: &str) -> Result<ApprovalRecord, DomainError>;
+
+	/// `proposer`'s own proposal only; any other is `NotFound`.
+	async fn withdraw(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, reason: &str) -> Result<ApprovalRecord, DomainError>;
+
+	/// `proposer`'s passed proposals inside their execution window, oldest
+	/// `executable_at` first.
+	async fn pull(&self, proposer: &str, limit: i64) -> Result<Vec<ApprovalRecord>, DomainError>;
+
+	/// `proposer`'s own proposal only; any other is `NotFound`. A repeated outcome
+	/// writes nothing.
+	async fn report(&self, id: Uuid, proposer: &str, actor: ApprovalActor<'_>, outcome: Outcome, detail: &str) -> Result<ApprovalRecord, DomainError>;
+
+	/// The policy scope `scope` is measured against; `None` for an unknown scope.
+	async fn policy(&self, scope: &str) -> Result<Option<ScopePolicy>, DomainError>;
+
+	/// An ACTIVE account, its `auth_subject` and whether its address is verified. A handle
+	/// naming several accounts names nobody (`Validation`).
+	async fn person(&self, who: PersonRef<'_>) -> Result<Option<(UserId, String, bool)>, DomainError>;
+
+	/// The platform's policy in force and when the owner roster last changed.
+	async fn platform_policy(&self) -> Result<(PlatformPolicy, i64), DomainError>;
+
+	/// Carry out one passed `concierge:*` proposal and record its outcome, in one
+	/// transaction. `None` when it is not (or no longer) this plane's to execute now.
+	async fn execute(&self, id: Uuid) -> Result<Option<Outcome>, DomainError>;
+
+	/// Queue the outcome mail of up to `limit` proposals whose effective state has moved
+	/// past what `requested_by` was last told (`approvals.mailed_state`), and record that
+	/// it was told; how many were settled. A sweep rather than the closing act, because an
+	/// expiry and a lapse are lazy and a void on a change of the owners is a trigger's:
+	/// no one code path sees every ending.
+	async fn mail_outcomes(&self, limit: i64) -> Result<usize, DomainError>;
+}
+
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
 #[async_trait]
 pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggregate = User> {
 	/// Find a user by canonical id.
 	async fn find_by_id(&self, id: UserId) -> Result<Option<User>, DomainError>;
 
-	/// Upsert by the immutable [`AuthSubject`] at sign-in: create (emitting `CREATED`)
-	/// or refresh the email. Idempotent for concurrent first-logins.
-	async fn provision(&self, subject: AuthSubject, email: Email, email_verified: bool) -> Result<User, DomainError>;
+	/// The account a sign-in opens — the ONE linking rule every non-password method lands
+	/// in, decided under advisory locks on the subject and the mailbox:
+	///
+	/// 1. a linked provider subject opens its account (the email follows the provider's,
+	///    never downgrading a verified one, never onto an address another account proved);
+	/// 2. a proven mailbox opens the account it is verified on;
+	/// 3. a proven mailbox takes over the account that registered it UNVERIFIED with a
+	///    password: sessions revoked, password dropped, address verified;
+	/// 4. otherwise a new account (`CREATED`), verified iff the mailbox was proven.
+	///
+	/// A provider subject is linked to whichever account 2-4 picked.
+	async fn resolve(&self, identity: ProvenIdentity, now: i64) -> Result<User, DomainError>;
+
+	/// The caller's chosen handle. [`DomainError::Conflict`] when somebody holds it.
+	async fn set_username(&self, id: UserId, username: Username) -> Result<User, DomainError>;
 
 	/// Full-replace the caller's editable profile fields.
 	async fn update_profile(&self, id: UserId, fields: ProfileFields) -> Result<User, DomainError>;
@@ -1051,6 +1380,15 @@ pub trait PlatformConfigRepository: Send + Sync {
 	async fn upsert_flag(&self, key: &str, description: &str, enabled: bool, rollout: i32) -> Result<(), DomainError>;
 }
 
+/// The topics one inbox read covers, as `notification::InboxView` resolves them. A topic
+/// counts when it is one of `keys` or its namespace — the part before the first `:` — is
+/// one of `namespaces`, and it is none of `except`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InboxTopics {
+	Every,
+	Within { keys: Vec<String>, namespaces: Vec<String>, except: Vec<String> },
+}
+
 /// Port for the notification plane's read/write surface: subscribers, their
 /// per-topic subscriptions, and the in-app inbox. Plain control-plane state rather
 /// than a domain aggregate, so — like [`PlatformConfigRepository`] — no kernel markers.
@@ -1064,6 +1402,11 @@ pub trait NotificationRepository: Send + Sync {
 	/// with the directory's copy of the address.
 	async fn subscriber_for_user(&self, user_id: Uuid, email: &str, email_verified: bool) -> Result<SubscriberRow, DomainError>;
 
+	/// The user's subscriber row if one exists, written nowhere: a read that must not
+	/// create state.
+	async fn subscriber_of_user(&self, user_id: Uuid) -> Result<Option<SubscriberRow>, DomainError>;
+
+	/// Every topic the subscriber touched: the ones it follows and the ones it switched off.
 	async fn subscriptions(&self, subscriber_id: Uuid) -> Result<Vec<SubscriptionRow>, DomainError>;
 
 	/// Flip one or both master channel switches. `None` leaves a channel untouched.
@@ -1073,15 +1416,28 @@ pub trait NotificationRepository: Send + Sync {
 	async fn set_topic_subscription(&self, subscriber_id: Uuid, topic: &str, subscribed: bool, email_enabled: bool) -> Result<(), DomainError>;
 
 	/// Record a notification and queue its email copy if every gate allows it.
-	/// Idempotent on `(subscriber, dedupe_key)`.
+	/// Idempotent on `(subscriber, dedupe_key)`. `default_subscribed` follows the topic for
+	/// an account that never touched it (no subscription, no opt-out), creating its
+	/// subscriber row if need be.
 	#[allow(clippy::too_many_arguments)]
-	async fn emit(&self, user_id: Uuid, topic: &str, kind: &str, title: &str, body: &str, link: &str, dedupe_key: &str, occurred_at: i64) -> Result<EmitOutcome, DomainError>;
+	async fn emit(
+		&self,
+		user_id: Uuid,
+		topic: &str,
+		kind: &str,
+		title: &str,
+		body: &str,
+		link: &str,
+		dedupe_key: &str,
+		occurred_at: i64,
+		default_subscribed: bool,
+	) -> Result<EmitOutcome, DomainError>;
 
 	/// Write an inbox entry REGARDLESS of what the user follows, and queue no email copy.
 	///
 	/// [`Self::emit`] is opt-in per topic, which is right for fund news and wrong for a
 	/// notice that somebody is asking to move this person's own money: nobody subscribes
-	/// to that, and there is no topic every user follows by default. The mail itself has
+	/// to that, and no topic of this plane's is followed by default. The mail itself has
 	/// already gone down the governance queue, which bypasses preferences for the same
 	/// reason — this is its in-app trace. The subscriber row is created on first touch, as
 	/// [`Self::subscriber_for_user`] does. False when `dedupe_key` had already been used
@@ -1104,12 +1460,21 @@ pub trait NotificationRepository: Send + Sync {
 	) -> Result<bool, DomainError>;
 
 	/// One page of the inbox, newest first. `cursor` is the last id of the previous page.
-	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>) -> Result<Vec<NotificationRow>, DomainError>;
+	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>, within: &InboxTopics) -> Result<Vec<NotificationRow>, DomainError>;
 
-	async fn unread_count(&self, subscriber_id: Uuid) -> Result<i64, DomainError>;
+	async fn unread_count(&self, subscriber_id: Uuid, within: &InboxTopics) -> Result<i64, DomainError>;
 
-	/// Mark specific ids, or every unread one. Returns the number actually flipped.
-	async fn mark_read(&self, subscriber_id: Uuid, ids: &[Uuid], all: bool) -> Result<u64, DomainError>;
+	/// Mark specific ids, or every unread one, among `within`. Returns the number actually
+	/// flipped.
+	async fn mark_read(&self, subscriber_id: Uuid, ids: &[Uuid], all: bool, within: &InboxTopics) -> Result<u64, DomainError>;
+
+	/// Whether `user_id` is visible to `scope` (`scope_members`): the one who may see the
+	/// scope's inbox.
+	async fn is_scope_member(&self, scope: &str, user_id: Uuid) -> Result<bool, DomainError>;
+
+	/// [`Self::is_scope_member`] for an ACTIVE account only. False for an unknown id too, so
+	/// a relying party asking about an arbitrary id learns no more than its stream says.
+	async fn is_active_scope_member(&self, scope: &str, user_id: Uuid) -> Result<bool, DomainError>;
 
 	/// Account-less subscribe (double opt-in). Returns the confirmation token ONLY
 	/// when a confirmation mail was actually queued — already-confirmed addresses and
@@ -1121,6 +1486,10 @@ pub trait NotificationRepository: Send + Sync {
 
 	/// One-click unsubscribe. `None` topic switches the email channel off entirely.
 	async fn unsubscribe(&self, token: &str, topic: Option<&str>) -> Result<bool, DomainError>;
+
+	/// The notification topics of every scope catalog in force, beside this plane's own
+	/// built-ins (`notification::TOPICS`).
+	async fn scope_topics(&self) -> Result<Vec<NotificationTopic>, DomainError>;
 }
 
 /// Port for draining the outbound email queue. Split from [`NotificationRepository`]
@@ -1138,6 +1507,9 @@ pub trait NotificationDispatchRepository: Send + Sync {
 
 	/// Sends in the trailing 24h — the input to the daily send-budget breaker.
 	async fn sent_last_24h(&self) -> Result<i64, DomainError>;
+
+	/// The topics the scope catalogs in force publish — the labels a mail names them by.
+	async fn scope_topics(&self) -> Result<Vec<NotificationTopic>, DomainError>;
 }
 
 /// Persistence + read port for the ownership consilium (the `OwnerRemoval` aggregate
@@ -1261,4 +1633,175 @@ pub trait OwnerGenesisRepository: Send + Sync {
 	/// what happened; the caller does the logging, so the branches stay assertable in a
 	/// test rather than only readable in a log.
 	async fn seed_owners(&self, subjects: &[GenesisSubject]) -> Result<GenesisOutcome, DomainError>;
+}
+
+/// How long an emailed code works.
+pub const CODE_TTL_SECS: i64 = 600;
+/// A sign-up ticket outlives its code: a mail that is late, or a code that expired while
+/// the tab sat open, is recovered by a resend under the same ticket.
+pub const SIGNUP_TICKET_TTL_SECS: i64 = 24 * 60 * 60;
+/// Wrong guesses a code survives before it burns (`email_codes_attempts`).
+pub const CODE_MAX_ATTEMPTS: i32 = 5;
+/// Codes one address may be sent per [`CODE_SEND_WINDOW_SECS`] for one purpose, counted
+/// in the table so the cap holds across replicas. Per purpose, so a session asking for
+/// verification codes cannot spend the budget the address's owner needs to sign in.
+pub const CODE_SENDS_PER_WINDOW: i64 = 5;
+pub const CODE_SEND_WINDOW_SECS: i64 = 900;
+/// Verification codes one account may be sent per [`VERIFY_BUDGET_WINDOW_SECS`]. The
+/// per-window cap alone lets a session mail its address 480 codes a day.
+pub const VERIFY_CODES_PER_DAY: i64 = 10;
+/// Wrong verification codes one account may present per [`VERIFY_BUDGET_WINDOW_SECS`],
+/// summed across its codes: each code burns on its fifth wrong guess, so without this a
+/// day of fresh codes is fifty guesses at the mailbox.
+pub const VERIFY_WRONG_PER_DAY: i64 = 20;
+pub const VERIFY_BUDGET_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// What a code is for. A sign-in code proves a mailbox to whoever asks; a verification
+/// code proves the signed-in account's own address and is bound to that account.
+#[derive(Clone, Debug)]
+pub enum CodePurpose {
+	Login(Email),
+	Verify(UserId),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum CodeIssue {
+	/// Stored and queued for the mailer.
+	Sent,
+	/// The address was sent [`CODE_SENDS_PER_WINDOW`] codes for this purpose in the window
+	/// already, or the account [`VERIFY_CODES_PER_DAY`] verification codes in a day.
+	Throttled,
+	/// The account presented [`VERIFY_WRONG_PER_DAY`] wrong verification codes in a day;
+	/// none is issued until the oldest of them leaves the window.
+	Exhausted,
+}
+
+/// Why a presented code did not prove the mailbox.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodeRefusal {
+	/// No live code was sent there, or it was already used.
+	Missing,
+	Expired,
+	/// Wrong, with guesses left.
+	Wrong,
+	/// Wrong, and that was the last guess: the code is burned.
+	Exhausted,
+}
+
+/// Failed password guesses before the password locks for [`PASSWORD_LOCK_SECS`]. The
+/// lock is on the password only: a code still signs the account in, so nobody can lock
+/// an owner out of their own account by guessing at it.
+pub const PASSWORD_MAX_FAILURES: i32 = 10;
+pub const PASSWORD_LOCK_SECS: i64 = 900;
+
+/// The password an account handle names, for checking.
+pub struct StoredPassword {
+	pub user: UserId,
+	/// PHC string, `$argon2id$…`.
+	pub phc: String,
+	pub locked_until: Option<i64>,
+}
+
+pub struct SignInMethods {
+	pub password: bool,
+	/// Linked providers, by `user_identities.provider`.
+	pub providers: Vec<String>,
+	pub passkeys: Vec<PasskeyRow>,
+}
+
+/// One registered passkey. `passkey` is the WebAuthn verifier's own serialization, opaque
+/// to persistence.
+pub struct PasskeyRow {
+	pub credential_id: String,
+	pub passkey: serde_json::Value,
+	pub name: String,
+	pub created_at: i64,
+	pub last_used_at: Option<i64>,
+}
+
+pub enum SignUp {
+	Created(Box<User>),
+	/// The address backs a password already, or is verified on an account: that person
+	/// signs in, with a code if need be.
+	Taken,
+}
+
+#[derive(Debug)]
+pub enum VerifyRefusal {
+	Code(CodeRefusal),
+	/// The address is verified on another account already.
+	Taken,
+}
+
+/// Why a sign-up confirmation was refused.
+#[derive(Debug)]
+pub enum SignUpConfirmRefusal {
+	/// Unknown, spent, expired, or outlived by a new password or a revoke-all. One
+	/// variant for all of them: the caller answers each the way it answers a wrong code.
+	Ticket,
+	/// The account is disabled. Decided before anything is written.
+	Disabled,
+	Verify(VerifyRefusal),
+}
+
+/// Emailed codes (and, beside them, passwords): the credentials this plane checks itself
+/// rather than trusting a provider for. Every method is one transaction, and a wrong guess
+/// is counted in it BEFORE the comparison, so an attempt that errors still counts.
+#[async_trait]
+pub trait CredentialRepository: Send + Sync {
+	/// Mint a code and queue the mail carrying it. The address a verification code goes
+	/// to is the account's current one, read here.
+	async fn issue_code(&self, purpose: CodePurpose, now: i64) -> Result<CodeIssue, DomainError>;
+
+	/// Spend a sign-in code. `Ok(Ok(()))` proves the mailbox; the account it opens is
+	/// [`UserDirectoryRepository::resolve`]'s to decide.
+	async fn redeem_login_code(&self, email: &Email, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError>;
+
+	/// Spend a verification code and mark the account's address verified, in one
+	/// transaction.
+	async fn verify_email(&self, user: UserId, code: &str, now: i64) -> Result<Result<User, VerifyRefusal>, DomainError>;
+
+	/// A new account behind an email and a password, its address unverified.
+	async fn sign_up(&self, email: &Email, phc: String, now: i64) -> Result<SignUp, DomainError>;
+
+	/// The password of the one account `handle` names (an email or a username), if it
+	/// has one.
+	async fn password_named(&self, handle: &str) -> Result<Option<StoredPassword>, DomainError>;
+
+	/// Count a guess: a failure moves toward the lock, a success clears the count.
+	async fn record_password_attempt(&self, user: UserId, succeeded: bool, now: i64) -> Result<(), DomainError>;
+
+	/// How the account can sign in, for its settings.
+	async fn methods(&self, user: UserId) -> Result<SignInMethods, DomainError>;
+
+	/// The account's passkeys.
+	async fn passkeys(&self, user: UserId) -> Result<Vec<PasskeyRow>, DomainError>;
+
+	/// Register a passkey. `false` when its credential id is registered already.
+	async fn add_passkey(&self, user: UserId, passkey: PasskeyRow) -> Result<bool, DomainError>;
+
+	/// Record a sign-in with a passkey: its updated counter and backup state, and when.
+	async fn passkey_used(&self, credential_id: &str, passkey: serde_json::Value, now: i64) -> Result<(), DomainError>;
+
+	/// `false` when the account holds no such passkey.
+	async fn remove_passkey(&self, user: UserId, credential_id: &str) -> Result<bool, DomainError>;
+
+	/// Set (or replace) the password, on the strength of a verification code — so a stolen
+	/// session alone cannot plant a password that outlives its revocation. Spending the
+	/// code verifies the address, as [`Self::verify_email`] does.
+	async fn set_password(&self, user: UserId, code: &str, phc: String, now: i64) -> Result<Result<(), VerifyRefusal>, DomainError>;
+
+	/// Store a sign-up ticket (its digest) for `user`, bound to their current
+	/// `token_version` and password, alive for [`SIGNUP_TICKET_TTL_SECS`].
+	async fn issue_signup_ticket(&self, user: UserId, ticket_hash: &[u8], now: i64) -> Result<(), DomainError>;
+
+	/// Spend a sign-up ticket and the verification code beside it: the account's address
+	/// is verified exactly as [`Self::verify_email`] does it — the password stays, nothing
+	/// is taken over. A wrong code is counted against the code and leaves the ticket.
+	async fn confirm_signup(&self, ticket_hash: &[u8], code: &str, now: i64) -> Result<Result<User, SignUpConfirmRefusal>, DomainError>;
+
+	/// Mail a fresh verification code to the account a live sign-up ticket speaks for,
+	/// under the same throttle as every code. `None` when the ticket speaks for nobody —
+	/// unknown, spent, expired, outlived, or its account disabled — and nothing is mailed.
+	async fn resend_signup_code(&self, ticket_hash: &[u8], now: i64) -> Result<Option<CodeIssue>, DomainError>;
 }

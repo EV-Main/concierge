@@ -13,6 +13,15 @@ package concierge.v1;
 // BOTH off, in which case nothing is delivered and the emit is recorded as
 // suppressed. No channel is unconditional.
 //
+// INBOXES. Each direction (scope) has its own inbox, and the server decides which one a
+// call reads — never a request field (D21, docs/SCOPES-AND-APPROVALS.md §6). A user's
+// access token reads the PLATFORM inbox: this plane's built-in topics and `bank:*`. Every
+// user RPC below — the list, its topic filter, the unread count, MarkRead (including
+// `all`), the settings and SetTopicSubscription — is confined to that inbox. The summary
+// of every namespace is asked for with the metadata `x-ev-inbox-view: all` and needs the
+// permission `concierge:notifications:read_all`, else PERMISSION_DENIED. A direction's own
+// inbox is read by its backend through ScopeInboxService (scope_inbox.proto).
+//
 // SUBSCRIBERS. Account-less ("anonymous") subscribers are the SAME record as
 // signed-in ones, distinguished only by having no user id — one table, one
 // fan-out, and the read paths filter. An account-less subscriber can only ever
@@ -55,7 +64,12 @@ message EmitRequest {
   // Target subscriber, by concierge canonical user id (a UUID). Account-less
   // subscribers are not addressable by Emit — they receive topic broadcasts only.
   string user_id = 1;
-  // Topic key, e.g. "fund:quy-nhon". Must be in the server-side allowlist.
+  // Topic key, e.g. "platform:announcements". Must be one of this plane's own; a scope's
+  // topics (`invest:fund:quy-nhon`) are published through ScopeCatalogService and emitted
+  // by their own namespace through ScopeInboxService.EmitScopeNotification — here they are
+  // PERMISSION_DENIED. A key that moved to a scope (`fund:quy-nhon`,
+  // `account:money-movement`) is still accepted and stored under its new key until the
+  // emitters have moved (docs/SCOPES-AND-APPROVALS.md §6).
   string topic = 2;
   // Machine-readable event kind within the topic, e.g. "nav_updated".
   string kind = 3;
@@ -118,7 +132,8 @@ message GetUnreadCountResponse {
 }
 
 message MarkReadRequest {
-  // Notification ids to mark read. Ignored when `all` is set.
+  // Notification ids to mark read, at most 500 (else INVALID_ARGUMENT, also when `all`
+  // is set); not read when `all` is set.
   repeated string ids = 1;
   // Mark every unread notification read.
   bool all = 2;
@@ -166,6 +181,9 @@ message SetTopicSubscriptionRequest {
 
 message SubscribeAnonymousRequest {
   string email = 1;
+  // One of this plane's topics or one a scope's catalog in force publishes; anything else
+  // is INVALID_ARGUMENT. A scope's `default_subscribed` does not apply: the address asks
+  // for the topic by name and confirms it by mail.
   string topic = 2;
   // Client IP as seen by the edge, for rate limiting. Empty ⇒ every such caller
   // shares one bucket, which is the conservative choice.

@@ -31,6 +31,9 @@ use crate::AuthError;
 pub struct IssuedRefresh {
 	pub token: String,
 	pub expires_at: u64,
+	/// When the family's sign-in happened (unix seconds), preserved across rotations;
+	/// `None` for a family opened before the field existed.
+	pub auth_time: Option<u64>,
 }
 /// The lifetime policy applied to a refresh family: the sliding window reset on
 /// each rotation, the immutable absolute cap, and the idle timeout (`0` = off).
@@ -191,11 +194,13 @@ impl InProcessRefreshStore {
 				ip,
 				created_at: now,
 				last_seen: now,
+				auth_time: Some(now),
 			},
 		);
 		IssuedRefresh {
 			token: format!("{family}.{secret}"),
 			expires_at,
+			auth_time: Some(now),
 		}
 	}
 
@@ -227,6 +232,7 @@ impl InProcessRefreshStore {
 				refresh: IssuedRefresh {
 					token: format!("{family}.{new_secret}"),
 					expires_at,
+					auth_time: fam.auth_time,
 				},
 			})
 		} else if fam.prev.as_deref().is_some_and(|prev| ct_eq(prev, secret)) {
@@ -379,6 +385,7 @@ impl RedisRefreshStore {
 					("ip", &ip),
 					("created_at", &now.to_string()),
 					("last_seen", &now.to_string()),
+					("auth_time", &now.to_string()),
 				],
 			)
 			// TTL the family at its absolute cap, so an abandoned family is reaped even
@@ -393,6 +400,7 @@ impl RedisRefreshStore {
 		Ok(IssuedRefresh {
 			token: format!("{family}.{secret}"),
 			expires_at,
+			auth_time: Some(now),
 		})
 	}
 
@@ -403,7 +411,7 @@ impl RedisRefreshStore {
 		let expires_at = now + bounds.ttl_secs;
 
 		let mut conn = self.conn.clone();
-		// Returns `{"ok", user_id, token_version}` on success, `{"reuse", user_id}` to
+		// Returns `{"ok", user_id, token_version, auth_time}` on success, `{"reuse", user_id}` to
 		// signal a compromised family that must be wiped, or nil for any other rejection.
 		let outcome: Vec<String> = ROTATE_SCRIPT
 			.key(Self::fam_key(family))
@@ -417,13 +425,15 @@ impl RedisRefreshStore {
 			.map_err(redis_err)?;
 
 		match outcome.as_slice() {
-			[tag, _user_id, token_version] if tag == "ok" => {
+			[tag, _user_id, token_version, auth_time] if tag == "ok" => {
 				let token_version_snapshot = token_version.parse().unwrap_or(0);
 				Ok(RotatedRefresh {
 					token_version_snapshot,
 					refresh: IssuedRefresh {
 						token: format!("{family}.{new_secret}"),
 						expires_at,
+						// Empty for a family opened before the field existed.
+						auth_time: auth_time.parse().ok(),
 					},
 				})
 			}
@@ -575,7 +585,7 @@ impl RedisRefreshStore {
 
 /// The atomic rotate/reuse decision. KEYS[1] = family hash. ARGV = presented secret,
 /// now, idle_timeout_secs, new secret, new sliding expiry. Returns `{"ok", user_id,
-/// token_version}` on a successful rotation, `{"reuse", user_id}` when an already-rotated
+/// token_version, auth_time}` on a successful rotation, `{"reuse", user_id}` when an already-rotated
 /// secret is replayed (caller wipes the family), or nil for any other rejection
 /// (missing/expired/wrong secret).
 static ROTATE_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
@@ -599,7 +609,7 @@ end
 
 if h['current'] == ARGV[1] then
   redis.call('HSET', KEYS[1], 'prev', h['current'], 'current', ARGV[4], 'expires_at', ARGV[5], 'last_seen', ARGV[2])
-  return { 'ok', h['user_id'], h['token_version'] }
+  return { 'ok', h['user_id'], h['token_version'], h['auth_time'] or '' }
 elseif h['prev'] == ARGV[1] then
   return { 'reuse', h['user_id'] }
 else
@@ -656,6 +666,9 @@ struct Family {
 	ip: String,
 	created_at: u64,
 	last_seen: u64,
+	/// The interactive sign-in time that opened the family. Never moved by rotation
+	/// (unlike `last_seen`); `None` only for families that predate the field.
+	auth_time: Option<u64>,
 }
 
 #[cfg(test)]
@@ -686,6 +699,17 @@ mod tests {
 		assert!(store.rotate(&issued.token, bounds()).is_err());
 		// And the just-issued one is now dead too.
 		assert!(store.rotate(&rotated.refresh.token, bounds()).is_err());
+	}
+
+	#[test]
+	fn rotation_preserves_auth_time() {
+		let store = InProcessRefreshStore::new();
+		let issued = issue(&store, "user-auth-time");
+		assert!(issued.auth_time.is_some());
+		let rotated = store.rotate(&issued.token, bounds()).unwrap();
+		assert_eq!(rotated.refresh.auth_time, issued.auth_time);
+		let again = store.rotate(&rotated.refresh.token, bounds()).unwrap();
+		assert_eq!(again.refresh.auth_time, issued.auth_time);
 	}
 
 	#[test]
@@ -900,6 +924,7 @@ mod redis_tests {
 		let issued = store.issue(&user, 7, bounds(), "agent".into(), "1.2.3.4".into()).await.unwrap();
 		let rotated = store.rotate(&issued.token, bounds()).await.unwrap();
 		assert_eq!(rotated.token_version_snapshot, 7);
+		assert_eq!(rotated.refresh.auth_time, issued.auth_time);
 		assert!(matches!(store.inspect(&rotated.refresh.token, bounds()).await.unwrap(), RefreshInspect::Current { user_id } if user_id == user));
 		// Reuse of the rotated-out secret revokes the whole family.
 		assert!(store.rotate(&issued.token, bounds()).await.is_err());

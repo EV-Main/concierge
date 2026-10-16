@@ -75,6 +75,11 @@ ev::settings! {
 		web_bind: std::net::SocketAddr = "127.0.0.1:55671",
 		/// The user-facing origin the conductor serves; builds the OAuth redirect_uri.
 		public_origin: String,
+		/// The built micro-frontend bundles (`web/dist`), served under `/auth/mfe/*`. Unset,
+		/// or naming no readable directory, ⇒ the route is not mounted and answers 404 (the
+		/// second at `error!`). Never a boot refusal: sign-in for every zone runs on this
+		/// process, and missing bundles must not take it down.
+		web_mfe_dir: Option<String>,
 		/// SMTP host for outbound notification mail. Unset ⇒ mail is logged, not sent
 		/// (the whole emit → queue → render path still runs).
 		#[required_in("production")]
@@ -89,6 +94,10 @@ ev::settings! {
 		mail_from: String = "EV Investment <notifications@evinvest.ltd>",
 		/// Origin the cabinet is served from; builds the links inside emails.
 		cabinet_url: String = "https://evinvest.ltd/cabinet",
+		/// The approvals page of the admin console; an approval mail links to
+		/// `<APPROVALS_URL>/<id>`. Configuration and never the proposer's: no service
+		/// chooses where a mail asking people to decide sends them.
+		approvals_url: String = "https://evinvest.ltd/admin/approvals",
 		/// The HUMAN mailbox handed to a user whose verification cannot run right now.
 		///
 		/// Deliberately not `mail_from`: that address is a SENDER nobody reads, so
@@ -190,6 +199,18 @@ ev::settings! {
 		/// little too long, while a boot that refuses over an unset knob takes sign-in
 		/// down for the whole platform.
 		kyc_case_ttl_secs: i64 = "86400",
+		/// The floor's money caps (`domain::floors`) on `bank:account_transfer` and
+		/// `bank:scope_payout`: above this many USDT in one operation, and in a trailing day,
+		/// a scope's proposal goes to the platform owners. One pair for both kinds (owners'
+		/// decision). Environment and not the database, because the floor guards against a
+		/// compromised catalog publisher; the boot refuses anything but a positive canonical
+		/// amount.
+		approval_floor_per_operation_usdt: String = "1000",
+		approval_floor_daily_usdt: String = "5000",
+		/// Cloudflare Turnstile secret for the credential endpoints. Required everywhere:
+		/// development uses Cloudflare's always-pass test secret, so no arm skips the check.
+		#[secret]
+		turnstile_secret: String,
 	}
 }
 
@@ -215,10 +236,14 @@ mod tests {
 				"SMTP_HOST",
 				"SMTP_USERNAME",
 				"SMTP_PASSWORD",
+				"TURNSTILE_SECRET",
 			]
 		);
 		// Locally, only what the process genuinely cannot start without.
-		assert_eq!(AppConfig::required_var_names("development"), vec!["DATABASE_URL", "BRIDGE_SERVICE_TOKEN", "PUBLIC_ORIGIN"]);
+		assert_eq!(
+			AppConfig::required_var_names("development"),
+			vec!["DATABASE_URL", "BRIDGE_SERVICE_TOKEN", "PUBLIC_ORIGIN", "TURNSTILE_SECRET"]
+		);
 	}
 
 	fn minimal_env(var: &str) -> Option<String> {
@@ -226,6 +251,7 @@ mod tests {
 			"DATABASE_URL" => Some("postgres://localhost/concierge"),
 			"BRIDGE_SERVICE_TOKEN" => Some("token"),
 			"PUBLIC_ORIGIN" => Some("https://evinvest.ltd"),
+			"TURNSTILE_SECRET" => Some("1x0000000000000000000000000000000AA"),
 			_ => None,
 		}
 		.map(str::to_string)

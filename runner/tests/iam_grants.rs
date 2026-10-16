@@ -20,11 +20,7 @@ use concierge::{
 	ports::{GrantActor, GrantOutcome, GrantRepository, GrantSubject, RelyingPartyRepository, RevokeOutcome, UserDirectoryRepository},
 	relying_party::RelyingParties,
 };
-use domain::{
-	authz::Role,
-	iam::Target,
-	users::{AuthSubject, Email, UserId},
-};
+use domain::{authz::Role, iam::Target, users::UserId};
 use evconcierge_auth::{CatalogPublication, Claims, ClientGrantError, ClientGrants, RestrictedCaller, TokenType};
 use evconcierge_contracts::concierge::v1::{
 	CatalogAlias, GetMeRequest, GrantPermissionRequest, ListGrantsRequest, RevokePermissionRequest, grant_permission_request, revoke_permission_request, user_directory_server::UserDirectory,
@@ -51,7 +47,8 @@ struct Fixture {
 #[derive(Clone)]
 enum Who {
 	Id(UserId),
-	Email(String),
+	/// An email or a username.
+	Account(String),
 }
 
 const PERMISSIONS: [&str; 3] = ["work:leads:read", "work:leads:edit", "admin:sources:manage"];
@@ -151,9 +148,8 @@ impl Fixture {
 
 	async fn user(&self, tag: &str) -> UserId {
 		let unique = Uuid::new_v4();
-		let subject = AuthSubject::parse(&format!("iam-{tag}-{unique}")).unwrap();
-		let email = Email::parse(&format!("{tag}-{}@iam.example.com", &unique.simple().to_string()[..12])).unwrap();
-		self.users.provision(subject, email, true).await.unwrap().id()
+		let email = format!("{tag}-{}@iam.example.com", &unique.simple().to_string()[..12]);
+		self.users.resolve(common::google_as(&format!("iam-{tag}-{unique}"), &email, true), 0).await.unwrap().id()
 	}
 
 	async fn seated(&self, tag: &str, role: Role) -> UserId {
@@ -162,12 +158,58 @@ impl Fixture {
 		id
 	}
 
-	/// A holder of the tenant's `admin` alias, granted by a seat.
+	/// A holder of the tenant's `admin` alias, granted by an owner: the alias is the
+	/// scope's approval roster and no other seat grants it.
 	async fn delegate(&self) -> UserId {
-		let seat = self.seated("seat", Role::Admin).await;
+		let seat = self.seated("owner", Role::Owner).await;
 		let delegate = self.user("delegate").await;
-		self.grant(seat, delegate, &self.p("admin")).await.unwrap();
+		// The alias is granted only by an executed `concierge:scope_admin_grant`
+		// (`approvals.rs` covers that path); a fixture writes the row it leaves behind.
+		sqlx::query("INSERT INTO grants (user_id, namespace, target, granted_by, granted_at) VALUES ($1, split_part($2, ':', 1), $2, $3, 0)")
+			.bind(delegate.raw())
+			.bind(self.p("admin"))
+			.bind(seat.raw())
+			.execute(&self.pool)
+			.await
+			.expect("seat the delegate");
 		delegate
+	}
+
+	/// A fresh account holding `target`, written as the row a grant leaves.
+	async fn holding(&self, target: &str) -> UserId {
+		let granter = self.seated("owner", Role::Owner).await;
+		let holder = self.user("holder").await;
+		sqlx::query("INSERT INTO grants (user_id, namespace, target, granted_by, granted_at) VALUES ($1, split_part($2, ':', 1), $2, $3, 0)")
+			.bind(holder.raw())
+			.bind(target)
+			.bind(granter.raw())
+			.execute(&self.pool)
+			.await
+			.expect("grant the target");
+		holder
+	}
+
+	/// A catalog `Catalog::check` would refuse today, stored as one published before the
+	/// check existed: `operator`, `lead` and `admin` with `delegations` as given.
+	async fn plant_catalog(&self, version: i64, delegations: serde_json::Value) {
+		let all: Vec<String> = PERMISSIONS.iter().map(|p| self.p(p)).collect();
+		let catalog = serde_json::json!({
+			"version": version,
+			"permissions": all,
+			"aliases": {
+				self.p("operator"): [self.p("work:leads:read"), self.p("work:leads:edit")],
+				self.p("lead"): [self.p("work:leads:read")],
+				self.p("admin"): all,
+			},
+			"delegations": delegations,
+		});
+		sqlx::query("INSERT INTO catalogs (tenant_id, version, catalog, published_at) VALUES ($1, $2, $3, 0)")
+			.bind(&self.ns)
+			.bind(version)
+			.bind(catalog)
+			.execute(&self.pool)
+			.await
+			.expect("plant the catalog");
 	}
 
 	async fn email_of(&self, user: UserId) -> String {
@@ -178,7 +220,7 @@ impl Fixture {
 		let request = GrantPermissionRequest {
 			subject: Some(match who {
 				Who::Id(id) => grant_permission_request::Subject::UserId(id.to_string()),
-				Who::Email(email) => grant_permission_request::Subject::Email(email),
+				Who::Account(email) => grant_permission_request::Subject::Account(email),
 			}),
 			target: target.into(),
 			reason: "itest".into(),
@@ -190,7 +232,7 @@ impl Fixture {
 		let request = RevokePermissionRequest {
 			subject: Some(match who {
 				Who::Id(id) => revoke_permission_request::Subject::UserId(id.to_string()),
-				Who::Email(email) => revoke_permission_request::Subject::Email(email),
+				Who::Account(email) => revoke_permission_request::Subject::Account(email),
 			}),
 			target: target.into(),
 			reason: String::new(),
@@ -203,7 +245,7 @@ impl Fixture {
 	}
 
 	async fn grant_by_email(&self, actor: UserId, user: UserId, target: &str) -> Result<(), tonic::Status> {
-		self.grant_to(actor, Who::Email(self.email_of(user).await), target).await
+		self.grant_to(actor, Who::Account(self.email_of(user).await), target).await
 	}
 
 	async fn revoke(&self, actor: UserId, user: UserId, target: &str) -> Result<(), tonic::Status> {
@@ -245,14 +287,30 @@ impl Fixture {
 			.unwrap()
 	}
 
-	/// Two accounts on one address, returned as that address.
+	/// Two accounts an address names, returned as that address: the one it is verified on,
+	/// and one it backs a password of unverified — the only pair a handle can name.
 	async fn shared_email(&self) -> String {
 		let email = format!("shared-{}@iam.example.com", Uuid::new_v4().simple());
-		for _ in 0..2 {
-			let subject = AuthSubject::parse(&format!("iam-shared-{}", Uuid::new_v4())).unwrap();
-			self.users.provision(subject, Email::parse(&email).unwrap(), true).await.unwrap();
-		}
+		self.users.resolve(common::google_as(&format!("iam-shared-{}", Uuid::new_v4()), &email, true), 0).await.unwrap();
+		let second = self.users.resolve(common::google_as(&format!("iam-shared-{}", Uuid::new_v4()), &email, false), 0).await.unwrap();
+		sqlx::query("INSERT INTO password_credentials (user_id, phc, updated_at) VALUES ($1, '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA', 0)")
+			.bind(second.id().raw())
+			.execute(&self.pool)
+			.await
+			.unwrap();
 		email
+	}
+
+	async fn username_of(&self, user: UserId) -> String {
+		self.users
+			.find_by_id(user)
+			.await
+			.unwrap()
+			.unwrap()
+			.username()
+			.expect("a fixture account has a handle")
+			.as_str()
+			.to_owned()
 	}
 
 	async fn disabled_email(&self) -> String {
@@ -284,6 +342,7 @@ fn as_user<T>(user: UserId, audience: &str, inner: T) -> Request<T> {
 		typ: TokenType::Access,
 		jti: None,
 		token_version: 0,
+		auth_time: None,
 	});
 	request
 }
@@ -409,6 +468,13 @@ async fn a_delegate_grants_and_revokes_exactly_what_their_alias_delegates() {
 	fx.revoke(delegate, member, &fx.p("operator")).await.expect("revoking by id is fine: the roster hands ids back");
 	assert!(fx.active_grants(member).await.is_empty());
 
+	let handle = fx.username_of(member).await;
+	fx.grant_to(delegate, Who::Account(handle.clone()), &fx.p("operator"))
+		.await
+		.expect("a username names the account as its email does");
+	assert_eq!(fx.active_grants(member).await, [fx.p("operator")]);
+	fx.revoke_from(delegate, Who::Account(handle), &fx.p("operator")).await.unwrap();
+
 	// An operator holds nothing that delegates.
 	let operator = fx.user("operator").await;
 	fx.grant_by_email(delegate, operator, &fx.p("operator")).await.unwrap();
@@ -430,7 +496,7 @@ async fn a_delegate_cannot_tell_a_missing_address_from_a_shared_or_disabled_one(
 		("held", fx.held_email(seat).await),
 	];
 	for (what, email) in addresses {
-		let got = answer(fx.grant_to(delegate, Who::Email(email), &fx.p("operator")).await);
+		let got = answer(fx.grant_to(delegate, Who::Account(email), &fx.p("operator")).await);
 		assert_eq!(
 			got,
 			(Code::FailedPrecondition, "this address cannot be granted access".to_owned()),
@@ -442,8 +508,8 @@ async fn a_delegate_cannot_tell_a_missing_address_from_a_shared_or_disabled_one(
 	// otherwise PERMISSION_DENIED for a real account against the answer above for a missing
 	// one would be the same oracle by another door.
 	let real = fx.email_of(fx.user("real").await).await;
-	let for_real = answer(fx.grant_to(delegate, Who::Email(real), &fx.p("admin")).await);
-	let for_nobody = answer(fx.grant_to(delegate, Who::Email(unknown_email()), &fx.p("admin")).await);
+	let for_real = answer(fx.grant_to(delegate, Who::Account(real), &fx.p("admin")).await);
+	let for_nobody = answer(fx.grant_to(delegate, Who::Account(unknown_email()), &fx.p("admin")).await);
 	assert_eq!(for_real.0, Code::PermissionDenied);
 	assert_eq!(for_real, for_nobody);
 }
@@ -453,9 +519,9 @@ async fn a_delegate_cannot_tell_a_missing_address_from_a_shared_or_disabled_one(
 async fn a_seat_still_hears_why_an_address_cannot_be_granted() {
 	let Some(fx) = setup().await else { return };
 	let seat = fx.seated("seat", Role::Admin).await;
-	let unknown = answer(fx.grant_to(seat, Who::Email(unknown_email()), &fx.p("operator")).await);
-	let shared = answer(fx.grant_to(seat, Who::Email(fx.shared_email().await), &fx.p("operator")).await);
-	let disabled = answer(fx.grant_to(seat, Who::Email(fx.disabled_email().await), &fx.p("operator")).await);
+	let unknown = answer(fx.grant_to(seat, Who::Account(unknown_email()), &fx.p("operator")).await);
+	let shared = answer(fx.grant_to(seat, Who::Account(fx.shared_email().await), &fx.p("operator")).await);
+	let disabled = answer(fx.grant_to(seat, Who::Account(fx.disabled_email().await), &fx.p("operator")).await);
 	assert_eq!(unknown.0, Code::NotFound);
 	assert_eq!(shared.0, Code::FailedPrecondition);
 	assert!(shared.1.contains("more than one account"), "{}", shared.1);
@@ -475,7 +541,7 @@ async fn a_delegate_revoking_by_email_hears_one_not_found_for_everything() {
 		("disabled", fx.disabled_email().await),
 		("an account with no grant here", outsider),
 	] {
-		let got = answer(fx.revoke_from(delegate, Who::Email(email), &fx.p("operator")).await);
+		let got = answer(fx.revoke_from(delegate, Who::Account(email), &fx.p("operator")).await);
 		assert_eq!(got.0, Code::NotFound, "{what}");
 		answers.push(got);
 	}
@@ -565,6 +631,97 @@ async fn the_write_decides_from_the_actors_persisted_standing() {
 	let elevated = fx.user("elevated").await;
 	let outcome = grants.grant(&member, &operator, &actor(elevated, Role::Owner, true), &action(elevated), 0).await.unwrap();
 	assert!(matches!(outcome, GrantOutcome::Granted(_)), "break-glass elevation still counts inside the transaction");
+}
+
+/// `<ns>:admin` is the scope's approval roster (`docs/SCOPES-AND-APPROVALS.md` §5.6): a seat
+/// granting it to accounts it controls would pass the scope's quorum with no owner asked.
+/// Nobody grants it directly — not an admin seat, not an owner, not emergency access; the
+/// owners decide it as `concierge:scope_admin_grant`. Taking it away stays one act.
+#[tokio::test]
+async fn nobody_grants_the_admin_alias_outside_an_approval() {
+	let Some(fx) = setup().await else { return };
+	let admin = fx.seated("admin", Role::Admin).await;
+	let owner = fx.seated("owner", Role::Owner).await;
+	let member = fx.user("member").await;
+	for seat in [admin, owner] {
+		let refused = fx.grant(seat, member, &fx.p("admin")).await.unwrap_err();
+		assert_eq!(refused.code(), Code::PermissionDenied);
+		assert!(refused.message().contains("ProposeScopeAdminGrant"), "{}", refused.message());
+	}
+	assert!(fx.active_grants(member).await.is_empty());
+	fx.grant(admin, member, &fx.p("operator")).await.expect("other targets stay the seat's");
+
+	let grants = PgGrants::new(fx.pool.clone());
+	let elevated = fx.user("elevated").await;
+	let outcome = grants
+		.grant(
+			&GrantSubject::Id(member),
+			&Target::parse(&fx.p("admin")).unwrap(),
+			&GrantActor {
+				id: elevated,
+				role: Role::Owner,
+				elevated: true,
+			},
+			&AdminAction {
+				actor: Some(elevated),
+				action: "permission_granted",
+				..AdminAction::default()
+			},
+			0,
+		)
+		.await
+		.unwrap();
+	assert!(matches!(outcome, GrantOutcome::ByApprovalOnly), "emergency access least of all");
+
+	let delegate = fx.delegate().await;
+	fx.revoke(admin, delegate, &fx.p("admin")).await.expect("taking it away stays one act of any granting seat");
+}
+
+/// `<ns>:admin` is the scope's approval roster, so whoever may revoke it may empty the
+/// roster of everyone but themselves and pass the scope's quorum alone (§5.6: removing a
+/// scope admin is a seat's act). A publication that delegates it is refused; a catalog
+/// stored before that rule existed must hand nobody the alias either.
+#[tokio::test]
+async fn no_catalog_hands_anyone_the_admin_alias() {
+	let Some(fx) = setup().await else { return };
+	let invalid = |result: Result<(), ClientGrantError>| matches!(result, Err(ClientGrantError::InvalidCatalog(_)));
+	let leads = &PERMISSIONS[..2];
+	assert!(
+		invalid(fx.publish(5, &PERMISSIONS, &[("operator", leads, &[]), ("admin", &PERMISSIONS, &["admin", "operator"])]).await),
+		"admin delegating itself"
+	);
+	assert!(
+		invalid(
+			fx.publish(5, &PERMISSIONS, &[("operator", leads, &[]), ("lead", leads, &["admin"]), ("admin", &PERMISSIONS, &["operator"])])
+				.await
+		),
+		"another alias delegating admin"
+	);
+
+	for (version, holder_alias, delegations) in [
+		(2, "admin", serde_json::json!({ fx.p("admin"): [fx.p("admin"), fx.p("operator")] })),
+		(
+			3,
+			"lead",
+			serde_json::json!({ fx.p("lead"): [fx.p("admin"), fx.p("operator")], fx.p("admin"): [fx.p("operator")] }),
+		),
+	] {
+		fx.plant_catalog(version, delegations).await;
+		let holder = match holder_alias {
+			"admin" => fx.delegate().await,
+			_ => fx.holding(&fx.p("lead")).await,
+		};
+		let peer = fx.delegate().await;
+		assert_eq!(
+			code(fx.revoke(holder, peer, &fx.p("admin")).await),
+			Code::PermissionDenied,
+			"a stored `{holder_alias}` delegation of admin removes no peer"
+		);
+		assert_eq!(fx.active_grants(peer).await, [fx.p("admin")]);
+		let member = fx.user("member").await;
+		assert_eq!(code(fx.grant_by_email(holder, member, &fx.p("admin")).await), Code::PermissionDenied);
+		fx.grant_by_email(holder, member, &fx.p("operator")).await.expect("the rest of the stored delegation still holds");
+	}
 }
 
 #[tokio::test]

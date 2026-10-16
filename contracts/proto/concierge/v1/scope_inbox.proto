@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package concierge.v1;
+
+import "concierge/v1/notification.proto";
+
+// ScopeInboxService — a direction's own inbox, read by the direction's BACKEND on behalf
+// of a user it knows from its own session (D21, docs/SCOPES-AND-APPROVALS.md §6).
+//
+// CALLER. A relying party's client credential, as on ScopeEvents: metadata
+// `x-ev-client-id: <client_id>` + `authorization: Bearer <client_secret>`. An unknown,
+// disabled or secretless client and a wrong secret are one UNAUTHENTICATED; a client
+// whose scope is CLOSED is FAILED_PRECONDITION; the bridge token is PERMISSION_DENIED —
+// the money plane's topics live in the platform inbox, not in a scope's — on every RPC but
+// EmitScopeNotification, where it speaks for namespace `bank`. Mounted outside
+// the user auth layer, on BIND and on the bridge TLS listener. A relying party's USER
+// token still opens only UserDirectory.GetMe.
+//
+// NAMESPACE. Always the namespace of the calling client's own scope, never a request
+// field: an observer of a scope does not get that scope's inbox. Only that namespace's
+// catalog topics are offered, followed, filtered on, listed, counted and marked.
+//
+// USER. On a READ, `user_id` is the concierge user id — the `sub` of the client's own
+// access token for that user, and `ScopeEvent.user_id`. A WRITE (MarkScopeNotificationsRead,
+// SetScopeTopicSubscription) needs the user's say, because following a topic turns on mail
+// to their address: the metadata `x-ev-user-token` carries the access token THIS client was
+// issued for the user (raw, no `Bearer`), checked as GetMe checks it (signature,
+// `typ=access`, a live session) and with `aud` = this client's audience. The user is taken
+// from its `sub`; `user_id` may be empty, and when set must be that user. No or a bad token
+// is UNAUTHENTICATED; another client's token or a different `user_id` is PERMISSION_DENIED.
+// The user must be an active MEMBER of the scope (`ScopeEvent` MEMBER_JOINED); for anyone
+// else — an unknown id, an account the scope never saw, a disabled account, alike — the
+// reads answer empty and the writes FAILED_PRECONDITION, so the service tells a client
+// nothing its stream did not.
+//
+// The master channel switches (in-app, email) are the account's across every inbox and
+// are not set from here: NotificationService.SetChannelEnabled on PUBLIC_ORIGIN.
+service ScopeInboxService {
+  // Newest first. `limit` 0 ⇒ 20, clamped to 100; `next_cursor` empty on the last page.
+  rpc ListScopeNotifications(ListScopeNotificationsRequest) returns (ListNotificationsResponse);
+  rpc GetScopeUnreadCount(GetScopeUnreadCountRequest) returns (GetUnreadCountResponse);
+  // Marks only notifications of this inbox: an id of another inbox is not marked and not
+  // reported (`marked` counts what was flipped). At most 500 ids, else INVALID_ARGUMENT.
+  rpc MarkScopeNotificationsRead(MarkScopeNotificationsReadRequest) returns (MarkReadResponse);
+  // The settings snapshot with this inbox's topics only.
+  rpc GetScopeNotificationSettings(GetScopeNotificationSettingsRequest) returns (NotificationSettings);
+  // A topic outside this namespace's catalog in force is INVALID_ARGUMENT, as an unknown one.
+  rpc SetScopeTopicSubscription(SetScopeTopicSubscriptionRequest) returns (NotificationSettings);
+
+  // Emit one notification for one user on a topic of the CALLER's namespace — the client's
+  // scope's, or `bank` for the bridge token — that its catalog in force publishes
+  // (ScopeCatalogService). Another namespace's topic and this plane's own are
+  // PERMISSION_DENIED; a topic of the namespace its catalog does not publish is
+  // INVALID_ARGUMENT, as an unknown one. Validation, `dedupe_key` and the answer are
+  // NotificationService.Emit's. A scope's topic reaches only an ACTIVE member of the scope:
+  // for anyone else nothing is written and `delivered` is false, as for a user who does not
+  // follow the topic. A topic published with `default_subscribed` reaches every account
+  // that never touched it, until the user switches it off.
+  rpc EmitScopeNotification(EmitRequest) returns (EmitResponse);
+}
+
+message ListScopeNotificationsRequest {
+  string user_id = 1;
+  // Opaque cursor from a previous response; empty starts at the newest.
+  string cursor = 2;
+  uint32 limit = 3;
+  bool unread_only = 4;
+  // Optional topic filter within this inbox; empty ⇒ every topic of it.
+  string topic = 5;
+}
+
+message GetScopeUnreadCountRequest {
+  string user_id = 1;
+}
+
+message MarkScopeNotificationsReadRequest {
+  string user_id = 1;
+  // At most 500 (else INVALID_ARGUMENT, also when `all` is set); not read when `all` is set.
+  repeated string ids = 2;
+  // Every unread notification of this inbox.
+  bool all = 3;
+}
+
+message GetScopeNotificationSettingsRequest {
+  string user_id = 1;
+}
+
+message SetScopeTopicSubscriptionRequest {
+  string user_id = 1;
+  string topic = 2;
+  bool subscribed = 3;
+  bool email_enabled = 4;
+}

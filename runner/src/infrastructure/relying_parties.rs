@@ -1,5 +1,5 @@
 //! Postgres adapter for relying parties (`rp_clients`, `rp_codes`, `rp_sessions`,
-//! migration 0025).
+//! migration 0025), each read with its scope's state (`tenants.state`, migration 0031).
 //!
 //! Nothing secret is stored in a form that can be presented back: client secrets, codes
 //! and refresh secrets are all SHA-256 digests. A plain digest and not a slow KDF because
@@ -44,6 +44,8 @@ struct ClientRow {
 	secret_hash: Option<Vec<u8>>,
 	disabled_at: Option<i64>,
 	namespace: String,
+	scope: String,
+	scope_closed: bool,
 }
 
 impl TryFrom<ClientRow> for ClientRecord {
@@ -57,6 +59,8 @@ impl TryFrom<ClientRow> for ClientRecord {
 			secret_hash: row.secret_hash,
 			disabled: row.disabled_at.is_some(),
 			namespace: row.namespace,
+			scope: row.scope,
+			scope_closed: row.scope_closed,
 		})
 	}
 }
@@ -88,7 +92,7 @@ struct SessionDbRow {
 impl RelyingPartyRepository for PgRelyingParties {
 	async fn client(&self, client_id: &str) -> Result<Option<ClientRecord>, DomainError> {
 		sqlx::query_as::<_, ClientRow>(
-			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace \
+			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace, t.id AS scope, t.state = 'closed' AS scope_closed \
 			 FROM rp_clients c JOIN tenants t ON t.id = c.tenant_id WHERE c.client_id = $1",
 		)
 		.bind(client_id)
@@ -101,7 +105,7 @@ impl RelyingPartyRepository for PgRelyingParties {
 
 	async fn clients(&self) -> Result<Vec<ClientRecord>, DomainError> {
 		sqlx::query_as::<_, ClientRow>(
-			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace \
+			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace, t.id AS scope, t.state = 'closed' AS scope_closed \
 			 FROM rp_clients c JOIN tenants t ON t.id = c.tenant_id ORDER BY c.client_id",
 		)
 		.fetch_all(&self.pool)
@@ -235,6 +239,7 @@ impl RelyingPartyRepository for PgRelyingParties {
 		// upstream sign-out (`revoke_upstream`) that has the code row locked but not yet
 		// committed is WAITED for, and the row re-read after it — instead of this insert
 		// reading the pre-commit version and opening a session nothing then revokes.
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let opened = sqlx::query(
 			"INSERT INTO rp_sessions (id, client_id, user_id, code_hash, current_hash, token_version, upstream_family, created_at, last_used_at, expires_at, absolute_expires_at, client_ip, user_agent)
 			 SELECT $1, $2, $3, $4, $5, $6, c.upstream_family, $7, $7, $8, $9, c.client_ip, c.user_agent
@@ -250,11 +255,18 @@ impl RelyingPartyRepository for PgRelyingParties {
 		.bind(session.now)
 		.bind(session.expires_at)
 		.bind(session.absolute_expires_at)
-		.execute(&self.pool)
+		.execute(&mut *tx)
 		.await
 		.map_err(repo_err)?
-		.rows_affected();
-		Ok(opened == 1)
+		.rows_affected()
+			== 1;
+		// Signing in through a client makes the user visible to its scope, in the same
+		// transaction as the session that proves it.
+		if opened {
+			super::scope_events::signed_in(&mut tx, session.client_id, session.user).await?;
+		}
+		tx.commit().await.map_err(repo_err)?;
+		Ok(opened)
 	}
 
 	async fn session(&self, id: Uuid) -> Result<Option<SessionRow>, DomainError> {
@@ -336,8 +348,8 @@ impl RelyingPartyRepository for PgRelyingParties {
 
 	async fn session_live(&self, id: Uuid, audience: &str, now: i64) -> Result<bool, DomainError> {
 		let live: Option<bool> = sqlx::query_scalar(
-			"SELECT s.revoked_at IS NULL AND s.expires_at > $3 AND c.disabled_at IS NULL
-			 FROM rp_sessions s JOIN rp_clients c USING (client_id)
+			"SELECT s.revoked_at IS NULL AND s.expires_at > $3 AND c.disabled_at IS NULL AND t.state <> 'closed'
+			 FROM rp_sessions s JOIN rp_clients c USING (client_id) JOIN tenants t ON t.id = c.tenant_id
 			 WHERE s.id = $1 AND c.audience = $2",
 		)
 		.bind(id)

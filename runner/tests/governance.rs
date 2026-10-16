@@ -39,7 +39,7 @@ use domain::{
 	authz::Role,
 	error::DomainError,
 	governance::{AdmissionVote as DomainAdmissionVote, MAX_CODE_ATTEMPTS, ProposalState, REMOVAL_TTL_SECS, RemovalId, RemovalState, Vote},
-	users::{AuthSubject, Email, UserId},
+	users::UserId,
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
@@ -128,9 +128,7 @@ impl Fixture {
 	}
 
 	async fn provision(&self, email_verified: bool) -> UserId {
-		let subject = AuthSubject::parse(&format!("gov-itest-{}", Uuid::new_v4())).unwrap();
-		let email = Email::parse(&format!("gov-{}@example.com", Uuid::new_v4())).unwrap();
-		self.users.provision(subject, email, email_verified).await.expect("provision").id()
+		self.users.resolve(common::google("gov", email_verified), 0).await.expect("provision").id()
 	}
 
 	/// The money plane's push seam over the same adapters, with a ceiling no test here
@@ -763,9 +761,9 @@ async fn a_governance_mail_does_not_verify_the_subscriber_by_itself() {
 	// reaches the inbox and NOT the mail queue. The row is followed as the mail left
 	// it — re-resolving the subscriber here would overwrite the very flag under test.
 	let notifications = PgNotifications::new(fx.pool.clone());
-	notifications.set_topic_subscription(subscriber_id, "fund:quy-nhon", true, true).await.expect("follow");
+	notifications.set_topic_subscription(subscriber_id, "platform:announcements", true, true).await.expect("follow");
 	let outcome = notifications
-		.emit(owner.raw(), "fund:quy-nhon", "nav", "NAV updated", "", "", &format!("nav:{}", Uuid::new_v4()), T0)
+		.emit(owner.raw(), "platform:announcements", "nav", "NAV updated", "", "", &format!("nav:{}", Uuid::new_v4()), T0, false)
 		.await
 		.expect("emit");
 	assert!(outcome.in_app, "the in-app copy is unaffected");
@@ -2953,6 +2951,7 @@ fn as_user<T>(id: UserId, inner: T) -> Request<T> {
 		typ: TokenType::Access,
 		jti: None,
 		token_version: 0,
+		auth_time: None,
 	});
 	request
 }

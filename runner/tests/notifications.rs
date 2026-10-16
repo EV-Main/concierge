@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use concierge::{
 	infrastructure::{db, notifications::PgNotifications},
-	ports::{NotificationDispatchRepository, NotificationRepository},
+	ports::{InboxTopics, NotificationDispatchRepository, NotificationRepository},
 };
 use uuid::Uuid;
 
@@ -25,7 +25,7 @@ async fn setup() -> Option<Arc<PgNotifications>> {
 	Some(Arc::new(PgNotifications::new(pool)))
 }
 
-const TOPIC: &str = "fund:quy-nhon";
+const TOPIC: &str = "platform:announcements";
 
 #[tokio::test]
 async fn subscriber_is_idempotent_and_tracks_the_address() {
@@ -58,24 +58,24 @@ async fn emit_requires_a_subscription_and_dedupes() {
 	let sub = repo.subscriber_for_user(user, "emit@example.com", true).await.expect("subscriber");
 
 	// Not following yet ⇒ nothing is delivered, and it is not an error.
-	let none = repo.emit(user, TOPIC, "nav", "t", "b", "", "k1", 100).await.expect("emit without subscription");
+	let none = repo.emit(user, TOPIC, "nav", "t", "b", "", "k1", 100, false).await.expect("emit without subscription");
 	assert!(none.notification_id.is_none(), "an unfollowed topic stores nothing");
 	assert!(!none.in_app && !none.email, "and delivers on no channel");
 
 	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
 
-	let first = repo.emit(user, TOPIC, "nav", "NAV updated", "body", "/funds/x", "k1", 100).await.expect("emit");
+	let first = repo.emit(user, TOPIC, "nav", "NAV updated", "body", "/funds/x", "k1", 100, false).await.expect("emit");
 	assert!(first.notification_id.is_some(), "a followed topic stores the notification");
 	assert!(first.in_app, "in-app is on, so it is delivered there");
 	assert!(first.email, "email is on and the address is verified, so a copy is queued");
 	assert!(!first.deduped);
 
 	// The whole point of the unique dedupe index: an at-least-once retry is a no-op.
-	let retry = repo.emit(user, TOPIC, "nav", "NAV updated", "body", "/funds/x", "k1", 100).await.expect("retry emit");
+	let retry = repo.emit(user, TOPIC, "nav", "NAV updated", "body", "/funds/x", "k1", 100, false).await.expect("retry emit");
 	assert!(retry.deduped, "the same dedupe key must not produce a second notification or a second email");
 	assert!(retry.notification_id.is_none());
 
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 1, "the retry did not inflate the inbox");
+	assert_eq!(repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"), 1, "the retry did not inflate the inbox");
 }
 
 #[tokio::test]
@@ -90,19 +90,23 @@ async fn channels_gate_delivery_independently_and_may_both_be_off() {
 
 	// Email off, in-app on.
 	repo.set_channel_enabled(sub.id, None, Some(false)).await.expect("email off");
-	let a = repo.emit(user, TOPIC, "k", "t", "", "", "c1", 1).await.expect("emit");
+	let a = repo.emit(user, TOPIC, "k", "t", "", "", "c1", 1, false).await.expect("emit");
 	assert!(a.in_app && !a.email, "the master email switch alone suppresses the copy");
 
 	// Both off — a supported state, not a broken record.
 	repo.set_channel_enabled(sub.id, Some(false), None).await.expect("in-app off");
-	let b = repo.emit(user, TOPIC, "k", "t", "", "", "c2", 1).await.expect("emit");
+	let b = repo.emit(user, TOPIC, "k", "t", "", "", "c2", 1, false).await.expect("emit");
 	assert!(!b.in_app && !b.email, "with both channels off nothing is delivered");
 	assert!(b.notification_id.is_some(), "the durable record is still written — it anchors the dedupe key");
 
 	// Suppression is a read-path concern, so the inbox reads empty while in-app is off,
 	// and the history comes back when it is switched on again.
 	repo.set_channel_enabled(sub.id, Some(true), None).await.expect("in-app back on");
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 2, "re-enabling restores history rather than showing a gap");
+	assert_eq!(
+		repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"),
+		2,
+		"re-enabling restores history rather than showing a gap"
+	);
 }
 
 #[tokio::test]
@@ -118,37 +122,41 @@ async fn inbox_paginates_by_keyset_and_marks_read() {
 	// Emitted back-to-back on purpose: they land in the same second, which is what makes
 	// the select list's `… AS created_at` alias shadow the ORDER BY and break the cursor.
 	for i in 0..5 {
-		repo.emit(user, TOPIC, "k", &format!("n{i}"), "", "", &format!("p{i}"), 100 + i).await.expect("emit");
+		repo.emit(user, TOPIC, "k", &format!("n{i}"), "", "", &format!("p{i}"), 100 + i, false).await.expect("emit");
 	}
 
-	let page1 = repo.list(sub.id, None, 2, false, None).await.expect("page 1");
+	let page1 = repo.list(sub.id, None, 2, false, None, &InboxTopics::Every).await.expect("page 1");
 	assert_eq!(page1.len(), 2, "the limit is honoured");
 
 	// The cursor is the previous page's last id, resolved server-side into its
 	// (created_at, id) key — the construct being proven here.
-	let page2 = repo.list(sub.id, Some(page1[1].id), 2, false, None).await.expect("page 2");
+	let page2 = repo.list(sub.id, Some(page1[1].id), 2, false, None, &InboxTopics::Every).await.expect("page 2");
 	assert_eq!(page2.len(), 2);
 	assert!(
 		page1.iter().all(|a| page2.iter().all(|b| a.id != b.id)),
 		"pages must not overlap, or the reader sees duplicates while scrolling"
 	);
 
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 5);
-	let marked = repo.mark_read(sub.id, &[page1[0].id], false).await.expect("mark one");
+	assert_eq!(repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"), 5);
+	let marked = repo.mark_read(sub.id, &[page1[0].id], false, &InboxTopics::Every).await.expect("mark one");
 	assert_eq!(marked, 1);
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 4);
+	assert_eq!(repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"), 4);
 
-	let unread_only = repo.list(sub.id, None, 10, true, None).await.expect("unread page");
+	let unread_only = repo.list(sub.id, None, 10, true, None, &InboxTopics::Every).await.expect("unread page");
 	assert_eq!(unread_only.len(), 4, "the read one drops out of the unread filter");
 
-	assert_eq!(repo.mark_read(sub.id, &[], true).await.expect("mark all"), 4, "mark-all only touches what is still unread");
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 0);
+	assert_eq!(
+		repo.mark_read(sub.id, &[], true, &InboxTopics::Every).await.expect("mark all"),
+		4,
+		"mark-all only touches what is still unread"
+	);
+	assert_eq!(repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"), 0);
 
 	// A foreign id must not be markable even though ids are unguessable.
 	let other = Uuid::new_v4();
 	let other_sub = repo.subscriber_for_user(other, "other@example.com", true).await.expect("other subscriber");
 	assert_eq!(
-		repo.mark_read(other_sub.id, &[page1[0].id], false).await.expect("cross-subscriber mark"),
+		repo.mark_read(other_sub.id, &[page1[0].id], false, &InboxTopics::Every).await.expect("cross-subscriber mark"),
 		0,
 		"mark_read is scoped by subscriber, so one user cannot touch another's inbox"
 	);
@@ -188,7 +196,7 @@ async fn unsubscribe_stops_email_without_touching_the_inbox() {
 	let user = Uuid::new_v4();
 	let sub = repo.subscriber_for_user(user, "unsub@example.com", true).await.expect("subscriber");
 	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
-	repo.emit(user, TOPIC, "k", "t", "", "", "u1", 1).await.expect("emit");
+	repo.emit(user, TOPIC, "k", "t", "", "", "u1", 1, false).await.expect("emit");
 
 	assert!(repo.unsubscribe(&sub.unsubscribe_token, None).await.expect("unsubscribe"), "a known token unsubscribes");
 	assert!(
@@ -199,7 +207,11 @@ async fn unsubscribe_stops_email_without_touching_the_inbox() {
 	let after = repo.subscriber_for_user(user, "unsub@example.com", true).await.expect("reload");
 	assert!(!after.email_enabled, "List-Unsubscribe switches the email channel off");
 	assert!(after.in_app_enabled, "…and deliberately leaves the in-app channel alone");
-	assert_eq!(repo.unread_count(sub.id).await.expect("count"), 1, "unsubscribing is not account deletion — the inbox survives");
+	assert_eq!(
+		repo.unread_count(sub.id, &InboxTopics::Every).await.expect("count"),
+		1,
+		"unsubscribing is not account deletion — the inbox survives"
+	);
 }
 
 #[tokio::test]
@@ -217,7 +229,7 @@ async fn delivery_queue_claims_leases_and_backs_off() {
 	// long lease keeps the drained rows out of the way for the rest of this test.
 	while !repo.claim_due(500, 3600).await.expect("drain the queue").is_empty() {}
 
-	repo.emit(user, TOPIC, "nav", "Queued", "body", "/x", "q1", 100).await.expect("emit");
+	repo.emit(user, TOPIC, "nav", "Queued", "body", "/x", "q1", 100, false).await.expect("emit");
 
 	// The claim is a `FOR UPDATE SKIP LOCKED` CTE feeding an UPDATE … RETURNING, and
 	// the lease is `make_interval(secs => $2)` with a float bind — both runtime-only.
@@ -225,7 +237,10 @@ async fn delivery_queue_claims_leases_and_backs_off() {
 	let job = claimed.iter().find(|j| j.recipient == "queue@example.com").expect("our job is claimed");
 	assert_eq!(job.kind, "notification");
 	assert_eq!(job.title.as_deref(), Some("Queued"), "the join carries the notification body through for rendering");
-	assert!(!job.unsubscribe_token.is_empty(), "…and the subscriber's unsubscribe token, for the List-Unsubscribe header");
+	assert!(
+		job.unsubscribe_token.as_deref().is_some_and(|t| !t.is_empty()),
+		"…and the subscriber's unsubscribe token, for the List-Unsubscribe header"
+	);
 	assert_eq!(job.attempts, 1, "claiming counts an attempt, so a crash mid-send cannot retry forever");
 
 	// The lease hides it from a second dispatcher.
@@ -235,4 +250,34 @@ async fn delivery_queue_claims_leases_and_backs_off() {
 	repo.mark_failed(job.id, "smtp exploded", 60, 6).await.expect("mark failed");
 	repo.mark_sent(job.id).await.expect("mark sent");
 	assert!(repo.sent_last_24h().await.expect("budget read") >= 1, "the daily send budget can see what was sent");
+}
+
+#[tokio::test]
+async fn switching_a_topic_off_is_remembered_and_following_it_again_clears_that() {
+	let Some(repo) = setup().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = Uuid::new_v4();
+	let sub = repo.subscriber_for_user(user, "optout@example.com", true).await.expect("subscriber");
+	let stance = |rows: Vec<concierge::infrastructure::notifications::SubscriptionRow>| rows.into_iter().map(|r| (r.topic, r.subscribed)).collect::<Vec<_>>();
+	assert!(stance(repo.subscriptions(sub.id).await.unwrap()).is_empty(), "never touched: no row either way");
+
+	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
+	assert!(repo.unsubscribe(&sub.unsubscribe_token, Some(TOPIC)).await.expect("one-click unsubscribe of one topic"));
+	assert_eq!(stance(repo.subscriptions(sub.id).await.unwrap()), vec![(TOPIC.to_owned(), false)], "switched off, and said so");
+	let muted = repo.emit(user, TOPIC, "k", "t", "", "", "o1", 1, true).await.expect("emit on a default topic");
+	assert!(muted.notification_id.is_none(), "the default does not override a switch-off");
+
+	repo.set_topic_subscription(sub.id, TOPIC, true, false).await.expect("follow again");
+	assert_eq!(stance(repo.subscriptions(sub.id).await.unwrap()), vec![(TOPIC.to_owned(), true)]);
+	let heard = repo.emit(user, TOPIC, "k", "t", "", "", "o2", 1, false).await.expect("emit");
+	assert!(heard.in_app && !heard.email, "the per-topic mail copy the follow chose");
+
+	// An account-less address that left a topic and asks for it again is following it.
+	let email = format!("anon-optout-{}@example.com", Uuid::new_v4());
+	let (anon, _) = repo.subscribe_anonymous(&email, TOPIC, 3600).await.unwrap().expect("first subscribe mails a confirmation");
+	repo.set_topic_subscription(anon, TOPIC, false, false).await.expect("leave");
+	repo.subscribe_anonymous(&email, TOPIC, 3600).await.expect("subscribe again");
+	assert_eq!(stance(repo.subscriptions(anon).await.unwrap()), vec![(TOPIC.to_owned(), true)]);
 }

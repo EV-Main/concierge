@@ -30,8 +30,8 @@ use concierge::{
 	relying_party::{Admission, ClientTokenAuthenticator, RelyingParties, Requester, s256_challenge},
 	web::{self, KycDeps},
 };
-use domain::users::{AuthSubject, Email, UserId};
-use evconcierge_auth::{AuthConfig, AuthService, SigningConfig, TokenType, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
+use domain::users::UserId;
+use evconcierge_auth::{AuthConfig, AuthService, Claims, SigningConfig, TokenType, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
 	ClientTokenResponse, ExchangeCodeRequest, GetMeRequest, GetPlatformConfigRequest, RefreshClientTokenRequest, TokenResponse, UpdateProfileRequest, UserSummary,
 	auth_service_server::{AuthService as AuthRpc, AuthServiceServer},
@@ -73,6 +73,7 @@ fn auth_config() -> AuthConfig {
 			jwks_json: format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","x":"{TEST_JWK_X}","kid":"test-kid","alg":"EdDSA","use":"sig"}}]}}"#),
 		}),
 		google: None,
+		github: None,
 	}
 }
 
@@ -170,8 +171,7 @@ macro_rules! fixture {
 
 impl Fx {
 	async fn user(&self) -> UserId {
-		let subject = AuthSubject::parse(&format!("rp-itest-{}", Uuid::new_v4())).unwrap();
-		self.users.provision(subject, Email::parse("rp@example.com").unwrap(), true).await.expect("provision").id()
+		self.users.resolve(common::google("rp", true), 0).await.expect("provision").id()
 	}
 
 	/// The tenant's `operator` alias, granted by someone else.
@@ -442,6 +442,48 @@ async fn refresh_after_a_suspension_is_denied_and_ends_the_session() {
 	fx.refresh(&tokens.refresh_token).await.expect_err("revoked for good");
 }
 
+impl Fx {
+	async fn set_scope_state(&self, state: &str) {
+		sqlx::query("UPDATE tenants SET state = $2 WHERE id = $1")
+			.bind(&self.client.namespace)
+			.bind(state)
+			.execute(&self.pool)
+			.await
+			.expect("set the scope state");
+	}
+}
+
+/// A FROZEN scope's client keeps working (a direction has to learn it was frozen); a
+/// CLOSED one's is refused like a disabled client, and its session ends at the refresh.
+#[tokio::test]
+async fn a_closed_scope_ends_its_clients_and_a_frozen_one_does_not() {
+	let fx = fixture!();
+	let (_, tokens) = fx.signed_in().await;
+
+	fx.set_scope_state("frozen").await;
+	assert!(!fx.record().await.scope_closed, "a frozen scope still resolves its client");
+	let tokens = fx.refresh(&tokens.refresh_token).await.expect("a frozen scope's client still refreshes");
+	let user = fx.user().await;
+	let (code, verifier) = fx.code_for(user).await;
+	fx.exchange(&code, &verifier).await.expect("and still redeems a code");
+	let (pending, pending_verifier) = fx.code_for(user).await;
+
+	fx.set_scope_state("closed").await;
+	assert!(
+		fx.rp.resolve(&fx.client.id, &fx.client.redirect_uri).await.unwrap().is_none(),
+		"/auth/authorize answers with a page, as for a disabled client"
+	);
+	assert!(!fx.session_live(&tokens).await, "an outstanding access token stops opening GetMe at once");
+	let status = fx.exchange(&pending, &pending_verifier).await.expect_err("no code redeems");
+	assert_eq!(status.code(), Code::Unauthenticated);
+	let status = fx.refresh(&tokens.refresh_token).await.expect_err("no refresh");
+	assert_eq!(status.code(), Code::Unauthenticated);
+	assert_eq!(fx.revoked_reason(fx.session_of(&tokens).await).await.as_deref(), Some("scope_closed"));
+
+	fx.set_scope_state("active").await;
+	fx.refresh(&tokens.refresh_token).await.expect_err("a session the closure ended stays ended");
+}
+
 #[tokio::test]
 async fn refresh_after_revoke_all_is_refused() {
 	let fx = fixture!();
@@ -589,6 +631,7 @@ async fn router(fx: &Fx) -> Router {
 		fx.auth.clone(),
 		"https://evinvest.test".to_string(),
 		false,
+		common::inert_sign_in(&fx.pool),
 		KycDeps {
 			users: fx.users.clone(),
 			cases: Arc::new(PgKycCases::new(fx.pool.clone())),
@@ -642,17 +685,37 @@ fn params(location: &str) -> std::collections::HashMap<String, String> {
 	form_urlencoded::parse(query.as_bytes()).into_owned().collect()
 }
 
+/// The access token a session minted under `token_version` carries. Unsigned: the route
+/// reads the claim from its own session store and never verifies it, so only the claims
+/// matter here.
+fn access_token_at(user: UserId, token_version: u64, exp: u64) -> String {
+	let claims = Claims {
+		sub: user.to_string(),
+		iss: ISSUER.into(),
+		aud: PLANE_AUDIENCE.into(),
+		exp,
+		iat: 0,
+		typ: TokenType::Access,
+		jti: None,
+		token_version,
+		auth_time: None,
+	};
+	let encode = |json: &str| URL_SAFE_NO_PAD.encode(json.as_bytes());
+	format!("{}.{}.unsigned", encode(r#"{"alg":"EdDSA","typ":"JWT"}"#), encode(&serde_json::to_string(&claims).unwrap()))
+}
+
 /// A REAL `evinvest.ltd` session: a refresh family in the fixture's issuance store and a
 /// locker entry pointing at it, as a Google sign-in leaves them. Returns the cookie and
 /// the refresh token.
 async fn signed_in_browser(fx: &Fx, user: UserId) -> Option<(String, String)> {
 	std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty())?;
-	let refresh_token = fx.auth.open_family_for_tests(&user.to_string(), 0).await.expect("open a refresh family");
+	let token_version = fx.users.find_by_id(user).await.unwrap().expect("user exists").token_version();
+	let refresh_token = fx.auth.open_family_for_tests(&user.to_string(), token_version).await.expect("open a refresh family");
 	let sessions = web::WebSessions::from_env().await.expect("session store");
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 	let (id, ..) = sessions
 		.put(TokenResponse {
-			access_token: "access".into(),
+			access_token: access_token_at(user, token_version, now as u64 + 900),
 			access_expires_at: now + 900,
 			refresh_token: refresh_token.clone(),
 			refresh_expires_at: now + 3600,
@@ -660,9 +723,11 @@ async fn signed_in_browser(fx: &Fx, user: UserId) -> Option<(String, String)> {
 				user_id: user.to_string(),
 				email: "rp@example.com".into(),
 				status: "active".into(),
-				token_version: 0,
+				token_version,
 				role: "investor".into(),
 				role_is_break_glass: false,
+				email_verified: true,
+				username: String::new(),
 			}),
 		})
 		.await
@@ -804,6 +869,43 @@ async fn authorize_issues_a_code_only_to_an_active_account() {
 	assert_eq!(tokens.user_id, user.to_string());
 }
 
+/// A takeover (or a revoke-all) bumps `token_version` and leaves the squatter's refresh
+/// family in Redis until its next refresh, so the family check alone admits the session
+/// for as long as its cached access token lives. It must be refused here the way every
+/// signed-in route refuses it: 401, session closed, no code for the client.
+#[tokio::test]
+async fn a_session_minted_before_a_token_version_bump_gets_no_code_and_ends() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let squatted = fx.user().await;
+	let Some((cookie, refresh_token)) = signed_in_browser(&fx, squatted).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	fx.bump_token_version(squatted).await;
+	assert!(
+		fx.auth.live_family(&refresh_token).await.unwrap().is_some(),
+		"the precondition: the family is still live, so only token_version can refuse"
+	);
+
+	let answer = get(&router, &authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48))), Some(&cookie)).await;
+	assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+	assert_eq!(answer.location, None, "no code travels to the client");
+	assert!(
+		answer.headers.get_all(header::SET_COOKIE).iter().any(|c| c.to_str().unwrap().starts_with("ev_session=;")),
+		"the session cookies are cleared"
+	);
+	let session_id = cookie.trim_start_matches("ev_session=");
+	assert!(web::WebSessions::from_env().await.unwrap().csrf(session_id).await.unwrap().is_none(), "the locker entry is gone");
+	assert!(fx.auth.live_family(&refresh_token).await.unwrap().is_none(), "the family is revoked upstream");
+	let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM rp_codes WHERE user_id = $1")
+		.bind(squatted.raw())
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(codes, 0);
+}
+
 // ─── Security follow-ups (PR #100 review) ────────────────────────────────────────
 
 #[tokio::test]
@@ -822,7 +924,7 @@ async fn get_me_on_a_client_token_carries_no_identity_document_fields() {
 	let me = directory.get_me(bearer(GetMeRequest {}, &tokens.access_token)).await.expect("GetMe").into_inner();
 	assert_eq!(me.user_id, user.to_string());
 	assert_eq!(me.preferred_name, "Jane");
-	assert_eq!(me.email, "rp@example.com");
+	assert_eq!(me.email, fx.users.find_by_id(user).await.unwrap().expect("user exists").email().as_str());
 	for (field, value) in [
 		("legal_name", &me.legal_name),
 		("phone", &me.phone),
@@ -1055,4 +1157,45 @@ async fn a_replica_without_the_secret_variable_keeps_the_stored_secret() {
 	let user = fx.user().await;
 	let (code, verifier) = fx.code_for(user).await;
 	fx.exchange(&code, &verifier).await.expect("the client still authenticates with the secret another replica set");
+}
+
+/// The column refuses what `check_registered_redirects` refuses at boot, so a hand-written
+/// INSERT cannot register a redirect the plane would then send codes to.
+#[tokio::test]
+async fn the_registry_refuses_a_redirect_uri_of_the_wrong_shape() {
+	let fx = fixture!();
+	// Each attempt in its own transaction, rolled back: nothing is left registered.
+	let register = |uri: &'static str| {
+		let pool = fx.pool.clone();
+		async move {
+			let mut tx = pool.begin().await.unwrap();
+			let id = format!("shape_{}", uuid::Uuid::new_v4().simple().to_string().get(..12).unwrap());
+			sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, TRUE, 0)")
+				.bind(&id)
+				.execute(&mut *tx)
+				.await
+				.unwrap();
+			sqlx::query("INSERT INTO rp_clients (client_id, audience, redirect_uris, created_at, tenant_id) VALUES ($1, $1, ARRAY[$2], 0, $1)")
+				.bind(&id)
+				.bind(uri)
+				.execute(&mut *tx)
+				.await
+				.map(|_| ())
+		}
+	};
+	for bad in [
+		"http://rp.test/cb",
+		"https://rp.test/cb#fragment",
+		"https://user@rp.test/cb",
+		"https://rp.test/c b",
+		"https://rp.test/cb\n",
+		"https:///cb",
+		"rp.test/cb",
+	] {
+		let err = register(bad).await.expect_err(bad);
+		assert!(err.to_string().contains("rp_clients_redirect_uris_shape"), "{bad:?}: {err}");
+	}
+	for good in ["https://rp.test/auth/callback", "https://rp.test:8443/cb?x=1", "https://rp.test?x=1"] {
+		register(good).await.unwrap_or_else(|e| panic!("{good:?}: {e}"));
+	}
 }

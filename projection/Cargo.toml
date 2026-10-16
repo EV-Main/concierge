@@ -1,0 +1,37 @@
+[package]
+name = "evconcierge_projection"
+version = "0.3.0"
+edition = "2024"
+description = "The pull engine a relying party keeps its projection of EV concierge's users with: cursors, dedupe, per-key ordering, parking and replay over the lifecycle and scope streams."
+license = "BlueOak-1.0.0"
+repository = "https://github.com/EV-Main/concierge"
+readme = "README.md"
+include = ["Cargo.toml", "README.md", "src/**/*.rs"]
+
+[features]
+# The two `ProjectionStore` adapters. Features rather than crates of their own: they share
+# the store's private helpers and its schema-version rule, and ship in one version with
+# the engine whose bookkeeping they hold.
+pg = ["dep:sqlx", "sqlx?/postgres"]
+sqlite = ["dep:sqlx", "sqlx?/sqlite-bundled"]
+
+[dependencies]
+async-trait.workspace = true
+evconcierge_contracts.workspace = true
+# Not the workspace entry: that one keeps sqlx's default features (macros, migrate), which
+# a published library would force on every consumer. Runtime queries need none of them.
+sqlx = { version = "0.9.0", optional = true, default-features = false, features = ["runtime-tokio"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Every test target sees both adapters, whatever features the command line named.
+evconcierge_projection = { path = ".", features = ["pg", "sqlite"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "test-util"] }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+uuid = { workspace = true, features = ["v4"] }
+
+[lints]
+workspace = true

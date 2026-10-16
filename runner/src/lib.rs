@@ -26,13 +26,22 @@
 //!   relying_party   — this plane as the IdP of first-party clients on other origins:
 //!                     the registry, one-time codes and client refresh families behind
 //!                     `/auth/authorize` and `AuthService.ExchangeCode`
+//!   scopes          — the scope registry's read service (`ScopeRegistry`)
+//!   scope_events    — `ScopeEvents`, the per-scope stream relying parties project from
+//!   scope_catalog   — `ScopeCatalogService`: approval kinds and notification topics per namespace
+//!   service_caller  — who calls a service-credential RPC: the bridge token or a client secret
+//!   approvals       — `ApprovalService` (people) and `ApprovalExecutionService` (proposers):
+//!                     the consilium generalised to every scope, plus the executor loop of
+//!                     this plane's own `concierge:*` kinds
 //!   web             — the site-level auth HTTP surface (login/callback/session cookies)
 //!   notification    — the notification plane: subscribers, the in-app inbox, queued email
 //!   dispatch        — the background loops: draining the outbound email queue, and the
-//!                     hold sweep (the ONE thing here that sweeps — a lapse must be a
-//!                     write, or the money plane never learns the account is unfrozen)
+//!                     hold sweep (a lapse must be a write, or the money plane never learns
+//!                     the account is unfrozen); with the approval executor, the only loops
+//!                     that act on their own
 //!   log             — DEFERRED stub (no platform audit surface yet)
 
+pub mod approvals;
 pub mod authz;
 pub mod bridge;
 pub mod bridge_tls;
@@ -47,5 +56,10 @@ pub mod notification;
 pub mod platform;
 pub mod ports;
 pub mod relying_party;
+pub mod scope_catalog;
+pub mod scope_events;
+pub mod scope_inbox;
+pub mod scopes;
+pub mod service_caller;
 pub mod support;
 pub mod web;
