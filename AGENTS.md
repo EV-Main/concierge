@@ -785,7 +785,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   answers 303 to `return_to`. A plain GET never signs anybody out. A wrong refresh secret presented by the right client
   for a live session revokes it (`refresh_reuse`), not only a rotated-out one.
   `RP_DEV_REDIRECT_URIS` (`client=http://localhost:<port>/…`, loopback only) adds dev
-  redirect targets and refuses to boot in production. Sign-ins are recorded by
+  redirect targets and refuses to boot in production.
+  `SCOPE_DEV_ORIGINS` (`scope=http://localhost:<port>`, loopback only) likewise admits a dev
+  origin for a registered scope's sign-in and refuses to boot in production. Sign-ins are recorded by
   `rp_codes`/`rp_sessions` and `tracing`, not `admin_action` (nobody acted on anyone); a
   replay or a reused refresh token is `error!` → Sentry.
 - **The USER consilia pass on a MAJORITY, the OWNER consilia on unanimity**, and the

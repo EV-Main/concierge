@@ -4,9 +4,58 @@
 //! Which routes they may call is the router's structure (`web::router`); keeping it
 //! current against the registry is `allowlist::SignInAllowlist`'s.
 
+use color_eyre::eyre::{Result, bail, ensure};
 use domain::scopes::{is_return_path, is_sign_in_origin};
 
 use crate::ports::ScopeRecord;
+
+/// Development-only extra origins for registered scopes, `scope=origin` pairs separated by
+/// commas — `SCOPE_DEV_ORIGINS`. The registry's CHECKs allow `https` hosts under the site
+/// only, so a cabinet served from `http://localhost:3000` can never be registered; this
+/// lets a developer's plane admit it without a migration that production would carry too.
+/// Refused in production and refused for anything but a loopback `http://` origin.
+#[derive(Clone, Debug, Default)]
+pub struct DevOrigins {
+	pairs: Vec<(String, String)>,
+}
+
+impl DevOrigins {
+	pub fn parse(raw: &str, production: bool) -> Result<Self> {
+		let entries: Vec<&str> = raw.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+		if entries.is_empty() {
+			return Ok(Self::default());
+		}
+		ensure!(!production, "SCOPE_DEV_ORIGINS must never be set in production: it admits origins no migration reviewed");
+		let mut pairs = Vec::new();
+		for entry in entries {
+			let Some((scope, origin)) = entry.split_once('=') else {
+				bail!("SCOPE_DEV_ORIGINS entry {entry:?} is not `scope=origin`");
+			};
+			ensure!(
+				!scope.is_empty() && is_loopback_origin(origin),
+				"SCOPE_DEV_ORIGINS entry {entry:?}: only http://localhost:<port> or http://127.0.0.1:<port> is accepted"
+			);
+			pairs.push((scope.to_owned(), origin.to_owned()));
+		}
+		Ok(Self { pairs })
+	}
+
+	fn of<'a>(&'a self, scope: &'a str) -> impl Iterator<Item = &'a String> {
+		self.pairs.iter().filter(move |(id, _)| id == scope).map(|(_, origin)| origin)
+	}
+}
+
+/// Exactly `http://<loopback host>:<port>`, nothing after the port.
+fn is_loopback_origin(raw: &str) -> bool {
+	let Some(authority) = raw.strip_prefix("http://") else {
+		return false;
+	};
+	["localhost:", "127.0.0.1:"].iter().any(|host| {
+		authority.strip_prefix(host).is_some_and(|port| {
+			(1..=5).contains(&port.len()) && !port.starts_with('0') && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u32>().is_ok_and(|p| p <= u32::from(u16::MAX))
+		})
+	})
+}
 
 /// The origins of every scope that still signs people in, each with the paths an OAuth
 /// sign-in may land on there.
@@ -32,6 +81,12 @@ impl ScopeOrigins {
 	/// rules — the CHECKs refuse such a row, so meeting one here means somebody bypassed
 	/// them, and the answer to that is to trust it less, not to stop signing everyone in.
 	pub fn from_scopes(scopes: &[ScopeRecord]) -> Self {
+		Self::from_scopes_with(scopes, &DevOrigins::default())
+	}
+
+	/// As [`Self::from_scopes`], plus the development origins of the scopes that sign in.
+	/// A dev origin of a scope that is closed or absent admits nothing.
+	pub fn from_scopes_with(scopes: &[ScopeRecord], dev: &DevOrigins) -> Self {
 		let scopes = scopes
 			.iter()
 			.filter(|scope| scope.state.signs_in())
@@ -46,7 +101,7 @@ impl ScopeOrigins {
 				ScopeHosts {
 					id: scope.id.clone(),
 					namespace: scope.namespace.clone(),
-					origins: scope.origins.iter().filter(|o| keep("origin", o, is_sign_in_origin)).cloned().collect(),
+					origins: scope.origins.iter().filter(|o| keep("origin", o, is_sign_in_origin)).chain(dev.of(&scope.id)).cloned().collect(),
 					return_paths: scope.return_paths.iter().filter(|p| keep("return path", p, is_return_path)).cloned().collect(),
 				}
 			})
@@ -133,6 +188,46 @@ mod tests {
 			"",
 		] {
 			assert!(!o.admits(bad), "{bad}");
+		}
+	}
+
+	#[test]
+	fn dev_origins_are_loopback_only_and_never_in_production() {
+		let dev = DevOrigins::parse("invest=http://localhost:3000", false).unwrap();
+		let o = ScopeOrigins::from_scopes_with(
+			&[
+				scope("invest", ScopeState::Active, &["https://invest.evinvest.ltd"], &["/cabinet"]),
+				scope("old", ScopeState::Closed, &["https://old.evinvest.ltd"], &["/"]),
+			],
+			&dev,
+		);
+		assert!(o.admits("http://localhost:3000"));
+		assert!(o.is_return_target("http://localhost:3000/cabinet"));
+		assert!(!o.is_return_target("http://localhost:3000/"), "the scope's own return paths still apply");
+		assert!(!o.admits("http://localhost:3001"));
+		assert!(!registry().admits("http://localhost:3000"), "no dev origins, no localhost");
+
+		let other = DevOrigins::parse("old=http://localhost:3000, nope=http://localhost:4000", false).unwrap();
+		let o = ScopeOrigins::from_scopes_with(&[scope("old", ScopeState::Closed, &["https://old.evinvest.ltd"], &["/"])], &other);
+		assert!(!o.admits("http://localhost:3000"), "a closed scope admits no dev origin");
+		assert!(!o.admits("http://localhost:4000"), "an unregistered scope admits no dev origin");
+
+		assert!(DevOrigins::parse("", true).is_ok());
+		assert!(DevOrigins::parse("invest=http://localhost:3000", true).is_err(), "production refuses a dev origin");
+		for bad in [
+			"invest=https://localhost:3000",
+			"invest=http://localhost",
+			"invest=http://localhost:3000/",
+			"invest=http://localhost:3000.evil.com",
+			"invest=http://localhost.evil.com:3000",
+			"invest=http://user@localhost:3000",
+			"invest=http://localhost:0",
+			"invest=http://localhost:65536",
+			"invest=http://example.com:3000",
+			"=http://localhost:3000",
+			"http://localhost:3000",
+		] {
+			assert!(DevOrigins::parse(bad, false).is_err(), "{bad:?} must be refused");
 		}
 	}
 
