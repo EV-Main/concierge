@@ -144,6 +144,9 @@ pub struct AdminAction {
 	pub reason: String,
 	/// The proposal that authorized this, when one did.
 	pub proposal_id: Option<Uuid>,
+	/// The approval (`approvals`) that authorized this, when one did: the legacy proposal
+	/// above is a `user_proposal`, and a decision of the generalised consilium is not.
+	pub approval_id: Option<Uuid>,
 	/// What the action did, in the vocabulary of the action itself.
 	pub detail: Option<serde_json::Value>,
 	/// Where the request came from. Same provenance the consilium records.
@@ -166,6 +169,11 @@ impl AdminAction {
 			user_agent: audit.user_agent.clone(),
 			..Self::default()
 		}
+	}
+
+	pub fn with_approval(mut self, approval_id: Uuid) -> Self {
+		self.approval_id = Some(approval_id);
+		self
 	}
 
 	pub fn with_reason(mut self, reason: &str) -> Self {
@@ -409,13 +417,15 @@ impl UserDirectoryRepository for PgUsers {
 		};
 		// The plane's lazy-expiry convention: a proposal past its deadline is not open,
 		// whether or not a write path has got round to stamping it so.
-		let ratification_pending: bool =
-			sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM user_proposal WHERE subject_user_id = $1 AND kind = 'suspension' AND state = 'open' AND expires_at > $2)")
-				.bind(id.raw())
-				.bind(now)
-				.fetch_one(&mut *tx)
-				.await
-				.map_err(repo_err)?;
+		let ratification_pending: bool = sqlx::query_scalar(
+			"SELECT EXISTS (SELECT 1 FROM user_proposal WHERE subject_user_id = $1 AND kind = 'suspension' AND state = 'open' AND expires_at > $2) \
+				 OR EXISTS (SELECT 1 FROM approvals WHERE kind = 'concierge:user_suspension' AND scope = 'main' AND subject_ref = 'user:' || $1::text AND state IN ('open', 'passed'))",
+		)
+		.bind(id.raw())
+		.bind(now)
+		.fetch_one(&mut *tx)
+		.await
+		.map_err(repo_err)?;
 		user.hold(by, now, ratification_pending)?;
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
@@ -967,8 +977,8 @@ fn detail_with(base: Option<serde_json::Value>, keys: serde_json::Value) -> serd
 /// the mutation it describes commit together or not at all.
 pub(crate) async fn record_action(conn: &mut PgConnection, subject: UserId, action: &AdminAction, now: i64) -> Result<(), DomainError> {
 	sqlx::query(
-		"INSERT INTO admin_action (subject_user_id, actor_user_id, action, proposal_id, reason, detail, occurred_at, client_ip, user_agent) \
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+		"INSERT INTO admin_action (subject_user_id, actor_user_id, action, proposal_id, reason, detail, occurred_at, client_ip, user_agent, approval_id) \
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
 	)
 	.bind(subject.raw())
 	.bind(action.actor.map(|a| a.raw()))
@@ -979,6 +989,7 @@ pub(crate) async fn record_action(conn: &mut PgConnection, subject: UserId, acti
 	.bind(now)
 	.bind(action.client_ip.chars().take(64).collect::<String>())
 	.bind(action.user_agent.chars().take(256).collect::<String>())
+	.bind(action.approval_id)
 	.execute(&mut *conn)
 	.await
 	.map_err(repo_err)?;

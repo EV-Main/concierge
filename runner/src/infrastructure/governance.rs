@@ -41,7 +41,7 @@ use uuid::Uuid;
 use crate::{
 	genesis::{GenesisOutcome, GenesisSubject, Resolution, Unseatable, UnseatableReason},
 	infrastructure::{notifications, users},
-	ports::{GovernanceMailQueued, GovernanceRepository, OwnerGenesisRepository},
+	ports::{Drained, GovernanceMailQueued, GovernanceRepository, LegacyKind, OwnerGenesisRepository},
 };
 
 /// Crockford base32 with `I`, `L`, `O` and `U` removed — the four a person mistypes or
@@ -191,7 +191,7 @@ impl Audit {
 	}
 }
 
-fn repo_err(err: sqlx::Error) -> DomainError {
+pub(super) fn repo_err(err: sqlx::Error) -> DomainError {
 	DomainError::Repository(err.to_string())
 }
 
@@ -256,7 +256,7 @@ async fn insert_events(conn: &mut PgConnection, subject: Subject, version: u64, 
 
 /// Bump the revision counter and, by taking its row lock, serialize this transaction
 /// against every other governance write. Must be the FIRST statement of any write path.
-async fn lock_governance(conn: &mut PgConnection) -> Result<i64, DomainError> {
+pub(super) async fn lock_governance(conn: &mut PgConnection) -> Result<i64, DomainError> {
 	sqlx::query_scalar::<_, i64>("UPDATE governance_revision SET revision = revision + 1 WHERE id RETURNING revision")
 		.fetch_one(&mut *conn)
 		.await
@@ -265,7 +265,7 @@ async fn lock_governance(conn: &mut PgConnection) -> Result<i64, DomainError> {
 
 /// The roster, locked for the duration of the transaction so a concurrent `SetRole`
 /// cannot move it between the snapshot and the decision taken from it.
-async fn owner_ids_for_update(conn: &mut PgConnection) -> Result<Vec<UserId>, DomainError> {
+pub(super) async fn owner_ids_for_update(conn: &mut PgConnection) -> Result<Vec<UserId>, DomainError> {
 	// Suspended owners are DELIBERATELY included: ownership is the role, and excluding
 	// them would let an admin lower the denominator (and the floor) by suspending people.
 	let rows = sqlx::query("SELECT id FROM users WHERE role = 'owner' ORDER BY id FOR UPDATE")
@@ -281,7 +281,7 @@ async fn owner_ids_for_update(conn: &mut PgConnection) -> Result<Vec<UserId>, Do
 /// The demotion is all the way to `Investor` rather than `Admin`. An expulsion is
 /// adversarial, and someone the fund has just voted out should not keep every
 /// identity mutation except granting roles.
-async fn take_seat(conn: &mut PgConnection, target: UserId) -> Result<(), DomainError> {
+pub(super) async fn take_seat(conn: &mut PgConnection, target: UserId) -> Result<(), DomainError> {
 	let mut user = users::load_for_update(conn, target).await?;
 	user.set_role(Role::Investor);
 	users::update_row(conn, &user).await?;
@@ -291,7 +291,7 @@ async fn take_seat(conn: &mut PgConnection, target: UserId) -> Result<(), Domain
 /// Grant the seat, through the SAME identity helpers `take_seat` uses, on THIS
 /// transaction — so the role write, its cross-plane `ROLE_CHANGED` and the verdict that
 /// authorized it commit together or not at all.
-async fn grant_seat(conn: &mut PgConnection, candidate: UserId) -> Result<(), DomainError> {
+pub(super) async fn grant_seat(conn: &mut PgConnection, candidate: UserId) -> Result<(), DomainError> {
 	let mut user = users::load_for_update(conn, candidate).await?;
 	user.set_role(Role::Owner);
 	users::update_row(conn, &user).await?;
@@ -316,7 +316,7 @@ async fn load_peers(conn: &mut PgConnection, id: RemovalId) -> Result<Vec<Peer>,
 }
 
 /// Read one proposal `FOR UPDATE`, with its snapshotted peers, as the aggregate.
-async fn load_for_update(conn: &mut PgConnection, id: RemovalId) -> Result<OwnerRemoval, DomainError> {
+pub(super) async fn load_for_update(conn: &mut PgConnection, id: RemovalId) -> Result<OwnerRemoval, DomainError> {
 	let row = sqlx::query(concat!("SELECT ", removal_columns!(), " FROM owner_removal r WHERE r.id = $1 FOR UPDATE"))
 		.bind(id.raw())
 		.fetch_optional(&mut *conn)
@@ -355,7 +355,7 @@ fn optional_ts(value: i64) -> Option<i64> {
 }
 
 /// Write the proposal back and drain its events into the audit log.
-async fn persist(conn: &mut PgConnection, removal: &mut OwnerRemoval, actor: Option<UserId>, audit: &Audit, now: i64) -> Result<(), DomainError> {
+pub(super) async fn persist(conn: &mut PgConnection, removal: &mut OwnerRemoval, actor: Option<UserId>, audit: &Audit, now: i64) -> Result<(), DomainError> {
 	sqlx::query(
 		"UPDATE owner_removal SET state = $2, decided_at = $3, void_reason = $4, version = $5, \
 		 target_decision = $6, target_decided_at = $7, target_notified = $8 WHERE id = $1",
@@ -881,6 +881,54 @@ impl OwnerGenesisRepository for PgGovernance {
 
 /// Append `id` unless it is already there: the same person may be named twice, once by
 /// id and once by mailbox, and they hold one seat either way.
+/// The current owner roster, oldest seat first. Shared with the approvals adapter, which
+/// serves the same list from its own service.
+pub(super) async fn owner_rows(pool: &PgPool) -> Result<Vec<OwnerRow>, DomainError> {
+	// `owner_since` is the last time this plane recorded them BECOMING an owner —
+	// the outbox is the only record of when a role changed — falling back to the
+	// account's own creation for seats granted before the bridge carried roles.
+	sqlx::query_as::<_, OwnerRow>(
+		"SELECT u.id, u.email, u.email_verified, COALESCE(NULLIF(u.preferred_name, ''), u.legal_name) AS display_name, \
+		        COALESCE((SELECT max(o.occurred_at) FROM user_outbox o \
+		                  WHERE o.user_id = u.id AND o.kind = 'ROLE_CHANGED' AND o.role = 'owner'), \
+		                 EXTRACT(EPOCH FROM u.created_at)::BIGINT) AS owner_since \
+		 FROM users u WHERE u.role = 'owner' ORDER BY owner_since ASC, u.id ASC",
+	)
+	.fetch_all(pool)
+	.await
+	.map_err(repo_err)
+}
+
+/// Give up a seat: the same floor as a removal, and a removal open against the one leaving
+/// is moot. The legacy `ResignOwnership` and the approvals' are this one transaction.
+pub(super) async fn resign_seat(pool: &PgPool, who: UserId, now: i64) -> Result<(), DomainError> {
+	let mut tx = pool.begin().await.map_err(repo_err)?;
+	lock_governance(&mut tx).await?;
+	let owners = owner_ids_for_update(&mut tx).await?;
+	if !owners.contains(&who) {
+		return Err(DomainError::Forbidden("you do not hold an owner seat".into()));
+	}
+	// Leaving voluntarily is subject to the SAME floor as being removed: the last
+	// seats are not anyone's to vacate.
+	check_floor(owners.len())?;
+
+	// An open proposal against someone who has just left is moot; void it so the
+	// one-open-per-target index does not keep a dead row.
+	if let Some(open) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM owner_removal WHERE target_user_id = $1 AND state = 'open'")
+		.bind(who.raw())
+		.fetch_optional(&mut *tx)
+		.await
+		.map_err(repo_err)?
+	{
+		let mut moot = load_for_update(&mut tx, RemovalId::from_raw(open)).await?;
+		moot.void("the target resigned the seat", now)?;
+		persist(&mut tx, &mut moot, Some(who), &Audit::default(), now).await?;
+	}
+
+	take_seat(&mut tx, who).await?;
+	tx.commit().await.map_err(repo_err)
+}
+
 fn remember(ids: &mut Vec<UserId>, id: UserId) {
 	if !ids.contains(&id) {
 		ids.push(id);
@@ -890,19 +938,7 @@ fn remember(ids: &mut Vec<UserId>, id: UserId) {
 #[async_trait]
 impl GovernanceRepository for PgGovernance {
 	async fn owners(&self) -> Result<Vec<OwnerRow>, DomainError> {
-		// `owner_since` is the last time this plane recorded them BECOMING an owner —
-		// the outbox is the only record of when a role changed — falling back to the
-		// account's own creation for seats granted before the bridge carried roles.
-		sqlx::query_as::<_, OwnerRow>(
-			"SELECT u.id, u.email, u.email_verified, COALESCE(NULLIF(u.preferred_name, ''), u.legal_name) AS display_name, \
-			        COALESCE((SELECT max(o.occurred_at) FROM user_outbox o \
-			                  WHERE o.user_id = u.id AND o.kind = 'ROLE_CHANGED' AND o.role = 'owner'), \
-			                 EXTRACT(EPOCH FROM u.created_at)::BIGINT) AS owner_since \
-			 FROM users u WHERE u.role = 'owner' ORDER BY owner_since ASC, u.id ASC",
-		)
-		.fetch_all(&self.pool)
-		.await
-		.map_err(repo_err)
+		owner_rows(&self.pool).await
 	}
 
 	async fn open_removal(&self, target: UserId, initiator: UserId, reason: &str, now: i64) -> Result<RemovalRecord, DomainError> {
@@ -1476,31 +1512,67 @@ impl GovernanceRepository for PgGovernance {
 	}
 
 	async fn resign(&self, who: UserId, now: i64) -> Result<(), DomainError> {
+		resign_seat(&self.pool, who, now).await
+	}
+
+	async fn drain(&self, items: &[(LegacyKind, Uuid)], reason: &str, by: UserId, now: i64) -> Result<Vec<Drained>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		lock_governance(&mut tx).await?;
-		let owners = owner_ids_for_update(&mut tx).await?;
-		if !owners.contains(&who) {
-			return Err(DomainError::Forbidden("you do not hold an owner seat".into()));
+		let audit = Audit::default();
+		let mut drained = Vec::with_capacity(items.len());
+		for (kind, id) in items {
+			let result = match kind {
+				LegacyKind::Removal => match load_for_update(&mut tx, RemovalId::from_raw(*id)).await {
+					Err(DomainError::NotFound { .. }) => Drained::NotFound,
+					Err(other) => return Err(other),
+					Ok(mut removal) => {
+						// A due proposal is closed as the expired thing it is, not voided.
+						let lapsed = expire_if_due(&mut removal, now);
+						let open = removal.state().is_open();
+						if open {
+							removal.void(reason, now)?;
+						}
+						if lapsed || open {
+							persist(&mut tx, &mut removal, Some(by), &audit, now).await?;
+						}
+						if open { Drained::Voided } else { Drained::NotOpen }
+					}
+				},
+				LegacyKind::Admission => match load_admission_for_update(&mut tx, AdmissionId::from_raw(*id)).await {
+					Err(DomainError::NotFound { .. }) => Drained::NotFound,
+					Err(other) => return Err(other),
+					Ok(mut admission) => {
+						let lapsed = expire_admission_if_due(&mut admission, now);
+						let open = admission.state().is_open();
+						if open {
+							admission.void(reason, now)?;
+						}
+						if lapsed || open {
+							persist_admission(&mut tx, &mut admission, Some(by), &audit, now).await?;
+						}
+						if open { Drained::Voided } else { Drained::NotOpen }
+					}
+				},
+				LegacyKind::UserProposal => match load_proposal_for_update(&mut tx, UserProposalId::from_raw(*id)).await {
+					Err(DomainError::NotFound { .. }) => Drained::NotFound,
+					Err(other) => return Err(other),
+					Ok(mut proposal) => {
+						let lapsed = expire_proposal_if_due(&mut proposal, now);
+						let open = proposal.state().is_open();
+						if open {
+							proposal.void(reason, now)?;
+						}
+						if lapsed || open {
+							persist_proposal(&mut tx, &mut proposal, Some(by), &audit, now).await?;
+						}
+						if open { Drained::Voided } else { Drained::NotOpen }
+					}
+				},
+			};
+			drained.push(result);
 		}
-		// Leaving voluntarily is subject to the SAME floor as being removed: the last
-		// seats are not anyone's to vacate.
-		check_floor(owners.len())?;
-
-		// An open proposal against someone who has just left is moot; void it so the
-		// one-open-per-target index does not keep a dead row.
-		if let Some(open) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM owner_removal WHERE target_user_id = $1 AND state = 'open'")
-			.bind(who.raw())
-			.fetch_optional(&mut *tx)
-			.await
-			.map_err(repo_err)?
-		{
-			let mut moot = load_for_update(&mut tx, RemovalId::from_raw(open)).await?;
-			moot.void("the target resigned the seat", now)?;
-			persist(&mut tx, &mut moot, Some(who), &Audit::default(), now).await?;
-		}
-
-		take_seat(&mut tx, who).await?;
-		tx.commit().await.map_err(repo_err)
+		tx.commit().await.map_err(repo_err)?;
+		Ok(drained)
 	}
 
 	async fn revision(&self) -> Result<u64, DomainError> {

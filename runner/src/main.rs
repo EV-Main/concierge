@@ -529,12 +529,9 @@ async fn run(config: config::AppConfig) -> Result<()> {
 				governance_revisions.clone(),
 			)))
 			.add_service(MailRelayServiceServer::new(mail_relay))
-			.add_service(auth.layer(GovernanceServiceServer::new(governance::Governance::new(
-				users.clone(),
-				break_glass.clone(),
-				governance_repo,
-				governance_revisions,
-			))))
+			.add_service(auth.layer(GovernanceServiceServer::new(
+				governance::Governance::new(users.clone(), break_glass.clone(), governance_repo, governance_revisions).with_openings_closed(config.governance_new_votes_closed),
+			)))
 			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), grants, break_glass.clone()).with_grant_write_limiter(grant_write_limiter))))
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass.clone(), platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users.clone(), subscribe_limiter))))

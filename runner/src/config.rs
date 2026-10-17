@@ -140,6 +140,12 @@ ev::settings! {
 		/// signed in, but there is no `/governance/*` surface on the site and a link into
 		/// one would 404 every removal invitation ever sent.
 		governance_approval_url: String = "https://evinvest.ltd/cabinet/owner-removal",
+		/// Close new openings of the legacy `GovernanceService` consilia (owner admission and
+		/// removal, user suspension, reinstatement, admin admission): they are refused and name
+		/// the `ApprovalService` RPC that replaces them. Off by default. Votes on what is
+		/// already open, cancellation, resignation and `DrainLegacyProposals` keep working, so
+		/// the window can be emptied before the old service goes.
+		governance_new_votes_closed: bool = "false",
 		/// Didit (identity verification) credentials. The feature is ON only when all three
 		/// are present; with any of them missing `/kyc/start` and `/kyc/callback/didit` answer
 		/// 503 and no case can be opened.

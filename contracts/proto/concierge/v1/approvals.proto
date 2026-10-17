@@ -114,6 +114,48 @@ service ApprovalService {
   // level, opened by a persisted owner, who is kept off the roster. `cooldown_secs` is
   // 0..=1209600 (14 days; INVALID_ARGUMENT otherwise). One change is live at a time.
   rpc ProposePlatformPolicyChange(ProposePlatformPolicyChangeRequest) returns (Approval);
+
+  // The decisions about PEOPLE, moved here from GovernanceService (docs §5.3). All five are
+  // PLATFORM level in scope `main`, opened by a persisted, active owner (PERMISSION_DENIED
+  // otherwise) who is kept off the roster, as is the account the decision is about: nobody
+  // votes on their own seat, and the subject has no veto on it either. The account is named
+  // by `user_id` or by `account` (an email or username); `reason` is required, one line, at
+  // most 200 bytes, no link. One decision about an account per kind is live at a time
+  // (ALREADY_EXISTS / FAILED_PRECONDITION on a second). Each is carried out by this plane's
+  // executor once passed, with the same effect the legacy GovernanceService path had; a
+  // decision that no longer applies when it is executed is VOID.
+  //
+  // ProposeOwnerAdmission  — grant `Role::Owner` to an ACTIVE account with a VERIFIED address
+  //                          that holds no seat. UNANIMITY of the other owners.
+  // ProposeOwnerRemoval    — take an owner's seat (the account falls to `investor`). UNANIMITY
+  //                          of the owners besides the opener and the target; refused (and void
+  //                          at execution) if fewer than two owners would remain.
+  // ProposeUserSuspension  — make a hold permanent (`suspended_by = governance`). More than
+  //                          half of the owners besides the opener.
+  // ProposeUserReinstatement — lift a suspension the owners imposed. Same quorum.
+  // ProposeAdminAdmission  — grant `Role::Admin`. Same quorum.
+  //
+  // `Role::Owner` is written by exactly two things: genesis and this plane's executor of an
+  // executed `concierge:owner_admission`.
+  rpc ProposeOwnerAdmission(ProposePersonDecisionRequest) returns (Approval);
+  rpc ProposeOwnerRemoval(ProposePersonDecisionRequest) returns (Approval);
+  rpc ProposeUserSuspension(ProposePersonDecisionRequest) returns (Approval);
+  rpc ProposeUserReinstatement(ProposePersonDecisionRequest) returns (Approval);
+  rpc ProposeAdminAdmission(ProposePersonDecisionRequest) returns (Approval);
+
+  // The owner roster (the seat holders, suspended ones included), for a caller holding the
+  // permission to grant roles — the same gate as GovernanceService.ListOwners.
+  rpc ListOwners(ListPlatformOwnersRequest) returns (PlatformOwnerList);
+
+  // Give up your own seat, typed-confirmed with your own address. Subject to the same floor
+  // as a removal: fewer than two owners may not remain (FAILED_PRECONDITION). Void any live
+  // platform decision, as every change of the owners does.
+  rpc ResignOwnership(ResignPlatformOwnershipRequest) returns (PlatformOwnerList);
+
+  // A number that moves whenever an approval or the owner roster does, for a console that
+  // polls it and refetches when it changes (the replacement of WatchGovernance's stream:
+  // a revision, never a tally). Platform owners and scope admins.
+  rpc GetApprovalsRevision(GetApprovalsRevisionRequest) returns (ApprovalsRevision);
 }
 
 // ApprovalExecutionService — the proposing services. Every RPC acts only on kinds of the
@@ -594,4 +636,40 @@ message ReportOutcomeRequest {
   ApprovalOutcome outcome = 2;
   // Required for FAILED and VOID; same rules as a TEXT field.
   string detail = 3;
+}
+
+message ProposePersonDecisionRequest {
+  oneof subject {
+    string user_id = 1;
+    // An email or a username, resolved as GrantPermissionRequest.account is.
+    string account = 2;
+  }
+  // Required. One line, at most 200 bytes, no link.
+  string reason = 3;
+}
+
+message ListPlatformOwnersRequest {}
+
+message PlatformOwner {
+  string user_id = 1;
+  string email = 2;
+  string display_name = 3;
+  int64 owner_since = 4;
+}
+
+message PlatformOwnerList {
+  repeated PlatformOwner items = 1;
+  // Below three, the money plane can no longer reach its payout threshold.
+  bool below_payout_floor = 2;
+}
+
+message ResignPlatformOwnershipRequest {
+  // Typed confirmation: must equal the caller's own email.
+  string confirm_email = 1;
+}
+
+message GetApprovalsRevisionRequest {}
+
+message ApprovalsRevision {
+  uint64 revision = 1;
 }

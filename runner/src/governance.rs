@@ -50,14 +50,14 @@ use domain::{
 	users::{Email, User, UserId},
 };
 use evconcierge_contracts::concierge::v1::{
-	AdmissionPeer as AdmissionPeerMsg, AdmissionVote, CancelOwnerAdmissionRequest, CancelOwnerRemovalRequest, CancelUserProposalRequest, FeeTerms as FeeTermsMsg, GetOwnerAdmissionRequest,
-	GetOwnerRemovalRequest, GetRemovalInvitationRequest, GetUserProposalRequest, GovernanceMailKind, GovernanceTick, ListOwnerAdmissionsRequest, ListOwnerRemovalsRequest, ListOwnersRequest,
-	ListUserProposalsRequest, OpenAdminAdmissionRequest, OpenOwnerAdmissionRequest, OpenOwnerRemovalRequest, OpenUserReinstatementRequest, OpenUserSuspensionRequest, Owner,
-	OwnerAdmission as OwnerAdmissionMsg, OwnerAdmissionList, OwnerAdmissionState, OwnerList, OwnerRemoval as OwnerRemovalMsg, OwnerRemovalInvitation, OwnerRemovalList, OwnerRemovalState,
-	ProposalVote as ProposalVoteMsg, RemovalPeer, RemovalVote, ResignOwnershipRequest, SendGovernanceMailRequest, SendGovernanceMailResponse, SubmitAdmissionVoteRequest,
-	SubmitPeerVoteRequest, SubmitSelfDecisionRequest, SubmitSelfDecisionResponse, SubmitUserProposalVoteRequest, UserProposal as UserProposalMsg, UserProposalKind as UserProposalKindMsg,
-	UserProposalList, UserProposalPeer as UserProposalPeerMsg, UserProposalState, WatchGovernanceRequest, governance_service_server::GovernanceService,
-	mail_relay_service_server::MailRelayService, owner_removal_approval_service_server::OwnerRemovalApprovalService,
+	AdmissionPeer as AdmissionPeerMsg, AdmissionVote, CancelOwnerAdmissionRequest, CancelOwnerRemovalRequest, CancelUserProposalRequest, DrainLegacyProposalsRequest,
+	DrainLegacyProposalsResponse, DrainedProposal, FeeTerms as FeeTermsMsg, GetOwnerAdmissionRequest, GetOwnerRemovalRequest, GetRemovalInvitationRequest, GetUserProposalRequest,
+	GovernanceMailKind, GovernanceTick, LegacyProposalKind, ListOwnerAdmissionsRequest, ListOwnerRemovalsRequest, ListOwnersRequest, ListUserProposalsRequest, OpenAdminAdmissionRequest,
+	OpenOwnerAdmissionRequest, OpenOwnerRemovalRequest, OpenUserReinstatementRequest, OpenUserSuspensionRequest, Owner, OwnerAdmission as OwnerAdmissionMsg, OwnerAdmissionList,
+	OwnerAdmissionState, OwnerList, OwnerRemoval as OwnerRemovalMsg, OwnerRemovalInvitation, OwnerRemovalList, OwnerRemovalState, ProposalVote as ProposalVoteMsg, RemovalPeer, RemovalVote,
+	ResignOwnershipRequest, SendGovernanceMailRequest, SendGovernanceMailResponse, SubmitAdmissionVoteRequest, SubmitPeerVoteRequest, SubmitSelfDecisionRequest, SubmitSelfDecisionResponse,
+	SubmitUserProposalVoteRequest, UserProposal as UserProposalMsg, UserProposalKind as UserProposalKindMsg, UserProposalList, UserProposalPeer as UserProposalPeerMsg, UserProposalState,
+	WatchGovernanceRequest, governance_service_server::GovernanceService, mail_relay_service_server::MailRelayService, owner_removal_approval_service_server::OwnerRemovalApprovalService,
 };
 use tokio::sync::{broadcast, mpsc};
 use tonic::{Request, Response, Status, codegen::tokio_stream::Stream};
@@ -70,7 +70,7 @@ use crate::{
 		governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision, UserProposalRecord},
 	},
 	notification::{RateLimiter, now_secs},
-	ports::{GovernanceMailQueued, GovernanceRepository, NotificationRepository, UserDirectoryRepository},
+	ports::{Drained, GovernanceMailQueued, GovernanceRepository, LegacyKind, NotificationRepository, UserDirectoryRepository},
 	support::{authenticate_service, domain_to_status},
 };
 
@@ -85,6 +85,8 @@ const FEED_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Buffered ticks per subscriber. A slow client is disconnected rather than served
 /// stale frames — it can always refetch.
 const FEED_BUFFER: usize = 8;
+/// Proposals one drain call may name.
+const MAX_DRAIN: usize = 100;
 const DEFAULT_REMOVAL_PAGE: u32 = 25;
 const MAX_REMOVAL_PAGE: u32 = 200;
 
@@ -95,6 +97,10 @@ pub struct Governance {
 	break_glass: Arc<BreakGlass>,
 	governance: Arc<dyn GovernanceRepository>,
 	revisions: broadcast::Sender<u64>,
+	/// The window's freeze: new openings are refused and name the approvals RPC that
+	/// replaces them. Votes, cancellations, resignation and the drain keep working, so what
+	/// is already open can still be finished or emptied.
+	openings_closed: bool,
 }
 
 impl Governance {
@@ -104,7 +110,24 @@ impl Governance {
 			break_glass,
 			governance,
 			revisions,
+			openings_closed: false,
 		}
+	}
+
+	/// Close new openings (`GOVERNANCE_NEW_VOTES_CLOSED`).
+	pub fn with_openings_closed(mut self, closed: bool) -> Self {
+		self.openings_closed = closed;
+		self
+	}
+
+	/// Refuses an opening while the freeze is on, naming where to go instead.
+	fn openings_open(&self, replacement: &str) -> Result<(), Status> {
+		if self.openings_closed {
+			return Err(Status::failed_precondition(format!(
+				"new votes of the legacy governance are closed: open this with {replacement}, which the same owners decide"
+			)));
+		}
+		Ok(())
 	}
 
 	/// Owner-only, through the shared RBAC gate, with the live-record check that denies
@@ -446,6 +469,7 @@ impl GovernanceService for Governance {
 	}
 
 	async fn open_owner_removal(&self, request: Request<OpenOwnerRemovalRequest>) -> Result<Response<OwnerRemovalMsg>, Status> {
+		self.openings_open("ApprovalService.ProposeOwnerRemoval")?;
 		let caller = self.acting_owner(&request).await?;
 		let req = request.into_inner();
 		let target = parse_user_id(&req.target_user_id, "target_user_id")?;
@@ -480,6 +504,7 @@ impl GovernanceService for Governance {
 	/// `Role::Owner` is ever granted: `UserDirectory.SetRole` refuses it outright, so a
 	/// bad actor cannot mint the sock puppets that would carry a payout quorum.
 	async fn open_owner_admission(&self, request: Request<OpenOwnerAdmissionRequest>) -> Result<Response<OwnerAdmissionMsg>, Status> {
+		self.openings_open("ApprovalService.ProposeOwnerAdmission")?;
 		let caller = self.acting_owner(&request).await?;
 		let req = request.into_inner();
 		let candidate = parse_user_id(&req.candidate_user_id, "candidate_user_id")?;
@@ -537,6 +562,7 @@ impl GovernanceService for Governance {
 	/// emergency: `UserDirectory.HoldUser` freezes the account now and lapses in 24h, and
 	/// this is what makes it stay.
 	async fn open_user_suspension(&self, request: Request<OpenUserSuspensionRequest>) -> Result<Response<UserProposalMsg>, Status> {
+		self.openings_open("ApprovalService.ProposeUserSuspension")?;
 		let caller = self.acting_owner(&request).await?;
 		let req = request.into_inner();
 		self.open_proposal(UserProposalKind::Suspension, &req.user_id, &req.reason, caller.id()).await
@@ -546,6 +572,7 @@ impl GovernanceService for Governance {
 	/// those: without this RPC their verdict would be either permanent or reversible by
 	/// any one admin, and both are wrong.
 	async fn open_user_reinstatement(&self, request: Request<OpenUserReinstatementRequest>) -> Result<Response<UserProposalMsg>, Status> {
+		self.openings_open("ApprovalService.ProposeUserReinstatement")?;
 		let caller = self.acting_owner(&request).await?;
 		let req = request.into_inner();
 		self.open_proposal(UserProposalKind::Reinstatement, &req.user_id, &req.reason, caller.id()).await
@@ -556,6 +583,7 @@ impl GovernanceService for Governance {
 	/// reason: an operator who can appoint operators can appoint accomplices, and the
 	/// admin seat carries every identity mutation except role granting.
 	async fn open_admin_admission(&self, request: Request<OpenAdminAdmissionRequest>) -> Result<Response<UserProposalMsg>, Status> {
+		self.openings_open("ApprovalService.ProposeAdminAdmission")?;
 		let caller = self.acting_owner(&request).await?;
 		let req = request.into_inner();
 		self.open_proposal(UserProposalKind::AdminAdmission, &req.user_id, &req.reason, caller.id()).await
@@ -643,6 +671,55 @@ impl GovernanceService for Governance {
 		let records = self.governance.list_removals(i64::from(limit), now_secs()).await.map_err(domain_to_status)?;
 		Ok(Response::new(OwnerRemovalList {
 			items: records.iter().map(removal_to_proto).collect(),
+		}))
+	}
+
+	/// The window's drain. An owner only, and deliberately usable while openings are closed.
+	/// Any owner may void what is open: during the window the platform owners' approvals
+	/// already let any one of them veto any decision, so this adds no power a legacy
+	/// proposal's initiator did not have over their own.
+	async fn drain_legacy_proposals(&self, request: Request<DrainLegacyProposalsRequest>) -> Result<Response<DrainLegacyProposalsResponse>, Status> {
+		let caller = self.acting_owner(&request).await?;
+		let req = request.into_inner();
+		if req.items.is_empty() || req.items.len() > MAX_DRAIN {
+			return Err(Status::invalid_argument(format!("name 1 to {MAX_DRAIN} proposals")));
+		}
+		let reason = req.reason.trim();
+		if reason.is_empty() || reason.chars().count() > 200 {
+			return Err(Status::invalid_argument("a reason of 1 to 200 characters is required"));
+		}
+		let refs = req
+			.items
+			.iter()
+			.map(|item| {
+				let kind = match LegacyProposalKind::try_from(item.kind) {
+					Ok(LegacyProposalKind::OwnerRemoval) => LegacyKind::Removal,
+					Ok(LegacyProposalKind::OwnerAdmission) => LegacyKind::Admission,
+					Ok(LegacyProposalKind::UserProposal) => LegacyKind::UserProposal,
+					Ok(LegacyProposalKind::Unspecified) | Err(_) => return Err(Status::invalid_argument("name the kind of every proposal")),
+				};
+				let id = Uuid::parse_str(&item.id).map_err(|_| Status::invalid_argument("a proposal id is not a UUID"))?;
+				Ok((kind, id))
+			})
+			.collect::<Result<Vec<_>, Status>>()?;
+		let drained = self.governance.drain(&refs, reason, caller.id(), now_secs()).await.map_err(domain_to_status)?;
+		announce(self.governance.as_ref(), &self.revisions).await;
+		tracing::warn!(by = %caller.id(), count = refs.len(), "legacy governance proposals drained");
+		Ok(Response::new(DrainLegacyProposalsResponse {
+			items: req
+				.items
+				.into_iter()
+				.zip(drained)
+				.map(|(item, result)| DrainedProposal {
+					r#ref: Some(item),
+					result: match result {
+						Drained::Voided => "voided",
+						Drained::NotOpen => "not_open",
+						Drained::NotFound => "not_found",
+					}
+					.to_owned(),
+				})
+				.collect(),
 		}))
 	}
 

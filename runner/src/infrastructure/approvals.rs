@@ -29,8 +29,8 @@ use std::{
 use async_trait::async_trait;
 use domain::{
 	approvals::{
-		self, Action, Decision, EXECUTION_WINDOW_SECS, Field, FieldValue, MAX_LIVE_PER_PROPOSER, MAX_TTL_SECS, Outcome, PLATFORM_DELAY_SECS, PLATFORM_MIN_ROSTER, PLATFORM_QUORUM_BPS,
-		PULL_MARGIN_SECS, PlatformPolicy, ROLLING_WINDOW_SECS, ScopePolicy, Vote, Voter,
+		self, Action, Decision, EXECUTION_WINDOW_SECS, Field, FieldValue, MAX_LIVE_PER_PROPOSER, MAX_TTL_SECS, Outcome, PLATFORM_DELAY_SECS, PLATFORM_MIN_ROSTER, PULL_MARGIN_SECS,
+		PlatformPolicy, ROLLING_WINDOW_SECS, ScopePolicy, Vote, Voter,
 	},
 	error::DomainError,
 	scope_catalog::{ApprovalKind, ApprovalLevel},
@@ -42,16 +42,17 @@ use uuid::Uuid;
 
 use super::{
 	email::templates::{ApprovalMail, ApprovalMailField, ApprovalMailValue, ApprovalNote, NoteAuthor},
+	governance,
 	grants::{ApprovedGrant, grant_by_approval, lock_accounts},
 	notifications::{enqueue_governance_mail, upsert_subscriber},
-	scope_catalogs,
+	people, scope_catalogs,
 	users::{Named, account_named},
 };
 use crate::ports::{
-	ApprovalActor, ApprovalFilter, ApprovalPerson, ApprovalRecord, ApprovalRepository, ApprovalViewer, GovernanceMailQueued, NewApproval, PersonRef, Proposed, ProvenInitiator,
+	AccountRef, ApprovalActor, ApprovalFilter, ApprovalPerson, ApprovalRecord, ApprovalRepository, ApprovalViewer, GovernanceMailQueued, NewApproval, PersonRef, Proposed, ProvenInitiator,
 };
 
-fn repo_err(err: sqlx::Error) -> DomainError {
+pub(super) fn repo_err(err: sqlx::Error) -> DomainError {
 	DomainError::Repository(err.to_string())
 }
 
@@ -680,6 +681,10 @@ impl ApprovalRepository for PgApprovals {
 			}
 		}
 
+		if let Some(action) = &new.action {
+			people::check_open(&mut tx, action, &owners, &active_owners).await?;
+		}
+
 		let due: Option<Uuid> = sqlx::query_scalar(
 			"SELECT id FROM approvals WHERE kind = $1 AND scope = $2 AND subject_ref = $3 \
 			 AND ((state = 'open' AND expires_at <= $4) OR (state = 'passed' AND executable_at + $5 <= $4))",
@@ -777,7 +782,7 @@ impl ApprovalRepository for PgApprovals {
 						"fewer than {PLATFORM_MIN_ROSTER} platform owners: nobody may decide for the platform alone"
 					)));
 				}
-				(owners, PLATFORM_QUORUM_BPS, PLATFORM_DELAY_SECS, MAX_TTL_SECS)
+				(owners, approvals::platform_quorum_bps(&new.kind.name), PLATFORM_DELAY_SECS, MAX_TTL_SECS)
 			}
 		};
 		// A service's proven initiator leaves a platform roster only (D24(1)); a scope's
@@ -959,7 +964,11 @@ impl ApprovalRepository for PgApprovals {
 		let (mut tx, mut record, now) = self.begin_locked(id).await?;
 		record.decision.expire_if_due(now);
 		let owner = is_owner(&mut tx, by).await?;
-		let result = if !owner && record.decision.is_voter(by) && record.decision.state.is_live() && !holds_seat(&mut tx, &record, by).await? {
+		// Nobody judges their own standing: an owner's say over a decision about them would
+		// make a removal or a suspension something its target could always stop.
+		let result = if record.action.as_ref().and_then(Action::about) == Some(by.raw()) {
+			Err(DomainError::Forbidden("nobody vetoes a decision about their own standing".into()))
+		} else if !owner && record.decision.is_voter(by) && record.decision.state.is_live() && !holds_seat(&mut tx, &record, by).await? {
 			Err(DomainError::Forbidden("you no longer hold the seat this roster was drawn from".into()))
 		} else {
 			record.decision.veto(by, owner, reason, now)
@@ -1090,15 +1099,30 @@ impl ApprovalRepository for PgApprovals {
 		// A grant locks the two accounts it names before the proposal, in the order a change
 		// of the owners takes them (the `users` row, then the trigger's `approvals` rows):
 		// taken the other way round, the executor and an owner's role change could each
-		// hold what the other waits for.
-		let accounts = {
+		// hold what the other waits for. A decision about a person locks every owner too,
+		// because the floor and the roster it was voted on are read under those locks.
+		let (accounts, about_people) = {
 			let mut conn = self.pool.acquire().await.map_err(repo_err)?;
-			match load(&mut conn, id, false, 0).await?.and_then(|r| r.action) {
-				Some(Action::GrantAdmin { user, granted_by, .. }) => vec![UserId::from_raw(user), UserId::from_raw(granted_by)],
-				Some(Action::InstallPolicy { .. } | Action::InstallPlatformPolicy { .. }) | None => Vec::new(),
+			let now = self.instant(&mut conn).await?;
+			match load(&mut conn, id, false, now).await? {
+				Some(record) if record.decision.is_pullable(now) => match record.action {
+					Some(Action::GrantAdmin { user, granted_by, .. }) => (vec![UserId::from_raw(user), UserId::from_raw(granted_by)], false),
+					Some(Action::People { user, opened_by, .. }) => {
+						let mut accounts = people::owner_ids(&mut conn).await?;
+						accounts.extend([UserId::from_raw(user), UserId::from_raw(opened_by)]);
+						(accounts, true)
+					}
+					Some(Action::InstallPolicy { .. } | Action::InstallPlatformPolicy { .. }) | None => (Vec::new(), false),
+				},
+				Some(_) | None => (Vec::new(), false),
 			}
 		};
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		if about_people {
+			// First, as every legacy governance write takes it: the one row that orders them
+			// all, and what moves the legacy live feed when the owners change.
+			governance::lock_governance(&mut tx).await?;
+		}
 		lock_accounts(&mut tx, &accounts).await?;
 		let mut record = load(&mut tx, id, true, 0).await?.ok_or_else(|| not_found(id))?;
 		let now = self.instant(&mut tx).await?;
@@ -1114,6 +1138,7 @@ impl ApprovalRepository for PgApprovals {
 		if !record.decision.is_pullable(now) {
 			return Ok(None);
 		}
+		let mut effect = None;
 		let refused = match &record.action {
 			None => Some("nothing to execute was stored with it".to_owned()),
 			Some(Action::GrantAdmin { user, scope, granted_by }) => match grant_by_approval(&mut tx, UserId::from_raw(*user), scope, UserId::from_raw(*granted_by), id, now).await? {
@@ -1137,6 +1162,14 @@ impl ApprovalRepository for PgApprovals {
 					}
 				}
 			}
+			Some(Action::People { effect: what, user, opened_by }) => {
+				let (user, opened_by) = (UserId::from_raw(*user), UserId::from_raw(*opened_by));
+				let why = people::refusal(&mut tx, &record, *what, user, opened_by, &accounts).await?;
+				if why.is_none() {
+					effect = Some((*what, user));
+				}
+				why
+			}
 		};
 		let (outcome, detail) = match refused {
 			None => (Outcome::Executed, String::new()),
@@ -1152,8 +1185,53 @@ impl ApprovalRepository for PgApprovals {
 			now,
 		)
 		.await?;
+		// After the outcome, never before: changing the owners voids every live platform
+		// decision in this transaction (a trigger on `users`), and this one must already be
+		// executed when it does.
+		if let Some((what, user)) = effect {
+			people::apply(&mut tx, &record, what, user, now).await?;
+		}
 		tx.commit().await.map_err(repo_err)?;
 		Ok(Some(outcome))
+	}
+
+	async fn account(&self, who: PersonRef<'_>) -> Result<Option<AccountRef>, DomainError> {
+		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+		let id = match who {
+			PersonRef::Id(id) => id,
+			PersonRef::Handle(handle) => match account_named(&mut conn, handle).await? {
+				Named::One(id) => id,
+				Named::Nobody => return Ok(None),
+				Named::Several => return Err(DomainError::Validation("this handle names more than one account; name it by user_id".into())),
+			},
+		};
+		let row: Option<(String, bool, bool)> = sqlx::query_as("SELECT auth_subject, status = 'active', email_verified FROM users WHERE id = $1")
+			.bind(id.raw())
+			.fetch_optional(&mut *conn)
+			.await
+			.map_err(repo_err)?;
+		Ok(row.map(|(auth_subject, active, verified)| AccountRef { id, auth_subject, active, verified }))
+	}
+
+	async fn owner_roster(&self) -> Result<Vec<governance::OwnerRow>, DomainError> {
+		governance::owner_rows(&self.pool).await
+	}
+
+	async fn resign(&self, who: UserId) -> Result<(), DomainError> {
+		let now = {
+			let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+			self.instant(&mut conn).await?
+		};
+		governance::resign_seat(&self.pool, who, now).await
+	}
+
+	async fn revision(&self) -> Result<u64, DomainError> {
+		// Both counters only grow, so their sum moves whenever either does.
+		let value: i64 = sqlx::query_scalar("SELECT (SELECT coalesce(max(id), 0) FROM approval_events) + (SELECT revision FROM governance_revision WHERE id)")
+			.fetch_one(&self.pool)
+			.await
+			.map_err(repo_err)?;
+		Ok(u64::try_from(value).unwrap_or_default())
 	}
 }
 
@@ -1168,7 +1246,7 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 /// The members of `record`'s roster who no longer hold the seat it was drawn from.
-async fn unseated(conn: &mut PgConnection, record: &ApprovalRecord) -> Result<Vec<UserId>, DomainError> {
+pub(super) async fn unseated(conn: &mut PgConnection, record: &ApprovalRecord) -> Result<Vec<UserId>, DomainError> {
 	let query = match record.level {
 		ApprovalLevel::Platform =>
 		// A suspended owner keeps the role and has no say while suspended.

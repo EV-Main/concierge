@@ -709,6 +709,28 @@ pub trait ApprovalRepository: Send + Sync {
 	/// expiry and a lapse are lazy and a void on a change of the owners is a trigger's:
 	/// no one code path sees every ending.
 	async fn mail_outcomes(&self, limit: i64) -> Result<usize, DomainError>;
+
+	/// An account by id or handle whatever its status — a suspended one is exactly who a
+	/// reinstatement is about. A handle naming several accounts names nobody (`Validation`).
+	async fn account(&self, who: PersonRef<'_>) -> Result<Option<AccountRef>, DomainError>;
+
+	/// The owner roster, oldest seat first.
+	async fn owner_roster(&self) -> Result<Vec<OwnerRow>, DomainError>;
+
+	/// Give up `who`'s seat, under the floor.
+	async fn resign(&self, who: UserId) -> Result<(), DomainError>;
+
+	/// Moves whenever an approval or the owner roster does.
+	async fn revision(&self) -> Result<u64, DomainError>;
+}
+
+/// An account as a decision about a person resolves it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountRef {
+	pub id: UserId,
+	pub auth_subject: String,
+	pub active: bool,
+	pub verified: bool,
 }
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
@@ -1517,6 +1539,23 @@ pub trait NotificationDispatchRepository: Send + Sync {
 ///
 /// `now` is passed in rather than read here so the domain layer stays clock-free and
 /// every decision is reproducible from its inputs.
+/// Which legacy table a drained proposal lives in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyKind {
+	Removal,
+	Admission,
+	UserProposal,
+}
+
+/// What a drain did to one proposal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Drained {
+	Voided,
+	/// Already decided, expired or withdrawn: nothing changed.
+	NotOpen,
+	NotFound,
+}
+
 #[async_trait]
 pub trait GovernanceRepository: Send + Sync {
 	/// The current owner roster, oldest seat first.
@@ -1581,6 +1620,11 @@ pub trait GovernanceRepository: Send + Sync {
 
 	/// The live feed's clock, read straight from Postgres.
 	async fn revision(&self) -> Result<u64, DomainError>;
+
+	/// Void the OPEN legacy proposals named, in one transaction, and say what became of
+	/// each: the window's drain, so this service's part of the consilia can be emptied
+	/// before the people's decisions live in `approvals` alone.
+	async fn drain(&self, items: &[(LegacyKind, Uuid)], reason: &str, by: UserId, now: i64) -> Result<Vec<Drained>, DomainError>;
 
 	/// Queue one governance mail to a resolved recipient, bypassing notification
 	/// preferences. What happened to `dedupe_key` is the answer — see

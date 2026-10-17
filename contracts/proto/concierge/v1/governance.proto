@@ -118,6 +118,12 @@ service GovernanceService {
   // count. The server also re-reads on an interval, so correctness never depends on an
   // in-process broadcast reaching every replica.
   rpc WatchGovernance(WatchGovernanceRequest) returns (stream GovernanceTick);
+
+  // Drain the window (reorganisation, expand step): void the OPEN legacy proposals named in
+  // the request, so this service's part of the consilia can be emptied before they move to
+  // ApprovalService. An owner only. Works whether or not new openings are closed
+  // (GOVERNANCE_NEW_VOTES_CLOSED). A proposal that is not open is reported, not changed.
+  rpc DrainLegacyProposals(DrainLegacyProposalsRequest) returns (DrainLegacyProposalsResponse);
 }
 
 // OwnerRemovalApprovalService — the surface the TARGET of a removal reaches from their
@@ -872,4 +878,34 @@ message PaymentOutcomeMail {
 message SendGovernanceMailResponse {
   // False when `dedupe_key` had already been accepted.
   bool enqueued = 1;
+}
+
+enum LegacyProposalKind {
+  LEGACY_PROPOSAL_KIND_UNSPECIFIED = 0;
+  LEGACY_PROPOSAL_KIND_OWNER_REMOVAL = 1;
+  LEGACY_PROPOSAL_KIND_OWNER_ADMISSION = 2;
+  // Suspension, reinstatement and admin admission: the id is a UserProposal id.
+  LEGACY_PROPOSAL_KIND_USER_PROPOSAL = 3;
+}
+
+message LegacyProposalRef {
+  LegacyProposalKind kind = 1;
+  string id = 2;
+}
+
+message DrainLegacyProposalsRequest {
+  // At most 100.
+  repeated LegacyProposalRef items = 1;
+  // Required; recorded as the void reason. At most 200 characters.
+  string reason = 2;
+}
+
+message DrainedProposal {
+  LegacyProposalRef ref = 1;
+  // `voided`, `not_open` (already decided, expired or withdrawn) or `not_found`.
+  string result = 2;
+}
+
+message DrainLegacyProposalsResponse {
+  repeated DrainedProposal items = 1;
 }

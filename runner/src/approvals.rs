@@ -25,15 +25,16 @@ use std::{
 
 use domain::{
 	approvals::{self as rules, Amount, ApprovalState, Field, FieldValue, Outcome, REASON_BYTES, TEXT_FIELD_BYTES, Vote},
-	authz::Iam,
+	authz::{Iam, Roles},
 	scope_catalog::ApprovalLevel as Level,
 	scopes::ROOT,
-	users::UserId,
+	users::{Email, UserId},
 };
 use evconcierge_contracts::concierge::v1::{
-	self as cc, Approval, ApprovalAmount, ApprovalFieldValue, CancelApprovalRequest, GetApprovalRequest, GetProposalRequest, GetScopeApprovalPolicyRequest, ListApprovalKindsRequest,
-	ListApprovalKindsResponse, ListApprovalsRequest, ListApprovalsResponse, ProposeRequest, ProposeScopeAdminGrantRequest, ProposeScopePolicyChangeRequest, PullApprovedRequest,
-	PullApprovedResponse, ReportOutcomeRequest, ScopeApprovalPolicy, VetoApprovalRequest, VoteApprovalRequest, WithdrawProposalRequest,
+	self as cc, Approval, ApprovalAmount, ApprovalFieldValue, ApprovalsRevision, CancelApprovalRequest, GetApprovalRequest, GetApprovalsRevisionRequest, GetProposalRequest,
+	GetScopeApprovalPolicyRequest, ListApprovalKindsRequest, ListApprovalKindsResponse, ListApprovalsRequest, ListApprovalsResponse, ListPlatformOwnersRequest, PlatformOwner,
+	PlatformOwnerList, ProposePersonDecisionRequest, ProposeRequest, ProposeScopeAdminGrantRequest, ProposeScopePolicyChangeRequest, PullApprovedRequest, PullApprovedResponse,
+	ReportOutcomeRequest, ResignPlatformOwnershipRequest, ScopeApprovalPolicy, VetoApprovalRequest, VoteApprovalRequest, WithdrawProposalRequest,
 	approval_execution_service_server::ApprovalExecutionService, approval_field_value, approval_service_server::ApprovalService, propose_scope_admin_grant_request,
 };
 use sha2::{Digest, Sha256};
@@ -194,7 +195,7 @@ pub fn approval_to(record: ApprovalRecord, reader: Reader) -> Approval {
 	};
 	let proposed_policy = match (&record.action, reader) {
 		(Some(rules::Action::InstallPolicy { scope, policy }), Reader::Decider | Reader::Bystander) => Some(policy_to(scope, policy.clone())),
-		(Some(rules::Action::InstallPolicy { .. } | rules::Action::GrantAdmin { .. } | rules::Action::InstallPlatformPolicy { .. }) | None, _) => None,
+		(Some(rules::Action::InstallPolicy { .. } | rules::Action::GrantAdmin { .. } | rules::Action::InstallPlatformPolicy { .. } | rules::Action::People { .. }) | None, _) => None,
 	};
 	let (requested_by, mut requested_by_email) = record.requested_by.map(|(_, p)| (p.auth_subject, p.email)).unwrap_or_default();
 	let mut vetoed_by = record.vetoed_by.map(|p| p.auth_subject).unwrap_or_default();
@@ -537,6 +538,59 @@ impl ApprovalService for Approvals {
 		Ok(Response::new(record))
 	}
 
+	async fn propose_owner_admission(&self, request: Request<ProposePersonDecisionRequest>) -> Result<Response<Approval>, Status> {
+		self.propose_person(rules::PersonEffect::AdmitOwner, request).await
+	}
+
+	async fn propose_owner_removal(&self, request: Request<ProposePersonDecisionRequest>) -> Result<Response<Approval>, Status> {
+		self.propose_person(rules::PersonEffect::RemoveOwner, request).await
+	}
+
+	async fn propose_user_suspension(&self, request: Request<ProposePersonDecisionRequest>) -> Result<Response<Approval>, Status> {
+		self.propose_person(rules::PersonEffect::Suspend, request).await
+	}
+
+	async fn propose_user_reinstatement(&self, request: Request<ProposePersonDecisionRequest>) -> Result<Response<Approval>, Status> {
+		self.propose_person(rules::PersonEffect::Reinstate, request).await
+	}
+
+	async fn propose_admin_admission(&self, request: Request<ProposePersonDecisionRequest>) -> Result<Response<Approval>, Status> {
+		self.propose_person(rules::PersonEffect::AdmitAdmin, request).await
+	}
+
+	async fn list_owners(&self, request: Request<ListPlatformOwnersRequest>) -> Result<Response<PlatformOwnerList>, Status> {
+		require_permission(self.users.as_ref(), &self.break_glass, &request, Roles::Grant).await?;
+		Ok(Response::new(self.owner_list().await?))
+	}
+
+	async fn resign_ownership(&self, request: Request<ResignPlatformOwnershipRequest>) -> Result<Response<PlatformOwnerList>, Status> {
+		let caller = self.caller(&request).await?;
+		let me = self
+			.users
+			.find_by_id(caller)
+			.await
+			.map_err(domain_to_status)?
+			.ok_or_else(|| Status::permission_denied("no account behind this token"))?;
+		// Normalised through the parser the identity record was stored with, so casing never
+		// matters; typed so that resigning cannot be a stray click.
+		let confirm = Email::parse(&request.get_ref().confirm_email).map_err(|_| Status::invalid_argument("confirm_email must be your own address"))?;
+		if confirm != *me.email() {
+			return Err(Status::invalid_argument("confirm_email must be your own address"));
+		}
+		self.approvals.resign(caller).await.map_err(domain_to_status)?;
+		tracing::warn!(by = %caller, "an owner resigned the seat");
+		Ok(Response::new(self.owner_list().await?))
+	}
+
+	async fn get_approvals_revision(&self, request: Request<GetApprovalsRevisionRequest>) -> Result<Response<ApprovalsRevision>, Status> {
+		let viewer = self.viewer(&request).await?;
+		if !viewer.owner && viewer.admin_of.is_empty() {
+			return Err(Status::permission_denied("the approvals' revision is read by the platform owners and scope admins"));
+		}
+		let revision = self.approvals.revision().await.map_err(domain_to_status)?;
+		Ok(Response::new(ApprovalsRevision { revision }))
+	}
+
 	async fn propose_scope_policy_change(&self, request: Request<ProposeScopePolicyChangeRequest>) -> Result<Response<Approval>, Status> {
 		let caller = self.caller(&request).await?;
 		let viewer = self.approvals.viewer(caller).await.map_err(domain_to_status)?;
@@ -590,14 +644,80 @@ impl ApprovalService for Approvals {
 }
 
 impl Approvals {
+	/// The five decisions about a person share one shape: an owner names an account and a
+	/// reason, and the platform's other owners decide.
+	async fn propose_person(&self, effect: rules::PersonEffect, request: Request<ProposePersonDecisionRequest>) -> Result<Response<Approval>, Status> {
+		let caller = self.caller(&request).await?;
+		let viewer = self.approvals.viewer(caller).await.map_err(domain_to_status)?;
+		if !viewer.owner {
+			return Err(Status::permission_denied(format!("{} is opened by an active platform owner", effect.rpc())));
+		}
+		let req = request.into_inner();
+		if req.reason.is_empty() {
+			return Err(Status::invalid_argument("a reason is required"));
+		}
+		rules::check_text("reason", &req.reason, TEXT_FIELD_BYTES).map_err(invalid)?;
+		let named = match &req.subject {
+			Some(cc::propose_person_decision_request::Subject::UserId(raw)) =>
+				PersonRef::Id(UserId::from_raw(Uuid::parse_str(raw).map_err(|_| Status::invalid_argument("user_id is not a user id"))?)),
+			Some(cc::propose_person_decision_request::Subject::Account(handle)) => PersonRef::Handle(handle),
+			None => return Err(Status::invalid_argument("name the account by user_id or account")),
+		};
+		let account = self
+			.approvals
+			.account(named)
+			.await
+			.map_err(domain_to_status)?
+			.ok_or_else(|| Status::not_found("no account by that name"))?;
+		let fields = vec![
+			Field {
+				key: "account".into(),
+				value: FieldValue::User(account.auth_subject),
+			},
+			Field {
+				key: "reason".into(),
+				value: FieldValue::Text(req.reason.clone()),
+			},
+		];
+		let action = rules::Action::People {
+			effect,
+			user: account.id.raw(),
+			opened_by: caller.raw(),
+		};
+		// One live decision per kind and account: every one about this account collides on
+		// the live-subject index.
+		let record = self
+			.open_own(caller, effect.kind(), ROOT.to_owned(), format!("user:{}", account.id.raw()), fields, req.reason, action)
+			.await?;
+		Ok(Response::new(record))
+	}
+
+	/// The roster as the wire shows it. `below_payout_floor` is the money plane's warning,
+	/// not a rule that blocks anything: two owners is a legal roster that cannot authorize
+	/// a payout.
+	async fn owner_list(&self) -> Result<PlatformOwnerList, Status> {
+		let owners = self.approvals.owner_roster().await.map_err(domain_to_status)?;
+		Ok(PlatformOwnerList {
+			below_payout_floor: owners.len() < domain::governance::PAYOUT_MIN_OWNERS,
+			items: owners
+				.into_iter()
+				.map(|owner| PlatformOwner {
+					user_id: owner.id.to_string(),
+					email: owner.email.unwrap_or_default(),
+					display_name: owner.display_name.unwrap_or_default(),
+					owner_since: owner.owner_since,
+				})
+				.collect(),
+		})
+	}
+}
+
+impl Approvals {
 	/// Open one of this plane's own kinds for `opener`, who is proven by the session and
 	/// so kept off the roster (D23).
 	#[allow(clippy::too_many_arguments)] // why: every argument is a distinct part of the proposal; a struct for one private call would only rename them
 	async fn open_own(&self, opener: UserId, kind: &str, scope: String, subject_ref: String, fields: Vec<Field>, reason: String, action: rules::Action) -> Result<Approval, Status> {
-		let mut exclude = vec![opener];
-		if let rules::Action::GrantAdmin { user, .. } = &action {
-			exclude.push(UserId::from_raw(*user));
-		}
+		let exclude: Vec<UserId> = action.off_roster(opener.raw()).into_iter().map(UserId::from_raw).collect();
 		let kind = rules::builtin_kinds()
 			.into_iter()
 			.find(|k| k.name == kind)
