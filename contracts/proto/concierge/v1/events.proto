@@ -21,7 +21,7 @@ package concierge.v1;
 // (docs/SCOPES-AND-APPROVALS.md, "Service callers"). The request is unchanged — the
 // filter comes from WHO is asking, never from a field a caller could widen: a client
 // sees only users visible to its scope and to the scopes that name it an observer, and
-// each row is redacted for it (`seat_permissions` absent, `permissions` empty — the
+// each row is redacted for it (`seat_permissions` absent — the
 // money plane's seat set is not a direction's business). The bridge token keeps the
 // unfiltered stream.
 //
@@ -117,9 +117,10 @@ message UserLifecycleEvent {
   // authoritative for ROLE_CHANGED — the money plane mirrors it to gate operator RPCs.
   string role = 11;
 
-  // DEPRECATED: read `seat_permissions`. Kept while consumers move over; empty here
-  // cannot tell "holds nothing" from "not stated".
-  repeated string permissions = 12;
+  // Field 12 was `repeated string permissions`, superseded by `seat_permissions` (#111):
+  // never reuse the number or the name.
+  reserved 12;
+  reserved "permissions";
 
   // The user's concrete `bank:*` permissions as of this row (no alias, no wildcard): a
   // snapshot on EVERY kind, like `role` and `kyc_level`, so the two can never disagree
