@@ -55,7 +55,7 @@ pub use config::{AuthConfig, OAuthClientConfig, SigningConfig, VerifierConfig};
 pub use interceptor::{AuthLayer, Authenticate, RestrictedCaller, claims_of, grpc_auth_layer};
 pub use jwks::{JwksCache, VerifyPolicy, verify_token};
 pub use provisioner::{ProvisionCommand, ProvisionRequest, ProvisionedUser, Provisioner, provisioner_channel};
-pub use service::AuthService;
+pub use service::{AuthService, Reauthenticated};
 pub use service_token::ServiceTokenSource;
 use thiserror::Error;
 pub use verifier::Verifier;

@@ -50,6 +50,13 @@ pub struct RotatedRefresh {
 	pub token_version_snapshot: u64,
 	pub refresh: IssuedRefresh,
 }
+/// What [`RefreshStore::touch_auth_time`] reports for the family it moved.
+pub struct AuthTimeMoved {
+	/// The `token_version` the family was issued under, for the caller's "revoke all" check.
+	pub token_version_snapshot: u64,
+	/// The family's new `auth_time` (unix seconds).
+	pub auth_time: u64,
+}
 /// A read-only view of one active refresh family for the "sessions & devices" surface.
 pub struct SessionView {
 	pub id: String,
@@ -107,6 +114,18 @@ impl RefreshStore {
 		match self {
 			Self::InProcess(s) => s.rotate(token, bounds),
 			Self::Redis(s) => s.rotate(token, bounds).await,
+		}
+	}
+
+	/// Move the family's `auth_time` to now WITHOUT rotating the handle, on the strength of
+	/// the family's CURRENT secret: the re-authentication step. `None` when the handle is
+	/// not that live secret (unknown, expired, rotated out) — nothing is moved then, and a
+	/// replayed rotated-out secret is NOT treated as theft here (the caller's `inspect` is
+	/// what classifies that). The time only ever moves forward.
+	pub async fn touch_auth_time(&self, token: &str, bounds: SessionBounds) -> Result<Option<AuthTimeMoved>, AuthError> {
+		match self {
+			Self::InProcess(s) => Ok(s.touch_auth_time(token, bounds)),
+			Self::Redis(s) => s.touch_auth_time(token, bounds).await,
 		}
 	}
 
@@ -244,6 +263,24 @@ impl InProcessRefreshStore {
 		}
 	}
 
+	/// The in-process twin of the Redis `TOUCH_AUTH_TIME_SCRIPT`.
+	pub fn touch_auth_time(&self, token: &str, bounds: SessionBounds) -> Option<AuthTimeMoved> {
+		let (family, secret) = token.split_once('.')?;
+		let mut map = self.families.lock().unwrap_or_else(|e| e.into_inner());
+		let fam = map.get_mut(family)?;
+		let now = get_current_timestamp();
+		let idle_expired = bounds.idle_timeout_secs != 0 && now.saturating_sub(fam.last_seen) > bounds.idle_timeout_secs;
+		if now >= fam.absolute_expires_at || idle_expired || now >= fam.expires_at || !ct_eq(&fam.current, secret) {
+			return None;
+		}
+		let auth_time = now.max(fam.auth_time.unwrap_or(0));
+		fam.auth_time = Some(auth_time);
+		Some(AuthTimeMoved {
+			token_version_snapshot: fam.token_version,
+			auth_time,
+		})
+	}
+
 	/// Classify a presented handle by its secret (constant-time), without mutating the
 	/// family. `current` ⇒ the live credential; a rotated-out `prev` ⇒ replay/theft.
 	pub fn inspect(&self, token: &str, bounds: SessionBounds) -> RefreshInspect {
@@ -315,6 +352,15 @@ impl InProcessRefreshStore {
 	pub fn family_id_of(&self, refresh_token: &str) -> Option<String> {
 		let family = refresh_token.split_once('.')?.0;
 		self.families.lock().unwrap_or_else(|e| e.into_inner()).get(family).map(|f| f.id.clone())
+	}
+
+	/// Move a family's `auth_time` back by `secs`, so a test can see it advance.
+	#[cfg(test)]
+	fn backdate_auth_time(&self, token: &str, secs: u64) {
+		let family = token.split_once('.').unwrap().0;
+		let mut map = self.families.lock().unwrap_or_else(|e| e.into_inner());
+		let fam = map.get_mut(family).unwrap();
+		fam.auth_time = fam.auth_time.map(|t| t - secs);
 	}
 
 	/// Backdate a family's `created_at`/`last_seen` (and its absolute deadline) by
@@ -444,6 +490,28 @@ impl RedisRefreshStore {
 			}
 			_ => Err(AuthError::InvalidToken),
 		}
+	}
+
+	pub async fn touch_auth_time(&self, token: &str, bounds: SessionBounds) -> Result<Option<AuthTimeMoved>, AuthError> {
+		let Some((family, secret)) = token.split_once('.') else {
+			return Ok(None);
+		};
+		let mut conn = self.conn.clone();
+		let outcome: Option<Vec<String>> = TOUCH_AUTH_TIME_SCRIPT
+			.key(Self::fam_key(family))
+			.arg(secret)
+			.arg(get_current_timestamp())
+			.arg(bounds.idle_timeout_secs)
+			.invoke_async(&mut conn)
+			.await
+			.map_err(redis_err)?;
+		Ok(match outcome.as_deref() {
+			Some([token_version, auth_time]) => Some(AuthTimeMoved {
+				token_version_snapshot: token_version.parse().unwrap_or(0),
+				auth_time: auth_time.parse().map_err(|_| AuthError::Unavailable)?,
+			}),
+			_ => None,
+		})
 	}
 
 	pub async fn user_of(&self, token: &str) -> Result<Option<String>, AuthError> {
@@ -619,6 +687,33 @@ end
 	)
 });
 
+/// The atomic re-authentication step. KEYS[1] = family hash. ARGV = presented secret, now,
+/// idle_timeout_secs. Moves `auth_time` to `now` (never backwards) iff the secret is the
+/// family's CURRENT one and the family is inside its bounds; returns `{token_version,
+/// auth_time}`, or nil for any rejection. Unlike ROTATE it deletes nothing: an expired
+/// family is left for its own TTL, and a rotated-out secret is not a reuse signal here.
+static TOUCH_AUTH_TIME_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+	redis::Script::new(
+		r#"
+local fam = redis.call('HGETALL', KEYS[1])
+if #fam == 0 then return nil end
+local h = {}
+for i = 1, #fam, 2 do h[fam[i]] = fam[i + 1] end
+
+local now = tonumber(ARGV[2])
+local idle = tonumber(ARGV[3])
+if now >= tonumber(h['absolute_expires_at']) or now >= tonumber(h['expires_at']) or (idle ~= 0 and (now - tonumber(h['last_seen'])) > idle) then
+  return nil
+end
+if h['current'] ~= ARGV[1] then return nil end
+
+local auth_time = math.max(now, tonumber(h['auth_time'] or '0'))
+redis.call('HSET', KEYS[1], 'auth_time', tostring(auth_time))
+return { h['token_version'], tostring(auth_time) }
+"#,
+	)
+});
+
 /// Atomically revoke every refresh family for a user (logout-everywhere / revoke-all).
 /// KEYS[1] = the per-user family index set. ARGV[1] = the family-key prefix. Runs the
 /// member read and the deletes as one script so a concurrent `issue` cannot interleave
@@ -710,6 +805,30 @@ mod tests {
 		assert_eq!(rotated.refresh.auth_time, issued.auth_time);
 		let again = store.rotate(&rotated.refresh.token, bounds()).unwrap();
 		assert_eq!(again.refresh.auth_time, issued.auth_time);
+	}
+
+	#[test]
+	fn touch_auth_time_moves_forward_only_on_the_current_secret() {
+		let store = InProcessRefreshStore::new();
+		let issued = store.issue("user-touch", 9, bounds(), String::new(), String::new());
+		store.backdate_auth_time(&issued.token, 100);
+		let moved = store.touch_auth_time(&issued.token, bounds()).expect("the live secret moves it");
+		assert_eq!(moved.token_version_snapshot, 9);
+		assert!(moved.auth_time >= issued.auth_time.unwrap(), "the backdated time moved forward to now");
+		// Rotation keeps the moved time and retires the old secret, which then moves nothing.
+		let rotated = store.rotate(&issued.token, bounds()).unwrap();
+		assert_eq!(rotated.refresh.auth_time, Some(moved.auth_time));
+		assert!(store.touch_auth_time(&issued.token, bounds()).is_none());
+		assert!(store.touch_auth_time("no-dot", bounds()).is_none());
+		assert!(store.touch_auth_time("unknown.family", bounds()).is_none());
+	}
+
+	#[test]
+	fn touch_auth_time_refuses_an_expired_family() {
+		let store = InProcessRefreshStore::new();
+		let issued = issue(&store, "user-touch-expired");
+		store.backdate(&issued.token, 7_776_001);
+		assert!(store.touch_auth_time(&issued.token, bounds()).is_none());
 	}
 
 	#[test]
@@ -930,6 +1049,23 @@ mod redis_tests {
 		assert!(store.rotate(&issued.token, bounds()).await.is_err());
 		assert!(store.rotate(&rotated.refresh.token, bounds()).await.is_err());
 		assert!(store.list_for_user(&user).await.unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn touch_auth_time_moves_forward_only_on_the_current_secret() {
+		let Some((store, user)) = store().await else {
+			return;
+		};
+		let issued = store.issue(&user, 4, bounds(), String::new(), String::new()).await.unwrap();
+		let moved = store.touch_auth_time(&issued.token, bounds()).await.unwrap().expect("the live secret moves it");
+		assert_eq!(moved.token_version_snapshot, 4);
+		assert!(Some(moved.auth_time) >= issued.auth_time);
+		let rotated = store.rotate(&issued.token, bounds()).await.unwrap();
+		assert_eq!(rotated.refresh.auth_time, Some(moved.auth_time));
+		// A rotated-out secret moves nothing and does not wipe the family.
+		assert!(store.touch_auth_time(&issued.token, bounds()).await.unwrap().is_none());
+		assert!(matches!(store.inspect(&rotated.refresh.token, bounds()).await.unwrap(), RefreshInspect::Current { .. }));
+		assert!(store.touch_auth_time("unknown.family", bounds()).await.unwrap().is_none());
 	}
 
 	#[tokio::test]
