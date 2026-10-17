@@ -209,8 +209,7 @@ one event returned, `next_position` is that event's position. The
 that one; the scan runs past the last event only when the page did not fill.
 
 **`UserEvents.PullUserLifecycle`**, read by a client credential: same request,
-filtered by visibility, and each row redacted — `seat_permissions` absent and
-`permissions` empty. `kyc_level` is carried: directions layer their own policy on the
+filtered by visibility, and each row redacted — `seat_permissions` absent. `kyc_level` is carried: directions layer their own policy on the
 KYC level and may not manage it (D5).
 
 **`ScopeEvents.PullScopeEvents`** is a separate stream because `UserLifecycleEvent.Kind`
@@ -695,8 +694,7 @@ Topics a direction emits on are published with its scope catalog
 text, and whether an account that never touched the topic receives it (default no). A
 service may emit only its own namespace's topics (`ScopeInboxService.EmitScopeNotification`). Topics a user cannot be without (the
 payment-consent trace, security notices) stay this plane's own. Today's
-`fund:quy-nhon` and `account:money-movement` move to `invest:` and `bank:`; carrying the
-existing subscriptions across is the implementation's migration.
+`fund:quy-nhon` and `account:money-movement` moved to `invest:` and `bank:` (migration 0042).
 
 **Each direction has its own inbox (D21).** Which one a request reads is decided by the
 server from where the request came from, never by a request field
@@ -795,11 +793,9 @@ the offer when a later catalog withdraws them.
   from then on. Do not add a bulk send for account-less rows.
 - **The move has happened.** `fund:quy-nhon` is `invest:fund:quy-nhon` (invest's members
   only) and `account:money-movement` is `bank:money-movement`; migration 0042 carried the
-  subscriptions, account-less ones included, and the fund's inbox history. Until banking and
-  invest publish those topics and emit on them, the old keys are aliases wherever a topic is
-  named — `Emit` (by `typ=service` token), following, the account-less subscribe and unsubscribe —
-  and stand for the new ones (`notification::MOVED_TOPICS`); the aliases go at the contract
-  step. `account:money-movement` itself stays this plane's TRACE topic: the in-app trace of a
+  subscriptions, account-less ones included, and the fund's inbox history. The old keys were
+  aliases until the contract step; they are not any more, and are as unknown as a made-up
+  key wherever a topic is named. `account:money-movement` itself stays this plane's TRACE topic: the in-app trace of a
   payment consent, a fee notice, a payment outcome or a decision opened in someone's name is
   filed there whatever they follow, so it is shown and filterable in the platform inbox but
   neither offered to follow nor emitted on.
