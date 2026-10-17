@@ -1657,11 +1657,14 @@ pub const VERIFY_WRONG_PER_DAY: i64 = 20;
 pub const VERIFY_BUDGET_WINDOW_SECS: i64 = 24 * 60 * 60;
 
 /// What a code is for. A sign-in code proves a mailbox to whoever asks; a verification
-/// code proves the signed-in account's own address and is bound to that account.
+/// code proves the signed-in account's own address and is bound to that account. A
+/// re-authentication code is bound the same way but spent for one act only (#166), so
+/// neither of the other two can stand in for it.
 #[derive(Clone, Debug)]
 pub enum CodePurpose {
 	Login(Email),
 	Verify(UserId),
+	Reauth(UserId),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1756,6 +1759,11 @@ pub trait CredentialRepository: Send + Sync {
 	/// Spend a sign-in code. `Ok(Ok(()))` proves the mailbox; the account it opens is
 	/// [`UserDirectoryRepository::resolve`]'s to decide.
 	async fn redeem_login_code(&self, email: &Email, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError>;
+
+	/// Spend a re-authentication code mailed to the account's CURRENT address. `Ok(Ok(()))`
+	/// proves the signed-in account again; it changes nothing on the account. The daily
+	/// code and wrong-guess budgets of [`CodePurpose::Reauth`] apply.
+	async fn redeem_reauth_code(&self, user: UserId, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError>;
 
 	/// Spend a verification code and mark the account's address verified, in one
 	/// transaction.

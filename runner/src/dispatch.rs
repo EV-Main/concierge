@@ -279,16 +279,18 @@ fn topic_label<'a>(key: &str, scoped: &'a [NotificationTopic]) -> Option<&'a str
 fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &DispatcherConfig, scoped: &[NotificationTopic]) -> Option<OutgoingEmail> {
 	if job.kind == "email_code" {
 		let payload = job.payload.as_ref()?;
-		let sign_in = match text_field(payload, "purpose").as_str() {
-			"login" => true,
-			"verify" => false,
-			_ => return None,
-		};
+		let purpose = text_field(payload, "purpose");
+		if !matches!(purpose.as_str(), "login" | "verify" | "reauth") {
+			return None;
+		}
 		let code = text_field(payload, "code");
 		if code.is_empty() {
 			return None;
 		}
-		let rendered = templates::email_code(sign_in, &code, int_field(payload, "expires_at"));
+		let rendered = match purpose.as_str() {
+			"reauth" => templates::reauth_code(&code, int_field(payload, "expires_at")),
+			other => templates::email_code(other == "login", &code, int_field(payload, "expires_at")),
+		};
 		return Some(OutgoingEmail {
 			to: job.recipient.clone(),
 			subject: rendered.subject,
