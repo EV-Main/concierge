@@ -273,7 +273,7 @@ async fn disable_user_refuses_and_names_both_halves_of_the_verb() {
 
 	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
 	assert!(err.message().contains("HoldUser"), "the emergency half is named: {err}");
-	assert!(err.message().contains("OpenUserSuspension"), "the permanent half is named: {err}");
+	assert!(err.message().contains("ProposeUserSuspension"), "the permanent half is named: {err}");
 	assert_eq!(fx.reload(target).await.status(), UserStatus::Active, "a refusal changes nothing");
 	assert!(fx.audit(target).await.is_empty(), "and records nothing");
 }
@@ -395,7 +395,7 @@ async fn a_hold_is_not_renewed_by_holding_again() {
 
 	let err = fx.hold(owner, target, "still stuffing").await.unwrap_err();
 	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-	assert!(err.message().contains("OpenUserSuspension"), "the refusal names the proposal to open instead: {err}");
+	assert!(err.message().contains("ProposeUserSuspension"), "the refusal names the proposal to open instead: {err}");
 	assert_eq!(fx.reload(target).await.suspension().unwrap().hold_expires_at(), Some(first), "the deadline did not move");
 	assert_eq!(fx.audit(target).await.len(), 1, "a refusal is not an action");
 	assert_eq!(fx.outbox_kinds(target).await, ["CREATED", "SUSPENDED"], "and the money plane heard of one freeze");
@@ -498,7 +498,7 @@ async fn a_seat_is_held_only_by_an_owner() {
 	for target in [owner, another_admin] {
 		let err = fx.hold(admin, target, "silence the roster").await.unwrap_err();
 		assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-		assert!(err.message().contains("OpenUserSuspension"), "{err}");
+		assert!(err.message().contains("ProposeUserSuspension"), "{err}");
 		assert_eq!(fx.reload(target).await.status(), UserStatus::Active);
 		assert!(fx.audit(target).await.is_empty(), "a refusal is not an action");
 	}
@@ -541,7 +541,7 @@ async fn nobody_holds_their_own_account() {
 	let owner = fx.owner().await;
 	let err = fx.hold(owner, owner, "stepping back").await.unwrap_err();
 	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-	assert!(err.message().contains("OpenUserSuspension"), "{err}");
+	assert!(err.message().contains("ProposeUserSuspension"), "{err}");
 	assert_eq!(fx.reload(owner).await.status(), UserStatus::Active);
 	assert!(fx.audit(owner).await.is_empty());
 }
@@ -598,7 +598,7 @@ async fn reinstate_lifts_a_hold_in_one_act_and_refuses_the_owners_verdict() {
 		.await
 		.unwrap_err();
 	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-	assert!(err.message().contains("OpenUserReinstatement"), "the refusal points at the proposal: {err}");
+	assert!(err.message().contains("ProposeUserReinstatement"), "the refusal points at the proposal: {err}");
 	assert_eq!(fx.reload(target).await.status(), UserStatus::Disabled, "the verdict stands");
 	assert!(
 		!fx.audit(target).await.iter().any(|a| a.2 == "changed my mind"),

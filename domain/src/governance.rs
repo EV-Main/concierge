@@ -1121,9 +1121,9 @@ impl UserProposalKind {
 	/// The RPC a refusal should name, so an operator who is told "no" is told where to go.
 	pub fn rpc_name(self) -> &'static str {
 		match self {
-			Self::Suspension => "GovernanceService.OpenUserSuspension",
-			Self::Reinstatement => "GovernanceService.OpenUserReinstatement",
-			Self::AdminAdmission => "GovernanceService.OpenAdminAdmission",
+			Self::Suspension => "ApprovalService.ProposeUserSuspension",
+			Self::Reinstatement => "ApprovalService.ProposeUserReinstatement",
+			Self::AdminAdmission => "ApprovalService.ProposeAdminAdmission",
 		}
 	}
 }
