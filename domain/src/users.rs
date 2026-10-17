@@ -479,21 +479,21 @@ impl User {
 		}
 		if matches!(self.role, Role::Admin | Role::Owner) && by != Role::Owner {
 			return Err(DomainError::Forbidden(format!(
-				"an account holding the {} seat is held only by a fund owner; anyone else asks the owners through GovernanceService.OpenUserSuspension",
+				"an account holding the {} seat is held only by a fund owner; anyone else asks the owners through ApprovalService.ProposeUserSuspension",
 				self.role.as_str()
 			)));
 		}
 		if !ratification_pending {
 			if let Some(expires_at) = self.suspension.and_then(Suspension::hold_expires_at) {
 				return Err(DomainError::Forbidden(format!(
-					"this account is already held until {expires_at}; a hold is not renewed by holding again — keeping it frozen past that is the owners' decision, through GovernanceService.OpenUserSuspension, and the hold extends while they decide"
+					"this account is already held until {expires_at}; a hold is not renewed by holding again — keeping it frozen past that is the owners' decision, through ApprovalService.ProposeUserSuspension, and the hold extends while they decide"
 				)));
 			}
 			if let Some(ended_at) = self.hold_ended_at
 				&& now < ended_at.saturating_add(HOLD_COOLDOWN_SECS)
 			{
 				return Err(DomainError::Forbidden(format!(
-					"a hold on this account ended at {ended_at}, less than {} days ago; a second one needs the owners — open GovernanceService.OpenUserSuspension, and the account may be held again while they decide",
+					"a hold on this account ended at {ended_at}, less than {} days ago; a second one needs the owners — open ApprovalService.ProposeUserSuspension, and the account may be held again while they decide",
 					HOLD_COOLDOWN_SECS / (24 * 60 * 60)
 				)));
 			}

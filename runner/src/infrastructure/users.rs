@@ -144,6 +144,9 @@ pub struct AdminAction {
 	pub reason: String,
 	/// The proposal that authorized this, when one did.
 	pub proposal_id: Option<Uuid>,
+	/// The approval (`approvals`) that authorized this, when one did: the legacy proposal
+	/// above is a `user_proposal`, and a decision of the generalised consilium is not.
+	pub approval_id: Option<Uuid>,
 	/// What the action did, in the vocabulary of the action itself.
 	pub detail: Option<serde_json::Value>,
 	/// Where the request came from. Same provenance the consilium records.
@@ -166,6 +169,11 @@ impl AdminAction {
 			user_agent: audit.user_agent.clone(),
 			..Self::default()
 		}
+	}
+
+	pub fn with_approval(mut self, approval_id: Uuid) -> Self {
+		self.approval_id = Some(approval_id);
+		self
 	}
 
 	pub fn with_reason(mut self, reason: &str) -> Self {
@@ -379,6 +387,7 @@ impl UserDirectoryRepository for PgUsers {
 	/// and the write would let a hold extend on the strength of a decision nobody is
 	/// making any more.
 	async fn hold_user(&self, id: UserId, action: &AdminAction, by: UserId, now: i64) -> Result<User, DomainError> {
+		let actor_id = by;
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let mut user = load_for_update(&mut tx, id).await?;
 		// The actor's role and status are taken AFTER the target's lock and on the same
@@ -409,13 +418,34 @@ impl UserDirectoryRepository for PgUsers {
 		};
 		// The plane's lazy-expiry convention: a proposal past its deadline is not open,
 		// whether or not a write path has got round to stamping it so.
-		let ratification_pending: bool =
-			sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM user_proposal WHERE subject_user_id = $1 AND kind = 'suspension' AND state = 'open' AND expires_at > $2)")
-				.bind(id.raw())
-				.bind(now)
-				.fetch_one(&mut *tx)
-				.await
-				.map_err(repo_err)?;
+		let ratification_pending: bool = sqlx::query_scalar(
+			"SELECT EXISTS (SELECT 1 FROM user_proposal WHERE subject_user_id = $1 AND kind = 'suspension' AND state = 'open' AND expires_at > $2) \
+			 OR EXISTS (SELECT 1 FROM approvals WHERE kind = 'concierge:user_suspension' AND scope = 'main' AND subject_ref = 'user:' || $1::text \
+			            AND ((state = 'open' AND expires_at > $2) OR (state = 'passed' AND executable_at + $3 > $2)))",
+		)
+		.bind(id.raw())
+		.bind(now)
+		.bind(domain::approvals::EXECUTION_WINDOW_SECS)
+		.fetch_one(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+		// Whoever the owners are deciding to remove or suspend does not get to hold the people
+		// deciding it: a hold takes an owner out of the vote, and a decision about oneself is
+		// the one a hold could be pressed to stop.
+		let about_actor: bool = sqlx::query_scalar(
+			"SELECT EXISTS (SELECT 1 FROM approvals WHERE kind IN ('concierge:owner_removal', 'concierge:user_suspension') AND scope = 'main' \
+			                AND subject_ref = 'user:' || $1::text \
+			                AND ((state = 'open' AND expires_at > $2) OR (state = 'passed' AND executable_at + $3 > $2)))",
+		)
+		.bind(actor_id.raw())
+		.bind(now)
+		.bind(domain::approvals::EXECUTION_WINDOW_SECS)
+		.fetch_one(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+		if about_actor {
+			return Err(DomainError::Forbidden("the owners are deciding your own standing; you hold nobody while they do".into()));
+		}
 		user.hold(by, now, ratification_pending)?;
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
@@ -576,6 +606,7 @@ impl UserDirectoryRepository for PgUsers {
 		Ok(KycLevelChange::Raised { from: current, to: target })
 	}
 
+	#[cfg(feature = "test-support")]
 	async fn set_role(&self, id: UserId, role: Role) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.set_role(role);
@@ -896,6 +927,21 @@ pub(crate) async fn load_for_update(conn: &mut PgConnection, id: UserId) -> Resu
 		.into_domain()
 }
 
+/// As [`load_for_update`], but `FOR NO KEY UPDATE`: the lock a write that leaves the key
+/// alone needs, and one that does not conflict with `FOR KEY SHARE` — which is what an
+/// insert into `approval_voters` (a foreign key to `users`) takes on the row. The approvals'
+/// executor writes a person under this one, so a vote or a proposal opening while it works
+/// is not queued behind it.
+pub(crate) async fn load_for_no_key_update(conn: &mut PgConnection, id: UserId) -> Result<User, DomainError> {
+	sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE id = $1 FOR NO KEY UPDATE"))
+		.bind(id.raw())
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?
+		.ok_or_else(|| DomainError::NotFound { entity: "user", id: id.to_string() })?
+		.into_domain()
+}
+
 /// Persist the full editable surface, identity flags, and `row_version` of a user row.
 pub(crate) async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(), DomainError> {
 	sqlx::query(
@@ -967,8 +1013,8 @@ fn detail_with(base: Option<serde_json::Value>, keys: serde_json::Value) -> serd
 /// the mutation it describes commit together or not at all.
 pub(crate) async fn record_action(conn: &mut PgConnection, subject: UserId, action: &AdminAction, now: i64) -> Result<(), DomainError> {
 	sqlx::query(
-		"INSERT INTO admin_action (subject_user_id, actor_user_id, action, proposal_id, reason, detail, occurred_at, client_ip, user_agent) \
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+		"INSERT INTO admin_action (subject_user_id, actor_user_id, action, proposal_id, reason, detail, occurred_at, client_ip, user_agent, approval_id) \
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
 	)
 	.bind(subject.raw())
 	.bind(action.actor.map(|a| a.raw()))
@@ -979,6 +1025,7 @@ pub(crate) async fn record_action(conn: &mut PgConnection, subject: UserId, acti
 	.bind(now)
 	.bind(action.client_ip.chars().take(64).collect::<String>())
 	.bind(action.user_agent.chars().take(256).collect::<String>())
+	.bind(action.approval_id)
 	.execute(&mut *conn)
 	.await
 	.map_err(repo_err)?;

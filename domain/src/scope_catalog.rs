@@ -226,6 +226,14 @@ pub(crate) fn plain_text(text: &str, max_bytes: usize, may_be_empty: bool) -> Re
 	if text.chars().any(char::is_control) {
 		return Err("carries a control character");
 	}
+	// Direction overrides and zero-width characters are not control characters, and they let
+	// one line read as another once rendered next to a name or an address.
+	if text
+		.chars()
+		.any(|c| matches!(c, '\u{ad}' | '\u{61c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'))
+	{
+		return Err("carries an invisible or direction-changing character");
+	}
 	let lower = text.to_ascii_lowercase();
 	if lower.contains("://") || lower.contains("www.") {
 		return Err("carries a link");

@@ -23,6 +23,8 @@
 //!   publishes, every version kept.
 //! - [`approvals`] — proposals of every scope, their frozen rosters and history, each
 //!   transition and its history row in one transaction.
+//! - [`people`] — the decisions about people inside `approvals`: what may be asked at open
+//!   and what an executed one writes, through the same `users` helpers the legacy consilia use.
 //! - [`credentials`] — what this plane checks itself: emailed one-time codes and
 //!   passwords.
 //! - [`email`] — the SMTP transport seam and the rendered messages that cross it.
@@ -35,6 +37,7 @@ pub mod governance;
 pub mod grants;
 pub mod kyc;
 pub mod notifications;
+pub mod people;
 pub mod platform;
 pub mod relying_parties;
 pub mod scope_catalogs;

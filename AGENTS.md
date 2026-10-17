@@ -70,13 +70,15 @@ auth layer. One trust relationship between the planes means one secret to rotate
 graduate to mTLS/SPIFFE at platform scale.
 
 **Ownership** (`Role::Owner`) is governed, not administered: it is granted only by
-an executed admission consilium and taken only by an executed removal, so
+an executed admission consilium (`concierge:owner_admission` in `approvals`, unanimity of the
+other owners; the legacy `governance` consilium until it goes) and taken only by an executed removal, so
 `UserDirectory.SetRole` refuses both directions (`governance` module; the policy is
 `banking`'s `docs/CONSILIUM.md`).
 
 **So is `Role::Admin`, and so is a permanent suspension** — see the Hard rule below.
 `SetRole` refuses to GRANT `admin` (never to take it away), and `DisableUser` is
-retired in favour of `HoldUser` plus `GovernanceService.OpenUserSuspension`.
+retired in favour of `HoldUser` plus `ApprovalService.ProposeUserSuspension` (the owners' decision;
+`GovernanceService.OpenUserSuspension` stays beside it until the contract step).
 
 ---
 
@@ -547,7 +549,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `DisableUser` is retired (it refuses, naming both replacements) and splits into
   `HoldUser` — one operator, `Users::Suspend`, `users.suspended_by =
   'admin_hold'` with `hold_expires_at = now + HOLD_TTL_SECS` (24h) — and
-  `GovernanceService.OpenUserSuspension`, the owners' proposal, which writes
+  `ApprovalService.ProposeUserSuspension`, the owners' decision (`concierge:user_suspension`; the legacy
+  `GovernanceService.OpenUserSuspension` does the same until it goes), which writes
   `suspended_by = 'governance'` and carries no deadline. One actor may stop money
   temporarily and never permanently — and "temporarily" is enforced, not assumed: a
   hold is refused while one is live and for `HOLD_COOLDOWN_SECS` (7 days, longer than
@@ -559,7 +562,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   target's row lock) — an admin who could hold the owners could hold them out of the
   votes that stop the hold — and nobody holds their own account. `ReinstateUser`
   reads `suspended_by` and is the mirror rule: one act for a hold, refused for a
-  verdict (naming `OpenUserReinstatement`), or the consilium would be advisory. A disabled row with `suspended_by IS NULL` predates
+  verdict (naming `ApprovalService.ProposeUserReinstatement`), or the consilium would be advisory. A disabled row with `suspended_by IS NULL` predates
   the column and deliberately keeps the OLD semantics — one-act, never lapsing — because
   that is the rule those accounts were suspended under; there is no backfill.
 - **The hold sweep is load-bearing.** Consilium expiry is
@@ -572,7 +575,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   therefore load-bearing: if it stops, one operator's 24h brake quietly becomes
   indefinite.
 - **`Role::Admin` is granted by proposal and revoked by one act.** `SetRole` refuses to
-  GRANT it (naming `GovernanceService.OpenAdminAdmission`) for a relative of the reason
+  GRANT it (naming `ApprovalService.ProposeAdminAdmission`) for a relative of the reason
   it refuses `owner`: an operator who can appoint operators can appoint accomplices, and
   the seat carries every identity mutation except role granting. Taking it away stays a
   single act deliberately — containing a rogue operator must never be the slower path.

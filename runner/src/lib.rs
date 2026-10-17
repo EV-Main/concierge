@@ -1,7 +1,7 @@
 #![feature(default_field_values)]
 // `ev::settings!` expands one recursion level per field, and `AppConfig` has outgrown
 // the default limit of 128.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 //! `concierge` — the identity/platform-plane runner library.
 //!
 //! The modular monolith's internal modules, exposed as a library so the binary

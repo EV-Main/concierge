@@ -48,6 +48,10 @@ pub const EXECUTION_WINDOW_SECS: i64 = 72 * 60 * 60;
 /// At most this many live proposals per proposer namespace and scope: one leaked
 /// credential must not be able to bury a scope's deciders.
 pub const MAX_LIVE_PER_PROPOSER: i64 = 200;
+/// Live decisions about people one owner may have open at once: opening is cheap and each
+/// one mails every other owner, so one owner (or one stolen session) must not be able to fill
+/// the proposer's whole live cap with them.
+pub const MAX_LIVE_PEOPLE_PER_OPENER: i64 = 5;
 /// `PullApproved` stops serving a decision this long before it lapses, so whatever a
 /// proposer pulled it still has this long to report — a pull at the last second would
 /// otherwise hand out work whose report is already too late.
@@ -65,6 +69,27 @@ pub const OWN_NAMESPACE: &str = "concierge";
 pub const SCOPE_ADMIN_GRANT: &str = "concierge:scope_admin_grant";
 pub const SCOPE_POLICY_CHANGE: &str = "concierge:scope_policy_change";
 pub const PLATFORM_POLICY: &str = "concierge:platform_policy";
+/// The decisions about people, moved here from the legacy governance consilia. Each is the
+/// platform's, in scope `main`.
+pub const OWNER_ADMISSION: &str = "concierge:owner_admission";
+pub const OWNER_REMOVAL: &str = "concierge:owner_removal";
+pub const USER_SUSPENSION: &str = "concierge:user_suspension";
+pub const USER_REINSTATEMENT: &str = "concierge:user_reinstatement";
+pub const ADMIN_ADMISSION: &str = "concierge:admin_admission";
+/// The unanimity the owner consilia demand: every owner on the roster, which is what the
+/// roster's quorum comes to at 100 %.
+pub const UNANIMOUS_QUORUM_BPS: u32 = 10_000;
+
+/// The bar a platform proposal of `kind` is measured by: every owner on the roster for a
+/// change of the seats — nobody may grow or shrink the roster that decides everything else
+/// by a majority (the reason the legacy consilia were unanimous) — and more than half for
+/// the rest, as the user consilia were.
+pub fn platform_quorum_bps(kind: &str) -> u32 {
+	match kind {
+		OWNER_ADMISSION | OWNER_REMOVAL => UNANIMOUS_QUORUM_BPS,
+		_ => PLATFORM_QUORUM_BPS,
+	}
+}
 
 /// How long platform decisions pause after the owner roster changes, until the owners set
 /// another (D24(2)): long enough for the owners who were there before to notice a seat
@@ -298,6 +323,16 @@ pub fn builtin_kinds() -> Vec<ApprovalKind> {
 			],
 			escalations: Vec::new(),
 		},
+		person_kind(OWNER_ADMISSION, "Admit an owner", "Seat an account as a platform owner. Every other owner must agree.", &field),
+		person_kind(
+			OWNER_REMOVAL,
+			"Remove an owner",
+			"Take an owner's seat away. Every other owner besides the target must agree.",
+			&field,
+		),
+		person_kind(USER_SUSPENSION, "Suspend an account", "Freeze an account until the owners lift it.", &field),
+		person_kind(USER_REINSTATEMENT, "Reinstate an account", "Lift a suspension the owners imposed.", &field),
+		person_kind(ADMIN_ADMISSION, "Appoint an admin", "Grant the admin role to an account.", &field),
 		ApprovalKind {
 			name: PLATFORM_POLICY.into(),
 			label: "Change the platform's approval policy".into(),
@@ -307,6 +342,17 @@ pub fn builtin_kinds() -> Vec<ApprovalKind> {
 			escalations: Vec::new(),
 		},
 	]
+}
+
+fn person_kind(name: &str, label: &str, description: &str, field: &dyn Fn(&str, &str, FieldType) -> FieldSpec) -> ApprovalKind {
+	ApprovalKind {
+		name: name.into(),
+		label: label.into(),
+		description: description.into(),
+		level: ApprovalLevel::Platform,
+		fields: vec![field("account", "Account", FieldType::User), field("reason", "Reason", FieldType::Text)],
+		escalations: Vec::new(),
+	}
 }
 
 /// What a passed `concierge:*` proposal does when this plane's executor carries it out.
@@ -322,6 +368,153 @@ pub enum Action {
 	InstallPolicy { scope: String, policy: ScopePolicy },
 	/// Install `policy` as the platform's next version.
 	InstallPlatformPolicy { policy: PlatformPolicy },
+	/// A decision about one person's standing, opened by the owner `opened_by`.
+	People { effect: PersonEffect, user: uuid::Uuid, opened_by: uuid::Uuid },
+}
+
+impl Action {
+	/// The account whose own standing this decision is about, if it is that kind of
+	/// decision: it neither votes nor vetoes (nobody judges their own seat).
+	pub fn about(&self) -> Option<uuid::Uuid> {
+		match self {
+			Self::People { user, .. } => Some(*user),
+			Self::GrantAdmin { .. } | Self::InstallPolicy { .. } | Self::InstallPlatformPolicy { .. } => None,
+		}
+	}
+
+	/// The people kept off the roster: whoever opened it over a session, and whoever it
+	/// seats or is about.
+	pub fn off_roster(&self, opener: uuid::Uuid) -> Vec<uuid::Uuid> {
+		match self {
+			Self::GrantAdmin { user, .. } | Self::People { user, .. } => vec![opener, *user],
+			Self::InstallPolicy { .. } | Self::InstallPlatformPolicy { .. } => vec![opener],
+		}
+	}
+}
+
+/// What an executed decision about a person writes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonEffect {
+	/// `Role::Owner`. Written by nothing else but genesis.
+	AdmitOwner,
+	/// Back to `investor`, as an expulsion always was.
+	RemoveOwner,
+	/// `suspended_by = governance`: the owners' verdict, no expiry.
+	Suspend,
+	/// Lift such a verdict.
+	Reinstate,
+	AdmitAdmin,
+}
+
+impl PersonEffect {
+	pub fn kind(self) -> &'static str {
+		match self {
+			Self::AdmitOwner => OWNER_ADMISSION,
+			Self::RemoveOwner => OWNER_REMOVAL,
+			Self::Suspend => USER_SUSPENSION,
+			Self::Reinstate => USER_REINSTATEMENT,
+			Self::AdmitAdmin => ADMIN_ADMISSION,
+		}
+	}
+
+	/// The `admin_action` verb its execution records.
+	pub fn audit_verb(self) -> &'static str {
+		match self {
+			Self::AdmitOwner => "owner_admitted_by_approval",
+			Self::RemoveOwner => "owner_removed_by_approval",
+			Self::Suspend => "suspended_by_approval",
+			Self::Reinstate => "reinstated_by_approval",
+			Self::AdmitAdmin => "admin_granted_by_approval",
+		}
+	}
+
+	/// The RPC a refusal names.
+	pub fn rpc(self) -> &'static str {
+		match self {
+			Self::AdmitOwner => "ApprovalService.ProposeOwnerAdmission",
+			Self::RemoveOwner => "ApprovalService.ProposeOwnerRemoval",
+			Self::Suspend => "ApprovalService.ProposeUserSuspension",
+			Self::Reinstate => "ApprovalService.ProposeUserReinstatement",
+			Self::AdmitAdmin => "ApprovalService.ProposeAdminAdmission",
+		}
+	}
+
+	/// Whether the decision changes who the platform owners are, and so how many must
+	/// remain: it is held to the floor.
+	pub fn is_removal(self) -> bool {
+		self == Self::RemoveOwner
+	}
+}
+
+/// What a decision about a person is measured against, read under the lock that makes it
+/// current: at open to refuse what cannot be done, at execution to void what no longer can.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersonStanding {
+	pub role: crate::authz::Role,
+	pub active: bool,
+	pub verified: bool,
+	/// Suspended by the owners' verdict (not by one admin's hold).
+	pub governance_suspended: bool,
+}
+
+/// Why `effect` cannot be carried out against `subject` as they stand, if it cannot.
+/// `owners` is the number of STANDING owner seats, `subject`'s included if it stands: the
+/// floor is over seats that can still decide. An owner suspended by the owners' verdict has
+/// no say and is not counted, or two suspensions and a resignation would leave one voice; a
+/// temporary hold (`admin_hold`) is counted, because it lapses and is one operator's brake.
+pub fn person_inapplicable(effect: PersonEffect, subject: PersonStanding, owners: usize) -> Option<&'static str> {
+	use crate::authz::Role;
+	match effect {
+		PersonEffect::AdmitOwner =>
+			if subject.role == Role::Owner {
+				Some("the account already holds an owner seat")
+			} else if !subject.active {
+				Some("the account is no longer active")
+			} else if !subject.verified {
+				Some("the account's address is not verified")
+			} else {
+				None
+			},
+		PersonEffect::RemoveOwner =>
+			if subject.role != Role::Owner {
+				Some("the account no longer holds an owner seat")
+			} else if crate::governance::check_floor(owners).is_err() {
+				Some("the platform would be left below the owner floor")
+			} else {
+				None
+			},
+		PersonEffect::Suspend =>
+			if subject.governance_suspended {
+				Some("the account is already suspended by the owners")
+			} else {
+				None
+			},
+		PersonEffect::Reinstate =>
+			if subject.governance_suspended {
+				None
+			} else {
+				// Nothing left to lift, or a hold one admin could lift anyway: either way the
+				// owners' verdict would not be what freed this account.
+				Some("the account is no longer suspended by the owners")
+			},
+		PersonEffect::AdmitAdmin => match subject.role {
+			// Writing `admin` over `owner` would be an expulsion with no removal decision,
+			// no floor check and no audit of the seat.
+			Role::Owner => Some("the account holds an owner seat, which outranks admin"),
+			Role::Admin => Some("the account already holds the admin role"),
+			// Parity with an owner admission: an admin is reached by mail and acts with a
+			// session, so the account must be live and its address proven.
+			Role::Investor | Role::Operator =>
+				if !subject.active {
+					Some("the account is no longer active")
+				} else if !subject.verified {
+					Some("the account's address is not verified")
+				} else {
+					None
+				},
+		},
+	}
 }
 
 /// The fields a policy change shows its voters, every override with its value among them.
@@ -1525,5 +1718,132 @@ mod tests {
 		assert!(d.expire_if_due(1000));
 		assert_eq!((d.state, d.decided_at), (ApprovalState::Expired, Some(1000)));
 		assert!(d.vote(roster[0], Vote::For, 1001, &[]).is_err());
+	}
+
+	fn standing(role: crate::authz::Role) -> PersonStanding {
+		PersonStanding {
+			role,
+			active: true,
+			verified: true,
+			governance_suspended: false,
+		}
+	}
+
+	#[test]
+	fn only_the_seat_changes_demand_unanimity() {
+		for kind in [OWNER_ADMISSION, OWNER_REMOVAL] {
+			assert_eq!(platform_quorum_bps(kind), 10_000, "{kind}");
+		}
+		for kind in [USER_SUSPENSION, USER_REINSTATEMENT, ADMIN_ADMISSION, SCOPE_ADMIN_GRANT, PLATFORM_POLICY, "bank:payment"] {
+			assert_eq!(platform_quorum_bps(kind), PLATFORM_QUORUM_BPS, "{kind}");
+		}
+		// The bar over a roster of n: unanimity is n, the majority is what the user consilia
+		// frozen onto their rows (floor(n/2)+1).
+		for n in 1..=9usize {
+			assert_eq!(threshold(n, 10_000) as usize, n);
+			assert_eq!(threshold(n, PLATFORM_QUORUM_BPS) as usize, n / 2 + 1, "n = {n}");
+		}
+	}
+
+	#[test]
+	fn every_people_kind_is_built_in_at_the_platform_level_with_an_account_and_a_reason() {
+		let kinds = builtin_kinds();
+		for effect in [
+			PersonEffect::AdmitOwner,
+			PersonEffect::RemoveOwner,
+			PersonEffect::Suspend,
+			PersonEffect::Reinstate,
+			PersonEffect::AdmitAdmin,
+		] {
+			let kind = kinds.iter().find(|k| k.name == effect.kind()).unwrap_or_else(|| panic!("{} is built in", effect.kind()));
+			assert_eq!(kind.level, ApprovalLevel::Platform);
+			assert!(kind.escalations.is_empty());
+			let keys: Vec<_> = kind.fields.iter().map(|f| (f.key.as_str(), f.field_type)).collect();
+			assert_eq!(keys, [("account", FieldType::User), ("reason", FieldType::Text)]);
+		}
+	}
+
+	#[test]
+	fn a_people_action_names_the_account_it_is_about_and_keeps_it_off_the_roster() {
+		let (opener, user) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+		let action = Action::People {
+			effect: PersonEffect::RemoveOwner,
+			user,
+			opened_by: opener,
+		};
+		assert_eq!(action.about(), Some(user));
+		assert_eq!(action.off_roster(opener), vec![opener, user]);
+		let stored: Action = serde_json::from_value(serde_json::to_value(&action).unwrap()).unwrap();
+		assert_eq!(stored, action);
+		assert_eq!(Action::InstallPlatformPolicy { policy: PlatformPolicy::default() }.about(), None, "a policy is about nobody");
+	}
+
+	#[test]
+	fn what_no_longer_applies_is_void_not_executed() {
+		use crate::authz::Role;
+		let at = |effect, subject, owners| person_inapplicable(effect, subject, owners);
+		assert!(at(PersonEffect::AdmitOwner, standing(Role::Investor), 2).is_none());
+		assert!(at(PersonEffect::AdmitOwner, standing(Role::Owner), 2).is_some(), "already seated");
+		assert!(
+			at(
+				PersonEffect::AdmitOwner,
+				PersonStanding {
+					active: false,
+					..standing(Role::Investor)
+				},
+				2
+			)
+			.is_some()
+		);
+		assert!(
+			at(
+				PersonEffect::AdmitOwner,
+				PersonStanding {
+					verified: false,
+					..standing(Role::Investor)
+				},
+				2
+			)
+			.is_some()
+		);
+		// The floor: a removal leaves at least MIN_OWNERS behind, here and at execution.
+		assert!(at(PersonEffect::RemoveOwner, standing(Role::Owner), 3).is_none());
+		assert!(at(PersonEffect::RemoveOwner, standing(Role::Owner), 2).is_some(), "would leave one");
+		assert!(at(PersonEffect::RemoveOwner, standing(Role::Admin), 5).is_some(), "not an owner any more");
+		// Reinstatement lifts only the owners' own verdict.
+		let verdict = PersonStanding {
+			governance_suspended: true,
+			..standing(Role::Investor)
+		};
+		assert!(at(PersonEffect::Reinstate, verdict, 2).is_none());
+		assert!(at(PersonEffect::Reinstate, standing(Role::Investor), 2).is_some());
+		assert!(at(PersonEffect::Suspend, verdict, 2).is_some(), "already suspended");
+		assert!(at(PersonEffect::Suspend, standing(Role::Investor), 2).is_none());
+		// `admin` over `owner` would be an expulsion by another door.
+		assert!(at(PersonEffect::AdmitAdmin, standing(Role::Owner), 3).is_some());
+		assert!(at(PersonEffect::AdmitAdmin, standing(Role::Admin), 3).is_some());
+		assert!(at(PersonEffect::AdmitAdmin, standing(Role::Operator), 3).is_none());
+		assert!(
+			at(
+				PersonEffect::AdmitAdmin,
+				PersonStanding {
+					active: false,
+					..standing(Role::Investor)
+				},
+				3
+			)
+			.is_some()
+		);
+		assert!(
+			at(
+				PersonEffect::AdmitAdmin,
+				PersonStanding {
+					verified: false,
+					..standing(Role::Investor)
+				},
+				3
+			)
+			.is_some()
+		);
 	}
 }

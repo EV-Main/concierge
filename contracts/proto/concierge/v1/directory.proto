@@ -22,7 +22,7 @@ service UserDirectory {
   rpc RevokeTokens(RevokeTokensRequest) returns (RevokeTokensResponse);
 
   // DEPRECATED — always refuses, naming HoldUser or
-  // GovernanceService.OpenUserSuspension.
+  // ApprovalService.ProposeUserSuspension.
   //
   // The verb was ambiguous in the one way that mattered: it was both the emergency
   // brake (the frozen flag the money plane re-reads at dispatch, which stops a
@@ -34,7 +34,7 @@ service UserDirectory {
   rpc DisableUser(DisableUserRequest) returns (DisableUserResponse) { option deprecated = true; };
 
   // Admin (UserSuspend): the emergency brake. Freezes the account NOW and lapses on
-  // its own after 24h unless the owners ratify it with OpenUserSuspension. One actor
+  // its own after 24h unless the owners ratify it with ProposeUserSuspension. One actor
   // may stop money temporarily; one actor may never stop it permanently. Emits
   // SUSPENDED across the cross-plane bridge, and REINSTATED again when it lapses.
   rpc HoldUser(HoldUserRequest) returns (HoldUserResponse);
@@ -43,7 +43,7 @@ service UserDirectory {
   // freeze. Emits REINSTATED across the cross-plane bridge.
   //
   // Refuses with FAILED_PRECONDITION when the suspension was the owners' verdict,
-  // naming GovernanceService.OpenUserReinstatement — otherwise one admin could
+  // naming ApprovalService.ProposeUserReinstatement — otherwise one admin could
   // overturn a consilium and the consilium would be advisory.
   rpc ReinstateUser(ReinstateUserRequest) returns (ReinstateUserResponse);
 
@@ -147,7 +147,7 @@ message UserProfile {
   //   "admin_hold"  — one operator's brake; lapses at hold_expires_at; ReinstateUser
   //                   lifts it in one act.
   //   "governance"  — the owners' ratified verdict; never lapses; ReinstateUser
-  //                   refuses and names OpenUserReinstatement.
+  //                   refuses and names ProposeUserReinstatement.
   string suspended_by = 19;
   // Unix SECONDS an "admin_hold" lapses. 0 when nothing lapses.
   int64 hold_expires_at = 20;

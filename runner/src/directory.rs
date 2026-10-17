@@ -356,7 +356,7 @@ impl UserDirectory for Directory {
 		require_permission(self, &request, Users::Suspend).await?;
 		Err(Status::failed_precondition(
 			"DisableUser is retired because it meant two different things: use UserDirectory.HoldUser to freeze \
-			 this account now (it lapses in 24h unless ratified), or GovernanceService.OpenUserSuspension to \
+			 this account now (it lapses in 24h unless ratified), or ApprovalService.ProposeUserSuspension to \
 			 make it permanent, which every other owner votes on",
 		))
 	}
@@ -386,7 +386,7 @@ impl UserDirectory for Directory {
 			// session, and with it your ability to explain, lift or ratify it. The verb for
 			// stepping back is the owners' proposal, not the emergency brake.
 			return Err(Status::failed_precondition(
-				"a hold cannot be placed on your own account; ask the owners through GovernanceService.OpenUserSuspension",
+				"a hold cannot be placed on your own account; ask the owners through ApprovalService.ProposeUserSuspension",
 			));
 		}
 		let reason = require_reason(&req.reason)?;
@@ -414,7 +414,7 @@ impl UserDirectory for Directory {
 			Reinstatement::Applied(_) => Ok(Response::new(ReinstateUserResponse {})),
 			Reinstatement::GovernanceHeld => Err(Status::failed_precondition(
 				"this suspension is the owner consilium's verdict; lifting it goes through \
-				 GovernanceService.OpenUserReinstatement, which the other owners vote on",
+				 ApprovalService.ProposeUserReinstatement, which the other owners vote on",
 			)),
 		}
 	}
@@ -562,13 +562,13 @@ impl UserDirectory for Directory {
 				role: user.role().as_str().to_owned(),
 			})),
 			RoleChange::WouldGrantOwnership => Err(Status::failed_precondition(
-				"granting ownership goes through GovernanceService.OpenOwnerAdmission, which every other owner must agree to — one owner may not mint another",
+				"granting ownership goes through ApprovalService.ProposeOwnerAdmission, which every other owner must agree to — one owner may not mint another",
 			)),
 			RoleChange::WouldTakeOwnership => Err(Status::failed_precondition(
-				"taking ownership away goes through GovernanceService.OpenOwnerRemoval, or ResignOwnership for your own seat",
+				"taking ownership away goes through ApprovalService.ProposeOwnerRemoval, or ApprovalService.ResignOwnership for your own seat",
 			)),
 			RoleChange::WouldGrantAdmin => Err(Status::failed_precondition(
-				"granting the admin role goes through GovernanceService.OpenAdminAdmission, which the other owners vote on — \
+				"granting the admin role goes through ApprovalService.ProposeAdminAdmission, which the other owners vote on — \
 				 an operator who can appoint operators can appoint accomplices. Taking the role away is still one act",
 			)),
 		}

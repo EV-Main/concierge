@@ -2705,7 +2705,7 @@ async fn set_role_refuses_to_mint_or_to_strip_an_owner() {
 		.await
 		.unwrap_err();
 	assert_eq!(minted.code(), Code::FailedPrecondition, "{minted}");
-	assert!(minted.message().contains("OpenOwnerAdmission"), "the refusal points at the consilium: {minted}");
+	assert!(minted.message().contains("ProposeOwnerAdmission"), "the refusal points at the consilium: {minted}");
 	assert_eq!(fx.role_of(candidate).await, Role::Investor);
 
 	let stripped = directory
@@ -2737,7 +2737,7 @@ async fn set_role_refuses_to_mint_or_to_strip_an_owner() {
 		.await
 		.unwrap_err();
 	assert_eq!(appointed.code(), Code::FailedPrecondition, "{appointed}");
-	assert!(appointed.message().contains("OpenAdminAdmission"), "the refusal points at the consilium: {appointed}");
+	assert!(appointed.message().contains("ProposeAdminAdmission"), "the refusal points at the consilium: {appointed}");
 	assert_eq!(fx.role_of(candidate).await, Role::Investor);
 
 	// Every OTHER role change is untouched — this closes ownership and appointment, not
@@ -2786,7 +2786,7 @@ async fn set_role_refuses_to_seat_an_owner_even_on_an_empty_registry() {
 		.await
 		.unwrap_err();
 	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-	assert!(err.message().contains("OpenOwnerAdmission"), "the refusal points at the consilium: {err}");
+	assert!(err.message().contains("ProposeOwnerAdmission"), "the refusal points at the consilium: {err}");
 	assert_eq!(fx.role_of(candidate).await, Role::Investor, "an empty registry is not a licence to seat anyone");
 
 	// The rest of the console still works on that same authority — emergency access
@@ -3008,7 +3008,7 @@ async fn set_role_cannot_strip_a_seat_granted_while_it_was_deciding() {
 
 	let err = result.unwrap_err();
 	assert_eq!(err.code(), Code::FailedPrecondition, "the demotion must see the committed seat: {err}");
-	assert!(err.message().contains("OpenOwnerRemoval"), "and be pointed at the consilium: {err}");
+	assert!(err.message().contains("ProposeOwnerRemoval"), "and be pointed at the consilium: {err}");
 	assert_eq!(fx.role_of(candidate).await, Role::Owner, "the seat the consilium granted survives");
 }
 
