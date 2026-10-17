@@ -921,6 +921,29 @@ pub fn email_code(sign_in: bool, code: &str, expires_at: i64) -> RenderedEmail {
 	}
 }
 
+/// The code that confirms a sensitive act of the signed-in account (re-authentication,
+/// #166). It says what it is for: the person must be able to tell it from a sign-in code
+/// and to see that handing it over lets someone act with their money.
+pub fn reauth_code(code: &str, expires_at: i64) -> RenderedEmail {
+	let title = "Confirm an action on your account";
+	let ask = "Enter this code on the page where you were asked to confirm an action with your money.";
+	let warn = "If this was not you, do not share the code: change your sign-in methods and sign out of other sessions now.";
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Account"));
+	inner.push_str(&heading(title));
+	inner.push_str(&paragraph(ask));
+	inner.push_str(&code_panel(code));
+	inner.push_str(&paragraph(&format!("It works once, until {}. {warn}", fmt_ts(expires_at))));
+	RenderedEmail {
+		subject: format!("{code} confirms an action on your EV Investment account"),
+		html: shell(title, &card(&inner), FOOTER_CODE, "", "Account"),
+		text: format!(
+			"{title}\n\n{ask}\n\nYour code: {code}\n\nIt works once, until {}. {warn}\n\n—\n{FOOTER_CODE}\n",
+			fmt_ts(expires_at)
+		),
+	}
+}
+
 const FOOTER_CODE: &str = "You received this because this address was entered on evinvest.ltd. EV Investment never asks for this code by phone, chat or email.";
 
 const FOOTER_SECURITY: &str =

@@ -144,6 +144,44 @@ impl AuthService {
 		Ok(token_response(access_token, access_exp, refresh, &summary))
 	}
 
+	/// Re-authentication: the caller has just proven `user_id` again (passkey, code,
+	/// password — decided by the web surface), so move the session's `auth_time` to now and
+	/// mint a new access token carrying it. The refresh handle is NOT rotated, so the
+	/// session the browser holds stays valid and nothing about it changes but the claim.
+	///
+	/// `refresh_token` must be the family's current secret AND belong to `user_id`: the
+	/// proven user has to be the one in the session, or a proof of someone else's could
+	/// refresh this session's `auth_time`. Revoke-all and disabled accounts are refused as
+	/// `refresh` refuses them. Relying-party and service tokens are not touched.
+	pub async fn reauthenticate(&self, refresh_token: &str, user_id: &str) -> Result<Reauthenticated, Status> {
+		let engine = &self.engine;
+		let signer = engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
+		match engine.refresh.inspect(refresh_token, engine.session_bounds).await? {
+			RefreshInspect::Current { user_id: owner } if owner == user_id => {}
+			// A foreign family, a rotated-out secret and an unknown handle read alike. A
+			// replayed secret is not escalated into a family wipe here: this entry point
+			// is reached with the server-held handle under the session lock, so it is a
+			// bug on our side rather than evidence of theft, and `refresh` still classifies it.
+			RefreshInspect::Current { .. } | RefreshInspect::Reuse { .. } | RefreshInspect::Invalid => return Err(AuthError::InvalidToken.into()),
+		}
+		let summary = engine.provisioner.lookup(user_id.to_owned()).await.inspect_err(crate::telemetry::report_unexpected)?;
+		if summary.is_disabled() {
+			self.revoke_user_everywhere(&summary.user_id).await?;
+			return Err(Status::permission_denied("user is disabled"));
+		}
+		let moved = engine.refresh.touch_auth_time(refresh_token, engine.session_bounds).await?.ok_or(AuthError::InvalidToken)?;
+		if summary.token_version > moved.token_version_snapshot {
+			self.revoke_user_everywhere(&summary.user_id).await?;
+			return Err(Status::unauthenticated("tokens revoked"));
+		}
+		let (access_token, access_exp) = signer.mint_access(&summary.user_id, summary.token_version, Some(moved.auth_time))?;
+		Ok(Reauthenticated {
+			access_token,
+			access_expires_at: access_exp as i64,
+			auth_time: moved.auth_time,
+		})
+	}
+
 	/// Open a refresh family without a sign-in, for integration suites that need
 	/// a real `evinvest.ltd` session to exist. Returns the refresh token.
 	#[cfg(feature = "test-support")]
@@ -182,6 +220,14 @@ impl AuthService {
 		let user = self.engine.provisioner.lookup(user_id.to_string()).await.inspect_err(crate::telemetry::report_unexpected)?;
 		Ok(user_summary(&user))
 	}
+}
+
+/// What [`AuthService::reauthenticate`] hands back: the new access half of the pair.
+pub struct Reauthenticated {
+	pub access_token: String,
+	pub access_expires_at: i64,
+	/// The family's new `auth_time` (unix seconds), also inside `access_token`.
+	pub auth_time: u64,
 }
 
 struct AuthEngine {

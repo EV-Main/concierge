@@ -92,7 +92,7 @@ async fn redeem(conn: &mut PgConnection, email: &Email, purpose: &str, user: Opt
 		return Ok(Err(CodeRefusal::Expired));
 	}
 	if let Some(user) = user
-		&& verify_spent(conn, email, user, now).await?.wrong >= VERIFY_WRONG_PER_DAY
+		&& verify_spent(conn, email, user, purpose, now).await?.wrong >= VERIFY_WRONG_PER_DAY
 	{
 		return Ok(Err(CodeRefusal::Exhausted));
 	}
@@ -142,6 +142,17 @@ impl CredentialRepository for PgCredentials {
 	async fn redeem_login_code(&self, email: &Email, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let outcome = redeem(&mut tx, email, "login", None, code, now).await?;
+		// Committed whatever the outcome: a wrong guess must stay counted.
+		tx.commit().await.map_err(repo_err)?;
+		Ok(outcome)
+	}
+
+	async fn redeem_reauth_code(&self, user: UserId, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		// The address is read first and locked second, as `issue_in` does.
+		let email = email_of(&mut tx, user).await?;
+		lock_email(&mut tx, &email).await?;
+		let outcome = redeem(&mut tx, &email, "reauth", Some(user), code, now).await?;
 		// Committed whatever the outcome: a wrong guess must stay counted.
 		tx.commit().await.map_err(repo_err)?;
 		Ok(outcome)
@@ -356,12 +367,13 @@ async fn issue_in(conn: &mut PgConnection, purpose: CodePurpose, now: i64) -> Re
 	let (email, purpose, user) = match purpose {
 		CodePurpose::Login(email) => (email, "login", None),
 		CodePurpose::Verify(user) => (email_of(conn, user).await?, "verify", Some(user)),
+		CodePurpose::Reauth(user) => (email_of(conn, user).await?, "reauth", Some(user)),
 	};
 	lock_email(conn, &email).await?;
 	issue_locked(conn, &email, purpose, user, now).await
 }
 
-/// What one account spent of its daily verification budget on its address.
+/// What one account spent of its daily budget, for one account-bound `purpose`, on its address.
 struct VerifySpent {
 	issued: i64,
 	wrong: i64,
@@ -369,14 +381,15 @@ struct VerifySpent {
 
 /// Counted on the account's current address as well as its id: a code sent to an address
 /// it no longer has can verify nothing, and the address leads the only index the table has.
-async fn verify_spent(conn: &mut PgConnection, email: &Email, user: UserId, now: i64) -> Result<VerifySpent, DomainError> {
+async fn verify_spent(conn: &mut PgConnection, email: &Email, user: UserId, purpose: &str, now: i64) -> Result<VerifySpent, DomainError> {
 	let (issued, wrong): (i64, i64) = sqlx::query_as(
 		"SELECT count(*), COALESCE(sum(attempts), 0)::BIGINT FROM email_codes \
-		 WHERE email = $1 AND purpose = 'verify' AND user_id = $2 AND created_at > $3",
+		 WHERE email = $1 AND purpose = $4 AND user_id = $2 AND created_at > $3",
 	)
 	.bind(email.as_str())
 	.bind(user.raw())
 	.bind(now - VERIFY_BUDGET_WINDOW_SECS)
+	.bind(purpose)
 	.fetch_one(&mut *conn)
 	.await
 	.map_err(repo_err)?;
@@ -387,7 +400,7 @@ async fn verify_spent(conn: &mut PgConnection, email: &Email, user: UserId, now:
 async fn issue_locked(conn: &mut PgConnection, email: &Email, purpose: &str, user: Option<UserId>, now: i64) -> Result<CodeIssue, DomainError> {
 	// The guess cap first: it outlasts the send window, so it is the answer worth giving.
 	if let Some(user) = user {
-		let spent = verify_spent(conn, email, user, now).await?;
+		let spent = verify_spent(conn, email, user, purpose, now).await?;
 		if spent.wrong >= VERIFY_WRONG_PER_DAY {
 			return Ok(CodeIssue::Exhausted);
 		}

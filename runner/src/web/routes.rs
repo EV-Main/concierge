@@ -414,7 +414,7 @@ pub(super) fn store_err(e: color_eyre::Report) -> (StatusCode, &'static str) {
 	(StatusCode::INTERNAL_SERVER_ERROR, "session store unavailable")
 }
 
-async fn refresh_of(st: &super::Inner, jar: &CookieJar) -> Result<Option<String>, (StatusCode, &'static str)> {
+pub(super) async fn refresh_of(st: &super::Inner, jar: &CookieJar) -> Result<Option<String>, (StatusCode, &'static str)> {
 	let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_string()) else {
 		return Ok(None);
 	};
@@ -510,6 +510,9 @@ pub(super) struct Caller {
 	/// The `token_version` the session's access token was minted under — the half of
 	/// `authz::caller_gate`'s check the live summary cannot supply.
 	pub(super) minted_token_version: Option<u64>,
+	/// The session's last interactive authentication (unix seconds) as the access token
+	/// carries it; `None` for a family that predates the claim. See `sign_in::require_fresh`.
+	pub(super) auth_time: Option<u64>,
 	access_token: String,
 	remaining_secs: i64,
 }
@@ -524,6 +527,7 @@ impl Caller {
 			role: fresh.user.role.clone(),
 			role_is_break_glass: fresh.user.role_is_break_glass,
 			minted_token_version: minted_token_version(&fresh.access_token),
+			auth_time: minted_claims(&fresh.access_token).and_then(|claims| claims.auth_time),
 			access_token: fresh.access_token.clone(),
 			remaining_secs: fresh.remaining_secs,
 		})
@@ -565,9 +569,13 @@ pub(super) async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<O
 /// token comes from: the server-side session store, never the browser. `None` for a
 /// token that does not parse, which the caller refuses.
 pub(super) fn minted_token_version(token: &str) -> Option<u64> {
+	minted_claims(token).map(|claims| claims.token_version)
+}
+
+fn minted_claims(token: &str) -> Option<evconcierge_auth::Claims> {
 	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 	let payload = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
-	serde_json::from_slice::<evconcierge_auth::Claims>(&payload).ok().map(|claims| claims.token_version)
+	serde_json::from_slice(&payload).ok()
 }
 
 /// Constant-time string equality.

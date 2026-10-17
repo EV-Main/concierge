@@ -166,6 +166,21 @@ pub(super) async fn gate(st: &super::Inner, caller: &Caller) -> Result<User, Den
 	Ok(user)
 }
 
+/// How recent the session's `auth_time` must be for an act that adds or removes a way to
+/// sign in. A stolen session that has not just proved itself again can plant nothing.
+pub(super) const REAUTH_FRESH_SECS: u64 = 300;
+
+/// Refuse `403 reauth_required` unless the caller authenticated within
+/// [`REAUTH_FRESH_SECS`]: the client sends the person through `/auth/reauth/*` and retries.
+/// A family that predates the claim has no `auth_time` and counts as stale.
+pub(super) fn require_fresh(caller: &Caller) -> Result<(), Refusal> {
+	let now = now_secs().max(0) as u64;
+	match caller.auth_time {
+		Some(at) if now.saturating_sub(at) <= REAUTH_FRESH_SECS => Ok(()),
+		_ => Err(Refusal(StatusCode::FORBIDDEN, "reauth_required")),
+	}
+}
+
 /// End the browser's session as a sign-out does and hand back the jar that clears it.
 pub(super) async fn end_session(st: &super::Inner, jar: CookieJar) -> CookieJar {
 	if let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_owned())
@@ -368,7 +383,7 @@ async fn hash(password: String) -> Result<String, Refusal> {
 	.map_err(|e| internal("password not hashed", e))
 }
 
-async fn matches(phc: String, password: String) -> Result<bool, Refusal> {
+pub(super) async fn matches(phc: String, password: String) -> Result<bool, Refusal> {
 	tokio::task::spawn_blocking(move || {
 		use argon2::password_hash::{PasswordHash, PasswordVerifier};
 		let parsed = PasswordHash::new(&phc).map_err(|e| e.to_string())?;
@@ -381,7 +396,7 @@ async fn matches(phc: String, password: String) -> Result<bool, Refusal> {
 
 /// Verified when a handle names no password, so that answer costs what a wrong password
 /// costs and the timing says nothing about who has an account.
-static DECOY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+pub(super) static DECOY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 	use argon2::password_hash::{PasswordHasher, SaltString};
 	let salt = SaltString::encode_b64(b"concierge-decoy!").expect("16 bytes is a valid salt");
 	argon2::Argon2::default().hash_password(b"no account has this password", &salt).expect("decoy hashes").to_string()
