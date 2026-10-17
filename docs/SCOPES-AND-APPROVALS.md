@@ -280,7 +280,8 @@ emitters.
 
 The owners' consilium (`governance.proto`, banking's `docs/CONSILIUM.md`) generalised to
 every scope. `GovernanceService` and `MailRelayService` stay as they are until the
-contract step of the reorganisation; the new kinds below replace banking's consilium
+contract step of the reorganisation (the people's decisions have a second home in the
+`concierge:*` kinds below); the new kinds replace banking's consilium
 tables, whose foreign keys become `subject_ref`s on banking's side.
 
 ### 5.1 One owner per kind: proposer = executor
@@ -487,6 +488,43 @@ executor loop once passed (D23).
 | `concierge:scope_admin_grant` | PLATFORM | a seat holding `iam:tenants:grant`, for an account with a VERIFIED address | account (USER) | a grant of `<namespace>:admin`, `granted_by` the opener; VOID if the account is no longer active or verified, or the scope no longer active |
 | `concierge:platform_policy` | PLATFORM | a persisted owner | cooldown_secs (COUNT) | the platform's next policy `version` |
 | `concierge:scope_policy_change` | PLATFORM | such a seat, or an admin of the scope | quorum_bps, delay_secs, ttl_secs, thresholds (COUNT), and one `threshold` TEXT field per override, `<kind>/<parameter>=<value>` — the values are in `payload_hash`; the whole policy is also `Approval.proposed_policy` | the scope's next policy `version`, checked again against the catalogs then in force; VOID if it no longer fits |
+
+The decisions about **people**, moved here from `GovernanceService` (expand step; the old
+service keeps working beside them until the contract step). All five are `PLATFORM`, in
+scope `main`, with `account (USER)` and `reason (TEXT)` fields, opened over `ApprovalService`
+by an active persisted owner, who is kept off the roster, as is the account they are about
+(`Action::People`; subject_ref `user:<uuid>`, one live decision per kind and account).
+
+| Kind | Bar | Executed as |
+| ---- | --- | ----------- |
+| `concierge:owner_admission` | UNANIMITY of the owners besides the opener | `Role::Owner`; VOID if the account holds the seat, is inactive or unverified |
+| `concierge:owner_removal` | UNANIMITY of the owners besides the opener and the target | back to `investor`; VOID if it would leave fewer than two seats (`MIN_OWNERS`) |
+| `concierge:user_suspension` | more than half of the owners besides the opener | `suspended_by = governance`, no expiry |
+| `concierge:user_reinstatement` | as suspension | lifts a verdict the owners imposed; VOID if there is none |
+| `concierge:admin_admission` | as suspension | `Role::Admin`; VOID over an owner or an admin |
+
+Unanimity is the quorum at 10000 bps over the frozen roster (`platform_quorum_bps`): the
+reason the legacy consilia were unanimous holds — a minority able to add or remove owners by
+majority grows itself into a majority. The target of a removal is not asked, as the legacy
+peer set did not ask them, and the emailed self-accept is gone: the target has no vote and
+no veto over a decision about their own standing (nobody judges their own seat); any other
+owner vetoes inside the delay, as on every platform decision. A FOR counts only while its
+voter holds the seat, so a held owner cannot carry a unanimous decision, and execution
+counts the seated FORs again against the threshold (a decision whose voters left is VOID).
+The floor, the 48 h pause (D24(2)) and the voiding of live platform decisions on a change
+of the owners apply as to every platform decision. `Role::Owner` is written by genesis and
+by the executor of an executed `owner_admission`, and (until the contract step) by the
+legacy service. An execution takes the governance revision, every owner's `users` row and
+the two accounts, and only then the proposal; it records its outcome BEFORE writing the
+seat, so the trigger that voids live platform decisions finds this one already executed.
+
+`ApprovalService.ListOwners` and `ResignOwnership` (same gate, same typed confirmation, same
+floor) replace the legacy pair, and `GetApprovalsRevision` replaces `WatchGovernance`: a
+number that moves whenever an approval or the owner roster does, which a console polls and
+refetches on a change — no stream. `GOVERNANCE_NEW_VOTES_CLOSED=true` closes the legacy
+openings (they answer `FAILED_PRECONDITION` naming the RPC above) and
+`GovernanceService.DrainLegacyProposals` voids the open legacy proposals by list, so the
+window can be emptied.
 
 Assigning an operator in a scope is still a delegated `GrantPermission` by a
 `<scope>:admin`, with no approval.
