@@ -368,7 +368,7 @@ async fn hash(password: String) -> Result<String, Refusal> {
 	.map_err(|e| internal("password not hashed", e))
 }
 
-async fn matches(phc: String, password: String) -> Result<bool, Refusal> {
+pub(super) async fn matches(phc: String, password: String) -> Result<bool, Refusal> {
 	tokio::task::spawn_blocking(move || {
 		use argon2::password_hash::{PasswordHash, PasswordVerifier};
 		let parsed = PasswordHash::new(&phc).map_err(|e| e.to_string())?;
@@ -381,7 +381,7 @@ async fn matches(phc: String, password: String) -> Result<bool, Refusal> {
 
 /// Verified when a handle names no password, so that answer costs what a wrong password
 /// costs and the timing says nothing about who has an account.
-static DECOY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+pub(super) static DECOY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 	use argon2::password_hash::{PasswordHasher, SaltString};
 	let salt = SaltString::encode_b64(b"concierge-decoy!").expect("16 bytes is a valid salt");
 	argon2::Argon2::default().hash_password(b"no account has this password", &salt).expect("decoy hashes").to_string()

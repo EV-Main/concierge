@@ -31,6 +31,7 @@ mod notifications;
 mod oauth;
 pub mod origins;
 mod passkey;
+mod reauth;
 mod routes;
 mod session;
 mod sign_in;
@@ -55,13 +56,15 @@ use evconcierge_auth::{AuthService, oauth::OAuthProvider};
 pub use kyc::START_MAX_PER_WINDOW;
 /// Re-exported for the same reason: the suite drives the passkey sign-in up to this budget.
 pub use passkey::SIGN_IN_STARTS_PER_MINUTE;
+/// Re-exported for the same reason: the suite drives re-authentication up to this budget.
+pub use reauth::ATTEMPTS_PER_WINDOW as REAUTH_ATTEMPTS_PER_WINDOW;
 pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
 use tokio::sync::Notify;
 pub use turnstile::{SITEVERIFY, Turnstile, is_test_secret};
 use webauthn_rs::{
 	Webauthn,
-	prelude::{DiscoverableAuthentication, PasskeyRegistration},
+	prelude::{DiscoverableAuthentication, PasskeyAuthentication, PasskeyRegistration},
 };
 
 use crate::{
@@ -148,6 +151,8 @@ impl WebState {
 				passkey_registrations: Ceremonies::default(),
 				passkey_sign_ins: Ceremonies::default(),
 				passkey_sign_in_starts: RateLimiter::new(std::time::Duration::from_secs(60), passkey::SIGN_IN_STARTS_PER_MINUTE),
+				passkey_reauths: Ceremonies::default(),
+				reauth_attempts: RateLimiter::new(std::time::Duration::from_secs(reauth::WINDOW_SECS), reauth::ATTEMPTS_PER_WINDOW),
 				subscribe_limiter: sign_in.subscribe_limiter,
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
@@ -261,6 +266,14 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/passkey/register/options", post(passkey::register_options))
 		.route("/auth/passkey/register/verify", post(passkey::register_verify))
 		.route("/auth/passkey/remove", post(passkey::remove))
+		// Re-authentication: prove the signed-in account again and move the session's
+		// `auth_time`, without a new session. `PUBLIC_ORIGIN` only (no CORS), CSRF-checked
+		// (`web::reauth`).
+		.route("/auth/reauth/code/request", post(reauth::code_request))
+		.route("/auth/reauth/code/verify", post(reauth::code_verify))
+		.route("/auth/reauth/password", post(reauth::password))
+		.route("/auth/reauth/passkey/options", post(reauth::passkey_options))
+		.route("/auth/reauth/passkey/verify", post(reauth::passkey_verify))
 		// The relying-party code flow's front door. It needs no CSRF token: it changes
 		// nothing a cross-site request could exploit — it only ever redirects to an
 		// address registered for the client, carrying a code that is useless without the
@@ -308,6 +321,12 @@ struct Inner {
 	/// reading of the allowlist even if it is rebuilt in between.
 	passkey_registrations: Ceremonies<(UserId, PasskeyRegistration, Arc<Webauthn>)>,
 	passkey_sign_ins: Ceremonies<(DiscoverableAuthentication, Arc<Webauthn>)>,
+	/// A re-authentication ceremony is bound to the account that began it.
+	passkey_reauths: Ceremonies<(UserId, PasskeyAuthentication, Arc<Webauthn>)>,
+	/// Per ACCOUNT (not per address — the caller is signed in): every re-authentication
+	/// request spends from it, so a stolen session cannot be used to grind a password,
+	/// a code or an assertion any faster than this.
+	reauth_attempts: RateLimiter,
 	/// Per client address, in process: a replica's own ceremony store is what it protects.
 	passkey_sign_in_starts: RateLimiter,
 	subscribe_limiter: Arc<RateLimiter>,

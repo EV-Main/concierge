@@ -59,6 +59,13 @@ pub struct Fresh {
 	pub remaining_secs: i64,
 }
 
+/// A session whose `auth_time` just moved: what the route sets in the browser.
+pub struct Reauthed {
+	pub access_token: String,
+	pub auth_time: u64,
+	pub remaining_secs: i64,
+}
+
 pub struct WebSessions {
 	store: Store,
 	/// Per-session single-flight for the refresh path: two racing rotations of one
@@ -173,6 +180,35 @@ impl WebSessions {
 			user: s.user,
 			access_token: s.access_token,
 			remaining_secs: (s.refresh_expires_at - now).max(0),
+		}))
+	}
+
+	/// Move the session's `auth_time` after a re-authentication the caller has already
+	/// decided, and keep the new access token the issuance service minted for it. The
+	/// whole step runs under the session's single-flight: the refresh handle is read and
+	/// used with no rotation able to land in between (a rotated-out handle would be
+	/// refused), and a concurrent [`Self::fresh`] cannot save its older access token over
+	/// the new one. The inner `Err` is the issuance service's verdict, or `Unauthenticated` when
+	/// the session is gone or is not `user_id`'s.
+	pub async fn reauthenticated(&self, id: &str, user_id: &str, auth: &AuthService) -> color_eyre::Result<Result<Reauthed, tonic::Status>> {
+		let _flight = self.locks.acquire(id.to_string()).await;
+		let Some(mut s) = self.store.load(id).await? else {
+			return Ok(Err(tonic::Status::unauthenticated("no such session")));
+		};
+		if s.user.user_id != user_id {
+			return Ok(Err(tonic::Status::unauthenticated("no such session")));
+		}
+		let moved = match auth.reauthenticate(&s.refresh_token, user_id).await {
+			Ok(moved) => moved,
+			Err(status) => return Ok(Err(status)),
+		};
+		s.access_token = moved.access_token.clone();
+		s.access_expires_at = moved.access_expires_at;
+		self.store.save(id, &s).await?;
+		Ok(Ok(Reauthed {
+			access_token: moved.access_token,
+			auth_time: moved.auth_time,
+			remaining_secs: (s.refresh_expires_at - now_secs()).max(0),
 		}))
 	}
 

@@ -49,7 +49,7 @@ impl<T> Default for Ceremonies<T> {
 }
 
 impl<T> Ceremonies<T> {
-	async fn put(&self, state: T) -> String {
+	pub(super) async fn put(&self, state: T) -> String {
 		let id = random_token(24);
 		let now = now_secs();
 		let mut open = self.open.lock().await;
@@ -63,7 +63,7 @@ impl<T> Ceremonies<T> {
 		id
 	}
 
-	async fn take(&self, id: &str) -> Option<T> {
+	pub(super) async fn take(&self, id: &str) -> Option<T> {
 		let (state, at) = self.open.lock().await.remove(id)?;
 		(now_secs() - at <= CEREMONY_TTL.as_secs() as i64).then_some(state)
 	}
@@ -88,16 +88,16 @@ pub fn verifier<'a>(public_origin: &str, scope_origins: impl Iterator<Item = &'a
 	builder.rp_name("EV Investment").build().context("the passkey verifier refused its configuration")
 }
 
-fn base64url(bytes: &[u8]) -> String {
+pub(super) fn base64url(bytes: &[u8]) -> String {
 	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 	URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn expired() -> Refusal {
+pub(super) fn expired() -> Refusal {
 	Refusal::new(axum::http::StatusCode::BAD_REQUEST, "passkey_expired")
 }
 
-fn rejected() -> Refusal {
+pub(super) fn rejected() -> Refusal {
 	Refusal::new(axum::http::StatusCode::UNAUTHORIZED, "passkey_rejected")
 }
 

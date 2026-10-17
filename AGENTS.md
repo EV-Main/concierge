@@ -231,6 +231,20 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   checks itself, like the password — not a provider subject and not a `user_identities`
   row. Its ceremony state lives in process between the two requests, as the OAuth
   transaction's does.
+- **Re-authentication moves `auth_time` and nothing else** (#166, `web::reauth`). A signed-in
+  account proves itself again — a passkey assertion, a mailed code, its password (there is no
+  TOTP in this plane) — at `/auth/reauth/{code/request,code/verify,password,passkey/options,
+  passkey/verify}`, and the session's `auth_time` jumps to now WITHOUT a new session:
+  `RefreshStore::touch_auth_time` (one Redis script, keyed by the CURRENT refresh secret,
+  never backwards, no rotation) and `AuthService::reauthenticate`, which then mints a new
+  access token and the route re-sets `ev_access`. The proof must be of the SESSION's
+  account — a code is redeemed against that account's own VERIFIED address, a password is
+  looked up by that address and held to the session's user, a passkey ceremony is bound to
+  the account that began it — and the routes are `PUBLIC_ORIGIN`-only (never in the CORS
+  list), CSRF-checked and `signed_in_live`. One budget per account
+  (`REAUTH_ATTEMPTS_PER_WINDOW` per five minutes) across all five. `auth_time` stays in the
+  user's access token only: relying-party and service tokens never carry it, and neither
+  `GetMe` nor `UserSummary` reports it — a consumer reads it from the token it verifies.
 - **KYC has exactly one writer**: the `User` aggregate's `set_kyc_level` and the
   `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
   banking's mirror). Two ENTRY POINTS reach it, and they differ in what they
