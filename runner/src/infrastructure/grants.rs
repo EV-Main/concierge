@@ -478,6 +478,20 @@ pub(crate) async fn lock_accounts(conn: &mut PgConnection, ids: &[UserId]) -> Re
 	lock_users(conn, ids).await.map(drop)
 }
 
+/// As [`lock_accounts`], `FOR NO KEY UPDATE`: for the approvals' executor of a decision about
+/// people, whose writes leave the key alone, so that a vote or an opening — an insert into
+/// `approval_voters`, which takes `FOR KEY SHARE` on the voter's row — is not queued behind
+/// the whole execution. Same order, so the two never deadlock with each other.
+pub(crate) async fn lock_accounts_no_key(conn: &mut PgConnection, ids: &[UserId]) -> Result<(), DomainError> {
+	let raw: Vec<Uuid> = ids.iter().map(|id| id.raw()).collect();
+	sqlx::query("SELECT id FROM users WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE")
+		.bind(&raw)
+		.fetch_all(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	Ok(())
+}
+
 /// What an executed `concierge:scope_admin_grant` did.
 pub(crate) enum ApprovedGrant {
 	Granted,

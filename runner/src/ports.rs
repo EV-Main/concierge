@@ -853,10 +853,11 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// Set a user's platform access role UNCONDITIONALLY; emits ROLE_CHANGED across the
 	/// bridge.
 	///
-	/// ⚠️ THIS WRITES `owner` IF ASKED TO. It is the raw writer the genesis seed and the
-	/// consilium are built on, not a handler's tool — a request-driven path must call
-	/// [`Self::set_role_outside_ownership`] instead, or the "exactly two writers of
-	/// `owner`" invariant this plane rests on is simply untrue.
+	/// ⚠️ THIS WRITES `owner` IF ASKED TO, and so exists only under the `test-support`
+	/// feature, for suites that need a roster. The binary has no such writer: the seats move
+	/// through the consilium and the approvals' executor, and a request-driven role change
+	/// is [`Self::set_role_outside_ownership`].
+	#[cfg(feature = "test-support")]
 	async fn set_role(&self, id: UserId, role: Role) -> Result<User, DomainError>;
 
 	/// Set a role, refusing BOTH directions of ownership, with the decision taken inside

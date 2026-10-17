@@ -43,7 +43,7 @@ use uuid::Uuid;
 use super::{
 	email::templates::{ApprovalMail, ApprovalMailField, ApprovalMailValue, ApprovalNote, NoteAuthor},
 	governance,
-	grants::{ApprovedGrant, grant_by_approval, lock_accounts},
+	grants::{ApprovedGrant, grant_by_approval, lock_accounts, lock_accounts_no_key},
 	notifications::{enqueue_governance_mail, upsert_subscriber},
 	people, scope_catalogs,
 	users::{Named, account_named},
@@ -133,6 +133,20 @@ fn person(row: &PgRow, subject: &str, email: &str) -> Result<Option<ApprovalPers
 	}))
 }
 
+/// The action stored with a proposal. One this binary cannot read — written by a newer
+/// release and met during a rollback — reads as none: the proposal still lists, votes and
+/// vetoes, and the executor voids it ("nothing to execute was stored with it") instead of
+/// every read of the table failing.
+fn action_of(stored: Option<serde_json::Value>, id: Uuid) -> Option<Action> {
+	match serde_json::from_value(stored?) {
+		Ok(action) => Some(action),
+		Err(err) => {
+			tracing::error!(approval = %id, %err, "a stored approval action is unreadable; the proposal reads as having none");
+			None
+		}
+	}
+}
+
 fn record_of(row: &PgRow, voters: Vec<Voter>, people: Vec<ApprovalPerson>, as_of: i64) -> Result<ApprovalRecord, DomainError> {
 	let get_i64 = |column: &str| row.try_get::<i64, _>(column).map_err(repo_err);
 	let get_opt = |column: &str| row.try_get::<Option<i64>, _>(column).map_err(repo_err);
@@ -160,12 +174,7 @@ fn record_of(row: &PgRow, voters: Vec<Voter>, people: Vec<ApprovalPerson>, as_of
 		policy_version: unsigned(get_i64("policy_version")?, "policy_version")?,
 		created_at: get_i64("created_at")?,
 		requested_by_client: row.try_get("requested_by_client").map_err(repo_err)?,
-		action: row
-			.try_get::<Option<serde_json::Value>, _>("action")
-			.map_err(repo_err)?
-			.map(serde_json::from_value)
-			.transpose()
-			.map_err(|e| DomainError::Repository(format!("stored approval action is unreadable: {e}")))?,
+		action: action_of(row.try_get::<Option<serde_json::Value>, _>("action").map_err(repo_err)?, row.try_get("id").map_err(repo_err)?),
 		requested_by_proven: row.try_get("requested_by_proven").map_err(repo_err)?,
 		as_of,
 		decision: Decision {
@@ -639,6 +648,25 @@ impl ApprovalRepository for PgApprovals {
 		if live >= MAX_LIVE_PER_PROPOSER {
 			return Ok(Proposed::Saturated);
 		}
+		// One owner may hold only a few decisions about people open: each mails the other owners,
+		// and an uncapped opener could fill the whole live cap above with removals and starve
+		// every other decision of this plane.
+		if let Some(Action::People { opened_by, .. }) = &new.action {
+			let mine: i64 = sqlx::query_scalar(
+				"SELECT count(*) FROM approvals WHERE proposer = $1 AND action->>'type' = 'people' AND action->>'opened_by' = $2 \
+				 AND ((state = 'open' AND expires_at > $3) OR (state = 'passed' AND executable_at + $4 > $3))",
+			)
+			.bind(&new.proposer)
+			.bind(opened_by.to_string())
+			.bind(now)
+			.bind(EXECUTION_WINDOW_SECS)
+			.fetch_one(&mut *tx)
+			.await
+			.map_err(repo_err)?;
+			if mine >= approvals::MAX_LIVE_PEOPLE_PER_OPENER {
+				return Ok(Proposed::Saturated);
+			}
+		}
 
 		// `users` before `tenants`, the plane's order, even when this proposal ends up at
 		// the scope.
@@ -682,7 +710,7 @@ impl ApprovalRepository for PgApprovals {
 		}
 
 		if let Some(action) = &new.action {
-			people::check_open(&mut tx, action, &owners, &active_owners).await?;
+			people::check_open(&mut tx, action, &active_owners).await?;
 		}
 
 		let due: Option<Uuid> = sqlx::query_scalar(
@@ -1123,7 +1151,11 @@ impl ApprovalRepository for PgApprovals {
 			// all, and what moves the legacy live feed when the owners change.
 			governance::lock_governance(&mut tx).await?;
 		}
-		lock_accounts(&mut tx, &accounts).await?;
+		if about_people {
+			lock_accounts_no_key(&mut tx, &accounts).await?;
+		} else {
+			lock_accounts(&mut tx, &accounts).await?;
+		}
 		let mut record = load(&mut tx, id, true, 0).await?.ok_or_else(|| not_found(id))?;
 		let now = self.instant(&mut tx).await?;
 		record.as_of = now;
@@ -1166,7 +1198,7 @@ impl ApprovalRepository for PgApprovals {
 				let (user, opened_by) = (UserId::from_raw(*user), UserId::from_raw(*opened_by));
 				let why = people::refusal(&mut tx, &record, *what, user, opened_by, &accounts).await?;
 				if why.is_none() {
-					effect = Some((*what, user));
+					effect = Some((*what, user, opened_by));
 				}
 				why
 			}
@@ -1188,8 +1220,8 @@ impl ApprovalRepository for PgApprovals {
 		// After the outcome, never before: changing the owners voids every live platform
 		// decision in this transaction (a trigger on `users`), and this one must already be
 		// executed when it does.
-		if let Some((what, user)) = effect {
-			people::apply(&mut tx, &record, what, user, now).await?;
+		if let Some((what, user, opened_by)) = effect {
+			people::apply(&mut tx, &record, what, user, opened_by, now).await?;
 		}
 		tx.commit().await.map_err(repo_err)?;
 		Ok(Some(outcome))

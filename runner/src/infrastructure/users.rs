@@ -387,6 +387,7 @@ impl UserDirectoryRepository for PgUsers {
 	/// and the write would let a hold extend on the strength of a decision nobody is
 	/// making any more.
 	async fn hold_user(&self, id: UserId, action: &AdminAction, by: UserId, now: i64) -> Result<User, DomainError> {
+		let actor_id = by;
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let mut user = load_for_update(&mut tx, id).await?;
 		// The actor's role and status are taken AFTER the target's lock and on the same
@@ -419,13 +420,32 @@ impl UserDirectoryRepository for PgUsers {
 		// whether or not a write path has got round to stamping it so.
 		let ratification_pending: bool = sqlx::query_scalar(
 			"SELECT EXISTS (SELECT 1 FROM user_proposal WHERE subject_user_id = $1 AND kind = 'suspension' AND state = 'open' AND expires_at > $2) \
-				 OR EXISTS (SELECT 1 FROM approvals WHERE kind = 'concierge:user_suspension' AND scope = 'main' AND subject_ref = 'user:' || $1::text AND state IN ('open', 'passed'))",
+			 OR EXISTS (SELECT 1 FROM approvals WHERE kind = 'concierge:user_suspension' AND scope = 'main' AND subject_ref = 'user:' || $1::text \
+			            AND ((state = 'open' AND expires_at > $2) OR (state = 'passed' AND executable_at + $3 > $2)))",
 		)
 		.bind(id.raw())
 		.bind(now)
+		.bind(domain::approvals::EXECUTION_WINDOW_SECS)
 		.fetch_one(&mut *tx)
 		.await
 		.map_err(repo_err)?;
+		// Whoever the owners are deciding to remove or suspend does not get to hold the people
+		// deciding it: a hold takes an owner out of the vote, and a decision about oneself is
+		// the one a hold could be pressed to stop.
+		let about_actor: bool = sqlx::query_scalar(
+			"SELECT EXISTS (SELECT 1 FROM approvals WHERE kind IN ('concierge:owner_removal', 'concierge:user_suspension') AND scope = 'main' \
+			                AND subject_ref = 'user:' || $1::text \
+			                AND ((state = 'open' AND expires_at > $2) OR (state = 'passed' AND executable_at + $3 > $2)))",
+		)
+		.bind(actor_id.raw())
+		.bind(now)
+		.bind(domain::approvals::EXECUTION_WINDOW_SECS)
+		.fetch_one(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+		if about_actor {
+			return Err(DomainError::Forbidden("the owners are deciding your own standing; you hold nobody while they do".into()));
+		}
 		user.hold(by, now, ratification_pending)?;
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
@@ -586,6 +606,7 @@ impl UserDirectoryRepository for PgUsers {
 		Ok(KycLevelChange::Raised { from: current, to: target })
 	}
 
+	#[cfg(feature = "test-support")]
 	async fn set_role(&self, id: UserId, role: Role) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.set_role(role);
@@ -898,6 +919,21 @@ async fn link(conn: &mut PgConnection, provider: Provider, subject: &str, user: 
 /// transaction as the consilium's verdict — one identity writer, not two.
 pub(crate) async fn load_for_update(conn: &mut PgConnection, id: UserId) -> Result<User, DomainError> {
 	sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE id = $1 FOR UPDATE"))
+		.bind(id.raw())
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?
+		.ok_or_else(|| DomainError::NotFound { entity: "user", id: id.to_string() })?
+		.into_domain()
+}
+
+/// As [`load_for_update`], but `FOR NO KEY UPDATE`: the lock a write that leaves the key
+/// alone needs, and one that does not conflict with `FOR KEY SHARE` — which is what an
+/// insert into `approval_voters` (a foreign key to `users`) takes on the row. The approvals'
+/// executor writes a person under this one, so a vote or a proposal opening while it works
+/// is not queued behind it.
+pub(crate) async fn load_for_no_key_update(conn: &mut PgConnection, id: UserId) -> Result<User, DomainError> {
+	sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE id = $1 FOR NO KEY UPDATE"))
 		.bind(id.raw())
 		.fetch_optional(&mut *conn)
 		.await

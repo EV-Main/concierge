@@ -55,7 +55,14 @@ tower-http = { workspace = true, features = ["cors", "fs", "trace"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid.workspace = true
+[features]
+# The raw role writer (`UserDirectoryRepository::set_role`) seats anyone as anything, owner
+# included, past every consilium. Tests need it to build a roster; the binary must not carry it.
+test-support = []
+
 [dev-dependencies]
+# Turns the feature above on for this crate's own tests.
+concierge = { path = ".", features = ["test-support"] }
 # Opens real refresh families, so the relying-party suite can sign a browser in and out.
 evconcierge_auth = { workspace = true, features = ["test-support"] }
 # A software authenticator, so the passkey suite drives real WebAuthn ceremonies.

@@ -699,12 +699,17 @@ async fn the_roster_the_revision_and_the_only_writers_of_the_owner_seat() {
 	assert_eq!(revision(outsider).await.unwrap_err().code(), Code::PermissionDenied);
 }
 
-/// `Role::Owner` is written by genesis and by the executor of an executed admission, and by
-/// the legacy `GovernanceService` until the contract step — nothing else may grow a path.
+/// Who may write the owner seat. Every call site of the aggregate's `set_role`, every raw
+/// `SET role` and every insert into `users` in the binary's source is named here: a new
+/// writer is a second path to the seat and must be routed through an approval — or argued
+/// for in this list. (A database trigger refusing `role = 'owner'` outside the two writers
+/// was considered and left out: `update_row` rewrites `role` on every account mutation, genesis
+/// and the legacy consilium write it too, and older binaries write beside this one during a
+/// rollout, so a trigger would fail closed on paths nobody changed.)
 #[test]
 fn nothing_else_writes_the_owner_seat() {
 	let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-	let mut offenders = Vec::new();
+	let mut found: std::collections::BTreeMap<&str, Vec<String>> = std::collections::BTreeMap::new();
 	let mut stack = vec![src.clone()];
 	while let Some(dir) = stack.pop() {
 		for entry in std::fs::read_dir(&dir).unwrap() {
@@ -713,18 +718,345 @@ fn nothing_else_writes_the_owner_seat() {
 				stack.push(path);
 			} else if path.extension().is_some_and(|e| e == "rs") {
 				let text = std::fs::read_to_string(&path).unwrap();
-				if text.contains("set_role(Role::Owner)") {
-					offenders.push(path.strip_prefix(&src).unwrap().to_string_lossy().into_owned());
+				let name = path.strip_prefix(&src).unwrap().to_string_lossy().into_owned();
+				for (needle, label) in [(".set_role(", "set_role"), ("SET role", "sql role"), ("INSERT INTO users", "insert user")] {
+					if text.contains(needle) {
+						found.entry(label).or_default().push(name.clone());
+					}
 				}
 			}
 		}
 	}
-	offenders.sort();
+	for files in found.values_mut() {
+		files.sort();
+	}
+	let get = |label: &str| found.get(label).cloned().unwrap_or_default();
+	// The executor of an approval, the legacy consilium (until it goes) and the one
+	// request-driven writer, which refuses `owner` and the granting of `admin`.
 	assert_eq!(
-		offenders,
-		["infrastructure/governance.rs", "infrastructure/people.rs"],
-		"a new writer of Role::Owner is a second path to the seat: route it through an approval"
+		get("set_role"),
+		["infrastructure/governance.rs", "infrastructure/people.rs", "infrastructure/users.rs"],
+		"an aggregate role write"
 	);
+	assert!(get("sql role").is_empty(), "a raw role write: {:?}", get("sql role"));
+	assert_eq!(get("insert user"), ["infrastructure/users.rs"], "a new account is created in one place, as an investor");
+}
+
+#[test]
+fn the_raw_role_writer_exists_only_for_tests() {
+	let ports = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ports.rs")).unwrap();
+	let at = ports.find("async fn set_role(").expect("the port declares it");
+	assert!(
+		ports[..at].trim_end().ends_with("#[cfg(feature = \"test-support\")]"),
+		"the binary must not carry a writer that seats anyone as anything"
+	);
+}
+
+// ---------------------------------------------------------------------------------
+// Review: holds, drain, the tally, the floor over standing seats, locks, caps, decoding.
+// ---------------------------------------------------------------------------------
+
+fn admin_action(actor: UserId, reason: &str) -> concierge::infrastructure::users::AdminAction {
+	concierge::infrastructure::users::AdminAction {
+		actor: Some(actor),
+		action: "held",
+		reason: reason.into(),
+		..Default::default()
+	}
+}
+
+#[tokio::test]
+async fn an_expired_decision_does_not_extend_a_hold() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let subject = fx.user("subject").await;
+	fx.at(T0);
+	let now = fx.db_now().await;
+	fx.users.hold_user(subject, &admin_action(owners[1], "first"), owners[1], now).await.expect("a hold");
+	let opened = fx.open(owners[0], Decision::Suspend, subject).await.unwrap();
+	fx.users
+		.hold_user(subject, &admin_action(owners[1], "while they decide"), owners[1], now)
+		.await
+		.expect("a LIVE decision lets the hold extend");
+	// The decision lapses unvoted: a hold must not stay extendable by a corpse.
+	sqlx::query("UPDATE approvals SET created_at = $2 - 300000, expires_at = $2 - 100000 WHERE id = $1::uuid")
+		.bind(&opened.id)
+		.bind(now)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	let refused = fx.users.hold_user(subject, &admin_action(owners[1], "forever"), owners[1], now).await.unwrap_err();
+	assert!(
+		matches!(refused, domain::error::DomainError::Forbidden(_)),
+		"an expired decision proves nobody is deciding: {refused}"
+	);
+}
+
+#[tokio::test]
+async fn nobody_holds_the_owners_while_they_decide_on_them_and_the_target_does_not_see_the_tally() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(4).await;
+	let bystander = fx.user("bystander").await;
+	fx.at(T0);
+	let target = owners[3];
+	let opened = fx.open(owners[0], Decision::Remove, target).await.unwrap();
+	fx.vote(owners[1], &opened.id, ApprovalVote::For).await.unwrap();
+
+	let refused = fx.users.hold_user(bystander, &admin_action(target, "to stall"), target, fx.db_now().await).await.unwrap_err();
+	assert!(matches!(refused, domain::error::DomainError::Forbidden(_)), "the target may not hold the deciders: {refused}");
+
+	let seen_by_target = fx.get(target, &opened.id).await;
+	assert_eq!(seen_by_target.id, opened.id, "the target knows the decision exists");
+	assert!(
+		seen_by_target
+			.voters
+			.iter()
+			.all(|v| v.vote == ApprovalVote::Pending as i32 && v.email.is_empty() && v.auth_subject.is_empty()),
+		"and not who voted what: {:?}",
+		seen_by_target.voters
+	);
+	let seen_by_peer = fx.get(owners[2], &opened.id).await;
+	assert!(seen_by_peer.voters.iter().any(|v| v.vote == ApprovalVote::For as i32), "a decider still sees the tally");
+}
+
+#[tokio::test]
+async fn the_drain_is_refused_over_a_proposal_about_the_caller_and_holds_its_reason_to_the_text_rules() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(4).await;
+	let service = Governance::new(
+		fx.users.clone(),
+		Arc::new(BreakGlass::new(Vec::new())),
+		fx.governance_repo.clone(),
+		tokio::sync::broadcast::channel(8).0,
+	);
+	let removal = service
+		.open_owner_removal(as_user(
+			owners[0],
+			evconcierge_contracts::concierge::v1::OpenOwnerRemovalRequest {
+				target_user_id: owners[3].to_string(),
+				reason: "legacy".into(),
+			},
+		))
+		.await
+		.expect("the legacy path opens")
+		.into_inner();
+	let by = LegacyProposalRef {
+		kind: LegacyProposalKind::OwnerRemoval as i32,
+		id: removal.id.clone(),
+	};
+	let drain = |who: UserId, reason: &str| {
+		let request = as_user(
+			who,
+			DrainLegacyProposalsRequest {
+				items: vec![by.clone()],
+				reason: reason.to_owned(),
+			},
+		);
+		let service = service.clone();
+		async move { service.drain_legacy_proposals(request).await }
+	};
+	assert_eq!(drain(owners[3], "stopping my own removal").await.unwrap_err().code(), Code::PermissionDenied);
+	assert_eq!(drain(owners[1], "see https://evil.example").await.unwrap_err().code(), Code::InvalidArgument, "no link");
+	assert_eq!(drain(owners[1], "tricky\u{202e}text").await.unwrap_err().code(), Code::InvalidArgument, "no direction override");
+	assert_eq!(drain(owners[1], "   ").await.unwrap_err().code(), Code::InvalidArgument);
+	let drained = drain(owners[1], "moving to approvals").await.expect("another owner drains it").into_inner();
+	assert_eq!(drained.items[0].result, "voided");
+}
+
+#[tokio::test]
+async fn the_floor_counts_the_seats_that_can_still_decide() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	fx.at(T0);
+	// The owners' verdict on C: the seat is kept and has no say.
+	sqlx::query("UPDATE users SET status = 'disabled', suspended_by = 'governance' WHERE id = $1")
+		.bind(owners[2].raw())
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+		.bind(owners[1].raw())
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	let resign = fx
+		.people
+		.resign_ownership(as_user(owners[1], ResignPlatformOwnershipRequest { confirm_email: email }))
+		.await
+		.unwrap_err();
+	assert_eq!(resign.code(), Code::AlreadyExists, "A and B stand: B leaving would leave one voice: {resign}");
+	assert_eq!(fx.role(owners[1]).await, Role::Owner);
+	let removal = fx.open(owners[0], Decision::Remove, owners[1]).await.unwrap_err();
+	assert_eq!(removal.code(), Code::FailedPrecondition, "and so for a removal: {}", removal.message());
+	// A temporary hold is counted: it lapses, and one operator's brake must not also freeze the roster.
+	sqlx::query("UPDATE users SET status = 'active', suspended_by = NULL WHERE id = $1")
+		.bind(owners[2].raw())
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	let fourth = fx.user("fourth").await;
+	fx.users.set_role(fourth, Role::Owner).await.unwrap();
+	fx.users
+		.hold_user(owners[2], &admin_action(owners[0], "brake"), owners[0], fx.db_now().await)
+		.await
+		.expect("a hold");
+	fx.open(owners[0], Decision::Remove, owners[1]).await.expect("four seats, one on a hold that lapses: one may go");
+}
+
+#[tokio::test]
+async fn a_vote_and_an_opening_are_not_queued_behind_the_executor_s_locks() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(4).await;
+	let (first, second) = (fx.user("first").await, fx.user("second").await);
+	fx.at(T0);
+	let live = fx.open(owners[0], Decision::Admin, first).await.unwrap();
+	// What the executor holds on the owners while it works: NO KEY UPDATE.
+	let mut working = fx.pool.begin().await.unwrap();
+	sqlx::query("SELECT id FROM users WHERE role = 'owner' ORDER BY id FOR NO KEY UPDATE")
+		.fetch_all(&mut *working)
+		.await
+		.unwrap();
+	let both = async {
+		let voted = fx.vote(owners[1], &live.id, ApprovalVote::For).await;
+		let opened = fx.open(owners[1], Decision::Admin, second).await;
+		(voted, opened)
+	};
+	let (voted, opened) = tokio::time::timeout(std::time::Duration::from_secs(10), both)
+		.await
+		.expect("a vote and an opening go through while the executor holds the owners");
+	voted.expect("the vote");
+	opened.expect("the opening");
+	working.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn one_owner_holds_only_a_few_decisions_about_people_open() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	fx.at(T0);
+	let mut opened = Vec::new();
+	for _ in 0..concierge_cap() {
+		let subject = fx.user("subject").await;
+		opened.push(fx.open(owners[0], Decision::Suspend, subject).await.expect("within the cap"));
+	}
+	let one_more = fx.user("one-more").await;
+	let refused = fx.open(owners[0], Decision::Suspend, one_more).await.unwrap_err();
+	assert_eq!(refused.code(), Code::ResourceExhausted, "{}", refused.message());
+	fx.open(owners[1], Decision::Suspend, one_more).await.expect("the cap is the opener's, not the platform's");
+	// Withdrawing one frees a place.
+	fx.people
+		.cancel_approval(as_user(
+			owners[0],
+			evconcierge_contracts::concierge::v1::CancelApprovalRequest { approval_id: opened[0].id.clone() },
+		))
+		.await
+		.unwrap();
+	let again = fx.user("again").await;
+	fx.open(owners[0], Decision::Suspend, again).await.expect("a place was freed");
+}
+
+fn concierge_cap() -> i64 {
+	domain::approvals::MAX_LIVE_PEOPLE_PER_OPENER
+}
+
+#[tokio::test]
+async fn an_action_this_binary_cannot_read_reads_as_none_and_is_voided_not_executed() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let subject = fx.user("subject").await;
+	fx.at(T0);
+	let opened = fx.open(owners[0], Decision::Suspend, subject).await.unwrap();
+	fx.carry(&owners[1..3], &opened.id).await;
+	sqlx::query("UPDATE approvals SET action = '{\"type\": \"from_a_newer_release\"}'::jsonb WHERE id = $1::uuid")
+		.bind(&opened.id)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(fx.get(owners[0], &opened.id).await.id, opened.id, "it still reads");
+	fx.execute_at(T0 + 24 * HOUR).await;
+	let done = fx.get(owners[0], &opened.id).await;
+	assert_eq!(state(&done), ApprovalState::Void);
+	assert_eq!(fx.row(subject).await.1, UserStatus::Active, "nothing was carried out");
+}
+
+#[tokio::test]
+async fn text_and_standing_are_checked_for_an_admin_too_and_the_audit_names_who_asked() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let subject = fx.user("subject").await;
+	fx.at(T0);
+	let ask = |reason: &str, subject: UserId| {
+		let request = as_user(
+			owners[0],
+			ProposePersonDecisionRequest {
+				subject: Some(Subject::UserId(subject.to_string())),
+				reason: reason.to_owned(),
+			},
+		);
+		let people = &fx.people;
+		async move { people.propose_admin_admission(request).await }
+	};
+	assert_eq!(ask("   ", subject).await.unwrap_err().code(), Code::InvalidArgument, "blank is not a reason");
+	assert_eq!(ask("fine\u{200b}print", subject).await.unwrap_err().code(), Code::InvalidArgument, "zero-width is not text");
+	let unverified = fx.users.resolve(common::google("unverified", false), 0).await.unwrap().id();
+	assert_eq!(ask("An admin", unverified).await.unwrap_err().code(), Code::FailedPrecondition, "an admin's address is proven");
+
+	let opened = ask("An admin", subject).await.unwrap().into_inner();
+	fx.carry(&owners[1..3], &opened.id).await;
+	fx.execute_at(T0 + 24 * HOUR).await;
+	let detail: serde_json::Value = sqlx::query_scalar("SELECT detail FROM admin_action WHERE approval_id = $1::uuid")
+		.bind(&opened.id)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(detail["opened_by"], owners[0].to_string());
+}
+
+#[tokio::test]
+async fn a_legacy_decision_is_void_once_an_owner_it_never_asked_is_seated() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let candidate = fx.user("candidate").await;
+	let newcomer = fx.user("newcomer").await;
+	let service = Governance::new(
+		fx.users.clone(),
+		Arc::new(BreakGlass::new(Vec::new())),
+		fx.governance_repo.clone(),
+		tokio::sync::broadcast::channel(8).0,
+	);
+	let admission = service
+		.open_owner_admission(as_user(
+			owners[0],
+			OpenOwnerAdmissionRequest {
+				candidate_user_id: candidate.to_string(),
+				reason: "legacy".into(),
+			},
+		))
+		.await
+		.unwrap()
+		.into_inner();
+	let vote = |who: UserId| {
+		let request = as_user(
+			who,
+			evconcierge_contracts::concierge::v1::SubmitAdmissionVoteRequest {
+				admission_id: admission.id.clone(),
+				vote: evconcierge_contracts::concierge::v1::AdmissionVote::Admit as i32,
+			},
+		);
+		let service = service.clone();
+		async move { service.submit_admission_vote(request).await }
+	};
+	vote(owners[1]).await.unwrap();
+	// Beside the legacy path, an owner is seated by another door while it is open.
+	fx.users.set_role(newcomer, Role::Owner).await.unwrap();
+	vote(owners[2]).await.unwrap();
+	let state: String = sqlx::query_scalar("SELECT state FROM owner_admission WHERE id = $1::uuid")
+		.bind(&admission.id)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(state, "void", "unanimity of the snapshot must not seat someone the newcomer never agreed to");
+	assert_eq!(fx.role(candidate).await, Role::Investor);
 }
 
 // ---------------------------------------------------------------------------------

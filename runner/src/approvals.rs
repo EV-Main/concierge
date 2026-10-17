@@ -72,6 +72,12 @@ fn invalid(why: String) -> Status {
 /// that names them, as a member of its roster or as the person it is for — the last as a
 /// [`Reader::Bystander`]. `None`: invisible, the same `NOT_FOUND` as an unknown id.
 pub fn visible(viewer: &ApprovalViewer, record: &ApprovalRecord) -> Option<Reader> {
+	// The person a decision is about reads that it exists, never how the deciders stand: the
+	// tally of a removal or a suspension is what lets its target lean on the one who has not
+	// voted yet.
+	if record.action.as_ref().and_then(rules::Action::about) == Some(viewer.user.raw()) {
+		return Some(Reader::Subject);
+	}
 	if viewer.owner || viewer.admin_of.contains(&record.scope) || record.decision.is_voter(viewer.user) {
 		Some(Reader::Decider)
 	} else if record.requested_by.as_ref().is_some_and(|(id, _)| *id == viewer.user) {
@@ -175,6 +181,9 @@ pub enum Reader {
 	/// Anyone else who may see it — the person it names as `requested_by`: the deciders'
 	/// addresses are not theirs to read.
 	Bystander,
+	/// The person a decision about their own standing is for: sees the decision, not who
+	/// voted what, nor the deciders' addresses.
+	Subject,
 	/// The proposing service: it learns how its proposal stands, never who the deciders
 	/// are — no address, no cross-plane subject, not who vetoed.
 	Service,
@@ -213,6 +222,15 @@ pub fn approval_to(record: ApprovalRecord, reader: Reader) -> Approval {
 	match reader {
 		Reader::Decider => {}
 		Reader::Bystander => voters.iter_mut().for_each(|v| v.email.clear()),
+		Reader::Subject => {
+			vetoed_by.clear();
+			for voter in &mut voters {
+				voter.email.clear();
+				voter.auth_subject.clear();
+				voter.vote = cc::ApprovalVote::Pending as i32;
+				voter.voted_at = 0;
+			}
+		}
 		Reader::Service => {
 			requested_by_email.clear();
 			vetoed_by.clear();
@@ -653,7 +671,7 @@ impl Approvals {
 			return Err(Status::permission_denied(format!("{} is opened by an active platform owner", effect.rpc())));
 		}
 		let req = request.into_inner();
-		if req.reason.is_empty() {
+		if req.reason.trim().is_empty() {
 			return Err(Status::invalid_argument("a reason is required"));
 		}
 		rules::check_text("reason", &req.reason, TEXT_FIELD_BYTES).map_err(invalid)?;
@@ -748,7 +766,10 @@ impl Approvals {
 		};
 		let record = match self.approvals.propose(new).await.map_err(domain_to_status)? {
 			Proposed::Opened(record) | Proposed::Existing(record) => record,
-			Proposed::Saturated => return Err(Status::resource_exhausted("too many of this plane's own proposals are live in this scope")),
+			Proposed::Saturated =>
+				return Err(Status::resource_exhausted(
+					"too many of this plane's own proposals are live (a person has at most a few decisions about people open at once): withdraw or wait for some",
+				)),
 		};
 		tracing::info!(approval = %record.id, kind = %record.kind, scope = %record.scope, by = %opener, "approval opened over a session");
 		let viewer = self.approvals.viewer(opener).await.map_err(domain_to_status)?;

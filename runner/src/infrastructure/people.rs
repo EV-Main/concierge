@@ -47,8 +47,7 @@ pub(super) async fn standing(conn: &mut PgConnection, user: UserId) -> Result<Op
 	.transpose()
 }
 
-/// Every persisted owner, and the number of seats (suspended ones included: the floor is
-/// over seats, and excluding the suspended would let one admin shrink the roster).
+/// Every persisted owner, suspended ones included (they are on the roster and in the locks).
 pub(super) async fn owner_ids(conn: &mut PgConnection) -> Result<Vec<UserId>, DomainError> {
 	let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE role = 'owner' ORDER BY id")
 		.fetch_all(conn)
@@ -57,10 +56,23 @@ pub(super) async fn owner_ids(conn: &mut PgConnection) -> Result<Vec<UserId>, Do
 	Ok(ids.into_iter().map(UserId::from_raw).collect())
 }
 
-/// The refusals at open. `owners` is every persisted seat, `active` those who can decide
-/// now. Cheap and unlocked: the decision that counts is taken again at execution, under
+/// The owner seats the floor counts for a decision about `subject`: those that can still
+/// decide — active, or held only temporarily (`admin_hold` lapses) — plus the subject's own
+/// when it is suspended by the owners' verdict, so that "one fewer" is true whether or not
+/// the subject stands. An owner the owners themselves suspended has no say, and counting it
+/// would let two suspensions and one resignation leave a single voice.
+pub(super) async fn floor_seats(conn: &mut PgConnection, subject: &PersonStanding) -> Result<usize, DomainError> {
+	let standing: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE role = 'owner' AND (status = 'active' OR suspended_by IS DISTINCT FROM 'governance')")
+		.fetch_one(conn)
+		.await
+		.map_err(repo_err)?;
+	let standing = usize::try_from(standing).unwrap_or_default();
+	Ok(standing + usize::from(subject.governance_suspended))
+}
+
+/// The refusals at open. `active` are the owners who can decide now. Cheap and unlocked: the decision that counts is taken again at execution, under
 /// the locks.
-pub(super) async fn check_open(conn: &mut PgConnection, action: &Action, owners: &[UserId], active: &[UserId]) -> Result<(), DomainError> {
+pub(super) async fn check_open(conn: &mut PgConnection, action: &Action, active: &[UserId]) -> Result<(), DomainError> {
 	let Action::People { effect, user, opened_by } = action else {
 		return Ok(());
 	};
@@ -75,7 +87,8 @@ pub(super) async fn check_open(conn: &mut PgConnection, action: &Action, owners:
 		}));
 	}
 	let standing = standing(conn, user).await?.ok_or_else(|| DomainError::Validation("the account does not exist".into()))?;
-	match person_inapplicable(*effect, standing, owners.len()) {
+	let seats = floor_seats(conn, &standing).await?;
+	match person_inapplicable(*effect, standing, seats) {
 		Some(why) => Err(DomainError::Precondition(why.into())),
 		None => Ok(()),
 	}
@@ -119,12 +132,13 @@ pub(super) async fn refusal(
 	let Some(standing) = standing(conn, user).await? else {
 		return Ok(Some("the account is gone".into()));
 	};
-	Ok(person_inapplicable(effect, standing, rows.len()).map(str::to_owned))
+	let seats = floor_seats(conn, &standing).await?;
+	Ok(person_inapplicable(effect, standing, seats).map(str::to_owned))
 }
 
 /// Write the effect, inside the transaction that records the outcome.
-pub(super) async fn apply(conn: &mut PgConnection, record: &ApprovalRecord, effect: PersonEffect, user: UserId, now: i64) -> Result<(), DomainError> {
-	let mut subject = users::load_for_update(conn, user).await?;
+pub(super) async fn apply(conn: &mut PgConnection, record: &ApprovalRecord, effect: PersonEffect, user: UserId, opened_by: UserId, now: i64) -> Result<(), DomainError> {
+	let mut subject = users::load_for_no_key_update(conn, user).await?;
 	match effect {
 		PersonEffect::AdmitOwner => subject.set_role(Role::Owner),
 		// All the way to `investor`: an expulsion is adversarial, and someone the owners
@@ -136,5 +150,10 @@ pub(super) async fn apply(conn: &mut PgConnection, record: &ApprovalRecord, effe
 	}
 	users::update_row(conn, &subject).await?;
 	users::drain_outbox(conn, &mut subject).await?;
-	users::record_action(conn, user, &AdminAction::system(effect.audit_verb()).with_reason(&record.reason).with_approval(record.id), now).await
+	// No human acted at execution, so the actor stays empty; who asked is in the detail.
+	let action = AdminAction::system(effect.audit_verb())
+		.with_reason(&record.reason)
+		.with_approval(record.id)
+		.with_detail(serde_json::json!({ "opened_by": opened_by.to_string() }));
+	users::record_action(conn, user, &action, now).await
 }

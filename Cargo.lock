@@ -741,6 +741,7 @@ dependencies = [
  "axum-extra",
  "base64 0.22.1",
  "color-eyre",
+ "concierge",
  "concierge_iam",
  "domain",
  "dotenvy",
