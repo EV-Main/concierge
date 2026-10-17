@@ -526,6 +526,44 @@ openings (they answer `FAILED_PRECONDITION` naming the RPC above) and
 `GovernanceService.DrainLegacyProposals` voids the open legacy proposals by list, so the
 window can be emptied.
 
+Review hardening of these kinds:
+
+- **The floor counts seats that can still decide.** `MIN_OWNERS` is measured over owners that
+  are active or only on a temporary hold (`admin_hold` lapses); an owner suspended by the
+  owners' verdict keeps the role and has no say, so it is not counted — by an owner removal,
+  at open and at execution, and by `ResignOwnership` (the legacy resignation shares the code).
+  Two suspensions and a resignation cannot leave one voice.
+- **A person is not told the tally of a decision about them** (`Reader::Subject`: they read
+  that it exists and its state, not who voted what, nor the deciders' addresses), cannot veto
+  it, and cannot hold anyone while a live `owner_removal` or `user_suspension` names them
+  (`hold_user` refuses). A hold extends only under a LIVE decision — open and not past its
+  deadline, or passed and inside its execution window — the same predicate
+  `Decision::effective_state` projects.
+- **One owner holds at most `MAX_LIVE_PEOPLE_PER_OPENER` (5) live decisions about people**
+  (`ResourceExhausted`); the proposer's cap of 200 is not theirs to fill.
+- **An execution writes the person under `FOR NO KEY UPDATE`**, so a vote or an opening (an
+  insert into `approval_voters`, a foreign key to `users`) is not queued behind it.
+- **A stored `action` this binary cannot decode reads as none**: the proposal lists, votes and
+  vetoes, and the executor voids it. That protects reads in a rollback, not execution.
+- **Legacy decisions are void when an owner they never asked is seated** meanwhile (admission,
+  removal and the user proposals compare the roster at settlement with their snapshot).
+- `UserDirectory`'s raw `set_role` exists only under the `test-support` feature; a test scans
+  the source for every call site of the aggregate's `set_role`, raw `SET role` and user
+  inserts. A database trigger on `role = 'owner'` was weighed and left out: `update_row`
+  rewrites `role` on every account mutation, genesis and the legacy consilium write it, and
+  older binaries run beside this one during a rollout.
+- **To do later:** `Propose*`, `ResignOwnership` and voting should require a fresh `auth_time`
+  (re-authentication, #168); they do not yet.
+
+**Rollout order (the window).** (1) deploy with `GOVERNANCE_NEW_VOTES_CLOSED=true`; (2)
+`DrainLegacyProposals` every open legacy proposal (list them with the `List*` RPCs of
+`GovernanceService`); (3) only then admit owners through `approvals` — a legacy decision still
+open when an owner is seated that way is void, but the window is cleanest empty. To roll the
+binary back, close the openings, withdraw or veto the live `concierge:owner_*`,
+`user_suspension`, `user_reinstatement` and `admin_admission` decisions, and
+`UPDATE approvals SET action = NULL WHERE kind IN (...)` for any left, before starting the old
+binary: it cannot decode the `people` action.
+
 Assigning an operator in a scope is still a delegated `GrantPermission` by a
 `<scope>:admin`, with no approval.
 
