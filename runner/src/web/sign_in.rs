@@ -166,6 +166,21 @@ pub(super) async fn gate(st: &super::Inner, caller: &Caller) -> Result<User, Den
 	Ok(user)
 }
 
+/// How recent the session's `auth_time` must be for an act that adds or removes a way to
+/// sign in. A stolen session that has not just proved itself again can plant nothing.
+pub(super) const REAUTH_FRESH_SECS: u64 = 300;
+
+/// Refuse `403 reauth_required` unless the caller authenticated within
+/// [`REAUTH_FRESH_SECS`]: the client sends the person through `/auth/reauth/*` and retries.
+/// A family that predates the claim has no `auth_time` and counts as stale.
+pub(super) fn require_fresh(caller: &Caller) -> Result<(), Refusal> {
+	let now = now_secs().max(0) as u64;
+	match caller.auth_time {
+		Some(at) if now.saturating_sub(at) <= REAUTH_FRESH_SECS => Ok(()),
+		_ => Err(Refusal(StatusCode::FORBIDDEN, "reauth_required")),
+	}
+}
+
 /// End the browser's session as a sign-out does and hand back the jar that clears it.
 pub(super) async fn end_session(st: &super::Inner, jar: CookieJar) -> CookieJar {
 	if let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_owned())

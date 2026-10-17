@@ -26,7 +26,7 @@ use crate::{
 	web::{
 		WebState, now_secs, random_token,
 		routes::ClientIp,
-		sign_in::{Answered, Refusal, Signed, guard, internal, signed_in, signed_in_as, signed_in_live},
+		sign_in::{Answered, Refusal, Signed, guard, internal, require_fresh, signed_in, signed_in_as, signed_in_live},
 	},
 };
 
@@ -118,8 +118,10 @@ pub async fn register_options(State(st): State<WebState>, jar: CookieJar, header
 	let st = &st.inner;
 	let Signed { caller, user } = signed_in_live(st, &jar, &headers).await?;
 	let id = caller.id;
+	let fresh = require_fresh(&caller);
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
+		fresh?;
 		unverified_refused(&user)?;
 		let existing = st.credentials.passkeys(id).await.map_err(|e| internal("passkey: credentials not read", e))?;
 		let exclude = existing
@@ -157,8 +159,10 @@ pub async fn register_verify(State(st): State<WebState>, jar: CookieJar, headers
 	let st = &st.inner;
 	let Signed { caller, user } = signed_in_live(st, &jar, &headers).await?;
 	let id = caller.id;
+	let fresh = require_fresh(&caller);
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
+		fresh?;
 		unverified_refused(&user)?;
 		let name = body.name.trim();
 		if name.is_empty() || name.chars().count() > 64 {
@@ -251,11 +255,15 @@ pub async fn remove(State(st): State<WebState>, jar: CookieJar, headers: HeaderM
 	let st = &st.inner;
 	let Signed { caller, .. } = signed_in(st, &jar, &headers).await?;
 	let id = caller.id;
+	let fresh = require_fresh(&caller);
 	let jar = caller.refreshed(st, jar);
-	let answer = match st.credentials.remove_passkey(id, &body.credential_id).await {
-		Ok(true) => Ok(Json(json!({ "ok": true }))),
-		Ok(false) => Err(Refusal::new(axum::http::StatusCode::NOT_FOUND, "passkey_unknown")),
-		Err(e) => Err(internal("passkey: not removed", e)),
+	let answer = match fresh {
+		Err(refusal) => Err(refusal),
+		Ok(()) => match st.credentials.remove_passkey(id, &body.credential_id).await {
+			Ok(true) => Ok(Json(json!({ "ok": true }))),
+			Ok(false) => Err(Refusal::new(axum::http::StatusCode::NOT_FOUND, "passkey_unknown")),
+			Err(e) => Err(internal("passkey: not removed", e)),
+		},
 	};
 	Ok((jar, answer))
 }
