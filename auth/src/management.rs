@@ -500,7 +500,6 @@ impl RedisRefreshStore {
 		let outcome: Option<Vec<String>> = TOUCH_AUTH_TIME_SCRIPT
 			.key(Self::fam_key(family))
 			.arg(secret)
-			.arg(get_current_timestamp())
 			.arg(bounds.idle_timeout_secs)
 			.invoke_async(&mut conn)
 			.await
@@ -687,8 +686,9 @@ end
 	)
 });
 
-/// The atomic re-authentication step. KEYS[1] = family hash. ARGV = presented secret, now,
-/// idle_timeout_secs. Moves `auth_time` to `now` (never backwards) iff the secret is the
+/// The atomic re-authentication step. KEYS[1] = family hash. ARGV = presented secret,
+/// idle_timeout_secs. `now` is Redis's own `TIME`, so replicas with skewed clocks cannot
+/// disagree about it. Moves `auth_time` to `now` (never backwards) iff the secret is the
 /// family's CURRENT one and the family is inside its bounds; returns `{token_version,
 /// auth_time}`, or nil for any rejection. Unlike ROTATE it deletes nothing: an expired
 /// family is left for its own TTL, and a rotated-out secret is not a reuse signal here.
@@ -700,8 +700,8 @@ if #fam == 0 then return nil end
 local h = {}
 for i = 1, #fam, 2 do h[fam[i]] = fam[i + 1] end
 
-local now = tonumber(ARGV[2])
-local idle = tonumber(ARGV[3])
+local now = tonumber(redis.call('TIME')[1])
+local idle = tonumber(ARGV[2])
 if now >= tonumber(h['absolute_expires_at']) or now >= tonumber(h['expires_at']) or (idle ~= 0 and (now - tonumber(h['last_seen'])) > idle) then
   return nil
 end

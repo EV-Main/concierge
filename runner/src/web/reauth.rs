@@ -23,18 +23,19 @@ use axum::{
 };
 use axum_extra::extract::cookie::CookieJar;
 use domain::users::UserId;
+use evconcierge_contracts::concierge::v1::{ListSessionsRequest, auth_service_server::AuthService as AuthRpc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tonic::Code;
 use webauthn_rs::prelude::{Passkey, PublicKeyCredential};
 
 use crate::{
-	ports::CodePurpose,
+	ports::{CodePurpose, PasskeyRow},
 	web::{
 		Inner, WebState, now_secs,
 		passkey::{base64url, expired, rejected},
-		routes::ClientIp,
-		sign_in::{Answered, DECOY, Refusal, Signed, code_refusal, end_session, human, internal, matches, sent, signed_in_live},
+		routes::{ClientIp, live_family_of, refresh_of},
+		sign_in::{Answered, DECOY, Halt, Refusal, Signed, code_refusal, end_session, human, internal, matches, sent, signed_in_live},
 	},
 };
 
@@ -46,6 +47,22 @@ pub const ATTEMPTS_PER_WINDOW: u32 = 10;
 
 fn throttled() -> Refusal {
 	Refusal::new(StatusCode::TOO_MANY_REQUESTS, "throttled")
+}
+
+/// These routes are for `PUBLIC_ORIGIN` alone. A browser always sends `Origin` on a POST;
+/// when it is there and is not ours the request is refused outright, ahead of CSRF.
+fn own_origin(st: &Inner, headers: &HeaderMap) -> Result<(), Refusal> {
+	match headers.get("origin").map(|v| v.to_str().ok()) {
+		None => Ok(()),
+		Some(Some(origin)) if origin.trim_end_matches('/') == st.public_origin => Ok(()),
+		Some(_) => Err(Refusal::new(StatusCode::FORBIDDEN, "origin")),
+	}
+}
+
+/// [`signed_in_live`] behind the origin check.
+async fn signed(st: &Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<Signed, Halt> {
+	own_origin(st, headers)?;
+	signed_in_live(st, jar, headers).await
 }
 
 fn spend(st: &Inner, user: UserId) -> Result<(), Refusal> {
@@ -67,7 +84,13 @@ async fn moved(st: &Inner, jar: CookieJar, user: UserId) -> (CookieJar, Result<J
 			(jar, Ok(Json(json!({ "ok": true, "authTime": done.auth_time }))))
 		}
 		Ok(Err(status)) => match status.code() {
-			Code::Unauthenticated => (end_session(st, jar).await, Err(Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated"))),
+			// "Unauthenticated" also reads as a handle another replica rotated under us. The
+			// session ends only when the family itself is confirmed dead.
+			Code::Unauthenticated => match live_family_of(st, &session).await {
+				Ok(None) => (end_session(st, jar).await, Err(Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated"))),
+				Ok(Some(_)) => (jar, Err(Refusal::new(StatusCode::CONFLICT, "retry"))),
+				Err(e) => (jar, Err(internal("reauth: session family not read", e))),
+			},
 			Code::PermissionDenied => (end_session(st, jar).await, Err(Refusal::new(StatusCode::FORBIDDEN, "disabled"))),
 			code => {
 				tracing::error!(?code, detail = %status.message(), "reauth: issuance refused");
@@ -95,11 +118,12 @@ pub struct CodeRequest {
 	turnstile_token: String,
 }
 
-/// `POST /auth/reauth/code/request` — mail the signed-in account a sign-in code. A mail
+/// `POST /auth/reauth/code/request` — mail the signed-in account a re-authentication code
+/// (its own purpose: a sign-in code, which anyone can ask for, never stands in for it). A mail
 /// costs us, so a person must be behind it, as on `/auth/code/request`.
 pub async fn code_request(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Json(body): Json<CodeRequest>) -> Answered {
 	let st = &st.inner;
-	let Signed { caller, user } = signed_in_live(st, &jar, &headers).await?;
+	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
 		spend(st, user.id())?;
@@ -107,7 +131,7 @@ pub async fn code_request(State(st): State<WebState>, jar: CookieJar, headers: H
 		human(st, &ip, &body.turnstile_token).await?;
 		let issue = st
 			.credentials
-			.issue_code(CodePurpose::Login(user.email().clone()), now_secs())
+			.issue_code(CodePurpose::Reauth(user.id()), now_secs())
 			.await
 			.map_err(|e| internal("reauth: code not issued", e))?;
 		sent(st, issue).await
@@ -121,17 +145,17 @@ pub struct CodeVerify {
 	code: String,
 }
 
-/// `POST /auth/reauth/code/verify` — spend the mailed code. The mailbox it proves is the
-/// account's own VERIFIED address, which belongs to this account alone
-/// (`users_verified_email_idx`), so there is no one else it could open.
+/// `POST /auth/reauth/code/verify` — spend the mailed code. It is bound to this account
+/// and to its VERIFIED address (`users_verified_email_idx`), and spends the account's own
+/// daily budget of codes and wrong guesses.
 pub async fn code_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<CodeVerify>) -> Answered {
 	let st = &st.inner;
-	let Signed { caller, user } = signed_in_live(st, &jar, &headers).await?;
+	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
 	if let Err(refusal) = spend(st, user.id()).and_then(|()| verified_address(&user)) {
 		return Ok((jar, Err(refusal)));
 	}
-	match st.credentials.redeem_login_code(user.email(), &body.code, now_secs()).await {
+	match st.credentials.redeem_reauth_code(user.id(), &body.code, now_secs()).await {
 		Ok(Ok(())) => Ok(moved(st, jar, user.id()).await),
 		Ok(Err(refusal)) => Ok((jar, Err(code_refusal(refusal)))),
 		Err(e) => Ok((jar, Err(internal("reauth: code not redeemed", e)))),
@@ -148,7 +172,7 @@ pub struct PasswordBody {
 /// included, and never the code or passkey paths.
 pub async fn password(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<PasswordBody>) -> Answered {
 	let st = &st.inner;
-	let Signed { caller, user } = signed_in_live(st, &jar, &headers).await?;
+	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
 	let id = user.id();
 	let invalid = || Refusal::new(StatusCode::UNAUTHORIZED, "invalid_credentials");
@@ -183,16 +207,39 @@ pub async fn password(State(st): State<WebState>, jar: CookieJar, headers: Heade
 	}
 }
 
+/// The account's passkeys that were there before this session began. A passkey planted
+/// during the session proves nothing about who holds it: a stolen session could add one
+/// and then "re-authenticate" with it. Registration also wants a fresh `auth_time`, but
+/// this is the half that holds when that window is open.
+async fn eligible_passkeys(st: &Inner, jar: &CookieJar, id: UserId) -> Result<Vec<PasskeyRow>, Refusal> {
+	let refresh = refresh_of(st, jar)
+		.await
+		.map_err(|_| internal("reauth: session store failed", "unavailable"))?
+		.ok_or_else(|| Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated"))?;
+	let listed = AuthRpc::list_sessions(&st.auth, tonic::Request::new(ListSessionsRequest { refresh_token: refresh }))
+		.await
+		.map_err(|e| internal("reauth: session not read", e.message().to_owned()))?
+		.into_inner();
+	let started = listed
+		.sessions
+		.iter()
+		.find(|s| s.current)
+		.map(|s| s.created_at)
+		.ok_or_else(|| Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated"))?;
+	let rows = st.credentials.passkeys(id).await.map_err(|e| internal("reauth: passkeys not read", e))?;
+	Ok(rows.into_iter().filter(|row| row.created_at <= started).collect())
+}
+
 /// `POST /auth/reauth/passkey/options` — begin an assertion against the signed-in
 /// account's own passkeys (not a discoverable one: the account is already named).
 pub async fn passkey_options(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Answered {
 	let st = &st.inner;
-	let Signed { caller, user } = signed_in_live(st, &jar, &headers).await?;
+	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
 	let id = user.id();
 	let answer = async {
 		spend(st, id)?;
-		let rows = st.credentials.passkeys(id).await.map_err(|e| internal("reauth: passkeys not read", e))?;
+		let rows = eligible_passkeys(st, &jar, id).await?;
 		let passkeys = rows
 			.into_iter()
 			.map(|row| serde_json::from_value::<Passkey>(row.passkey))
@@ -220,7 +267,7 @@ pub struct PasskeyVerify {
 /// offered, for the account that began the ceremony.
 pub async fn passkey_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<PasskeyVerify>) -> Answered {
 	let st = &st.inner;
-	let Signed { caller, user } = signed_in_live(st, &jar, &headers).await?;
+	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
 	let id = user.id();
 	let checked = async {
@@ -234,7 +281,7 @@ pub async fn passkey_verify(State(st): State<WebState>, jar: CookieJar, headers:
 			rejected()
 		})?;
 		let credential_id = base64url(result.cred_id());
-		let stored = st.credentials.passkeys(id).await.map_err(|e| internal("reauth: passkeys not read", e))?;
+		let stored = eligible_passkeys(st, &jar, id).await?;
 		let row = stored.into_iter().find(|row| row.credential_id == credential_id).ok_or_else(rejected)?;
 		let mut passkey: Passkey = serde_json::from_value(row.passkey).map_err(|e| internal("reauth: a stored passkey does not parse", e))?;
 		passkey.update_credential(&result);

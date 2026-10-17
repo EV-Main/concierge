@@ -192,24 +192,35 @@ impl WebSessions {
 	/// the session is gone or is not `user_id`'s.
 	pub async fn reauthenticated(&self, id: &str, user_id: &str, auth: &AuthService) -> color_eyre::Result<Result<Reauthed, tonic::Status>> {
 		let _flight = self.locks.acquire(id.to_string()).await;
-		let Some(mut s) = self.store.load(id).await? else {
-			return Ok(Err(tonic::Status::unauthenticated("no such session")));
-		};
-		if s.user.user_id != user_id {
-			return Ok(Err(tonic::Status::unauthenticated("no such session")));
+		let mut tried: Option<String> = None;
+		loop {
+			let Some(s) = self.store.load(id).await? else {
+				return Ok(Err(tonic::Status::unauthenticated("no such session")));
+			};
+			if s.user.user_id != user_id {
+				return Ok(Err(tonic::Status::unauthenticated("no such session")));
+			}
+			let moved = match auth.reauthenticate(&s.refresh_token, user_id).await {
+				Ok(moved) => moved,
+				// Another replica may have rotated the handle since the load; read the
+				// session once more and go again, but only if it holds a different handle.
+				Err(status) if status.code() == tonic::Code::Unauthenticated && tried.is_none() => {
+					tried = Some(s.refresh_token);
+					continue;
+				}
+				Err(status) => return Ok(Err(status)),
+			};
+			// Only the access half is written: a whole-session save here would put back the
+			// refresh pair this method loaded, over one a rotation elsewhere has since stored.
+			if !self.store.set_access(id, &moved.access_token, moved.access_expires_at).await? {
+				return Ok(Err(tonic::Status::unauthenticated("no such session")));
+			}
+			return Ok(Ok(Reauthed {
+				access_token: moved.access_token,
+				auth_time: moved.auth_time,
+				remaining_secs: (s.refresh_expires_at - now_secs()).max(0),
+			}));
 		}
-		let moved = match auth.reauthenticate(&s.refresh_token, user_id).await {
-			Ok(moved) => moved,
-			Err(status) => return Ok(Err(status)),
-		};
-		s.access_token = moved.access_token.clone();
-		s.access_expires_at = moved.access_expires_at;
-		self.store.save(id, &s).await?;
-		Ok(Ok(Reauthed {
-			access_token: moved.access_token,
-			auth_time: moved.auth_time,
-			remaining_secs: (s.refresh_expires_at - now_secs()).max(0),
-		}))
 	}
 
 	/// The session's CSRF token (double-submit check).
@@ -304,6 +315,35 @@ impl Store {
 			}
 		}
 		Ok(())
+	}
+
+	/// Replace the access token alone. `false` when the session is gone: nothing is written
+	/// then (a bare `HSET` would conjure a half-hash that `load` reports as corrupted).
+	async fn set_access(&self, id: &str, access_token: &str, access_expires_at: i64) -> color_eyre::Result<bool> {
+		match self {
+			Self::InProcess(map) => Ok(map
+				.lock()
+				.await
+				.get_mut(id)
+				.map(|s| {
+					s.access_token = access_token.to_owned();
+					s.access_expires_at = access_expires_at;
+				})
+				.is_some()),
+			Self::Redis(conn) => {
+				let mut conn = conn.clone();
+				let script =
+					redis::Script::new("if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end redis.call('HSET', KEYS[1], 'access_token', ARGV[1], 'access_expires_at', ARGV[2]) return 1");
+				let written: i64 = script
+					.key(Self::key(id))
+					.arg(access_token)
+					.arg(access_expires_at)
+					.invoke_async(&mut conn)
+					.await
+					.context("web session set access")?;
+				Ok(written == 1)
+			}
+		}
 	}
 
 	async fn remove(&self, id: &str) -> color_eyre::Result<Option<String>> {

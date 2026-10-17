@@ -29,9 +29,9 @@ impl Surface {
 		self.post("/auth/reauth/code/request", ORIGIN, json!({ "turnstileToken": "human" }), browser).await
 	}
 
-	/// The newest login code queued for the browser's own address.
+	/// The newest re-authentication code queued for the address.
 	async fn own_code(&self, email: &str) -> String {
-		self.mailed_code(email, "login").await
+		self.mailed_code(email, "reauth").await
 	}
 }
 
@@ -64,6 +64,75 @@ async fn a_mailed_code_moves_auth_time_and_re_sets_the_access_cookie() {
 	let session = fx.get("/auth/session", &mut browser).await;
 	assert_eq!(session.body["authenticated"], true);
 	assert_eq!(access_claims(&browser)["auth_time"], after["auth_time"], "a later refresh keeps the moved time");
+}
+
+#[tokio::test]
+async fn a_code_works_once_and_only_for_its_own_purpose() {
+	let fx = fixture!();
+	let email = address("reauth-purpose");
+	let mut browser = Browser::default();
+	fx.sign_in_with_code(&email, &mut browser).await;
+	let login_code = fx.mailed_code(&email, "login").await;
+	fx.reauth_code(&mut browser).await;
+	let code = fx.own_code(&email).await;
+
+	let wrong_kind = fx.post("/auth/reauth/code/verify", ORIGIN, json!({ "code": login_code }), &mut browser).await;
+	assert_eq!(
+		(wrong_kind.status, wrong_kind.body),
+		(StatusCode::BAD_REQUEST, json!({ "error": "invalid_code" })),
+		"a sign-in code is not a re-auth code"
+	);
+	let mut stranger = Browser::default();
+	let as_login = fx.post("/auth/code/verify", ORIGIN, json!({ "email": email, "code": code }), &mut stranger).await;
+	assert_eq!(as_login.status, StatusCode::BAD_REQUEST, "a re-auth code signs nobody in");
+
+	let first = fx.post("/auth/reauth/code/verify", ORIGIN, json!({ "code": code }), &mut browser).await;
+	assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
+	let again = fx.post("/auth/reauth/code/verify", ORIGIN, json!({ "code": code }), &mut browser).await;
+	assert_eq!((again.status, again.body), (StatusCode::BAD_REQUEST, json!({ "error": "invalid_code" })), "a code is spent once");
+}
+
+#[tokio::test]
+async fn the_code_mail_says_what_it_is_for() {
+	let fx = fixture!();
+	let email = address("reauth-mail");
+	let mut browser = Browser::default();
+	fx.sign_in_with_code(&email, &mut browser).await;
+	fx.reauth_code(&mut browser).await;
+	let purpose: String = sqlx::query_scalar("SELECT payload->>'purpose' FROM notification_deliveries WHERE kind = 'email_code' AND recipient = $1 ORDER BY id DESC LIMIT 1")
+		.bind(&email)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(purpose, "reauth");
+	let rendered = concierge::infrastructure::email::templates::reauth_code("123456", 0);
+	assert!(rendered.text.contains("123456") && rendered.text.contains("If this was not you"));
+}
+
+#[tokio::test]
+async fn a_revoked_session_cannot_re_authenticate() {
+	let fx = fixture!();
+	let email = address("reauth-revoked");
+	let mut browser = Browser::default();
+	fx.sign_in_with_code(&email, &mut browser).await;
+	sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE email = $1")
+		.bind(&email)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+
+	let refused = fx.post("/auth/reauth/passkey/options", ORIGIN, json!({}), &mut browser).await;
+	assert_eq!((refused.status, refused.body), (StatusCode::UNAUTHORIZED, json!({ "error": "unauthenticated" })));
+	assert!(browser.get("ev_session").is_none(), "the dead session is cleared");
+}
+
+#[tokio::test]
+async fn a_foreign_origin_is_refused_outright() {
+	let fx = fixture!();
+	let mut browser = Browser::default();
+	fx.sign_in_with_code(&address("reauth-origin"), &mut browser).await;
+	let refused = fx.post("/auth/reauth/password", "https://evil.example", json!({ "password": "x" }), &mut browser).await;
+	assert_eq!((refused.status, refused.body), (StatusCode::FORBIDDEN, json!({ "error": "origin" })));
 }
 
 #[tokio::test]
@@ -232,6 +301,89 @@ mod passkeys {
 			(StatusCode::BAD_REQUEST, json!({ "error": "passkey_expired" })),
 			"a ceremony is spent once"
 		);
+	}
+
+	/// Age the session's sign-in by `secs` as if it were that old: the family's `auth_time`
+	/// in Redis, and the stored access token expired so the next read mints one carrying it.
+	/// `false` (the test returns) when no Redis is configured.
+	async fn age_session(browser: &Browser, secs: i64) -> bool {
+		let Some(url) = std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty()) else {
+			return false;
+		};
+		let mut conn = redis::Client::open(url).unwrap().get_multiplexed_async_connection().await.unwrap();
+		let key = format!("websess:{}", browser.get("ev_session").unwrap());
+		let refresh: String = redis::cmd("HGET").arg(&key).arg("refresh_token").query_async(&mut conn).await.unwrap();
+		let family = refresh.split('.').next().unwrap();
+		let old = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - secs;
+		let _: () = redis::cmd("HSET")
+			.arg(format!("refresh:fam:{family}"))
+			.arg("auth_time")
+			.arg(old)
+			.query_async(&mut conn)
+			.await
+			.unwrap();
+		let _: () = redis::cmd("HSET").arg(&key).arg("access_expires_at").arg(0).query_async(&mut conn).await.unwrap();
+		true
+	}
+
+	#[tokio::test]
+	async fn changing_passkeys_needs_a_fresh_auth_time_that_re_auth_restores() {
+		let fx = fixture!();
+		let email = address("reauth-fresh");
+		let mut browser = Browser::default();
+		fx.sign_in_with_code(&email, &mut browser).await;
+		register(&fx, &mut browser).await;
+		if !age_session(&browser, 3600).await {
+			return;
+		}
+		let stale = fx.post("/auth/passkey/register/options", ORIGIN, json!({}), &mut browser).await;
+		assert_eq!((stale.status, stale.body), (StatusCode::FORBIDDEN, json!({ "error": "reauth_required" })));
+		let methods = fx.get("/auth/methods", &mut browser).await;
+		let credential_id = methods.body["passkeys"][0]["id"].as_str().unwrap().to_owned();
+		let removed = fx.post("/auth/passkey/remove", ORIGIN, json!({ "credentialId": credential_id }), &mut browser).await;
+		assert_eq!((removed.status, removed.body), (StatusCode::FORBIDDEN, json!({ "error": "reauth_required" })));
+
+		// A passkey registered in this very session is not a way back; a mailed code is.
+		fx.reauth_code(&mut browser).await;
+		let code = fx.own_code(&email).await;
+		let done = fx.post("/auth/reauth/code/verify", ORIGIN, json!({ "code": code }), &mut browser).await;
+		assert_eq!(done.status, StatusCode::OK, "{:?}", done.body);
+		let again = fx.post("/auth/passkey/register/options", ORIGIN, json!({}), &mut browser).await;
+		assert_eq!(again.status, StatusCode::OK, "{:?}", again.body);
+	}
+
+	#[tokio::test]
+	async fn a_passkey_planted_after_the_session_began_does_not_re_authenticate() {
+		let fx = fixture!();
+		let email = address("reauth-planted");
+		let mut browser = Browser::default();
+		fx.sign_in_with_code(&email, &mut browser).await;
+		let mut device = register(&fx, &mut browser).await;
+		let user: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1").bind(&email).fetch_one(&fx.pool).await.unwrap();
+
+		// Offered while the passkey still counts as older than the session...
+		let begun = fx.post("/auth/reauth/passkey/options", ORIGIN, json!({}), &mut browser).await;
+		assert_eq!(begun.status, StatusCode::OK, "{:?}", begun.body);
+		let rcr: RequestChallengeResponse = serde_json::from_value(begun.body["options"].clone()).unwrap();
+		let credential = device.do_authentication(origin(), rcr).unwrap();
+		// ...then made to look planted after it.
+		sqlx::query("UPDATE passkey_credentials SET created_at = created_at + 100000 WHERE user_id = $1")
+			.bind(user)
+			.execute(&fx.pool)
+			.await
+			.unwrap();
+
+		let refused = fx
+			.post(
+				"/auth/reauth/passkey/verify",
+				ORIGIN,
+				json!({ "ceremony": begun.body["ceremony"], "credential": credential }),
+				&mut browser,
+			)
+			.await;
+		assert_eq!((refused.status, refused.body), (StatusCode::UNAUTHORIZED, json!({ "error": "passkey_rejected" })));
+		let none = fx.post("/auth/reauth/passkey/options", ORIGIN, json!({}), &mut browser).await;
+		assert_eq!((none.status, none.body), (StatusCode::BAD_REQUEST, json!({ "error": "no_passkey" })), "it is not even offered");
 	}
 
 	#[tokio::test]
