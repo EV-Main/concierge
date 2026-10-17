@@ -238,10 +238,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `RefreshStore::touch_auth_time` (one Redis script, keyed by the CURRENT refresh secret,
   never backwards, no rotation) and `AuthService::reauthenticate`, which then mints a new
   access token and the route re-sets `ev_access`. The proof must be of the SESSION's
-  account — a code is redeemed against that account's own VERIFIED address, a password is
+  account — a code (its own `reauth` purpose, never a sign-in or verification code, with the
+  daily budgets of `verify`) is redeemed against that account's own VERIFIED address, a password is
   looked up by that address and held to the session's user, a passkey ceremony is bound to
-  the account that began it — and the routes are `PUBLIC_ORIGIN`-only (never in the CORS
-  list), CSRF-checked and `signed_in_live`. One budget per account
+  the account that began it and only counts if older than the session — and the routes are `PUBLIC_ORIGIN`-only (never in the CORS
+  list; a foreign `Origin` is refused), CSRF-checked and `signed_in_live`. Adding or removing a
+  passkey needs an `auth_time` within 300 s (`403 reauth_required`), so a stolen session cannot
+  plant a factor and then re-authenticate with it. One budget per account
   (`REAUTH_ATTEMPTS_PER_WINDOW` per five minutes) across all five. `auth_time` stays in the
   user's access token only: relying-party and service tokens never carry it, and neither
   `GetMe` nor `UserSummary` reports it — a consumer reads it from the token it verifies.
