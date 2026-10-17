@@ -48,6 +48,10 @@ pub const EXECUTION_WINDOW_SECS: i64 = 72 * 60 * 60;
 /// At most this many live proposals per proposer namespace and scope: one leaked
 /// credential must not be able to bury a scope's deciders.
 pub const MAX_LIVE_PER_PROPOSER: i64 = 200;
+/// Live decisions about people one owner may have open at once: opening is cheap and each
+/// one mails every other owner, so one owner (or one stolen session) must not be able to fill
+/// the proposer's whole live cap with them.
+pub const MAX_LIVE_PEOPLE_PER_OPENER: i64 = 5;
 /// `PullApproved` stops serving a decision this long before it lapses, so whatever a
 /// proposer pulled it still has this long to report — a pull at the last second would
 /// otherwise hand out work whose report is already too late.
@@ -455,8 +459,10 @@ pub struct PersonStanding {
 }
 
 /// Why `effect` cannot be carried out against `subject` as they stand, if it cannot.
-/// `owners` is the number of persisted owner seats, suspended ones counted: the floor
-/// is over seats, and excluding the suspended would let one admin shrink the roster.
+/// `owners` is the number of STANDING owner seats, `subject`'s included if it stands: the
+/// floor is over seats that can still decide. An owner suspended by the owners' verdict has
+/// no say and is not counted, or two suspensions and a resignation would leave one voice; a
+/// temporary hold (`admin_hold`) is counted, because it lapses and is one operator's brake.
 pub fn person_inapplicable(effect: PersonEffect, subject: PersonStanding, owners: usize) -> Option<&'static str> {
 	use crate::authz::Role;
 	match effect {
@@ -497,7 +503,16 @@ pub fn person_inapplicable(effect: PersonEffect, subject: PersonStanding, owners
 			// no floor check and no audit of the seat.
 			Role::Owner => Some("the account holds an owner seat, which outranks admin"),
 			Role::Admin => Some("the account already holds the admin role"),
-			Role::Investor | Role::Operator => None,
+			// Parity with an owner admission: an admin is reached by mail and acts with a
+			// session, so the account must be live and its address proven.
+			Role::Investor | Role::Operator =>
+				if !subject.active {
+					Some("the account is no longer active")
+				} else if !subject.verified {
+					Some("the account's address is not verified")
+				} else {
+					None
+				},
 		},
 	}
 }
@@ -1808,5 +1823,27 @@ mod tests {
 		assert!(at(PersonEffect::AdmitAdmin, standing(Role::Owner), 3).is_some());
 		assert!(at(PersonEffect::AdmitAdmin, standing(Role::Admin), 3).is_some());
 		assert!(at(PersonEffect::AdmitAdmin, standing(Role::Operator), 3).is_none());
+		assert!(
+			at(
+				PersonEffect::AdmitAdmin,
+				PersonStanding {
+					active: false,
+					..standing(Role::Investor)
+				},
+				3
+			)
+			.is_some()
+		);
+		assert!(
+			at(
+				PersonEffect::AdmitAdmin,
+				PersonStanding {
+					verified: false,
+					..standing(Role::Investor)
+				},
+				3
+			)
+			.is_some()
+		);
 	}
 }
