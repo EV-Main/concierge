@@ -674,10 +674,12 @@ impl GovernanceService for Governance {
 		}))
 	}
 
-	/// The window's drain. An owner only, and deliberately usable while openings are closed.
-	/// Any owner may void what is open: during the window the platform owners' approvals
-	/// already let any one of them veto any decision, so this adds no power a legacy
-	/// proposal's initiator did not have over their own.
+	/// The window's drain. An owner only, usable while openings are closed. It cancels what is
+	/// pending, so it is refused over a proposal about the caller's own seat or standing —
+	/// the one a caller could be tempted to stop — and the reason is held to the same rules as
+	/// every other piece of text a proposal carries. Any other owner may drain: a legacy
+	/// proposal's initiator could always withdraw their own, and the owners are few and
+	/// accountable (every drain is logged at `warn!` and audited on the proposal).
 	async fn drain_legacy_proposals(&self, request: Request<DrainLegacyProposalsRequest>) -> Result<Response<DrainLegacyProposalsResponse>, Status> {
 		let caller = self.acting_owner(&request).await?;
 		let req = request.into_inner();
@@ -685,9 +687,10 @@ impl GovernanceService for Governance {
 			return Err(Status::invalid_argument(format!("name 1 to {MAX_DRAIN} proposals")));
 		}
 		let reason = req.reason.trim();
-		if reason.is_empty() || reason.chars().count() > 200 {
-			return Err(Status::invalid_argument("a reason of 1 to 200 characters is required"));
+		if reason.is_empty() {
+			return Err(Status::invalid_argument("a reason is required"));
 		}
+		domain::approvals::check_text("reason", reason, domain::approvals::TEXT_FIELD_BYTES).map_err(Status::invalid_argument)?;
 		let refs = req
 			.items
 			.iter()

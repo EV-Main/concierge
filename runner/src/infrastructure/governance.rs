@@ -44,6 +44,9 @@ use crate::{
 	ports::{Drained, GovernanceMailQueued, GovernanceRepository, LegacyKind, OwnerGenesisRepository},
 };
 
+/// Why a legacy proposal is void when an owner it never asked has been seated meanwhile.
+const NEW_OWNER_VOID: &str = "an owner was seated after this was opened and was never asked";
+
 /// Crockford base32 with `I`, `L`, `O` and `U` removed — the four a person mistypes or
 /// mishears. Ten characters from it is ~46 bits, and 32 divides 256, so masking the low
 /// five bits of a random byte is uniform with no rejection loop.
@@ -470,6 +473,11 @@ async fn settle_admission(conn: &mut PgConnection, admission: &mut OwnerAdmissio
 		return Ok(());
 	}
 	let owners = owner_ids_for_update(conn).await?;
+	let known: Vec<UserId> = admission.peers().iter().map(|p| p.user_id).chain([admission.initiator()]).collect();
+	if owners.iter().any(|owner| !known.contains(owner)) {
+		admission.void(NEW_OWNER_VOID, now)?;
+		return Ok(());
+	}
 	// It passed over the SNAPSHOT but not against the roster as it stands: every voter
 	// who carried it has since lost their seat, so the eligible set is now empty and
 	// unanimity over nobody must not pass. Void it rather than failing the vote — the
@@ -581,6 +589,11 @@ async fn settle_proposal(conn: &mut PgConnection, proposal: &mut UserProposal, n
 		return Ok(());
 	}
 	let owners = owner_ids_for_update(conn).await?;
+	let known: Vec<UserId> = proposal.peers().iter().map(|p| p.user_id).chain([proposal.initiator()]).collect();
+	if owners.iter().any(|owner| !known.contains(owner)) {
+		proposal.void(NEW_OWNER_VOID, now)?;
+		return Ok(());
+	}
 	// It passed over the SNAPSHOT but not against the roster as it stands: the owners who
 	// carried it have since lost their seats. Void it rather than failing the vote — the
 	// last voter did nothing wrong, and an open proposal that can never pass is a trap for
@@ -724,6 +737,13 @@ async fn settle(conn: &mut PgConnection, removal: &mut OwnerRemoval, now: i64) -
 		return Ok(());
 	}
 	let owners = owner_ids_for_update(conn).await?;
+	// An owner seated since this was opened (now possible through `approvals`, beside this
+	// path) was never asked: the snapshot's unanimity would pass without them.
+	let known: Vec<UserId> = removal.peers().iter().map(|p| p.user_id).chain([removal.initiator(), removal.target()]).collect();
+	if owners.iter().any(|owner| !known.contains(owner)) {
+		removal.void(NEW_OWNER_VOID, now)?;
+		return Ok(());
+	}
 	if removal.execute(&owners, now)? == RemovalState::Executed {
 		take_seat(conn, removal.target()).await?;
 	}
@@ -909,8 +929,20 @@ pub(super) async fn resign_seat(pool: &PgPool, who: UserId, now: i64) -> Result<
 		return Err(DomainError::Forbidden("you do not hold an owner seat".into()));
 	}
 	// Leaving voluntarily is subject to the SAME floor as being removed: the last
-	// seats are not anyone's to vacate.
+	// seats are not anyone's to vacate. Counted over seats that can still decide: an owner
+	// the owners themselves suspended is on the roster and has no say, so two of them and a
+	// resignation must not leave one voice (a temporary hold is counted: it lapses).
 	check_floor(owners.len())?;
+	let standing: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE role = 'owner' AND (status = 'active' OR suspended_by IS DISTINCT FROM 'governance')")
+		.fetch_one(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+	let leaving_stands: bool = sqlx::query_scalar("SELECT status = 'active' OR suspended_by IS DISTINCT FROM 'governance' FROM users WHERE id = $1")
+		.bind(who.raw())
+		.fetch_one(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+	check_floor(usize::try_from(standing).unwrap_or_default() + usize::from(!leaving_stands))?;
 
 	// An open proposal against someone who has just left is moot; void it so the
 	// one-open-per-target index does not keep a dead row.
@@ -1526,6 +1558,9 @@ impl GovernanceRepository for PgGovernance {
 					Err(DomainError::NotFound { .. }) => Drained::NotFound,
 					Err(other) => return Err(other),
 					Ok(mut removal) => {
+						if removal.target() == by {
+							return Err(DomainError::Forbidden("nobody drains a proposal about their own seat".into()));
+						}
 						// A due proposal is closed as the expired thing it is, not voided.
 						let lapsed = expire_if_due(&mut removal, now);
 						let open = removal.state().is_open();
@@ -1542,6 +1577,9 @@ impl GovernanceRepository for PgGovernance {
 					Err(DomainError::NotFound { .. }) => Drained::NotFound,
 					Err(other) => return Err(other),
 					Ok(mut admission) => {
+						if admission.candidate() == by {
+							return Err(DomainError::Forbidden("nobody drains a proposal about their own seat".into()));
+						}
 						let lapsed = expire_admission_if_due(&mut admission, now);
 						let open = admission.state().is_open();
 						if open {
@@ -1557,6 +1595,9 @@ impl GovernanceRepository for PgGovernance {
 					Err(DomainError::NotFound { .. }) => Drained::NotFound,
 					Err(other) => return Err(other),
 					Ok(mut proposal) => {
+						if proposal.subject() == by {
+							return Err(DomainError::Forbidden("nobody drains a proposal about their own standing".into()));
+						}
 						let lapsed = expire_proposal_if_due(&mut proposal, now);
 						let open = proposal.state().is_open();
 						if open {
