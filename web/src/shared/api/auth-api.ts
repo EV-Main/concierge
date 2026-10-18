@@ -37,6 +37,10 @@ export const AUTH_ERRORS = [
   "origin_not_allowed",
   "platform_only",
   "forbidden",
+  "reauth_required",
+  "email_unverified",
+  "retry",
+  "no_passkey",
   "unavailable",
   "internal",
 ] as const;

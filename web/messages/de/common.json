@@ -187,6 +187,14 @@
     "en": "Too many wrong passwords. Sign in with a code instead.",
     "t": "Zu viele falsche Passwörter. Melde dich stattdessen mit einem Code an."
   },
+  "auth.err.reauthStill": {
+    "en": "We could not confirm it is you. Try again.",
+    "t": "Wir konnten nicht bestätigen, dass Sie es sind. Versuchen Sie es erneut."
+  },
+  "auth.err.sessionEnded": {
+    "en": "Your session has ended. Sign in again.",
+    "t": "Ihre Sitzung ist beendet. Melden Sie sich erneut an."
+  },
   "auth.err.signOut": {
     "en": "We couldn't sign you out. Please try again.",
     "t": "Abmelden fehlgeschlagen. Bitte versuchen Sie es erneut."
@@ -270,6 +278,86 @@
   "auth.password.set": {
     "en": "Set password",
     "t": "Passwort festlegen"
+  },
+  "auth.reauth.cancel": {
+    "en": "Cancel",
+    "t": "Abbrechen"
+  },
+  "auth.reauth.confirm": {
+    "en": "Confirm",
+    "t": "Bestätigen"
+  },
+  "auth.reauth.done": {
+    "en": "Confirmed. Now add the passkey.",
+    "t": "Bestätigt. Fügen Sie jetzt den Passkey hinzu."
+  },
+  "auth.reauth.err.emailUnverified": {
+    "en": "Your email is not verified, so we cannot mail you a code. Confirm another way.",
+    "t": "Ihre E-Mail-Adresse ist nicht bestätigt, daher können wir keinen Code senden. Bestätigen Sie auf anderem Weg."
+  },
+  "auth.reauth.err.invalidPassword": {
+    "en": "That password is not right.",
+    "t": "Das Passwort ist nicht richtig."
+  },
+  "auth.reauth.err.noPasskey": {
+    "en": "None of your passkeys can confirm this session. Use a code or your password.",
+    "t": "Keiner Ihrer Passkeys kann diese Sitzung bestätigen. Verwenden Sie einen Code oder Ihr Passwort."
+  },
+  "auth.reauth.err.origin": {
+    "en": "Confirm from the platform page of your account.",
+    "t": "Bestätigen Sie auf der Kontoseite der Plattform."
+  },
+  "auth.reauth.err.passkeyCancelled": {
+    "en": "Passkey confirmation was cancelled.",
+    "t": "Die Bestätigung per Passkey wurde abgebrochen."
+  },
+  "auth.reauth.err.passkeyRejected": {
+    "en": "That passkey could not confirm this session.",
+    "t": "Dieser Passkey konnte die Sitzung nicht bestätigen."
+  },
+  "auth.reauth.err.passwordLocked": {
+    "en": "Too many wrong passwords. Confirm with a code instead.",
+    "t": "Zu viele falsche Passwörter. Bestätigen Sie stattdessen mit einem Code."
+  },
+  "auth.reauth.err.retry": {
+    "en": "Your session was refreshed at the same moment. Try once more.",
+    "t": "Ihre Sitzung wurde gleichzeitig erneuert. Versuchen Sie es noch einmal."
+  },
+  "auth.reauth.err.throttled": {
+    "en": "Too many attempts. Try again in a few minutes.",
+    "t": "Zu viele Versuche. Versuchen Sie es in einigen Minuten erneut."
+  },
+  "auth.reauth.how": {
+    "en": "How to confirm",
+    "t": "Art der Bestätigung"
+  },
+  "auth.reauth.method.code": {
+    "en": "Email code",
+    "t": "E-Mail-Code"
+  },
+  "auth.reauth.method.passkey": {
+    "en": "Passkey",
+    "t": "Passkey"
+  },
+  "auth.reauth.newCode": {
+    "en": "Send a new code",
+    "t": "Neuen Code senden"
+  },
+  "auth.reauth.none": {
+    "en": "There is no way to confirm right now. Verify your email first, or sign in again.",
+    "t": "Derzeit gibt es keine Möglichkeit zur Bestätigung. Bestätigen Sie zuerst Ihre E-Mail-Adresse oder melden Sie sich erneut an."
+  },
+  "auth.reauth.sub": {
+    "en": "You signed in a while ago. Confirm again to change your passkeys.",
+    "t": "Sie haben sich vor einer Weile angemeldet. Bestätigen Sie erneut, um Ihre Passkeys zu ändern."
+  },
+  "auth.reauth.title": {
+    "en": "Confirm it is you",
+    "t": "Bestätigen Sie, dass Sie es sind"
+  },
+  "auth.reauth.usePasskey": {
+    "en": "Use a passkey",
+    "t": "Passkey verwenden"
   },
   "auth.signIn": {
     "en": "Sign in",

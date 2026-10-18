@@ -41,6 +41,11 @@ link elsewhere cannot sign a visitor out. Because the navigation follows
 the event at once, a host must end its session with a request that survives unload
 (`fetch(..., { keepalive: true })`, `sendBeacon`) or server-side.
 
+Passkey add/remove on a session older than five minutes is answered `403 reauth_required`
+(#168). The Security tab then opens a confirmation step in the same panel
+(`features/sign-in-methods`: email code, password, passkey — `/auth/reauth/*`) and
+retries the act once; a second `reauth_required` is shown as an error, not asked again.
+
 A new account confirms its address in the dialog through the ticket `password/signup`
 hands back (`/password/signup/confirm`, `/resend`), which needs no CSRF cookie and so
 works on every host; without a ticket the dialog sends the reader to the platform. An

@@ -187,6 +187,14 @@
     "en": "Too many wrong passwords. Sign in with a code instead.",
     "t": "Sai mật khẩu quá nhiều lần. Hãy đăng nhập bằng mã."
   },
+  "auth.err.reauthStill": {
+    "en": "We could not confirm it is you. Try again.",
+    "t": "Chúng tôi không thể xác nhận đó là bạn. Hãy thử lại."
+  },
+  "auth.err.sessionEnded": {
+    "en": "Your session has ended. Sign in again.",
+    "t": "Phiên của bạn đã kết thúc. Hãy đăng nhập lại."
+  },
   "auth.err.signOut": {
     "en": "We couldn't sign you out. Please try again.",
     "t": "Không thể đăng xuất. Vui lòng thử lại."
@@ -270,6 +278,86 @@
   "auth.password.set": {
     "en": "Set password",
     "t": "Đặt mật khẩu"
+  },
+  "auth.reauth.cancel": {
+    "en": "Cancel",
+    "t": "Hủy"
+  },
+  "auth.reauth.confirm": {
+    "en": "Confirm",
+    "t": "Xác nhận"
+  },
+  "auth.reauth.done": {
+    "en": "Confirmed. Now add the passkey.",
+    "t": "Đã xác nhận. Bây giờ hãy thêm khóa truy cập."
+  },
+  "auth.reauth.err.emailUnverified": {
+    "en": "Your email is not verified, so we cannot mail you a code. Confirm another way.",
+    "t": "Email của bạn chưa được xác minh nên chúng tôi không thể gửi mã. Hãy xác nhận bằng cách khác."
+  },
+  "auth.reauth.err.invalidPassword": {
+    "en": "That password is not right.",
+    "t": "Mật khẩu không đúng."
+  },
+  "auth.reauth.err.noPasskey": {
+    "en": "None of your passkeys can confirm this session. Use a code or your password.",
+    "t": "Không khóa truy cập nào của bạn có thể xác nhận phiên này. Hãy dùng mã hoặc mật khẩu."
+  },
+  "auth.reauth.err.origin": {
+    "en": "Confirm from the platform page of your account.",
+    "t": "Hãy xác nhận từ trang tài khoản trên nền tảng."
+  },
+  "auth.reauth.err.passkeyCancelled": {
+    "en": "Passkey confirmation was cancelled.",
+    "t": "Đã hủy xác nhận bằng khóa truy cập."
+  },
+  "auth.reauth.err.passkeyRejected": {
+    "en": "That passkey could not confirm this session.",
+    "t": "Khóa truy cập này không thể xác nhận phiên."
+  },
+  "auth.reauth.err.passwordLocked": {
+    "en": "Too many wrong passwords. Confirm with a code instead.",
+    "t": "Quá nhiều mật khẩu sai. Hãy xác nhận bằng mã."
+  },
+  "auth.reauth.err.retry": {
+    "en": "Your session was refreshed at the same moment. Try once more.",
+    "t": "Phiên của bạn vừa được làm mới cùng lúc. Hãy thử lại."
+  },
+  "auth.reauth.err.throttled": {
+    "en": "Too many attempts. Try again in a few minutes.",
+    "t": "Quá nhiều lần thử. Hãy thử lại sau vài phút."
+  },
+  "auth.reauth.how": {
+    "en": "How to confirm",
+    "t": "Cách xác nhận"
+  },
+  "auth.reauth.method.code": {
+    "en": "Email code",
+    "t": "Mã qua email"
+  },
+  "auth.reauth.method.passkey": {
+    "en": "Passkey",
+    "t": "Khóa truy cập"
+  },
+  "auth.reauth.newCode": {
+    "en": "Send a new code",
+    "t": "Gửi mã mới"
+  },
+  "auth.reauth.none": {
+    "en": "There is no way to confirm right now. Verify your email first, or sign in again.",
+    "t": "Hiện không có cách nào để xác nhận. Hãy xác minh email trước hoặc đăng nhập lại."
+  },
+  "auth.reauth.sub": {
+    "en": "You signed in a while ago. Confirm again to change your passkeys.",
+    "t": "Bạn đã đăng nhập từ lâu. Hãy xác nhận lại để thay đổi khóa truy cập."
+  },
+  "auth.reauth.title": {
+    "en": "Confirm it is you",
+    "t": "Xác nhận đó là bạn"
+  },
+  "auth.reauth.usePasskey": {
+    "en": "Use a passkey",
+    "t": "Dùng khóa truy cập"
   },
   "auth.signIn": {
     "en": "Sign in",

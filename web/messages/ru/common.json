@@ -187,6 +187,14 @@
     "en": "Too many wrong passwords. Sign in with a code instead.",
     "t": "Слишком много неверных паролей. Войдите с кодом."
   },
+  "auth.err.reauthStill": {
+    "en": "We could not confirm it is you. Try again.",
+    "t": "Не удалось подтвердить, что это вы. Попробуйте ещё раз."
+  },
+  "auth.err.sessionEnded": {
+    "en": "Your session has ended. Sign in again.",
+    "t": "Сессия завершена. Войдите снова."
+  },
   "auth.err.signOut": {
     "en": "We couldn't sign you out. Please try again.",
     "t": "Не удалось выйти. Попробуйте ещё раз."
@@ -270,6 +278,86 @@
   "auth.password.set": {
     "en": "Set password",
     "t": "Задать пароль"
+  },
+  "auth.reauth.cancel": {
+    "en": "Cancel",
+    "t": "Отмена"
+  },
+  "auth.reauth.confirm": {
+    "en": "Confirm",
+    "t": "Подтвердить"
+  },
+  "auth.reauth.done": {
+    "en": "Confirmed. Now add the passkey.",
+    "t": "Подтверждено. Теперь добавьте ключ доступа."
+  },
+  "auth.reauth.err.emailUnverified": {
+    "en": "Your email is not verified, so we cannot mail you a code. Confirm another way.",
+    "t": "Ваша почта не подтверждена, поэтому мы не можем отправить код. Подтвердите другим способом."
+  },
+  "auth.reauth.err.invalidPassword": {
+    "en": "That password is not right.",
+    "t": "Неверный пароль."
+  },
+  "auth.reauth.err.noPasskey": {
+    "en": "None of your passkeys can confirm this session. Use a code or your password.",
+    "t": "Ни один из ваших ключей доступа не подходит для подтверждения этой сессии. Используйте код или пароль."
+  },
+  "auth.reauth.err.origin": {
+    "en": "Confirm from the platform page of your account.",
+    "t": "Подтвердите на странице аккаунта на платформе."
+  },
+  "auth.reauth.err.passkeyCancelled": {
+    "en": "Passkey confirmation was cancelled.",
+    "t": "Подтверждение ключом доступа отменено."
+  },
+  "auth.reauth.err.passkeyRejected": {
+    "en": "That passkey could not confirm this session.",
+    "t": "Этот ключ доступа не подходит для подтверждения сессии."
+  },
+  "auth.reauth.err.passwordLocked": {
+    "en": "Too many wrong passwords. Confirm with a code instead.",
+    "t": "Слишком много неверных паролей. Подтвердите кодом."
+  },
+  "auth.reauth.err.retry": {
+    "en": "Your session was refreshed at the same moment. Try once more.",
+    "t": "Сессия обновилась в тот же момент. Попробуйте ещё раз."
+  },
+  "auth.reauth.err.throttled": {
+    "en": "Too many attempts. Try again in a few minutes.",
+    "t": "Слишком много попыток. Повторите через несколько минут."
+  },
+  "auth.reauth.how": {
+    "en": "How to confirm",
+    "t": "Способ подтверждения"
+  },
+  "auth.reauth.method.code": {
+    "en": "Email code",
+    "t": "Код на почту"
+  },
+  "auth.reauth.method.passkey": {
+    "en": "Passkey",
+    "t": "Ключ доступа"
+  },
+  "auth.reauth.newCode": {
+    "en": "Send a new code",
+    "t": "Отправить новый код"
+  },
+  "auth.reauth.none": {
+    "en": "There is no way to confirm right now. Verify your email first, or sign in again.",
+    "t": "Сейчас подтвердить нечем. Сначала подтвердите почту или войдите заново."
+  },
+  "auth.reauth.sub": {
+    "en": "You signed in a while ago. Confirm again to change your passkeys.",
+    "t": "Вы входили давно. Подтвердите себя снова, чтобы изменить ключи доступа."
+  },
+  "auth.reauth.title": {
+    "en": "Confirm it is you",
+    "t": "Подтвердите, что это вы"
+  },
+  "auth.reauth.usePasskey": {
+    "en": "Use a passkey",
+    "t": "Использовать ключ доступа"
   },
   "auth.signIn": {
     "en": "Sign in",
