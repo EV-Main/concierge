@@ -66,13 +66,22 @@ struct CodeRow {
 	expires_at: i64,
 	attempts: i32,
 	burned_at: Option<i64>,
+	binding: Option<Vec<u8>>,
 }
 
 /// Spend the live code sent to `email` for `purpose` (and `user`, for a verification).
 /// Issuing one burns its predecessors, so there is at most one to compare against.
-async fn redeem(conn: &mut PgConnection, email: &Email, purpose: &str, user: Option<UserId>, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError> {
+async fn redeem(
+	conn: &mut PgConnection,
+	email: &Email,
+	purpose: &str,
+	user: Option<UserId>,
+	binding: Option<&[u8; 32]>,
+	code: &str,
+	now: i64,
+) -> Result<Result<(), CodeRefusal>, DomainError> {
 	let Some(row) = sqlx::query_as::<_, CodeRow>(
-		"SELECT id, code_hash, expires_at, attempts, burned_at FROM email_codes \
+		"SELECT id, code_hash, expires_at, attempts, burned_at, binding FROM email_codes \
 		 WHERE email = $1 AND purpose = $2 AND user_id IS NOT DISTINCT FROM $3 \
 		 ORDER BY burned_at IS NULL DESC, created_at DESC LIMIT 1 FOR UPDATE",
 	)
@@ -85,6 +94,13 @@ async fn redeem(conn: &mut PgConnection, email: &Email, purpose: &str, user: Opt
 	else {
 		return Ok(Err(CodeRefusal::Missing));
 	};
+	// A code issued for another operation is no code for this one. Refused before anything
+	// is counted: the guess is not a guess at this operation's code.
+	if let Some(wanted) = binding
+		&& row.binding.as_deref() != Some(wanted.as_slice())
+	{
+		return Ok(Err(CodeRefusal::Missing));
+	}
 	if row.burned_at.is_some() {
 		return Ok(Err(if row.attempts >= CODE_MAX_ATTEMPTS { CodeRefusal::Exhausted } else { CodeRefusal::Missing }));
 	}
@@ -141,7 +157,7 @@ impl CredentialRepository for PgCredentials {
 
 	async fn redeem_login_code(&self, email: &Email, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		let outcome = redeem(&mut tx, email, "login", None, code, now).await?;
+		let outcome = redeem(&mut tx, email, "login", None, None, code, now).await?;
 		// Committed whatever the outcome: a wrong guess must stay counted.
 		tx.commit().await.map_err(repo_err)?;
 		Ok(outcome)
@@ -152,26 +168,38 @@ impl CredentialRepository for PgCredentials {
 		// The address is read first and locked second, as `issue_in` does.
 		let email = email_of(&mut tx, user).await?;
 		lock_email(&mut tx, &email).await?;
-		let outcome = redeem(&mut tx, &email, "reauth", Some(user), code, now).await?;
+		let outcome = redeem(&mut tx, &email, "reauth", Some(user), None, code, now).await?;
 		// Committed whatever the outcome: a wrong guess must stay counted.
 		tx.commit().await.map_err(repo_err)?;
 		Ok(outcome)
 	}
 
-	async fn issue_stepup_code(&self, user: UserId, context: serde_json::Value, ttl_secs: i64, now: i64) -> Result<CodeIssue, DomainError> {
+	async fn issue_stepup_code(&self, user: UserId, binding: [u8; 32], context: serde_json::Value, ttl_secs: i64, now: i64) -> Result<CodeIssue, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let email = email_of(&mut tx, user).await?;
 		lock_email(&mut tx, &email).await?;
-		let issue = issue_locked_with(&mut tx, &email, "stepup", Some(user), now, ttl_secs, Some(&context)).await?;
+		let issue = issue_locked_with(
+			&mut tx,
+			&email,
+			"stepup",
+			Some(user),
+			now,
+			Issue {
+				ttl_secs,
+				binding: Some(&binding),
+				context: Some(&context),
+			},
+		)
+		.await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(issue)
 	}
 
-	async fn redeem_stepup_code(&self, user: UserId, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError> {
+	async fn redeem_stepup_code(&self, user: UserId, binding: [u8; 32], code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let email = email_of(&mut tx, user).await?;
 		lock_email(&mut tx, &email).await?;
-		let outcome = redeem(&mut tx, &email, "stepup", Some(user), code, now).await?;
+		let outcome = redeem(&mut tx, &email, "stepup", Some(user), Some(&binding), code, now).await?;
 		// Committed whatever the outcome: a wrong guess must stay counted.
 		tx.commit().await.map_err(repo_err)?;
 		Ok(outcome)
@@ -417,20 +445,27 @@ async fn verify_spent(conn: &mut PgConnection, email: &Email, user: UserId, purp
 
 /// [`issue_in`] for a caller already holding `email`'s lock.
 async fn issue_locked(conn: &mut PgConnection, email: &Email, purpose: &str, user: Option<UserId>, now: i64) -> Result<CodeIssue, DomainError> {
-	issue_locked_with(conn, email, purpose, user, now, CODE_TTL_SECS, None).await
+	let extras = Issue {
+		ttl_secs: CODE_TTL_SECS,
+		binding: None,
+		context: None,
+	};
+	issue_locked_with(conn, email, purpose, user, now, extras).await
+}
+
+/// What a code is issued with beyond who it is for.
+struct Issue<'a> {
+	ttl_secs: i64,
+	/// The operation a step-up code is for.
+	binding: Option<&'a [u8; 32]>,
+	/// Extra fields for the mail's payload.
+	context: Option<&'a serde_json::Value>,
 }
 
 /// [`issue_locked`] with the code's lifetime and extra fields for the mail's payload. The
 /// extras never override the code or its expiry: they describe what the code is for.
-async fn issue_locked_with(
-	conn: &mut PgConnection,
-	email: &Email,
-	purpose: &str,
-	user: Option<UserId>,
-	now: i64,
-	ttl_secs: i64,
-	context: Option<&serde_json::Value>,
-) -> Result<CodeIssue, DomainError> {
+async fn issue_locked_with(conn: &mut PgConnection, email: &Email, purpose: &str, user: Option<UserId>, now: i64, extras: Issue<'_>) -> Result<CodeIssue, DomainError> {
+	let Issue { ttl_secs, binding, context } = extras;
 	// The guess cap first: it outlasts the send window, so it is the answer worth giving.
 	if let Some(user) = user {
 		let spent = verify_spent(conn, email, user, purpose, now).await?;
@@ -462,7 +497,7 @@ async fn issue_locked_with(
 	let id = Uuid::new_v4();
 	let code = six_digits();
 	let expires_at = now + ttl_secs;
-	sqlx::query("INSERT INTO email_codes (id, email, purpose, user_id, code_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+	sqlx::query("INSERT INTO email_codes (id, email, purpose, user_id, code_hash, expires_at, created_at, binding) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
 		.bind(id)
 		.bind(email.as_str())
 		.bind(purpose)
@@ -470,6 +505,7 @@ async fn issue_locked_with(
 		.bind(digest(id, &code))
 		.bind(expires_at)
 		.bind(now)
+		.bind(binding.map(|b| b.to_vec()))
 		.execute(&mut *conn)
 		.await
 		.map_err(repo_err)?;
@@ -545,7 +581,7 @@ async fn verify_with_code(conn: &mut PgConnection, user: UserId, code: &str, now
 /// [`verify_with_code`] for a caller already holding `email`'s lock and `account`'s row,
 /// with `account` on that address.
 async fn verify_locked(conn: &mut PgConnection, mut account: User, email: &Email, code: &str, now: i64) -> Result<Result<User, VerifyRefusal>, DomainError> {
-	if let Err(refusal) = redeem(conn, email, "verify", Some(account.id()), code, now).await? {
+	if let Err(refusal) = redeem(conn, email, "verify", Some(account.id()), None, code, now).await? {
 		return Ok(Err(VerifyRefusal::Code(refusal)));
 	}
 	if verified_holder(conn, email).await?.is_some_and(|holder| holder != account.id()) {

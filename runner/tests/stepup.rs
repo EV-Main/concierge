@@ -184,6 +184,7 @@ fn expect<'a>(user: &'a str, origin: &'a str, hash: &'a [u8; 32]) -> Expected<'a
 		intent_hash: hash,
 		sub: user,
 		origin,
+		methods: &[StepupMethod::Passkey, StepupMethod::EmailCode],
 	}
 }
 
@@ -542,7 +543,25 @@ async fn a_password_is_not_a_way_in() {
 			&mut who.browser,
 		)
 		.await;
-	assert!(!smuggled.status.is_success(), "an unknown field is not ignored: {:?}", smuggled.status);
+	assert_eq!(
+		(smuggled.status, smuggled.body),
+		(StatusCode::BAD_REQUEST, json!({ "error": "invalid_request" })),
+		"an unknown field is not ignored"
+	);
+	let garbage = fx
+		.wire(
+			Wire {
+				body: Some("{not json".into()),
+				..Wire::post("/auth/stepup/options", SA, json!({}))
+			},
+			&mut who.browser,
+		)
+		.await;
+	assert_eq!(
+		(garbage.status, garbage.body),
+		(StatusCode::BAD_REQUEST, json!({ "error": "invalid_request" })),
+		"a parse error is in the surface's own shape"
+	);
 	let begun = fx.begin(SA, &HASH_A, &mut who.browser).await;
 	let verify = fx
 		.stepup(
@@ -552,7 +571,7 @@ async fn a_password_is_not_a_way_in() {
 			&mut who.browser,
 		)
 		.await;
-	assert!(!verify.status.is_success());
+	assert_eq!((verify.status, verify.body), (StatusCode::BAD_REQUEST, json!({ "error": "invalid_request" })));
 	for path in ["/auth/stepup/password", "/auth/stepup/code/verify"] {
 		let missing = fx.stepup(path, SA, json!({ "password": "x" }), &mut who.browser).await;
 		assert!(matches!(missing.status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED), "{path}: {:?}", missing.status);
@@ -597,6 +616,55 @@ async fn asking_is_budgeted_per_account() {
 	assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
 	let mut stranger = enrolled(&fx, "stepup-budget-other").await;
 	assert_eq!(fx.begin(SA, &HASH_A, &mut stranger.browser).await.status, StatusCode::OK, "another account has its own");
+}
+
+#[tokio::test]
+async fn an_account_holds_at_most_three_ceremonies_and_evicts_its_own_oldest() {
+	let fx = fixture!();
+	let mut who = enrolled(&fx, "stepup-cap").await;
+	let mut other = enrolled(&fx, "stepup-cap-other").await;
+	let theirs = fx.begin(SA, &HASH_B, &mut other.browser).await;
+	let mut ceremonies = Vec::new();
+	for _ in 0..4 {
+		let begun = fx.begin(SA, &HASH_A, &mut who.browser).await;
+		assert_eq!(begun.status, StatusCode::OK, "{:?}", begun.body);
+		ceremonies.push(begun);
+	}
+	// Assertions are made up front; they need the options of their own ceremony.
+	let oldest = who.assert(SA, &ceremonies[0]);
+	let refused = fx
+		.stepup(
+			"/auth/stepup/verify",
+			SA,
+			json!({ "ceremony_id": ceremonies[0].body["ceremony_id"], "response": oldest }),
+			&mut who.browser,
+		)
+		.await;
+	assert_eq!(
+		(refused.status, refused.body),
+		(StatusCode::BAD_REQUEST, json!({ "error": "passkey_expired" })),
+		"the fourth evicted the first"
+	);
+	let newest = who.assert(SA, &ceremonies[3]);
+	let done = fx
+		.stepup(
+			"/auth/stepup/verify",
+			SA,
+			json!({ "ceremony_id": ceremonies[3].body["ceremony_id"], "response": newest }),
+			&mut who.browser,
+		)
+		.await;
+	assert_eq!(done.status, StatusCode::OK, "{:?}", done.body);
+	let theirs_response = other.assert(SA, &theirs);
+	let theirs_done = fx
+		.stepup(
+			"/auth/stepup/verify",
+			SA,
+			json!({ "ceremony_id": theirs.body["ceremony_id"], "response": theirs_response }),
+			&mut other.browser,
+		)
+		.await;
+	assert_eq!(theirs_done.status, StatusCode::OK, "another account's ceremony was not evicted");
 }
 
 mod email {
@@ -746,5 +814,47 @@ mod email {
 			.stepup("/auth/stepup/verify", SA, json!({ "ceremony_id": begun.body["ceremony_id"], "code": code }), &mut who.browser)
 			.await;
 		assert!(!right.status.is_success(), "a burned code is dead even when right");
+	}
+
+	#[tokio::test]
+	async fn a_code_mailed_for_one_operation_never_closes_the_ceremony_of_another() {
+		let fx = fixture!();
+		let mut who = enrolled(&fx, "stepup-race").await;
+		let sub = who.user.to_string();
+		// Two rounds: each spends four of the account's ten asks.
+		for round in 0..2 {
+			let (a, b) = {
+				let mut second = who.browser.clone();
+				tokio::join!(ask(&fx, &mut who, SA, &HASH_A, Some("Operation A")), async {
+					fx.stepup(
+						"/auth/stepup/options",
+						SA,
+						json!({ "intent_hash": hex(&HASH_B), "method": "email_code", "turnstile_token": "human", "summary": "Operation B" }),
+						&mut second,
+					)
+					.await
+				})
+			};
+			assert_eq!((a.status, b.status), (StatusCode::OK, StatusCode::OK), "round {round}: {:?} {:?}", a.body, b.body);
+			// The code that is live is bound to whichever operation was issued last.
+			let bound: Vec<u8> =
+				sqlx::query_scalar("SELECT binding FROM email_codes WHERE user_id = $1 AND purpose = 'stepup' AND burned_at IS NULL ORDER BY created_at DESC, id DESC LIMIT 1")
+					.bind(who.user)
+					.fetch_one(&fx.pool)
+					.await
+					.unwrap();
+			let code = mail(&fx, &who.email).await["code"].as_str().unwrap().to_owned();
+			for (ceremony, hash) in [(&a, &HASH_A), (&b, &HASH_B)] {
+				let answer = fx
+					.stepup("/auth/stepup/verify", SA, json!({ "ceremony_id": ceremony.body["ceremony_id"], "code": code }), &mut who.browser)
+					.await;
+				if answer.status == StatusCode::OK {
+					assert_eq!(bound, hash.to_vec(), "round {round}: a proof for an operation the code was not mailed for");
+					assert!(verify_stepup_proof(answer.body["proof"].as_str().unwrap(), &jwks(), ISSUER, &expect(&sub, SA, hash)).is_ok());
+				} else {
+					assert_ne!(bound, hash.to_vec(), "round {round}: the right ceremony was refused");
+				}
+			}
+		}
 	}
 }

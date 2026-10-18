@@ -1810,16 +1810,16 @@ pub trait CredentialRepository: Send + Sync {
 	/// code and wrong-guess budgets of [`CodePurpose::Reauth`] apply.
 	async fn redeem_reauth_code(&self, user: UserId, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError>;
 
-	/// Mint a step-up code that lives `ttl_secs` and queue the mail carrying it with
+	/// Mint a step-up code for the operation `binding` names, living `ttl_secs`, and queue the mail carrying it with
 	/// `context` (what the operation is, where it was asked from) beside the code. The
 	/// older code of the account, if any, is superseded. The daily code and wrong-guess
 	/// budgets of the `stepup` purpose apply.
-	async fn issue_stepup_code(&self, user: UserId, context: serde_json::Value, ttl_secs: i64, now: i64) -> Result<CodeIssue, DomainError>;
+	async fn issue_stepup_code(&self, user: UserId, binding: [u8; 32], context: serde_json::Value, ttl_secs: i64, now: i64) -> Result<CodeIssue, DomainError>;
 
 	/// Spend a step-up code mailed to the account's CURRENT address. `Ok(Ok(()))` proves
-	/// the mailbox for the operation the caller bound the code to; it changes nothing on
-	/// the account.
-	async fn redeem_stepup_code(&self, user: UserId, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError>;
+	/// the mailbox for the operation `binding` names; a code issued for another operation
+	/// is refused as missing and its guesses are untouched. It changes nothing on the account.
+	async fn redeem_stepup_code(&self, user: UserId, binding: [u8; 32], code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError>;
 
 	/// Spend a verification code and mark the account's address verified, in one
 	/// transaction.

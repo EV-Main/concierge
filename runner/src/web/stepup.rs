@@ -31,6 +31,7 @@ use std::{
 
 use axum::{
 	Extension, Json,
+	body::Bytes,
 	extract::{Request, State},
 	http::{HeaderMap, HeaderValue, Method, StatusCode, header},
 	middleware::Next,
@@ -70,6 +71,9 @@ const ATTEMPT_WINDOW_SECS: u64 = 300;
 const ATTEMPTS_PER_WINDOW: u32 = 10;
 /// Bounds the store whatever the rate; the oldest ceremony goes first.
 const MAX_CEREMONIES: usize = 10_000;
+/// How many ceremonies one account may hold open. A page that opens them in a loop evicts
+/// its own oldest, never anyone else's.
+const MAX_OPEN_PER_USER: usize = 3;
 const MAX_SUMMARY_CHARS: usize = 240;
 const MAX_AGENT_CHARS: usize = 200;
 /// How long a browser may reuse a preflight. Short: a listing withdrawn from the flag
@@ -100,12 +104,20 @@ pub fn parse_origins(raw: &[String], public_origin: &str, production: bool) -> c
 			url.origin().ascii_serialization() == entry,
 			"STEPUP_PROOF_ORIGINS entry {entry:?} is not a bare origin (scheme://host[:port], no path, no trailing slash)"
 		);
+		let host = url.host_str().unwrap_or_default();
+		let under_site = host == public_host || host.ends_with(&format!(".{public_host}"));
 		if production {
 			ensure!(url.scheme() == "https", "STEPUP_PROOF_ORIGINS entry {entry:?} must be https in production");
-			let host = url.host_str().unwrap_or_default();
-			if host != public_host && !host.ends_with(&format!(".{public_host}")) {
+			// `Url` drops a scheme's default port, so any port still there is not the default.
+			ensure!(url.port().is_none(), "STEPUP_PROOF_ORIGINS entry {entry:?} must not name a port in production");
+			if !under_site {
 				bail!("STEPUP_PROOF_ORIGINS entry {entry:?} is outside {public_host}");
 			}
+		} else {
+			// Outside production a page may run on loopback; anything else must still be the
+			// site or under it, so a mistyped host does not quietly become an allowlisted one.
+			let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
+			ensure!(under_site || loopback, "STEPUP_PROOF_ORIGINS entry {entry:?} is neither loopback nor under {public_host}");
 		}
 		if !origins.iter().any(|o| o == entry) {
 			origins.push(entry.to_owned());
@@ -175,6 +187,13 @@ impl Stepup {
 		open.retain(|_, c| c.born.elapsed() <= self.ttl);
 		if matches!(ceremony.kind, Kind::Email) {
 			open.retain(|_, c| !(c.user == ceremony.user && matches!(c.kind, Kind::Email)));
+		}
+		let mut mine: Vec<(String, Instant)> = open.iter().filter(|(_, c)| c.user == ceremony.user).map(|(k, c)| (k.clone(), c.born)).collect();
+		if mine.len() >= MAX_OPEN_PER_USER {
+			mine.sort_by_key(|(_, born)| *born);
+			for (key, _) in mine.iter().take(mine.len() + 1 - MAX_OPEN_PER_USER) {
+				open.remove(key);
+			}
 		}
 		if open.len() >= MAX_CEREMONIES
 			&& let Some(oldest) = open.iter().min_by_key(|(_, c)| c.born).map(|(k, _)| k.clone())
@@ -259,6 +278,12 @@ pub(super) async fn guard(State(st): State<WebState>, mut request: Request, next
 	response
 }
 
+/// The body, or `400 invalid_request` in this surface's own error shape — the extractor's
+/// plain-text 422 would be the one answer here a page cannot read as an error code.
+fn parse<T: serde::de::DeserializeOwned>(bytes: &Bytes) -> Result<T, Refusal> {
+	serde_json::from_slice(bytes).map_err(|_| invalid("invalid_request"))
+}
+
 fn spend(sp: &Stepup, user: UserId) -> Result<(), Refusal> {
 	match sp.attempts.check(&user.to_string()) {
 		true => Ok(()),
@@ -296,8 +321,9 @@ pub struct OptionsBody {
 }
 
 /// `POST /auth/stepup/options` — open a ceremony for one operation.
-pub async fn options(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Json(body): Json<OptionsBody>) -> Answered {
+pub async fn options(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, bytes: Bytes) -> Answered {
 	let st = &st.inner;
+	let body: OptionsBody = parse(&bytes)?;
 	let Signed { caller, user } = session(st, &jar).await?;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
@@ -326,7 +352,7 @@ pub async fn options(State(st): State<WebState>, Extension(Asked(origin)): Exten
 				});
 				let issue = st
 					.credentials
-					.issue_stepup_code(user.id(), context, sp.ttl_secs() as i64, now)
+					.issue_stepup_code(user.id(), intent_hash, context, sp.ttl_secs() as i64, now)
 					.await
 					.map_err(|e| internal("stepup: code not issued", e))?;
 				// Answers Ok only for a code that was queued; every other issue is a refusal.
@@ -394,8 +420,9 @@ pub struct VerifyBody {
 }
 
 /// `POST /auth/stepup/verify` — close the ceremony and answer the proof for its operation.
-pub async fn verify(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, Json(body): Json<VerifyBody>) -> Answered {
+pub async fn verify(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, bytes: Bytes) -> Answered {
 	let st = &st.inner;
+	let body: VerifyBody = parse(&bytes)?;
 	let Signed { caller, user } = session(st, &jar).await?;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
@@ -471,7 +498,7 @@ async fn verify_code(st: &Inner, sp: &Stepup, user: UserId, origin: &str, ceremo
 	}
 	match st
 		.credentials
-		.redeem_stepup_code(user, code, now_secs())
+		.redeem_stepup_code(user, intent_hash, code, now_secs())
 		.await
 		.map_err(|e| internal("stepup: code not redeemed", e))?
 	{
@@ -529,6 +556,8 @@ mod tests {
 			"https://elsewhere.example",
 			"invest.evinvest.ltd",
 			"https://INVEST.evinvest.ltd",
+			"https://invest.evinvest.ltd:8443",
+			"https://invest.evinvest.ltd:443",
 			"null",
 		] {
 			assert!(parse(&[bad], true).is_err(), "{bad:?} must be refused in production");
@@ -536,9 +565,15 @@ mod tests {
 	}
 
 	#[test]
-	fn outside_production_the_shape_is_still_checked_but_http_and_other_hosts_pass() {
-		assert_eq!(parse(&["http://localhost:3000"], false).unwrap(), ["http://localhost:3000"]);
-		for bad in ["*", "http://localhost:3000/", "http://localhost:3000/x"] {
+	fn outside_production_the_shape_is_still_checked_and_only_loopback_or_the_site_passes() {
+		assert_eq!(parse(&["http://localhost:3000", "http://127.0.0.1:3000", "http://sa.evinvest.ltd:3000"], false).unwrap().len(), 3);
+		for bad in [
+			"*",
+			"http://localhost:3000/",
+			"http://localhost:3000/x",
+			"https://elsewhere.example",
+			"https://evinvest.ltd.evil.example",
+		] {
 			assert!(parse(&[bad], false).is_err(), "{bad:?}");
 		}
 	}
