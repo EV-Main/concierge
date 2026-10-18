@@ -210,7 +210,7 @@ impl Stepup {
 	}
 }
 
-/// The caller's `Origin`, once [`guard`] has found it on the list.
+/// The caller's `Origin`, once `guard` has found it on the list.
 #[derive(Clone)]
 pub struct Asked(String);
 
@@ -449,7 +449,13 @@ async fn verify_passkey(st: &Inner, sp: &Stepup, jar: &CookieJar, user: UserId, 
 /// on another listed page; and an assertion made inside a cross-origin frame is refused.
 fn assert_made_on(credential: &PublicKeyCredential, origin: &str) -> Result<(), Refusal> {
 	let client_data: Value = serde_json::from_slice(credential.response.client_data_json.as_ref()).map_err(|_| rejected())?;
-	let same_page = client_data.get("origin").and_then(Value::as_str) == Some(origin);
+	// Compared as origins, as the verifier does: the software authenticator the tests drive
+	// writes the URL with a trailing slash that no browser does.
+	let same_page = client_data
+		.get("origin")
+		.and_then(Value::as_str)
+		.and_then(|claimed| Url::parse(claimed).ok())
+		.is_some_and(|claimed| claimed.origin().ascii_serialization() == origin);
 	let assertion = client_data.get("type").and_then(Value::as_str) == Some("webauthn.get");
 	let framed = client_data.get("crossOrigin").and_then(Value::as_bool).unwrap_or(false);
 	match same_page && assertion && !framed {
