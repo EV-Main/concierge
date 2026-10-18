@@ -15,7 +15,7 @@
 //! store shared by all its replicas and refuse a second presentation. This crate cannot
 //! do it for them.
 
-use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, Validation, decode, decode_header, get_current_timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::jwks::JwksCache;
@@ -82,6 +82,10 @@ pub struct Expected<'a> {
 	pub intent_hash: &'a [u8; 32],
 	pub sub: &'a str,
 	pub origin: &'a str,
+	/// The methods the bank accepts for THIS operation. A policy of the verifier, not of
+	/// the proof: a withdrawal that requires a passkey lists `[Passkey]` and a proof that
+	/// came from a mailed code is refused.
+	pub methods: &'a [StepupMethod],
 }
 
 /// Why a proof was not accepted. Callers answer all of these alike to a client.
@@ -129,8 +133,8 @@ pub fn parse_intent_hash(raw: &str) -> Option<[u8; 32]> {
 /// Verify a proof against the cached JWKS and the operation the verifier holds.
 ///
 /// Checks the signature (EdDSA, pinned), `iss`, `aud`, `exp`, `typ`, that the proof does
-/// not live longer than [`MAX_TTL_SECS`], then that `sub`, `intent_hash` and `origin`
-/// are exactly the expected ones. On success the caller still owes the replay check:
+/// not live longer than [`MAX_TTL_SECS`] nor reach past `now + MAX_TTL_SECS`, then that
+/// `sub`, `intent_hash` and `origin` are exactly the expected ones and `method` is allowed. On success the caller still owes the replay check:
 /// spend `jti` (until `exp`) in a shared store and refuse the proof if it was spent.
 pub fn verify_stepup_proof(token: &str, cache: &JwksCache, issuer: &str, expected: &Expected<'_>) -> Result<StepupClaims, StepupError> {
 	let header = decode_header(token).map_err(|_| StepupError::Invalid)?;
@@ -147,7 +151,10 @@ pub fn verify_stepup_proof(token: &str, cache: &JwksCache, issuer: &str, expecte
 	validation.leeway = LEEWAY_SECS;
 	let claims = decode::<StepupClaims>(token, key, &validation).map_err(|_| StepupError::Invalid)?.claims;
 
-	if claims.typ != TYP || claims.jti.is_empty() || claims.exp.saturating_sub(claims.iat) > MAX_TTL_SECS {
+	// A proof dated ahead of this verifier's clock, or ending later than a proof can live,
+	// was not minted by this plane's signer however well it is signed.
+	let now = get_current_timestamp();
+	if claims.typ != TYP || claims.jti.is_empty() || claims.exp.saturating_sub(claims.iat) > MAX_TTL_SECS || claims.iat > now + LEEWAY_SECS || claims.exp > now + MAX_TTL_SECS + LEEWAY_SECS {
 		return Err(StepupError::Invalid);
 	}
 	if claims.sub != expected.sub {
@@ -158,6 +165,9 @@ pub fn verify_stepup_proof(token: &str, cache: &JwksCache, issuer: &str, expecte
 	}
 	if claims.origin != expected.origin {
 		return Err(StepupError::Mismatch("origin"));
+	}
+	if !expected.methods.contains(&claims.method) {
+		return Err(StepupError::Mismatch("method"));
 	}
 	Ok(claims)
 }
@@ -219,6 +229,7 @@ mod tests {
 			intent_hash: &HASH,
 			sub: SUB,
 			origin: ORIGIN,
+			methods: &[StepupMethod::Passkey, StepupMethod::EmailCode],
 		}
 	}
 
@@ -250,6 +261,35 @@ mod tests {
 		};
 		assert_eq!(verify_stepup_proof(&token, &cache(), ISSUER, &wrong_origin).unwrap_err(), StepupError::Mismatch("origin"));
 		assert_eq!(verify_stepup_proof(&token, &cache(), "https://other.issuer", &expected()).unwrap_err(), StepupError::Invalid);
+	}
+
+	#[test]
+	fn a_method_the_bank_does_not_allow_for_the_operation_is_refused() {
+		let token = signer().mint_stepup(SUB, &HASH, StepupMethod::EmailCode, ORIGIN, 120).unwrap().token;
+		let passkey_only = Expected {
+			methods: &[StepupMethod::Passkey],
+			..expected()
+		};
+		assert_eq!(verify_stepup_proof(&token, &cache(), ISSUER, &passkey_only).unwrap_err(), StepupError::Mismatch("method"));
+		assert!(verify_stepup_proof(&proof(), &cache(), ISSUER, &passkey_only).is_ok());
+		let none = Expected { methods: &[], ..expected() };
+		assert_eq!(verify_stepup_proof(&proof(), &cache(), ISSUER, &none).unwrap_err(), StepupError::Mismatch("method"));
+	}
+
+	#[test]
+	fn a_proof_dated_ahead_of_the_clock_is_refused() {
+		let now = get_current_timestamp();
+		for (iat, ttl) in [(now + 600, 60), (now + 3600, 120), (now + LEEWAY_SECS + 30, 1)] {
+			let (token, _) = signer_token_at(iat, ttl);
+			assert_eq!(
+				verify_stepup_proof(&token, &cache(), ISSUER, &expected()).unwrap_err(),
+				StepupError::Invalid,
+				"iat {} ahead",
+				iat - now
+			);
+		}
+		let (within_skew, _) = signer_token_at(now + 2, 100);
+		assert!(verify_stepup_proof(&within_skew, &cache(), ISSUER, &expected()).is_ok(), "a little skew is tolerated");
 	}
 
 	#[test]
