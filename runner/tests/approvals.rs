@@ -2221,20 +2221,39 @@ async fn the_floor_escalates_what_the_catalog_left_out() {
 		key: "distribution".into(),
 		value: Some(Value::Flag(set)),
 	};
-	let one = propose("bank:scope_payout", vec![total("10"), recipients(1), distribution(false)]).await.unwrap().into_inner();
+	let within_budget = || ApprovalFieldValue {
+		key: "over_scope_budget".into(),
+		value: Some(Value::Flag(false)),
+	};
+	let one = propose("bank:scope_payout", vec![total("10"), recipients(1), distribution(false), within_budget()])
+		.await
+		.unwrap()
+		.into_inner();
 	assert_eq!(one.level, ApprovalLevel::Scope as i32);
-	let many = propose("bank:scope_payout", vec![total("10"), recipients(2), distribution(false)]).await.unwrap().into_inner();
+	let many = propose("bank:scope_payout", vec![total("10"), recipients(2), distribution(false), within_budget()])
+		.await
+		.unwrap()
+		.into_inner();
 	assert_eq!(many.level, ApprovalLevel::Platform as i32);
 	assert!(many.escalated_by.contains(&"floor_recipients".to_owned()), "{:?}", many.escalated_by);
-	let split = propose("bank:scope_payout", vec![total("10"), recipients(1), distribution(false)]).await.unwrap().into_inner();
+	let split = propose("bank:scope_payout", vec![total("10"), recipients(1), distribution(false), within_budget()])
+		.await
+		.unwrap()
+		.into_inner();
 	assert_eq!(
 		split.escalated_by,
 		vec!["floor_daily_recipients".to_owned()],
 		"a second single-recipient payout the same day is a split distribution"
 	);
-	let nobody = propose("bank:scope_payout", vec![total("10"), recipients(0), distribution(false)]).await.unwrap().into_inner();
+	let nobody = propose("bank:scope_payout", vec![total("10"), recipients(0), distribution(false), within_budget()])
+		.await
+		.unwrap()
+		.into_inner();
 	assert!(nobody.escalated_by.contains(&"floor_no_recipients".to_owned()), "{:?}", nobody.escalated_by);
-	let dividend = propose("bank:scope_payout", vec![total("10"), recipients(1), distribution(true)]).await.unwrap().into_inner();
+	let dividend = propose("bank:scope_payout", vec![total("10"), recipients(1), distribution(true), within_budget()])
+		.await
+		.unwrap()
+		.into_inner();
 	assert!(dividend.escalated_by.contains(&"floor_distribution".to_owned()), "{:?}", dividend.escalated_by);
 }
 
@@ -2246,6 +2265,7 @@ fn payout_spec() -> ApprovalKindSpec {
 			spec("total", ApprovalFieldType::Amount),
 			spec("recipients", ApprovalFieldType::Count),
 			spec("distribution", ApprovalFieldType::Flag),
+			spec("over_scope_budget", ApprovalFieldType::Flag),
 		],
 		vec![],
 	)

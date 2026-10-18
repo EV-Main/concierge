@@ -124,7 +124,7 @@ mod parity {
 		claims.jti = None;
 		let value = serde_json::to_value(&claims).unwrap();
 		assert!(value.get("jti").is_none(), "jti must be skipped when None to stay byte-compatible");
-		assert_eq!(keys(&value), ["aud", "exp", "iat", "iss", "sub", "token_version", "typ"]);
+		assert_eq!(keys(&value), ["aud", "auth_time", "exp", "iat", "iss", "sub", "token_version", "typ"]);
 	}
 
 	#[test]
