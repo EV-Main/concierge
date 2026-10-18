@@ -158,6 +158,25 @@ impl CredentialRepository for PgCredentials {
 		Ok(outcome)
 	}
 
+	async fn issue_stepup_code(&self, user: UserId, context: serde_json::Value, ttl_secs: i64, now: i64) -> Result<CodeIssue, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let email = email_of(&mut tx, user).await?;
+		lock_email(&mut tx, &email).await?;
+		let issue = issue_locked_with(&mut tx, &email, "stepup", Some(user), now, ttl_secs, Some(&context)).await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(issue)
+	}
+
+	async fn redeem_stepup_code(&self, user: UserId, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let email = email_of(&mut tx, user).await?;
+		lock_email(&mut tx, &email).await?;
+		let outcome = redeem(&mut tx, &email, "stepup", Some(user), code, now).await?;
+		// Committed whatever the outcome: a wrong guess must stay counted.
+		tx.commit().await.map_err(repo_err)?;
+		Ok(outcome)
+	}
+
 	async fn verify_email(&self, user: UserId, code: &str, now: i64) -> Result<Result<User, VerifyRefusal>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let outcome = verify_with_code(&mut tx, user, code, now).await?;
@@ -398,6 +417,20 @@ async fn verify_spent(conn: &mut PgConnection, email: &Email, user: UserId, purp
 
 /// [`issue_in`] for a caller already holding `email`'s lock.
 async fn issue_locked(conn: &mut PgConnection, email: &Email, purpose: &str, user: Option<UserId>, now: i64) -> Result<CodeIssue, DomainError> {
+	issue_locked_with(conn, email, purpose, user, now, CODE_TTL_SECS, None).await
+}
+
+/// [`issue_locked`] with the code's lifetime and extra fields for the mail's payload. The
+/// extras never override the code or its expiry: they describe what the code is for.
+async fn issue_locked_with(
+	conn: &mut PgConnection,
+	email: &Email,
+	purpose: &str,
+	user: Option<UserId>,
+	now: i64,
+	ttl_secs: i64,
+	context: Option<&serde_json::Value>,
+) -> Result<CodeIssue, DomainError> {
 	// The guess cap first: it outlasts the send window, so it is the answer worth giving.
 	if let Some(user) = user {
 		let spent = verify_spent(conn, email, user, purpose, now).await?;
@@ -428,7 +461,7 @@ async fn issue_locked(conn: &mut PgConnection, email: &Email, purpose: &str, use
 		.map_err(repo_err)?;
 	let id = Uuid::new_v4();
 	let code = six_digits();
-	let expires_at = now + CODE_TTL_SECS;
+	let expires_at = now + ttl_secs;
 	sqlx::query("INSERT INTO email_codes (id, email, purpose, user_id, code_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
 		.bind(id)
 		.bind(email.as_str())
@@ -443,11 +476,21 @@ async fn issue_locked(conn: &mut PgConnection, email: &Email, purpose: &str, use
 	sqlx::query("INSERT INTO notification_deliveries (kind, recipient, dedupe_key, payload) VALUES ('email_code', $1, $2, $3)")
 		.bind(email.as_str())
 		.bind(format!("email_code:{id}"))
-		.bind(serde_json::json!({ "purpose": purpose, "code": code, "expires_at": expires_at }))
+		.bind(delivery_payload(purpose, &code, expires_at, context))
 		.execute(&mut *conn)
 		.await
 		.map_err(repo_err)?;
 	Ok(CodeIssue::Sent)
+}
+
+/// The `email_code` delivery's payload: the context first, so a context key can never
+/// replace the three that make it a code.
+fn delivery_payload(purpose: &str, code: &str, expires_at: i64, context: Option<&serde_json::Value>) -> serde_json::Value {
+	let mut payload = context.and_then(|c| c.as_object().cloned()).unwrap_or_default();
+	payload.insert("purpose".into(), purpose.into());
+	payload.insert("code".into(), code.into());
+	payload.insert("expires_at".into(), expires_at.into());
+	serde_json::Value::Object(payload)
 }
 
 /// The account a sign-up ticket still speaks for, with its address, or `None`. The
