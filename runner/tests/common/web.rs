@@ -26,11 +26,17 @@ pub struct Surface {
 }
 
 pub async fn surface() -> Option<Surface> {
+	surface_with_stepup(None).await
+}
+
+/// [`surface`] with `/auth/stepup/*` mounted for `stepup`'s origins.
+pub async fn surface_with_stepup(stepup: Option<web::stepup::StepupDeps>) -> Option<Surface> {
 	let url = super::database_url()?;
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let mut sign_in = super::sign_in_with_turnstile(&pool, &super::stub_turnstile().await);
+	sign_in.stepup = stepup;
 	sign_in.allowlist = Arc::new(SignInAllowlist::live(Arc::new(PgScopes::new(pool.clone())), ORIGIN).await.expect("read the scope registry"));
 	let state = web::WebState::try_new(
 		super::signing_auth(users.clone()).await,

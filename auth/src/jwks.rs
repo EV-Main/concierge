@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use evconcierge_contracts::concierge::v1::Jwk;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 
 use crate::{AuthError, Claims, claims::TokenType};
@@ -36,6 +37,17 @@ impl JwksCache {
 	/// Replace the entire key set atomically (used by a JWKS refresh).
 	pub fn replace(&mut self, keys: HashMap<String, DecodingKey>) {
 		self.keys = keys;
+	}
+
+	/// The cache the `Jwks` RPC's answer makes: only Ed25519 (OKP) keys are signing keys
+	/// of this plane, and a key that does not parse is an error rather than a silent gap.
+	pub fn from_wire(keys: &[Jwk]) -> Result<Self, AuthError> {
+		let mut cache = Self::new();
+		for jwk in keys.iter().filter(|k| k.kty == "OKP" && k.crv == "Ed25519") {
+			let key = DecodingKey::from_ed_components(&jwk.x).map_err(|e| AuthError::JwksFetch(format!("bad Ed25519 key {}: {e}", jwk.kid)))?;
+			cache.insert(jwk.kid.clone(), key);
+		}
+		Ok(cache)
 	}
 
 	pub fn is_empty(&self) -> bool {

@@ -132,6 +132,7 @@ pub fn sign_in_with_turnstile(pool: &sqlx::PgPool, turnstile: &str) -> concierge
 			concierge::web::allowlist::SignInAllowlist::fixed(WEBAUTHN_ORIGIN, concierge::web::origins::ScopeOrigins::none()).expect("a test origin is a relying party"),
 		),
 		subscribe_limiter: std::sync::Arc::new(concierge::notification::RateLimiter::new(std::time::Duration::from_secs(3600), SUBSCRIBES_PER_HOUR)),
+		stepup: None,
 	}
 }
 

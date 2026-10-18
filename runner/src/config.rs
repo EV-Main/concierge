@@ -116,6 +116,11 @@ ev::settings! {
 		/// locked out a little past the deadline — while polling harder buys nothing: the
 		/// deadline is a day away and the query is one index scan.
 		hold_sweep_interval_secs: u64 = "60",
+		/// The exact origins of pages that may ask `/auth/stepup/*` to confirm one operation
+		/// of the money plane (comma-separated, e.g. `https://invest.evinvest.ltd`). Empty ⇒
+		/// the routes are not mounted and answer 404. In production each must be an `https`
+		/// origin that is `PUBLIC_ORIGIN` or a host under it, with no path and no pattern.
+		stepup_proof_origins: Vec<String> = "",
 		/// Account-less subscribe attempts allowed per client IP per window.
 		subscribe_rate_limit: u32 = "5",
 		subscribe_rate_window_secs: u64 = "3600",

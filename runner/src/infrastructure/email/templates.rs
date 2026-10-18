@@ -944,6 +944,62 @@ pub fn reauth_code(code: &str, expires_at: i64) -> RenderedEmail {
 	}
 }
 
+/// What a step-up mail says about the operation. `origin`, the time, the address and the
+/// browser are what THIS plane saw; `summary` is only what the page said, and the mail
+/// labels it that way — a script on a hijacked page chooses it freely.
+pub struct StepupMail<'a> {
+	pub code: &'a str,
+	pub expires_at: i64,
+	pub origin: &'a str,
+	pub summary: &'a str,
+	/// The first characters of the operation's hash: lets the person match the mail to the
+	/// page that shows the same reference.
+	pub reference: &'a str,
+	pub client_ip: &'a str,
+	pub user_agent: &'a str,
+	pub requested_at: i64,
+}
+
+/// The code that confirms ONE operation from a page of ours, with that operation's details
+/// beside it. It exists so a person who is asked for the code can see WHAT they are
+/// confirming and WHERE it was asked from, without trusting the page to say so.
+pub fn stepup_code(mail: &StepupMail<'_>) -> RenderedEmail {
+	let title = "Confirm an operation with your money";
+	let ask = "Enter this code on the page where you were asked to confirm it, only if the details below are what you intended.";
+	let warn = "If this was not you, do not share the code: change your sign-in methods and sign out of other sessions now.";
+	let origin = one_line(mail.origin);
+	let summary = one_line(mail.summary);
+	let reference = one_line(mail.reference);
+	let ip = one_line(mail.client_ip);
+	let agent = one_line(mail.user_agent);
+	let requested = fmt_ts_utc(mail.requested_at);
+	let rows = [
+		("Asked from", origin.clone()),
+		("Reference", reference.clone()),
+		("Time", requested.clone()),
+		("Address", ip.clone()),
+		("Browser", agent.clone()),
+	];
+	let label = format!("As described by {origin} (not checked by EV Investment)");
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Account"));
+	inner.push_str(&heading(title));
+	inner.push_str(&paragraph(ask));
+	inner.push_str(&detail_box(&rows));
+	inner.push_str(&labelled_note(&label, &summary));
+	inner.push_str(&code_panel(mail.code));
+	inner.push_str(&paragraph(&format!("It works once, until {}. {warn}", fmt_ts_utc(mail.expires_at))));
+	RenderedEmail {
+		subject: format!("{} confirms an operation on your EV Investment account", mail.code),
+		html: shell(title, &card(&inner), FOOTER_CODE, "", "Account"),
+		text: format!(
+			"{title}\n\n{ask}\n\nAsked from: {origin}\nReference: {reference}\nTime: {requested}\nAddress: {ip}\nBrowser: {agent}\n\n{label}:\n{summary}\n\nYour code: {}\n\nIt works once, until {}. {warn}\n\n—\n{FOOTER_CODE}\n",
+			mail.code,
+			fmt_ts_utc(mail.expires_at)
+		),
+	}
+}
+
 const FOOTER_CODE: &str = "You received this because this address was entered on evinvest.ltd. EV Investment never asks for this code by phone, chat or email.";
 
 const FOOTER_SECURITY: &str =
@@ -1009,9 +1065,14 @@ pub(crate) fn breaks_or_hides(c: char) -> bool {
 /// types freely, and a reader who cannot tell it from the platform's own copy is a reader
 /// who can be told anything ("EV Investment has verified this recipient") in our voice.
 fn initiator_note(text: &str) -> String {
+	labelled_note(INITIATOR_NOTE_LABEL, text)
+}
+
+/// [`initiator_note`] under a label that names whose words these are.
+fn labelled_note(label: &str, text: &str) -> String {
 	format!(
 		r#"<p style="margin:0 0 4px;font-family:{SANS};font-size:11px;line-height:15px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:{MUTED};">{}</p><p style="margin:0 0 14px;padding:12px 14px;background:{BLACK};border-left:3px solid {HAIR};border-radius:0 8px 8px 0;font-family:{SANS};font-size:14px;line-height:22px;color:{MIST};">{}</p>"#,
-		esc(INITIATOR_NOTE_LABEL),
+		esc(label),
 		esc(text)
 	)
 }
@@ -1460,9 +1521,42 @@ pub(crate) fn fmt_ts(ts: i64) -> String {
 	format!("{} {month} {}", dt.day(), dt.year())
 }
 
+/// [`fmt_ts`] with the minute, for a code that lives two of them.
+fn fmt_ts_utc(ts: i64) -> String {
+	match time::OffsetDateTime::from_unix_timestamp(ts) {
+		Ok(dt) => format!("{}, {:02}:{:02} UTC", fmt_ts(ts), dt.hour(), dt.minute()),
+		Err(_) => "—".to_owned(),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn a_step_up_mail_separates_what_we_saw_from_what_the_page_said() {
+		let mail = stepup_code(&StepupMail {
+			code: "123456",
+			expires_at: 1_790_000_120,
+			origin: "https://invest.evinvest.ltd",
+			summary: "Send 5 USDT <b>to</b> 0xabc\nTime: forged",
+			reference: "9f2c1ab3",
+			client_ip: "203.0.113.9",
+			user_agent: "Mozilla/5.0",
+			requested_at: 1_790_000_000,
+		});
+		assert!(mail.text.contains("Asked from: https://invest.evinvest.ltd"));
+		assert!(
+			mail.text
+				.contains("As described by https://invest.evinvest.ltd (not checked by EV Investment):\nSend 5 USDT <b>to</b> 0xabc Time: forged"),
+			"{}",
+			mail.text
+		);
+		assert!(!mail.text.contains("\nTime: forged"), "a newline in the summary cannot forge a line of ours");
+		assert!(mail.html.contains("&lt;b&gt;to&lt;/b&gt;"), "markup in the summary is escaped");
+		assert!(mail.text.contains("Reference: 9f2c1ab3") && mail.text.contains("Address: 203.0.113.9"));
+		assert!(!mail.subject.contains("Send 5"), "the page's words never reach the subject");
+		assert!(mail.subject.starts_with("123456 "));
+	}
 
 	const LONG_ADDRESS: &str = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
 
