@@ -38,6 +38,7 @@ pub mod jwks;
 pub mod provisioner;
 pub mod service;
 pub mod service_token;
+pub mod stepup;
 pub mod telemetry;
 pub mod verifier;
 

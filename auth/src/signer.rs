@@ -20,6 +20,7 @@ use crate::{
 	claims::TokenType,
 	config::{AuthConfig, SigningConfig},
 	jwks::JwksCache,
+	stepup::{self, StepupClaims, StepupMethod, StepupProof},
 };
 
 /// The ceiling on a relying party's access-token lifetime, whatever `AUTH_ACCESS_TTL_SECS`
@@ -110,6 +111,34 @@ impl Signer {
 	pub fn mint_client_access(&self, user_id: &str, audience: &str, token_version: u64, session_id: &str) -> Result<(String, u64), AuthError> {
 		let ttl = self.access_ttl_secs.min(MAX_CLIENT_ACCESS_TTL_SECS);
 		self.mint_with_jti(user_id, audience, TokenType::Access, ttl, token_version, format!("{session_id}:{}", uuid::Uuid::new_v4()), None)
+	}
+
+	/// Mint a step-up proof (`crate::stepup`): `typ=stepup` under the BFF's audience, for
+	/// one account, one operation and one page, living `ttl_secs` (never past
+	/// [`stepup::MAX_TTL_SECS`]).
+	pub fn mint_stepup(&self, sub: &str, intent_hash: &[u8; 32], method: StepupMethod, origin: &str, ttl_secs: u64) -> Result<StepupProof, AuthError> {
+		self.mint_stepup_at(get_current_timestamp(), sub, intent_hash, method, origin, ttl_secs)
+	}
+
+	fn mint_stepup_at(&self, now: u64, sub: &str, intent_hash: &[u8; 32], method: StepupMethod, origin: &str, ttl_secs: u64) -> Result<StepupProof, AuthError> {
+		let claims = StepupClaims {
+			sub: sub.to_owned(),
+			iss: self.issuer.clone(),
+			aud: stepup::AUDIENCE.to_owned(),
+			exp: now + ttl_secs.min(stepup::MAX_TTL_SECS),
+			iat: now,
+			typ: stepup::TYP.to_owned(),
+			intent_hash: stepup::hex32(intent_hash),
+			method,
+			origin: origin.to_owned(),
+			jti: uuid::Uuid::new_v4().to_string(),
+		};
+		let token = encode(&self.header(), &claims, &self.encoding).map_err(|_| AuthError::NotConfigured)?;
+		Ok(StepupProof {
+			token,
+			jti: claims.jti,
+			exp: claims.exp,
+		})
 	}
 
 	/// Mint an inter-service token for `service_name`. Returns `(token, exp_unix_secs)`.
