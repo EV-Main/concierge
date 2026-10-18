@@ -1,48 +1,44 @@
 import { useT } from "@evinvest/i18n/react";
 import { Button, ListRow } from "@evinvest/uikit";
-import { useState } from "react";
 
-import type { AuthAnswer } from "../../../shared/api/auth-api";
 import { useElement } from "../../../shared/element/element-context";
 import { passkeysSupported } from "../../../shared/lib/webauthn";
 import { addPasskey, removePasskey, type SignInMethods } from "../api/methods-api";
+import { reauthMethods } from "../model/reauth";
+import { useReauthGate } from "../model/use-reauth-gate";
+import { ReauthReady } from "./reauth-ready";
+import { ReauthStep } from "./reauth-step";
 import { refusal } from "./refusal";
 
 export function Passkeys({ methods, onChanged }: { methods: SignInMethods; onChanged: () => void }) {
   const t = useT();
   const { api } = useElement();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function act(action: () => Promise<AuthAnswer<true>>) {
-    setBusy(true);
-    setError(null);
-    const answer = await action();
-    setBusy(false);
-    if (answer.ok) onChanged();
-    else setError(refusal(t, answer.error));
-  }
+  const gate = useReauthGate(onChanged);
+  const locked = gate.busy || gate.stage !== "idle";
 
   const name = () => `${t("auth.passkeys.default", "Passkey")} · ${new Date().toLocaleDateString()}`;
+  const confirmWith = reauthMethods({ emailVerified: methods.emailVerified, password: methods.password, passkeys: methods.passkeys.length }, passkeysSupported());
   return (
     <>
       <ListRow label={t("auth.passkeys.title", "Passkeys")} description={t("auth.passkeys.sub", "Sign in with your fingerprint, face or screen lock — no code, no password")}>
         {passkeysSupported() && (
-          <Button variant="outline" size="sm" disabled={busy} onClick={() => void act(() => addPasskey(api, name()))}>
+          <Button variant="outline" size="sm" disabled={locked} onClick={() => void gate.start({ run: () => addPasskey(api, name()), gesture: true })}>
             {t("auth.passkeys.add", "Add a passkey")}
           </Button>
         )}
       </ListRow>
       {methods.passkeys.map((passkey) => (
         <ListRow key={passkey.id} label={passkey.name}>
-          <Button variant="outline" size="sm" disabled={busy} onClick={() => void act(() => removePasskey(api, passkey.id))}>
+          <Button variant="outline" size="sm" disabled={locked} onClick={() => void gate.start({ run: () => removePasskey(api, passkey.id), gesture: false })}>
             {t("auth.passkeys.remove", "Remove")}
           </Button>
         </ListRow>
       ))}
-      {error && (
+      {gate.stage === "confirm" && <ReauthStep methods={confirmWith} onConfirmed={gate.confirmed} onCancel={gate.cancel} />}
+      {gate.stage === "ready" && <ReauthReady busy={gate.busy} onProceed={gate.proceed} onCancel={gate.cancel} />}
+      {gate.error && (
         <li role="alert" className="list-none py-3 text-xs text-accent-error">
-          {error}
+          {refusal(t, gate.error)}
         </li>
       )}
     </>
