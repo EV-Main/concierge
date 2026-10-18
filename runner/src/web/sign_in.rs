@@ -234,6 +234,12 @@ pub(super) async fn signed_in_read(st: &super::Inner, jar: &CookieJar) -> Result
 /// session, and a credential planted in that window would outlive the revocation.
 pub(super) async fn signed_in_live(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<Signed, Halt> {
 	let signed = signed_in(st, jar, headers).await?;
+	require_live(st, jar, signed).await
+}
+
+/// The refresh-family half of [`signed_in_live`], for a route that cannot carry the CSRF
+/// token and so reads the session as [`signed_in_read`] does.
+pub(super) async fn require_live(st: &super::Inner, jar: &CookieJar, signed: Signed) -> Result<Signed, Halt> {
 	let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_owned()) else {
 		return Err(unauthenticated().into());
 	};

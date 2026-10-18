@@ -103,7 +103,7 @@ async fn moved(st: &Inner, jar: CookieJar, user: UserId) -> (CookieJar, Result<J
 
 /// Mailing a code to the address costs us and proves the mailbox only when the address is
 /// the account's verified one.
-fn verified_address(user: &domain::users::User) -> Result<(), Refusal> {
+pub(super) fn verified_address(user: &domain::users::User) -> Result<(), Refusal> {
 	match user.email_verified() {
 		true => Ok(()),
 		false => Err(Refusal::new(StatusCode::FORBIDDEN, "email_unverified")),
@@ -211,7 +211,7 @@ pub async fn password(State(st): State<WebState>, jar: CookieJar, headers: Heade
 /// during the session proves nothing about who holds it: a stolen session could add one
 /// and then "re-authenticate" with it. Registration also wants a fresh `auth_time`, but
 /// this is the half that holds when that window is open.
-async fn eligible_passkeys(st: &Inner, jar: &CookieJar, id: UserId) -> Result<Vec<PasskeyRow>, Refusal> {
+pub(super) async fn eligible_passkeys(st: &Inner, jar: &CookieJar, id: UserId) -> Result<Vec<PasskeyRow>, Refusal> {
 	let refresh = refresh_of(st, jar)
 		.await
 		.map_err(|_| internal("reauth: session store failed", "unavailable"))?

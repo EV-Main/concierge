@@ -37,6 +37,7 @@ mod session;
 mod sign_in;
 mod signup;
 mod single_flight;
+pub mod stepup;
 mod turnstile;
 
 // The one session-store name tests exercise the persistence invariant through.
@@ -45,6 +46,7 @@ use std::sync::Arc;
 use axum::{
 	Router,
 	http::Method,
+	middleware,
 	routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
@@ -137,6 +139,7 @@ impl WebState {
 		kyc: KycDeps,
 		relying_parties: Option<Arc<RelyingParties>>,
 	) -> color_eyre::Result<Self> {
+		let stepup = sign_in.stepup.map(|deps| stepup::Stepup::new(deps, &public_origin)).transpose()?;
 		Ok(Self {
 			inner: Arc::new(Inner {
 				auth,
@@ -154,6 +157,7 @@ impl WebState {
 				passkey_reauths: Ceremonies::default(),
 				reauth_attempts: RateLimiter::new(std::time::Duration::from_secs(reauth::WINDOW_SECS), reauth::ATTEMPTS_PER_WINDOW),
 				subscribe_limiter: sign_in.subscribe_limiter,
+				stepup,
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
@@ -183,6 +187,9 @@ pub struct SignInDeps {
 	/// The per-IP budget of the account-less subscribe: the SAME limiter
 	/// `NotificationService.SubscribeAnonymous` spends, so the two doors share one budget.
 	pub subscribe_limiter: Arc<RateLimiter>,
+	/// `None` ⇒ `/auth/stepup/*` is not mounted and answers 404 (`STEPUP_PROOF_ORIGINS`
+	/// unset): a host page can ask for nothing.
+	pub stepup: Option<stepup::StepupDeps>,
 }
 
 /// What the identity-verification routes need, gathered so the composition root hands
@@ -235,9 +242,22 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/notifications/subscribe", post(notifications::subscribe))
 		.layer(cors::layer(allowlist.clone(), Method::POST));
 	let scope_reads = Router::new().route("/auth/session", get(routes::session)).layer(cors::layer(allowlist, Method::GET));
+	// Step-up for a page of a trusted host: mounted only where `STEPUP_PROOF_ORIGINS` names
+	// an origin, with its own CORS layer over that exact list and a guard for what a
+	// preflight cannot settle (`web::stepup`). `.layer` for the same reason as above: the
+	// preflight of a POST route must reach the CORS layer.
+	let stepup_posts = match state.inner.stepup.as_ref() {
+		Some(stepup) => Router::new()
+			.route("/auth/stepup/options", post(stepup::options))
+			.route("/auth/stepup/verify", post(stepup::verify))
+			.layer(middleware::from_fn_with_state(state.clone(), stepup::guard))
+			.layer(stepup.cors()),
+		None => Router::new(),
+	};
 	Router::new()
 		.merge(scope_posts)
 		.merge(scope_reads)
+		.merge(stepup_posts)
 		// k8s liveness/readiness probe target.
 		.route("/health", get(|| async { "ok" }))
 		.route("/auth/login", get(routes::login))
@@ -330,6 +350,7 @@ struct Inner {
 	/// Per client address, in process: a replica's own ceremony store is what it protects.
 	passkey_sign_in_starts: RateLimiter,
 	subscribe_limiter: Arc<RateLimiter>,
+	stepup: Option<stepup::Stepup>,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
 	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/<provider>`.
 	public_origin: String,
