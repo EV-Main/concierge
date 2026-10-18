@@ -27,6 +27,22 @@ fn with_database(url: &str, name: &str) -> String {
 
 #[tokio::test]
 async fn a_production_boot_with_a_test_turnstile_secret_leaves_the_database_untouched() {
+	refused_boot(TEST_TURNSTILE_SECRET, None, "TURNSTILE_SECRET").await;
+}
+
+#[tokio::test]
+async fn a_production_boot_with_a_step_up_origin_outside_the_site_leaves_the_database_untouched() {
+	refused_boot("a-real-looking-turnstile-secret", Some("https://evinvest.test.evil.example"), "STEPUP_PROOF_ORIGINS").await;
+}
+
+#[tokio::test]
+async fn a_production_boot_with_a_step_up_pattern_leaves_the_database_untouched() {
+	refused_boot("a-real-looking-turnstile-secret", Some("https://*.evinvest.test"), "STEPUP_PROOF_ORIGINS").await;
+}
+
+/// Boot the binary as production with one invalid setting and assert it refuses, naming
+/// `expected`, before migrating anything.
+async fn refused_boot(turnstile_secret: &str, stepup_origins: Option<&str>, expected: &str) {
 	let Some(url) = common::database_url() else { return };
 	let name = format!("concierge_boot_{}", uuid::Uuid::new_v4().simple());
 	let mut admin = PgConnection::connect(&url).await.expect("connect to Postgres");
@@ -50,7 +66,8 @@ async fn a_production_boot_with_a_test_turnstile_secret_leaves_the_database_unto
 			("SMTP_HOST", "127.0.0.1"),
 			("SMTP_USERNAME", "boot"),
 			("SMTP_PASSWORD", "boot"),
-			("TURNSTILE_SECRET", TEST_TURNSTILE_SECRET),
+			("TURNSTILE_SECRET", turnstile_secret),
+			("STEPUP_PROOF_ORIGINS", stepup_origins.unwrap_or_default()),
 			("AUTH_SIGNING_KEY_PEM", "unused: refused before it is parsed"),
 			("AUTH_SIGNING_KID", "boot"),
 			("AUTH_JWKS_JSON", r#"{"keys":[]}"#),
@@ -75,6 +92,6 @@ async fn a_production_boot_with_a_test_turnstile_secret_leaves_the_database_unto
 		.expect("drop the scratch database");
 
 	assert!(!output.status.success(), "the boot is refused: {stderr}");
-	assert!(stderr.contains("TURNSTILE_SECRET"), "refused for the test secret, not for something else: {stderr}");
+	assert!(stderr.contains(expected), "refused for {expected}, not for something else: {stderr}");
 	assert!(!migrated, "nothing was migrated before the refusal: {stderr}");
 }
