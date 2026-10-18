@@ -151,11 +151,53 @@ async fn the_page_carries_the_sessions_token_and_never_one_from_the_link() {
 	assert_eq!(shown.hidden("return_to"), invest_landing());
 	assert!(!shown.html.contains("attacker-chosen"));
 	let csp = shown.headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
-	assert!(csp.starts_with("default-src 'none'; form-action 'self'") && csp.contains("frame-ancestors 'none'"), "{csp}");
+	assert!(
+		csp.starts_with("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'") && csp.contains("frame-ancestors 'none'"),
+		"{csp}"
+	);
 	assert_eq!(shown.headers[header::X_FRAME_OPTIONS], "DENY");
 	assert_eq!(shown.headers[header::CACHE_CONTROL], "no-store");
 	assert!(!shown.html.contains("<script") && !shown.html.contains("src="), "the page loads nothing");
+	assert!(!csp.contains("script-src") && !csp.contains("img-src"), "only styles are opened up: {csp}");
+	assert!(shown.html.contains("<form method=\"post\" action=\"/api/auth/logout/confirm\">") && shown.html.contains("<button type=\"submit\">Sign out</button>"));
+	assert!(shown.html.contains("<style>") && shown.html.contains("EV Investment"), "the page is styled and named");
+	assert!(
+		shown.html.contains(&format!("<a href=\"{}\">Cancel</a>", invest_landing())),
+		"Cancel goes back to the checked return_to"
+	);
 	assert!(authenticated(&fx, &mut browser).await, "showing the page signs nobody out");
+}
+
+#[tokio::test]
+async fn a_hostile_return_to_never_reaches_the_markup_unescaped() {
+	let fx = fixture!();
+	let mut browser = signed_in(&fx).await;
+	let hostile = format!("{ORIGIN}/cabinet?x=\"><script>alert(1)</script>");
+	let shown = page(&fx, &hostile, &mut browser).await;
+	if shown.status == StatusCode::OK {
+		assert!(!shown.html.contains("<script"), "{}", shown.html);
+		assert!(shown.html.contains("x=&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"), "escaped, not dropped: {}", shown.html);
+	} else {
+		assert_eq!(shown.status, StatusCode::BAD_REQUEST, "refused outright is as good");
+		assert!(!shown.html.contains("alert(1)"));
+	}
+}
+
+#[tokio::test]
+async fn the_page_follows_accept_language() {
+	let fx = fixture!();
+	let mut browser = signed_in(&fx).await;
+	let uri = format!("/auth/logout/confirm?{}", query(&[("return_to", &invest_landing())]));
+	for (asked, lang, button) in [("ru-RU,ru;q=0.9,en;q=0.5", "ru", "Выйти"), ("de", "de", "Abmelden"), ("ja", "en", "Sign out")] {
+		let request = Request::builder().method(Method::GET).uri(&uri).header(header::ACCEPT_LANGUAGE, asked);
+		let shown = send(&fx, request, Body::empty(), &mut browser).await;
+		assert!(
+			shown.html.contains(&format!("<html lang=\"{lang}\"")) && shown.html.contains(&format!(">{button}</button>")),
+			"{asked}: {}",
+			shown.html
+		);
+		assert_eq!(shown.headers[header::VARY], "accept-language");
+	}
 }
 
 #[tokio::test]

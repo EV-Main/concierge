@@ -137,8 +137,11 @@ They widen CORS for a **closed list** of sign-in routes and nothing else:
 Signing out on a scope host ends the `evinvest.ltd` session too when the host sends the
 browser — a top-level navigation, not a call — to
 `https://evinvest.ltd/api/auth/logout/confirm?return_to=<scope origin + one of its return
-paths>`. That is a page on this origin with one button; the button's form carries the
-session's CSRF token and comes back with a 303 to `return_to`. Without a session the page
+paths>`. That is a page on this origin, styled in the platform palette and localized from
+`Accept-Language` (en, ru, de, fr, vi), with one button and a Cancel link back to the
+checked `return_to`; the button's form carries the session's CSRF token and comes back
+with a 303 to `return_to`. Its CSP opens `style-src 'unsafe-inline'` for the page's own
+`<style>` and nothing else. Without a session the page
 answers the 303 at once.
 
 **Every scope whose hosts mount the account chip or the account page lists `/` in its
