@@ -115,6 +115,17 @@
             };
         # Where the bundles sit inside the image; WEB_MFE_DIR below points here.
         webMfeDir = "/share/concierge/web";
+        # The image is joined with lndir, which links every FILE of a real directory
+        # separately, so putting webMfe in `contents` made /share/concierge/web a plain
+        # directory of per-file links into /nix/store. mfe.rs canonicalises each served
+        # file and rejects any that leaves canonical(WEB_MFE_DIR) (traversal guard), so
+        # every bundle 404ed. One symlink to the whole store directory is kept as a
+        # symlink by lndir: canonical(WEB_MFE_DIR) becomes the store directory itself and
+        # the files really are inside it.
+        webMfeRoot = pkgs.runCommand "concierge-web-root" { } ''
+          mkdir -p $out/share/concierge
+          ln -s ${webMfe}/share/concierge/web $out${webMfeDir}
+        '';
 
         # ONE container: the runner binary serves gRPC (:55670), the auth web
         # surface (:55671) AND the bridge seams over TLS (:55672) in-process. The
@@ -131,7 +142,7 @@
             healthPath = "/health";
             criticality = "normal";
             entrypoint = [ "/bin/concierge" ];
-            contents = [ conciergeBin ] ++ pkgs.lib.optional hasWeb webMfe;
+            contents = [ conciergeBin ] ++ pkgs.lib.optional hasWeb webMfeRoot;
             env = {
               DATABASE_URL = "postgres://evinvest@10.42.0.1:5432/concierge";
               REDIS_URL = "redis://10.42.0.1:6379/1";
@@ -372,6 +383,21 @@
         } // pkgs.lib.optionalAttrs hasWeb { web = webMfe; } // containerStd.packages;
 
         containers = containerStd.containers;
+
+        # Guards the image layout, not the bundle: the root must hold the bundles behind
+        # ONE symlink and every file must canonicalise inside it, as mfe.rs requires.
+        checks = pkgs.lib.optionalAttrs hasWeb {
+          web-root = pkgs.runCommand "concierge-web-root-check" { } ''
+            root=${webMfeRoot}${webMfeDir}
+            [ -L "$root" ] || { echo "$root must be a single symlink" >&2; exit 1; }
+            [ -f "$root/registry.json" ] || { echo "registry.json missing" >&2; exit 1; }
+            base="$(readlink -f "$root")"
+            for f in "$root"/*; do
+              case "$(readlink -f "$f")" in "$base"/*) ;; *) echo "$f escapes $base" >&2; exit 1 ;; esac
+            done
+            touch $out
+          '';
+        };
 
         devShells.default =
           with pkgs;

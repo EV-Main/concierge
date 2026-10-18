@@ -1,0 +1,20 @@
+# HAND-WRITTEN, like sdk-check.yml. release-container.yml is generated and builds the image
+# only for a tag/dev/labelled PR; this catches a broken /share/concierge/web layout earlier,
+# without the (linux-only) image build.
+name: web-root-check
+'on':
+  pull_request:
+    paths: ['flake.nix', 'flake.lock', 'web/**', '.github/workflows/web-root-check.yml']
+permissions:
+  contents: read
+jobs:
+  check:
+    name: web bundles sit inside WEB_MFE_DIR
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: nix build .#checks.aarch64-linux.web-root --no-link --print-build-logs
