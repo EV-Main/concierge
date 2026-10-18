@@ -82,29 +82,53 @@ same JWKS (`AuthService.Jwks`).
 ## What the bank MUST do (PR2)
 
 1. Verify with `evconcierge_auth::stepup::verify_stepup_proof` against the cached JWKS — it
-   pins EdDSA, checks `iss`, `aud`, `exp`, `typ`, the lifetime cap, then that `sub`,
-   `intent_hash` and `origin` are exactly the expected ones. On `StepupError::UnknownKid`,
-   refresh the JWKS once and retry (as `Verifier` does).
+   pins EdDSA, checks `iss`, `aud`, `exp`, `typ`, the lifetime cap, that the proof is not dated
+   ahead of the verifier's clock (`iat <= now + 5 s`, `exp <= now + 120 s + 5 s`), then that
+   `sub`, `intent_hash` and `origin` are exactly the expected ones and `method` is one of the
+   `methods` the bank lists for this operation. On `StepupError::UnknownKid`, refresh the JWKS
+   and retry — **at most once per 30 s** per process, or a flood of forged `kid`s becomes a
+   flood of `Jwks` calls (the `Verifier` here does the same).
 2. Pass the values **the bank stored**: the intent's own hash, the intent's owner and the
    origin the intent was created from. Never a value read from the request or the proof.
-3. **Spend the `jti` once.** Concierge cannot know whether a proof was used: it never calls
+   `sub` is the **user id of the access token** the confirm request carries (the same value
+   as the access token's `sub`), compared with the proof's.
+3. **Choose the methods per operation.** The email method rests on a mailbox and on the
+   page's own summary; the bank must restrict it on hosts: cap the amount it can authorise
+   and require `[Passkey]` for a withdrawal or a mandate when the account has a passkey
+   (the proof's `method` is how the verifier tells).
+4. **Spend the `jti` once.** Concierge cannot know whether a proof was used: it never calls
    the bank. The bank must remember each accepted `jti` until its `exp` in a store shared by
    all BFF replicas (Redis `SET stepup:jti:<jti> 1 NX EX <exp - now + 5>`) and refuse a proof
    whose `SET NX` fails. An in-process set is not enough with more than one replica.
-4. Execute the operation once per intent (its own status CAS); a proof authorises the stored
-   intent only, so a second confirm of an executed intent is refused regardless of the `jti`.
+5. **Order of the confirm:** verify the proof → compare-and-set the intent
+   (`created → authorized`, one winner) → `SET NX` the `jti` → execute. A lost CAS or a lost
+   `SET NX` is a refusal; a proof is never spent for an intent that did not move.
+6. **Make the hash unique to the intent.** `intent_hash` is computed by the bank over a
+   random `intent_id` plus everything the person is to confirm (amount, fee, recipient,
+   network, scope, host origin, `expires_at`); two intents never share one. A proof whose
+   `iat` is earlier than the intent's `created_at` is refused: it cannot be for this intent.
+7. **Re-check at confirm, not only at create:** the account is not frozen, its
+   `token_version` is current and its session is the one that created the intent. A proof
+   authorises the stored intent only, so a second confirm of an executed intent is refused
+   regardless of the `jti`.
 
 ```rust
-use evconcierge_auth::{JwksCache, stepup::{Expected, StepupError, verify_stepup_proof}};
+use evconcierge_auth::{JwksCache, stepup::{Expected, StepupError, StepupMethod, verify_stepup_proof}};
 
 // `cache` is built from the Jwks RPC: JwksCache::from_wire(&response.keys)?
 let intent_hash: [u8; 32] = stored_intent.hash;
-let expected = Expected { intent_hash: &intent_hash, sub: &stored_intent.owner, origin: &stored_intent.origin };
+let expected = Expected {
+    intent_hash: &intent_hash,
+    sub: &access_token_user_id,          // from the verified access token, not the body
+    origin: &stored_intent.origin,
+    methods: &[StepupMethod::Passkey],   // per operation; add EmailCode only below the cap
+};
 let claims = match verify_stepup_proof(&proof, &cache, &issuer, &expected) {
     Ok(claims) => claims,
-    Err(StepupError::UnknownKid(_)) => { /* refresh the JWKS once, retry */ return retry() }
+    Err(StepupError::UnknownKid(_)) => { /* refresh the JWKS (<= once / 30 s), retry */ return retry() }
     Err(_) => return Err(Refused),
 };
+if !intent_cas_authorized(&stored_intent).await? { return Err(Refused) }
 if !redis_set_nx(format!("stepup:jti:{}", claims.jti), claims.exp).await? { return Err(Replayed) }
 ```
 
@@ -114,6 +138,16 @@ if !redis_set_nx(format!("stepup:jti:{}", claims.jti), claims.exp).await? { retu
   replicas the verify must reach the replica that answered `options`: run one replica, or
   make the route sticky. A verify that lands elsewhere fails (`passkey_expired`) and the page
   begins again; it never yields a wrong proof.
-* The summary of an email code is the page's claim, not ours. The trusted lines of the mail
-  are the origin (from the browser's `Origin`), the time, the address and the browser.
+* The `summary` of an email code is **written by the page**, not by us, and the mail says so.
+  The origin and `User-Agent` in the mail are trustworthy only when a browser makes the call
+  (a browser fixes `Origin`; a script outside one can write both); the time and the address
+  are what this plane saw. A hijacked page can therefore phrase a harmless summary over a
+  harmful operation: that is why the email method must be restricted on hosts (bank rule 3).
+  Follow-up recorded, not built: the bank signs the operation's summary (`summary_mac`) and
+  concierge quotes it only when the MAC verifies, so the mail would state the bank's words.
+* Request fields are snake_case (`intent_hash`, `ceremony_id`, `turnstile_token`), unlike the
+  camelCase of the older routes; a body that does not parse, or names an unknown field,
+  answers `400 {"error":"invalid_request"}`.
+* An account holds at most 3 open ceremonies; a fourth evicts its oldest. A step-up code is
+  bound to the `intent_hash` it was mailed for and redeems only for it.
 * Mail is English only, as every mail of this plane.
