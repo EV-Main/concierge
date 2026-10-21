@@ -53,7 +53,7 @@ impl KycProvider for StubKyc {
 	}
 
 	/// The cabinet itself: the stub's "vendor page" is a cabinet URL carrying a fake
-	/// session ref, so `CABINET_URL` is both what it composes and what it answers with.
+	/// session ref, so `KYC_RETURN_URL` is both what it composes and what it answers with.
 	///
 	/// Its scheme is taken as given rather than forced to `https`, because the stub is
 	/// refused in production (`build_kyc_provider`) and the machine it does run on
@@ -80,7 +80,7 @@ impl KycProvider for StubKyc {
 mod tests {
 	use super::*;
 
-	/// The stub's vendor IS the cabinet, so `CABINET_URL` decides what a redirect may be
+	/// The stub's vendor IS the cabinet, so `KYC_RETURN_URL` decides what a redirect may be
 	/// — and its scheme is taken as given. A developer serving the cabinet on
 	/// `http://localhost:3000` must not meet the 503 that "arrives as silence"; the stub
 	/// is refused in production, so nothing prod-facing inherits that latitude.
@@ -96,11 +96,11 @@ mod tests {
 		);
 	}
 
-	/// A `CABINET_URL` with no origin leaves the adapter unable to say where its vendor
+	/// A `KYC_RETURN_URL` with no origin leaves the adapter unable to say where its vendor
 	/// is. The empty answer refuses every redirect, and the boot refuses to mount it at
 	/// all — the one shape this must NOT take is degrading to "any https will do".
 	#[test]
-	fn an_originless_cabinet_url_declares_nothing() {
+	fn an_originless_return_url_declares_nothing() {
 		assert!(StubKyc::new("s".into(), "not a url".into()).session_origins().is_empty());
 	}
 }

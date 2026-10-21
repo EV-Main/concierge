@@ -58,8 +58,8 @@ const SUPPORT: &str = "support@evinvest.test";
 /// what the suite exercises is what an unconfigured deployment runs (#91).
 const CASE_TTL_SECS: i64 = 24 * 60 * 60;
 
-/// What the stub provider is built from — `CABINET_URL` in the composition root.
-const CABINET_URL: &str = "https://evinvest.test/cabinet";
+/// What the stub provider is built from — `KYC_RETURN_URL` in the composition root.
+const KYC_RETURN_URL: &str = "https://evinvest.test/cabinet";
 
 /// Its ORIGIN, which is what a redirect is judged against. Written out once here and
 /// never beside a double, so a test cannot accidentally hold a different opinion of
@@ -93,7 +93,7 @@ impl KycProvider for RefusingKyc {
 	}
 
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
-		StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()).parse_callback(headers, body, now)
+		StubKyc::new(SECRET.to_string(), KYC_RETURN_URL.to_string()).parse_callback(headers, body, now)
 	}
 }
 
@@ -124,7 +124,7 @@ impl KycProvider for RogueRedirectKyc {
 	}
 
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
-		StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()).parse_callback(headers, body, now)
+		StubKyc::new(SECRET.to_string(), KYC_RETURN_URL.to_string()).parse_callback(headers, body, now)
 	}
 }
 
@@ -141,7 +141,7 @@ struct CountingKyc {
 impl CountingKyc {
 	fn new(sessions: Arc<AtomicUsize>) -> Self {
 		Self {
-			inner: StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()),
+			inner: StubKyc::new(SECRET.to_string(), KYC_RETURN_URL.to_string()),
 			sessions,
 		}
 	}
@@ -233,7 +233,7 @@ struct Harness {
 }
 
 async fn setup() -> Option<Harness> {
-	setup_with(Some(Arc::new(StubKyc::new(SECRET.to_string(), CABINET_URL.to_string())))).await
+	setup_with(Some(Arc::new(StubKyc::new(SECRET.to_string(), KYC_RETURN_URL.to_string())))).await
 }
 
 /// The same router with the vendor swapped out, so a test can drive the two ways
@@ -295,7 +295,7 @@ impl Harness {
 	async fn case(&self, user: UserId, tier: u32) -> (Uuid, String) {
 		let id = Uuid::new_v4();
 		let provider_ref = format!("stub-{id}");
-		let redirect_url = format!("{CABINET_URL}?kyc_session={provider_ref}");
+		let redirect_url = format!("{KYC_RETURN_URL}?kyc_session={provider_ref}");
 		self.cases
 			.open_case(NewCase {
 				id,
@@ -1614,7 +1614,7 @@ const PEPPER: &str = "kyc-integration-pepper";
 /// A stub that computes identity digests, i.e. a deployment with `KYC_IDENTITY_PEPPER`
 /// set. The default stub has none, which is also the shape of a deployment without one.
 async fn setup_with_pepper() -> Option<Harness> {
-	setup_with(Some(Arc::new(StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()).with_identity_pepper(PEPPER)))).await
+	setup_with(Some(Arc::new(StubKyc::new(SECRET.to_string(), KYC_RETURN_URL.to_string()).with_identity_pepper(PEPPER)))).await
 }
 
 /// A webhook body whose verdict names a specific document.
@@ -1644,7 +1644,7 @@ fn digest_of(document: &str) -> String {
 		signature_v2: None,
 		timestamp: Some(at),
 	};
-	StubKyc::new(SECRET.to_string(), CABINET_URL.to_string())
+	StubKyc::new(SECRET.to_string(), KYC_RETURN_URL.to_string())
 		.with_identity_pepper(PEPPER)
 		.parse_callback(&headers, &raw, at)
 		.expect("a well-formed delivery")

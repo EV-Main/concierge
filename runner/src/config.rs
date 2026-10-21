@@ -169,6 +169,15 @@ ev::settings! {
 		#[secret]
 		didit_webhook_secret: Option<String>,
 		didit_base_url: String = "https://verification.didit.me",
+		/// The page a browser lands on when a verification ends: Didit's `callback`, and
+		/// under `KYC_STUB` the stub's "vendor page" (so also the only redirect origin the
+		/// stub accepts).
+		///
+		/// Separate from `cabinet_url` because the two move apart: mail links are moving to
+		/// the investor cabinet, while the KYC screen still lives only in the banking cabinet
+		/// (banking#564). Pointing this at a cabinet with no KYC screen would strand every
+		/// user who finishes a verification on a 404.
+		kyc_return_url: String = "https://evinvest.ltd/cabinet",
 		/// Run the no-network stub provider instead of Didit, so the whole flow (start →
 		/// redirect → signed callback → level change → outbox row) works on a laptop with no
 		/// vendor account. Refused in production by the composition root — a stub that could
@@ -290,6 +299,22 @@ mod tests {
 		assert_eq!(path, "/cabinet/owner-removal", "the cabinet serves /{{locale}}/cabinet/owner-removal/{{token}}");
 		assert!(!base.ends_with('/'), "the token is appended as `<base>/<token>`");
 		assert!(!base.contains('?'), "a query string would swallow the token segment");
+	}
+
+	/// The KYC return keeps today's page until it is moved on purpose. Moving
+	/// `CABINET_URL` to another cabinet must not carry the verification flow with it:
+	/// only the banking cabinet serves the KYC screen.
+	#[test]
+	fn an_unset_kyc_return_is_the_banking_cabinet() {
+		let config = AppConfig::from_source(minimal_env).expect("boot");
+		assert_eq!(config.kyc_return_url, "https://evinvest.ltd/cabinet");
+
+		let moved = AppConfig::from_source(|var| match var {
+			"CABINET_URL" => Some("https://invest.evinvest.ltd/cabinet".to_string()),
+			_ => minimal_env(var),
+		})
+		.expect("boot");
+		assert_eq!(moved.kyc_return_url, "https://evinvest.ltd/cabinet", "CABINET_URL does not move the KYC return");
 	}
 
 	/// The default has to be a duration a person can actually finish a verification in,

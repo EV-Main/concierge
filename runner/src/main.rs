@@ -146,7 +146,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	if let Some(provider) = kyc_provider.as_ref() {
 		ensure!(
 			!provider.session_origins().is_empty(),
-			"the {} KYC provider declares no session origin — check DIDIT_BASE_URL (or CABINET_URL under KYC_STUB): it must parse as an absolute URL with a host",
+			"the {} KYC provider declares no session origin — check DIDIT_BASE_URL (or KYC_RETURN_URL under KYC_STUB): it must parse as an absolute URL with a host",
 			provider.name()
 		);
 	}
@@ -581,7 +581,7 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 		);
 		let secret = config.didit_webhook_secret.clone().unwrap_or_else(|| "kyc-stub-secret".to_string());
 		tracing::warn!(webhook = %webhook_url, "kyc: running the STUB provider — no vendor is contacted and verdicts are locally signed");
-		let mut stub = stub::StubKyc::new(secret, config.cabinet_url.clone());
+		let mut stub = stub::StubKyc::new(secret, config.kyc_return_url.clone());
 		if let Some(pepper) = identity_pepper(config) {
 			stub = stub.with_identity_pepper(pepper);
 		}
@@ -615,7 +615,7 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 		webhook_secret,
 		// Where the BROWSER lands when the flow ends — a user-facing page, never the
 		// webhook path, which answers POST only.
-		return_url: config.cabinet_url.clone(),
+		return_url: config.kyc_return_url.clone(),
 		identity_pepper,
 	}))))
 }
