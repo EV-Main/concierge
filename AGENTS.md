@@ -697,7 +697,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   the opener of this plane's own `concierge:*` proposal, proven by the session, is (D23),
   and so is a money decision's initiator whose own access token the proposer presents —
   minted within 120 s, with an `auth_time` within 120 s (a re-authentication, #171; else
-  `FAILED_PRECONDITION` `reauth_required: …`) and spent once, so it proves the person
+  `FAILED_PRECONDITION` `reauth_required: …`; neither claim more than 30 s ahead) and spent
+  once, per token and per re-authentication, so it proves the person
   proved themselves just now and the service held that token, nothing more — from a PLATFORM roster, with two other ACTIVE owners still
   required and the initiator told in their inbox (D24(1)). Any change of the
   owner roster — a seat granted or taken, an owner suspended by the consilium's verdict or

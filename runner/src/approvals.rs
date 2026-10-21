@@ -766,6 +766,8 @@ impl Approvals {
 		};
 		let record = match self.approvals.propose(new).await.map_err(domain_to_status)? {
 			Proposed::Opened(record) | Proposed::Existing(record) => record,
+			// A proposal over a session presents no proof, so none can be spent.
+			Proposed::ProofSpent => return Err(Status::internal("a proposal over a session was refused for a spent proof")),
 			Proposed::Saturated =>
 				return Err(Status::resource_exhausted(
 					"too many of this plane's own proposals are live (a person has at most a few decisions about people open at once): withdraw or wait for some",
@@ -841,20 +843,45 @@ impl ApprovalExecution {
 		// that person then, not that they asked for this. Paired with spending the digest,
 		// a proof is one token minted for one request.
 		let now = self.approvals.now().await.map_err(domain_to_status)?;
-		if !within_proof_age(claims.iat, now) {
-			return Err(reauth_required(format!("the user token is older than {PROOF_MAX_AGE_SECS} seconds")));
+		match claim_age(claims.iat, now) {
+			ClaimAge::Fresh => {}
+			ClaimAge::Stale => {
+				return Err(reauth_required(format!(
+					"the user token is older than {PROOF_MAX_AGE_SECS} seconds; re-authenticate and retry with a new token"
+				)));
+			}
+			ClaimAge::Ahead => {
+				return Err(reauth_required(format!(
+					"the user token is dated more than {CLAIM_SKEW_SECS} seconds ahead of this plane's clock; re-authenticate and retry with a new token"
+				)));
+			}
 		}
 		// A young token alone shows only that the session was alive: a refresh mints one
 		// with the old `auth_time` (concierge#171). The person must have proven themselves
 		// again just now (`/auth/reauth/*` moves `auth_time`); a token without the claim
 		// comes from a session older than it and counts as stale.
-		if !claims.auth_time.is_some_and(|auth_time| within_proof_age(auth_time, now)) {
-			return Err(reauth_required(format!("the person who asked has not re-authenticated in the last {PROOF_MAX_AGE_SECS} seconds")));
+		let auth_time = claims.auth_time.unwrap_or(0);
+		match claim_age(auth_time, now) {
+			ClaimAge::Fresh => {}
+			ClaimAge::Stale => {
+				return Err(reauth_required(format!(
+					"the person who asked has not re-authenticated in the last {PROOF_MAX_AGE_SECS} seconds; re-authenticate and retry with a new token"
+				)));
+			}
+			// The session store never moves `auth_time` backwards, so one stamped ahead by a
+			// clock jump stays ahead through every re-authentication; a new sign-in opens a
+			// session stamped by the clock as it is now.
+			ClaimAge::Ahead => {
+				return Err(reauth_required(format!(
+					"the session's last authentication is dated more than {CLAIM_SKEW_SECS} seconds ahead of this plane's clock; sign in again and retry with a new token"
+				)));
+			}
 		}
 		Ok(Some(crate::ports::ProvenInitiator {
 			user: UserId::from_raw(user),
 			token_version: claims.token_version,
 			token_digest: hex(&Sha256::digest(token.as_bytes())),
+			reauth_digest: reauth_digest(user, auth_time),
 		}))
 	}
 }
@@ -936,6 +963,11 @@ impl ApprovalExecutionService for ApprovalExecution {
 				record
 			}
 			Proposed::Existing(record) => record,
+			Proposed::ProofSpent => {
+				return Err(reauth_required(
+					"this proof was already spent: one re-authentication proves one request; re-authenticate and retry with a new token".into(),
+				));
+			}
 			Proposed::Saturated => {
 				return Err(Status::resource_exhausted(format!(
 					"`{}` already holds {} live proposals in scope `{}`; withdraw or wait for some before opening more",
@@ -1034,18 +1066,43 @@ const PROOF_MAX_AGE_SECS: i64 = 120;
 
 /// The word a proposer matches to send the person through `/auth/reauth/*` and retry. It
 /// is `FAILED_PRECONDITION`, not `UNAUTHENTICATED`: the token is valid and the proposer
-/// is configured right, only the person's last proof is too old — the same request fails
-/// the same way until they re-authenticate.
+/// is configured right, only the person's last proof is too old, too far ahead or already
+/// spent — the same request fails the same way until they re-authenticate.
 const REAUTH_REQUIRED: &str = "reauth_required";
 
 fn reauth_required(why: String) -> Status {
-	Status::failed_precondition(format!("{REAUTH_REQUIRED}: {why}; re-authenticate and retry with a new token"))
+	Status::failed_precondition(format!("{REAUTH_REQUIRED}: {why}"))
 }
 
-/// Whether the unix instant `at` (a claim) is at most [`PROOF_MAX_AGE_SECS`] before `now`.
-/// A claim past `i64` is not a time this plane minted.
-fn within_proof_age(at: u64, now: i64) -> bool {
-	i64::try_from(at).is_ok_and(|at| at >= now - PROOF_MAX_AGE_SECS)
+/// How far ahead of `now` a claim may be dated. `now` is the database's clock and the
+/// claims are stamped by a replica's, so a few seconds of drift are honest. Without a
+/// bound, a clock that once jumped ahead (a failover) leaves a future `auth_time` in the
+/// session store, which keeps the larger value, and every refresh would prove again.
+const CLAIM_SKEW_SECS: i64 = 30;
+
+enum ClaimAge {
+	Fresh,
+	Stale,
+	Ahead,
+}
+
+/// Where the unix instant `at` (a claim) falls against `now`: fresh from
+/// [`PROOF_MAX_AGE_SECS`] before it to [`CLAIM_SKEW_SECS`] after it. A claim past `i64`
+/// is not a time this plane minted.
+fn claim_age(at: u64, now: i64) -> ClaimAge {
+	match i64::try_from(at) {
+		Ok(at) if at < now - PROOF_MAX_AGE_SECS => ClaimAge::Stale,
+		Ok(at) if at <= now + CLAIM_SKEW_SECS => ClaimAge::Fresh,
+		Ok(_) | Err(_) => ClaimAge::Ahead,
+	}
+}
+
+/// The digest one re-authentication is spent under, beside the token's: every refresh
+/// inside the window mints another token with the same `auth_time`, and each would
+/// otherwise prove another request. The parsed id, not the raw `sub`, so one account has
+/// one spelling.
+fn reauth_digest(user: Uuid, auth_time: u64) -> String {
+	hex(&Sha256::digest(format!("reauth:{user}:{auth_time}").as_bytes()))
 }
 
 /// How many due `concierge:*` decisions one executor pass takes on.

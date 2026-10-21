@@ -178,10 +178,13 @@ service ApprovalExecutionService {
   // ACTIVE owners, or fewer than two ACTIVE owners besides a proven initiator — this one
   // carries the code word `not_enough_owners_besides_initiator`, to be matched as a
   // SUBSTRING of the message (it follows a `precondition failed:` prefix); do NOT retry it
-  // without the token, which would put the initiator back on the roster); a spent proof ("this proof was
-  // already spent"); a user token older than 120 seconds, or whose `auth_time` is missing or
-  // older than 120 seconds (the message STARTS with the code word `reauth_required: `: send
-  // the person through `/auth/reauth/*` and retry with the token it mints); or the proposal resolves to
+  // without the token, which would put the initiator back on the roster); a user token that
+  // cannot prove who asked — older than 120 seconds or dated more than 30 seconds ahead,
+  // with an `auth_time` that is missing, older than 120 seconds or more than 30 seconds
+  // ahead, or a proof already spent (the token, or another token of the same
+  // re-authentication: "this proof was already spent") — whose message STARTS with the code
+  // word `reauth_required: `: send the person through `/auth/reauth/*` and retry with the
+  // token it mints; or the proposal resolves to
   // PLATFORM while the platform pauses after a change of its owners (PlatformApprovalPolicy
   // `cooldown_secs` from `roster_changed_at`). PERMISSION_DENIED: a relying party naming a
   // scope other than its own; a user token that is not `requested_by`'s or no longer
@@ -191,8 +194,8 @@ service ApprovalExecutionService {
   // (`typ=access`, verified as every RPC of this plane verifies one; `requested_by`
   // required with it), minted no more than 120 seconds before the call, with an `auth_time`
   // no more than 120 seconds before the call — the person re-authenticated just now; a
-  // refresh keeps the session's old `auth_time` — and spent by it: one token proves one
-  // request. What it proves is that the person proved themselves to this plane within the
+  // refresh keeps the session's old `auth_time` — neither dated more than 30 seconds after
+  // it, and spent by it: one token, and one re-authentication, prove one request. What it proves is that the person proved themselves to this plane within the
   // last two minutes and the service held the token that says so — not that they read this
   // proposal. When the proposal resolves to PLATFORM that person is kept off its roster
   // (D24(1)) — two other ACTIVE owners must remain — the proposal says

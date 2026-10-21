@@ -349,16 +349,23 @@ containment is never slower than the grant).
   holds (banking forwards the owner's). Verified as every RPC here verifies one, its `sub`
   must be `requested_by`, the account still active at that token's `token_version`, the
   token minted no more than 120 s before the call, its `auth_time` no more than 120 s
-  before the call too (concierge#171), and never used before: its SHA-256 is spent in the
-  transaction that opens the proposal (`approval_initiator_proofs`; a second use is
-  `FAILED_PRECONDITION` "this proof was already spent"). A young token alone is not
+  before the call too (concierge#171), neither claim dated more than 30 s after the call
+  (the replicas' and the database's clocks may drift that much, and no more), and never
+  used before. The transaction that opens the proposal spends two digests in
+  `approval_initiator_proofs`: the token's SHA-256, and the SHA-256 of
+  `reauth:<user id>:<auth_time>`. So one token proves one request, and so does one
+  re-authentication: every refresh inside the window mints another token with the same
+  `auth_time`. A young token alone is not
   enough: a refresh mints one and keeps the session's old `auth_time`, so it shows only
   that the session was alive. The person re-authenticates first (`/auth/reauth/*` moves
   `auth_time` to now and re-sets `ev_access`), and the proposer then presents that token.
-  A token older than 120 s, or with an `auth_time` that is missing or older than 120 s,
-  is refused `FAILED_PRECONDITION` with a message that starts with `reauth_required: `.
-  A proposer matches that word, sends the person through re-authentication and retries
-  with the new token. What that proves is honest and narrow: the person proved
+  Every refusal of the proof itself is `FAILED_PRECONDITION` with a message that starts
+  with `reauth_required: `: a token or an `auth_time` older than 120 s or more than 30 s
+  ahead, a missing `auth_time`, and a spent proof ("this proof was already spent"). A
+  proposer matches that word, sends the person through re-authentication and retries with
+  the new token. An `auth_time` ahead of the clock does not move back on a
+  re-authentication (the session store never moves it backwards), so that message asks
+  the person to sign in again. What that proves is honest and narrow: the person proved
   themselves to this plane within the last two minutes and the service held the token that
   says so — not that they read the proposal. When the proposal resolves to `PLATFORM` that person is kept off the roster,
   the proposal says `requested_by_proven`, and — if they were on that roster, i.e. an
