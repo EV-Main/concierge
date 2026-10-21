@@ -2,8 +2,8 @@
  * @module @evinvest/concierge
  *
  * Host side of the concierge microfrontends (sign-in dialog, account page,
- * account chip): where they live, their tags, the session shape, the RP-login
- * and platform sign-out hrefs. Server-safe: nothing touches the DOM at import
+ * account chip, re-authentication dialog): where they live, their tags, the
+ * session shape, the RP-login and platform sign-out hrefs. Server-safe: nothing touches the DOM at import
  * time. The React wrappers live in `./react`. Built on @evinvest/mfe; the
  * elements themselves are concierge's `web/`.
  */
@@ -17,6 +17,7 @@ export {
   CONCIERGE_REGISTRY_URL,
   conciergeEntry,
   fetchConciergeRegistry,
+  REAUTH_TAG,
   SIGN_IN_TAG,
 } from './elements';
 export type { ConciergeElement, ConciergeRegistryOptions } from './elements';
@@ -26,5 +27,8 @@ export type { Session, SessionUser } from './session';
 
 export { CLOSE_EVENT, hostReturnTo, RP_LOGIN_PATH, rpLoginHref } from './sign-in';
 export type { SignInIntent } from './sign-in';
+
+export { REAUTHENTICATED_EVENT } from './reauth';
+export type { ReauthEventMap, ReauthEventName } from './reauth';
 
 export { PLATFORM_SIGN_OUT_URL, platformSignOutHref } from './sign-out';

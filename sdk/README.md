@@ -1,7 +1,7 @@
 # @evinvest/concierge
 
 Host wrappers for the **concierge microfrontends** — the sign-in dialog, the
-account page and the account chip — over
+account page, the account chip and the re-authentication dialog — over
 [`@evinvest/mfe`](https://www.npmjs.com/package/@evinvest/mfe). A host
 (invest cabinet, the SA panel, admin) mounts them; the elements themselves are
 built in this repo's `web/` and served from `https://evinvest.ltd/api/auth/mfe/`
@@ -15,8 +15,9 @@ npm install @evinvest/concierge @evinvest/mfe
 
 - `.` — server-safe core: registry constants, tags, the session shape, the
   RP-login and platform sign-out hrefs.
-- `./react` — `SignInDialog`, `AccountPage`, `AccountChip`, `useSignInRequired`
-  (a `"use client"` bundle; `react` is an optional peer).
+- `./react` — `SignInDialog`, `AccountPage`, `AccountChip`, `ReauthDialog`,
+  `useSignInRequired`, `useReauthRequired` (a `"use client"` bundle; `react` is
+  an optional peer).
 
 `@evinvest/mfe` is a **peer**: its loader caches loads per tag, so the host and
 this package must share one copy.
@@ -30,6 +31,7 @@ No network calls beyond the registry and the session; the elements do the rest.
 | Sign-in dialog | `mfe-concierge-sign-in` | `concierge.sign-in` |
 | Account page | `mfe-concierge-account` | `concierge.account` |
 | Account chip | `mfe-concierge-account-chip` | `concierge.account-chip` |
+| Re-authentication dialog | `mfe-concierge-reauth` | `concierge.reauth` |
 
 ```ts
 import { conciergeEntry, fetchConciergeRegistry } from '@evinvest/concierge';
@@ -78,6 +80,54 @@ Element contract, host side:
 | attribute | `data-return-to` | origin + path of an absolute https URL on the host an OAuth round trip lands on (http only to loopback); query and hash are always cut, since concierge answers a `returnTo` with `?` or `#` with 400. Concierge accepts it only for an origin in a scope's registry. Relative values are left out (`hostReturnTo`) |
 | event | `ev:signed-in` | sign-in finished |
 | event | `ev:close` | dismissed by the user (`CLOSE_EVENT`) |
+
+## Confirm again when the host gets `reauth_required`
+
+Some acts need a recent proof of the user, not just a session: concierge
+accepts them only from an access token minted by a re-authentication, which
+moves the session's `auth_time` to now. A host on **evinvest.ltd** (the admin
+console) whose backend answers `403 reauth_required` asks the user to confirm,
+then retries the act **once**:
+
+```tsx
+'use client';
+import { ReauthDialog, useReauthRequired } from '@evinvest/concierge/react';
+
+const { requireReauth, dialogProps } = useReauthRequired();
+
+async function openPayment() {
+  let response = await post('/api/payments', body);
+  if (isReauthRequired(response)) {           // the host's own BFF vocabulary
+    if (!(await requireReauth())) return;     // dismissed: leave the act undone
+    response = await post('/api/payments', body); // once; a second refusal is an error
+  }
+  // …
+}
+
+<ReauthDialog scriptUrl={reauth.scriptUrl} {...dialogProps} />;
+```
+
+`requireReauth()` resolves `true` after the element reports
+`ev:reauthenticated` — concierge has accepted the proof and re-set the
+`ev_access` cookie by then — and `false` on `ev:close` or when the host
+unmounts. Calls while the dialog is open share one answer. The element offers
+an email code, the password or a passkey, whichever the account has.
+
+Re-authentication works only on evinvest.ltd: concierge refuses the
+`/api/auth/reauth/*` routes from any other `Origin`. Mounted elsewhere, the
+dialog says to confirm on the platform and sends nothing.
+
+Element contract, host side:
+
+| | Name | Meaning |
+| --- | --- | --- |
+| attribute | `open` | present while the dialog is open; only the host sets or removes it |
+| event | `ev:reauthenticated` | confirmed, the fresh `ev_access` is set (`REAUTHENTICATED_EVENT`) |
+| event | `ev:close` | dismissed by the user (`CLOSE_EVENT`) |
+
+Both events bubble, are `composed` and carry no detail (`ReauthEventMap`). At
+most one of them fires per opening. `ReauthDialog` calls `onReauthenticated`
+before `onOpenChange(false)`.
 
 ## Account page and chip
 
