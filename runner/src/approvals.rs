@@ -841,10 +841,15 @@ impl ApprovalExecution {
 		// that person then, not that they asked for this. Paired with spending the digest,
 		// a proof is one token minted for one request.
 		let now = self.approvals.now().await.map_err(domain_to_status)?;
-		if i64::try_from(claims.iat).map_or(true, |iat| iat < now - PROOF_MAX_AGE_SECS) {
-			return Err(Status::unauthenticated(format!(
-				"the user token is older than {PROOF_MAX_AGE_SECS} seconds: mint one for this request"
-			)));
+		if !within_proof_age(claims.iat, now) {
+			return Err(reauth_required(format!("the user token is older than {PROOF_MAX_AGE_SECS} seconds")));
+		}
+		// A young token alone shows only that the session was alive: a refresh mints one
+		// with the old `auth_time` (concierge#171). The person must have proven themselves
+		// again just now (`/auth/reauth/*` moves `auth_time`); a token without the claim
+		// comes from a session older than it and counts as stale.
+		if !claims.auth_time.is_some_and(|auth_time| within_proof_age(auth_time, now)) {
+			return Err(reauth_required(format!("the person who asked has not re-authenticated in the last {PROOF_MAX_AGE_SECS} seconds")));
 		}
 		Ok(Some(crate::ports::ProvenInitiator {
 			user: UserId::from_raw(user),
@@ -1021,9 +1026,27 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The oldest a user token may be to prove who asked for a proposal (D24(1), review of
-/// #141): long enough for the money plane to mint one and call, short enough that a token
-/// lifted from a session cannot be replayed into a proof later.
+/// #141), and how long ago its holder may have last re-authenticated (`auth_time`,
+/// concierge#171): long enough for the person to re-authenticate and the money plane to
+/// call, short enough that a token lifted from a session cannot be replayed into a proof
+/// later, and that a live session alone is not taken for the person asking.
 const PROOF_MAX_AGE_SECS: i64 = 120;
+
+/// The word a proposer matches to send the person through `/auth/reauth/*` and retry. It
+/// is `FAILED_PRECONDITION`, not `UNAUTHENTICATED`: the token is valid and the proposer
+/// is configured right, only the person's last proof is too old — the same request fails
+/// the same way until they re-authenticate.
+const REAUTH_REQUIRED: &str = "reauth_required";
+
+fn reauth_required(why: String) -> Status {
+	Status::failed_precondition(format!("{REAUTH_REQUIRED}: {why}; re-authenticate and retry with a new token"))
+}
+
+/// Whether the unix instant `at` (a claim) is at most [`PROOF_MAX_AGE_SECS`] before `now`.
+/// A claim past `i64` is not a time this plane minted.
+fn within_proof_age(at: u64, now: i64) -> bool {
+	i64::try_from(at).is_ok_and(|at| at >= now - PROOF_MAX_AGE_SECS)
+}
 
 /// How many due `concierge:*` decisions one executor pass takes on.
 const EXECUTOR_BATCH: i64 = 100;
