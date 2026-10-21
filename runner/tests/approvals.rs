@@ -112,8 +112,15 @@ impl concierge::ports::UserTokenVerifier for FakeTokens {
 }
 
 impl FakeTokens {
-	/// A token for `user` minted at `iat`, the instant its freshness is judged by.
+	/// A token for `user` minted at `iat` by a re-authentication, so `auth_time` = `iat`:
+	/// the token a proposer presents when the person just proved themselves again.
 	fn mint(&self, user: UserId, iat: i64) -> String {
+		self.mint_signed_in(user, iat, Some(iat))
+	}
+
+	/// A token for `user` minted at `iat` for a session last authenticated at `auth_time`
+	/// (`None`: a session older than the claim).
+	fn mint_signed_in(&self, user: UserId, iat: i64, auth_time: Option<i64>) -> String {
 		let token = format!("token-{}", Uuid::new_v4());
 		self.issued.lock().unwrap().insert(
 			token.clone(),
@@ -126,7 +133,7 @@ impl FakeTokens {
 				typ: TokenType::Access,
 				jti: None,
 				token_version: 0,
-				auth_time: None,
+				auth_time: auth_time.map(|at| u64::try_from(at).unwrap()),
 			},
 		);
 		token
@@ -1893,17 +1900,133 @@ async fn a_proven_initiator_does_not_vote_on_a_money_decision() {
 		.unwrap();
 	let spent = fx.payment(&kind, &scope, Some(owners[0]), Some(&token)).await.unwrap_err();
 	assert_eq!(spent.code(), Code::FailedPrecondition, "one token proves one request: {}", spent.message());
+	assert!(spent.message().starts_with("reauth_required: "), "{}", spent.message());
 	assert!(spent.message().contains("already spent"), "{}", spent.message());
 	let stale = fx.tokens.mint(owners[0], T0 - 121);
+	let refused = fx.payment(&kind, &scope, Some(owners[0]), Some(&stale)).await.unwrap_err();
 	assert_eq!(
-		code(fx.payment(&kind, &scope, Some(owners[0]), Some(&stale)).await),
-		Some(Code::Unauthenticated),
+		refused.code(),
+		Code::FailedPrecondition,
 		"a proof is a token minted for this request, not one kept from a session"
 	);
+	assert!(refused.message().starts_with("reauth_required: "), "{}", refused.message());
 	assert_eq!(
 		code(fx.payment(&kind, &scope, None, Some(&token)).await),
 		Some(Code::InvalidArgument),
 		"a token names no one without requested_by"
+	);
+}
+
+/// concierge#171: a young token shows only that the session was alive — a refresh mints one
+/// with the old `auth_time`. The proof needs the person to have re-authenticated within
+/// the same 120 s, and its refusal carries a word the proposer can send them to re-auth by.
+#[tokio::test]
+async fn a_proof_needs_a_re_authentication_within_the_window() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let kind = fx.bank_platform_kind(&scope).await;
+	fx.at(T0);
+	let reauth_required = |result: Result<Approval, tonic::Status>, why: &str| {
+		let refused = result.unwrap_err();
+		assert_eq!(refused.code(), Code::FailedPrecondition, "{why}: {}", refused.message());
+		assert!(refused.message().starts_with("reauth_required: "), "{why}: {}", refused.message());
+	};
+
+	let refreshed = fx.tokens.mint_signed_in(owners[0], T0, Some(T0 - 121));
+	reauth_required(
+		fx.payment(&kind, &scope, Some(owners[0]), Some(&refreshed)).await,
+		"a token refreshed just now for a session signed in earlier",
+	);
+	let unclaimed = fx.tokens.mint_signed_in(owners[0], T0, None);
+	reauth_required(fx.payment(&kind, &scope, Some(owners[0]), Some(&unclaimed)).await, "a session older than the claim");
+
+	let edge = fx.tokens.mint_signed_in(owners[0], T0, Some(T0 - 120));
+	assert!(
+		fx.payment(&kind, &scope, Some(owners[0]), Some(&edge)).await.unwrap().requested_by_proven,
+		"120 s after the re-authentication still proves"
+	);
+	let reauthenticated = fx.tokens.mint(owners[0], T0);
+	let opened = fx
+		.payment(&kind, &scope, Some(owners[0]), Some(&reauthenticated))
+		.await
+		.expect("a token from a re-authentication proves who asked");
+	assert!(opened.requested_by_proven);
+	assert_eq!(opened.voters.len(), 2, "the initiator is off the roster");
+	let spent = fx.payment(&kind, &scope, Some(owners[0]), Some(&reauthenticated)).await;
+	reauth_required(spent, "the same token twice");
+}
+
+/// Security review of concierge#171 (F4): a claim dated ahead of this plane's clock by more
+/// than the skew proves nothing. A clock that once jumped ahead would otherwise leave a future
+/// `auth_time` in the session, and every refresh would prove again.
+#[tokio::test]
+async fn a_proof_dated_ahead_of_the_clock_is_refused() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let kind = fx.bank_platform_kind(&scope).await;
+	fx.at(T0);
+
+	let token_ahead = fx.tokens.mint_signed_in(owners[0], T0 + 31, Some(T0));
+	let refused = fx.payment(&kind, &scope, Some(owners[0]), Some(&token_ahead)).await.unwrap_err();
+	assert_eq!(refused.code(), Code::FailedPrecondition, "{}", refused.message());
+	assert!(
+		refused.message().starts_with("reauth_required: the user token is dated more than 30 seconds ahead"),
+		"{}",
+		refused.message()
+	);
+
+	let session_ahead = fx.tokens.mint_signed_in(owners[0], T0, Some(T0 + 31));
+	let refused = fx.payment(&kind, &scope, Some(owners[0]), Some(&session_ahead)).await.unwrap_err();
+	assert_eq!(refused.code(), Code::FailedPrecondition, "{}", refused.message());
+	assert!(
+		refused
+			.message()
+			.starts_with("reauth_required: the session's last authentication is dated more than 30 seconds ahead"),
+		"{}",
+		refused.message()
+	);
+
+	let skewed = fx.tokens.mint(owners[0], T0 + 30);
+	assert!(
+		fx.payment(&kind, &scope, Some(owners[0]), Some(&skewed)).await.unwrap().requested_by_proven,
+		"30 s of drift between a replica and the database is honest"
+	);
+}
+
+/// Security review of concierge#171 (F6): every refresh inside the window mints another token
+/// with the same `auth_time`. One re-authentication proves one request, whichever of those
+/// tokens is presented, and a refused second request opens nothing.
+#[tokio::test]
+async fn one_re_authentication_proves_one_request() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let kind = fx.bank_platform_kind(&scope).await;
+	fx.at(T0);
+	let in_scope = || async {
+		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM approvals WHERE scope = $1")
+			.bind(&scope.id)
+			.fetch_one(&fx.pool)
+			.await
+			.unwrap()
+	};
+
+	let reauthenticated = fx.tokens.mint(owners[0], T0 - 10);
+	fx.payment(&kind, &scope, Some(owners[0]), Some(&reauthenticated)).await.expect("the first request");
+	let before = in_scope().await;
+	let refreshed = fx.tokens.mint_signed_in(owners[0], T0, Some(T0 - 10));
+	let refused = fx.payment(&kind, &scope, Some(owners[0]), Some(&refreshed)).await.unwrap_err();
+	assert_eq!(refused.code(), Code::FailedPrecondition, "{}", refused.message());
+	assert!(refused.message().starts_with("reauth_required: "), "{}", refused.message());
+	assert!(refused.message().contains("already spent"), "{}", refused.message());
+	assert_eq!(in_scope().await, before, "the refused request opened nothing");
+
+	let again = fx.tokens.mint(owners[0], T0);
+	assert!(
+		fx.payment(&kind, &scope, Some(owners[0]), Some(&again)).await.unwrap().requested_by_proven,
+		"a new re-authentication proves the next request"
 	);
 }
 
@@ -2104,7 +2227,7 @@ async fn a_retry_with_a_token_is_checked_as_the_first_call_was() {
 		Some(Code::PermissionDenied),
 		"someone else's token is refused on a retry as on the first call"
 	);
-	assert_eq!(code(send(Some(fx.tokens.mint(owners[0], T0 - 121))).await), Some(Code::Unauthenticated), "and a stale one");
+	assert_eq!(code(send(Some(fx.tokens.mint(owners[0], T0 - 121))).await), Some(Code::FailedPrecondition), "and a stale one");
 }
 
 // ---------------------------------------------------------------------------------

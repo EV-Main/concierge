@@ -369,22 +369,25 @@ async fn check_proof(conn: &mut PgConnection, proven: &ProvenInitiator, requeste
 	Ok(())
 }
 
-/// Spend a proof: one token proves one request. Spent in the transaction that opens the
-/// proposal, so a refused open spends nothing and a committed one can never be repeated
-/// under another `dedupe_key`.
-async fn spend_proof(conn: &mut PgConnection, proven: &ProvenInitiator, approval: Uuid, now: i64) -> Result<(), DomainError> {
-	let spent: Option<String> =
-		sqlx::query_scalar("INSERT INTO approval_initiator_proofs (token_digest, approval_id, at) VALUES ($1, $2, $3) ON CONFLICT (token_digest) DO NOTHING RETURNING token_digest")
-			.bind(&proven.token_digest)
-			.bind(approval)
-			.bind(now)
-			.fetch_optional(conn)
-			.await
-			.map_err(repo_err)?;
-	if spent.is_none() {
-		return Err(DomainError::Precondition("this proof was already spent: mint a token for each request".into()));
+/// Spend a proof: one token, and one re-authentication, prove one request. Both digests go
+/// in one column, so no migration and one primary key decides both races. Spent in the
+/// transaction that opens the proposal, so a refused open spends nothing and a committed
+/// one can never be repeated under another `dedupe_key`. `false`: either was spent before.
+async fn spend_proof(conn: &mut PgConnection, proven: &ProvenInitiator, approval: Uuid, now: i64) -> Result<bool, DomainError> {
+	for digest in [&proven.token_digest, &proven.reauth_digest] {
+		let spent: Option<String> =
+			sqlx::query_scalar("INSERT INTO approval_initiator_proofs (token_digest, approval_id, at) VALUES ($1, $2, $3) ON CONFLICT (token_digest) DO NOTHING RETURNING token_digest")
+				.bind(digest)
+				.bind(approval)
+				.bind(now)
+				.fetch_optional(&mut *conn)
+				.await
+				.map_err(repo_err)?;
+		if spent.is_none() {
+			return Ok(false);
+		}
 	}
-	Ok(())
+	Ok(true)
 }
 
 /// Tell the person a money decision names, proven by their token and so kept off its
@@ -897,7 +900,10 @@ impl ApprovalRepository for PgApprovals {
 			.await
 			.map_err(repo_err)?;
 		if let Some(proven) = &new.proven {
-			spend_proof(&mut tx, proven, new.id, now).await?;
+			if !spend_proof(&mut tx, proven, new.id, now).await? {
+				// Dropping the transaction rolls back the proposal written above.
+				return Ok(Proposed::ProofSpent);
+			}
 			if initiator_removed {
 				tell_initiator(&mut tx, proven.user, new.id, &new.scope, now).await?;
 			}

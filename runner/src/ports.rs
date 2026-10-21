@@ -551,6 +551,9 @@ pub struct ProvenInitiator {
 	pub token_version: u64,
 	/// SHA-256 of the token, lowercase hex: the token itself is never stored.
 	pub token_digest: String,
+	/// SHA-256 of `reauth:<user>:<auth_time>`, lowercase hex: spent beside the token's, so
+	/// one re-authentication proves one request, whatever tokens a refresh mints under it.
+	pub reauth_digest: String,
 }
 
 /// This plane's own token verifier as an approval sees it: whose access token a proposer
@@ -583,6 +586,9 @@ pub enum Proposed {
 	Existing(ApprovalRecord),
 	/// The proposer already holds `MAX_LIVE_PER_PROPOSER` live proposals.
 	Saturated,
+	/// The proof was spent before — this token, or another under the same
+	/// re-authentication: nothing was opened.
+	ProofSpent,
 }
 
 /// An account as a reader of a proposal sees it.
