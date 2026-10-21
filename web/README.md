@@ -1,6 +1,6 @@
 # concierge web — the identity plane's microfrontends
 
-Three self-registering custom elements, each a single ESM file with its own React,
+Four self-registering custom elements, each a single ESM file with its own React,
 rendered in the host's light DOM with the shared `@evinvest/uikit` tokens. Hosts mount
 them through [`@evinvest/mfe`](https://github.com/EV-Main/lib/tree/main/ts/mfe) /
 `@evinvest/concierge` ([`../sdk`](../sdk)) (registry, loader, events, `apiVersion` 2).
@@ -10,6 +10,7 @@ them through [`@evinvest/mfe`](https://github.com/EV-Main/lib/tree/main/ts/mfe) 
 | `mfe-concierge-sign-in` | `concierge.sign-in` | component |
 | `mfe-concierge-account` | `concierge.account` | page |
 | `mfe-concierge-account-chip` | `concierge.account-chip` | component |
+| `mfe-concierge-reauth` | `concierge.reauth` | component |
 
 The attributes and events of each element are documented at the top of its entry,
 `src/entries/<name>.tsx`.
@@ -45,6 +46,14 @@ Passkey add/remove on a session older than five minutes is answered `403 reauth_
 (#168). The Security tab then opens a confirmation step in the same panel
 (`features/sign-in-methods`: email code, password, passkey — `/auth/reauth/*`) and
 retries the act once; a second `reauth_required` is shown as an error, not asked again.
+
+`mfe-concierge-reauth` is the same confirmation as a dialog for a host on the platform
+origin whose own backend answers `403 reauth_required` (the admin console before it opens
+a payment, #171). The host sets `open`; the element fires `ev:reauthenticated` once the
+plane has accepted the proof and re-set `ev_access`, or `ev:close` when dismissed — at most
+one per opening. The host retries its act once and drops `open` either way. Off the
+platform origin the dialog only says to confirm on the platform: the reauth routes refuse
+every other `Origin`.
 
 A new account confirms its address in the dialog through the ticket `password/signup`
 hands back (`/password/signup/confirm`, `/resend`), which needs no CSRF cookie and so

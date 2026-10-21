@@ -287,6 +287,10 @@
     "en": "Confirm",
     "t": "Confirmer"
   },
+  "auth.reauth.dialogSub": {
+    "en": "This action needs a fresh confirmation. Confirm again to continue.",
+    "t": "Cette action demande une confirmation récente. Confirmez à nouveau pour continuer."
+  },
   "auth.reauth.done": {
     "en": "Confirmed. Now add the passkey.",
     "t": "Confirmé. Ajoutez maintenant la clé d’accès."
