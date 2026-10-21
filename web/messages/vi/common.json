@@ -287,6 +287,10 @@
     "en": "Confirm",
     "t": "Xác nhận"
   },
+  "auth.reauth.dialogSub": {
+    "en": "This action needs a fresh confirmation. Confirm again to continue.",
+    "t": "Thao tác này cần được xác nhận lại. Hãy xác nhận lại để tiếp tục."
+  },
   "auth.reauth.done": {
     "en": "Confirmed. Now add the passkey.",
     "t": "Đã xác nhận. Bây giờ hãy thêm khóa truy cập."

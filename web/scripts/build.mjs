@@ -1,4 +1,4 @@
-// Builds the three concierge elements into dist/: one self-registering ESM file per
+// Builds the concierge elements into dist/: one self-registering ESM file per
 // element, each with its own React, its own stylesheet inlined (scope-css.mjs) and only
 // the catalogue keys its own modules render, plus registry.json in the @evinvest/mfe
 // format. Hosts load dist/ under EV_MFE_BASE_PATH (default /api/auth/mfe/, concierge's
@@ -31,6 +31,7 @@ const ELEMENTS = [
   { id: "sign-in", name: "concierge.sign-in", tag: "mfe-concierge-sign-in", kind: "component" },
   { id: "account", name: "concierge.account", tag: "mfe-concierge-account", kind: "page" },
   { id: "account-chip", name: "concierge.account-chip", tag: "mfe-concierge-account-chip", kind: "component" },
+  { id: "reauth", name: "concierge.reauth", tag: "mfe-concierge-reauth", kind: "component" },
 ];
 
 const readJson = (file) => JSON.parse(readFileSync(file, "utf8"));

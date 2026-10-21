@@ -22,6 +22,7 @@ export const CONCIERGE_ELEMENTS = {
   signIn: { name: 'concierge.sign-in', tag: 'mfe-concierge-sign-in' },
   account: { name: 'concierge.account', tag: 'mfe-concierge-account' },
   accountChip: { name: 'concierge.account-chip', tag: 'mfe-concierge-account-chip' },
+  reauth: { name: 'concierge.reauth', tag: 'mfe-concierge-reauth' },
 } as const;
 
 export type ConciergeElement = keyof typeof CONCIERGE_ELEMENTS;
@@ -29,6 +30,7 @@ export type ConciergeElement = keyof typeof CONCIERGE_ELEMENTS;
 export const SIGN_IN_TAG = CONCIERGE_ELEMENTS.signIn.tag;
 export const ACCOUNT_TAG = CONCIERGE_ELEMENTS.account.tag;
 export const ACCOUNT_CHIP_TAG = CONCIERGE_ELEMENTS.accountChip.tag;
+export const REAUTH_TAG = CONCIERGE_ELEMENTS.reauth.tag;
 
 export interface ConciergeRegistryOptions {
   /** Default {@link CONCIERGE_MFE_PREFIX}; another value is for a staging stand only. */

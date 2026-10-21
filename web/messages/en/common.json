@@ -71,6 +71,7 @@
   "auth.password.set": "Set password",
   "auth.reauth.cancel": "Cancel",
   "auth.reauth.confirm": "Confirm",
+  "auth.reauth.dialogSub": "This action needs a fresh confirmation. Confirm again to continue.",
   "auth.reauth.done": "Confirmed. Now add the passkey.",
   "auth.reauth.err.emailUnverified": "Your email is not verified, so we cannot mail you a code. Confirm another way.",
   "auth.reauth.err.invalidPassword": "That password is not right.",

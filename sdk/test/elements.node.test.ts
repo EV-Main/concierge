@@ -19,6 +19,13 @@ const ACCOUNT_CHIP: MfeEntry = {
   scriptUrl: '/auth/mfe/account-chip.js',
 };
 
+const REAUTH: MfeEntry = {
+  name: 'concierge.reauth',
+  tag: 'mfe-concierge-reauth',
+  kind: 'component',
+  scriptUrl: '/auth/mfe/reauth.js',
+};
+
 describe('conciergeEntry', () => {
   it('should_return_the_entry_whose_name_and_tag_match', () => {
     expect(conciergeEntry([ACCOUNT_CHIP, SIGN_IN], 'signIn')).toEqual({ ok: true, value: SIGN_IN });
@@ -39,6 +46,25 @@ describe('conciergeEntry', () => {
       ok: false,
       error: 'concierge.sign-in: tag mfe-concierge-sign-in-v3, expected mfe-concierge-sign-in',
     });
+  });
+});
+
+describe('conciergeEntry for reauth', () => {
+  it('should_return_the_reauth_entry_whose_name_and_tag_match', () => {
+    expect(conciergeEntry([SIGN_IN, REAUTH], 'reauth')).toEqual({ ok: true, value: REAUTH });
+  });
+
+  it('should_refuse_a_reauth_entry_with_another_tag', () => {
+    const renamed: MfeEntry = { ...REAUTH, tag: 'mfe-concierge-reauth-v2' };
+
+    expect(conciergeEntry([renamed], 'reauth')).toEqual({
+      ok: false,
+      error: 'concierge.reauth: tag mfe-concierge-reauth-v2, expected mfe-concierge-reauth',
+    });
+  });
+
+  it('should_refuse_when_the_registry_has_no_reauth_entry', () => {
+    expect(conciergeEntry([SIGN_IN], 'reauth')).toEqual({ ok: false, error: 'registry has no concierge.reauth' });
   });
 });
 
