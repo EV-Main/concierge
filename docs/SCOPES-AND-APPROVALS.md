@@ -379,8 +379,21 @@ containment is never slower than the grant).
   one opening a grant for another leaves a roster of one, so that grant is decided by a
   single owner.
 - **A proven initiator of a money decision does not decide it** (D24(1)): a proposer may
-  present, in metadata `x-ev-user-token`, an access token of this plane that `requested_by`
-  holds (banking forwards the owner's). Verified as every RPC here verifies one, its `sub`
+  present, in metadata `x-ev-user-token`, an access token that `requested_by` holds. Which
+  token depends on who proposes:
+  - **the bridge** (banking) presents an access token of this plane (banking forwards the
+    owner's), verified as every RPC here verifies one;
+  - **a relying party** (invest's `invest:fee_policy`) presents the person's token issued to
+    ITSELF: verified by the client verifier as `GetMe` verifies it (a live client session),
+    and its `aud` must be the calling client's audience. A token of this plane is refused
+    `UNAUTHENTICATED` (a client cannot hold one, and the client verifier does not know its
+    audience); another client's token is refused `PERMISSION_DENIED` ("the user token was
+    issued to another client"). A client token's `auth_time` is the platform session's at
+    the moment the client was authorized, kept through every refresh, so the client gets a
+    fresh one by sending the person to `/api/auth/authorize?…&max_age=0` (§3.2), which
+    has them confirm on the platform before it issues the code.
+
+  Either way, its `sub`
   must be `requested_by`, the account still active at that token's `token_version`, the
   token minted no more than 120 s before the call, its `auth_time` no more than 120 s
   before the call too (concierge#171), neither claim dated more than 30 s after the call
@@ -389,10 +402,12 @@ containment is never slower than the grant).
   `approval_initiator_proofs`: the token's SHA-256, and the SHA-256 of
   `reauth:<user id>:<auth_time>`. So one token proves one request, and so does one
   re-authentication: every refresh inside the window mints another token with the same
-  `auth_time`. A young token alone is not
+  `auth_time` — of this plane or of a client, since a client token states the platform
+  session's `auth_time`. A young token alone is not
   enough: a refresh mints one and keeps the session's old `auth_time`, so it shows only
   that the session was alive. The person re-authenticates first (`/auth/reauth/*` moves
-  `auth_time` to now and re-sets `ev_access`), and the proposer then presents that token.
+  `auth_time` to now and re-sets `ev_access`; a relying party gets there through
+  `max_age`), and the proposer then presents that token.
   Every refusal of the proof itself is `FAILED_PRECONDITION` with a message that starts
   with `reauth_required: `: a token or an `auth_time` older than 120 s or more than 30 s
   ahead, a missing `auth_time`, and a spent proof ("this proof was already spent"). A

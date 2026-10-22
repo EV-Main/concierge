@@ -183,16 +183,22 @@ service ApprovalExecutionService {
   // with an `auth_time` that is missing, older than 120 seconds or more than 30 seconds
   // ahead, or a proof already spent (the token, or another token of the same
   // re-authentication: "this proof was already spent") — whose message STARTS with the code
-  // word `reauth_required: `: send the person through `/auth/reauth/*` and retry with the
-  // token it mints; or the proposal resolves to
+  // word `reauth_required: `: send the person through `/auth/reauth/*` (a relying party:
+  // through `/api/auth/authorize?…&max_age=0`) and retry with the token it mints; or the
+  // proposal resolves to
   // PLATFORM while the platform pauses after a change of its owners (PlatformApprovalPolicy
   // `cooldown_secs` from `roster_changed_at`). PERMISSION_DENIED: a relying party naming a
-  // scope other than its own; a user token that is not `requested_by`'s or no longer
-  // speaks for an active account. UNAUTHENTICATED: a user token this plane does not verify.
+  // scope other than its own; a user token that is not `requested_by`'s, was issued to
+  // another client ("the user token was issued to another client") or no longer speaks
+  // for an active account. UNAUTHENTICATED: a user token this plane does not verify — for
+  // a relying party, also this plane's own token or one of an ended client session.
   //
-  // Metadata `x-ev-user-token`: optionally, `requested_by`'s own access token of this plane
-  // (`typ=access`, verified as every RPC of this plane verifies one; `requested_by`
-  // required with it), minted no more than 120 seconds before the call, with an `auth_time`
+  // Metadata `x-ev-user-token`: optionally, `requested_by`'s own access token — from the
+  // bridge, one of this plane (`typ=access`, verified as every RPC of this plane verifies
+  // one); from a relying party, one issued to THAT client (`aud` = its audience, a live
+  // client session, as `GetMe` admits it; its `auth_time` is the platform session's when
+  // the client authorized, so ask for one with `max_age`) — `requested_by`
+  // required with it, minted no more than 120 seconds before the call, with an `auth_time`
   // no more than 120 seconds before the call — the person re-authenticated just now; a
   // refresh keeps the session's old `auth_time` — neither dated more than 30 seconds after
   // it, and spent by it: one token, and one re-authentication, prove one request. What it proves is that the person proved themselves to this plane within the

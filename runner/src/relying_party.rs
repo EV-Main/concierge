@@ -569,6 +569,15 @@ impl Authenticate for ClientTokenAuthenticator {
 	}
 }
 
+/// The same check as the restricted half of the auth layer, as an approval asks it: whose
+/// token a relying party presents to prove who asked for a proposal (D24(1)).
+#[async_trait::async_trait]
+impl crate::ports::UserTokenVerifier for ClientTokenAuthenticator {
+	async fn verify(&self, token: &str) -> Result<Claims, AuthError> {
+		self.authenticate(token.to_owned()).await
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

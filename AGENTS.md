@@ -699,6 +699,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   excluded from a service's roster (`requested_by` is what a service says, not a proof);
   the opener of this plane's own `concierge:*` proposal, proven by the session, is (D23),
   and so is a money decision's initiator whose own access token the proposer presents —
+  this plane's from the bridge, the one issued to the calling client from a relying party
+  (the client verifier, `aud` = that client, a live client session; this plane's token or
+  another client's is refused) —
   minted within 120 s, with an `auth_time` within 120 s (a re-authentication, #171; else
   `FAILED_PRECONDITION` `reauth_required: …`; neither claim more than 30 s ahead) and spent
   once, per token and per re-authentication, so it proves the person
