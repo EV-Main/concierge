@@ -1,6 +1,6 @@
 //! A scope's notification topics on `NotificationService` (`docs/SCOPES-AND-APPROVALS.md`
 //! §6): the account-less subscribe takes a published one, and the keys that moved to a
-//! scope keep working under their new names.
+//! scope are no longer aliased.
 //!
 //! Every test registers its own scope and catalog, so the suite runs beside the others on a
 //! shared database.
@@ -17,8 +17,7 @@ use concierge::{
 use domain::scope_catalog::{NotificationTopic, ScopeCatalog};
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
-	EmitRequest, GetNotificationSettingsRequest, ListNotificationsRequest, SetTopicSubscriptionRequest, SubscribeAnonymousRequest, UnsubscribeRequest,
-	notification_service_server::NotificationService,
+	EmitRequest, GetNotificationSettingsRequest, ListNotificationsRequest, SetTopicSubscriptionRequest, SubscribeAnonymousRequest, notification_service_server::NotificationService,
 };
 use sqlx::PgPool;
 use tonic::{Code, Request};
@@ -178,55 +177,38 @@ async fn an_address_subscribes_to_a_published_scope_topic() {
 	assert_eq!(fx.followed(&email).await, vec![topic], "a refused topic is not followed");
 }
 
-/// `fund:quy-nhon` moved to `invest:` and `account:money-movement` to `bank:` (§6). Until the
-/// emitters and pages have moved, the old key is accepted where a topic is named and stands
-/// for the new one; `account:money-movement` itself stays this plane's trace topic.
+/// `fund:quy-nhon` moved to `invest:` and `account:money-movement` to `bank:` (§6), and the
+/// contract step dropped the aliases: an old key is as unknown as a made-up one.
+/// `account:money-movement` itself stays this plane's trace topic.
 #[tokio::test]
-async fn a_moved_key_stands_for_its_new_one() {
+async fn a_moved_key_is_no_longer_an_alias() {
 	let Some(fx) = setup().await else { return };
 	let (user, email) = fx.user("moved").await;
 
-	let settings = fx
-		.service
-		.set_topic_subscription(as_user(
-			SetTopicSubscriptionRequest {
-				topic: "account:money-movement".into(),
-				subscribed: true,
-				email_enabled: true,
-			},
-			user,
-		))
-		.await
-		.unwrap()
-		.into_inner();
-	assert_eq!(fx.follows(user).await, vec!["bank:money-movement".to_owned()], "following the old key follows the new one");
-	assert!(
-		settings.topics.iter().all(|t| t.topic != "account:money-movement" && t.topic != "fund:quy-nhon"),
-		"neither old key is offered any more: {:?}",
-		settings.topics
-	);
+	for old in ["fund:quy-nhon", "account:money-movement"] {
+		let followed = fx
+			.service
+			.set_topic_subscription(as_user(
+				SetTopicSubscriptionRequest {
+					topic: old.into(),
+					subscribed: true,
+					email_enabled: true,
+				},
+				user,
+			))
+			.await
+			.unwrap_err();
+		assert_eq!(followed.code(), Code::InvalidArgument, "following {old}");
+		let subscribed = fx.service.subscribe_anonymous(as_service(subscribe(&email, old))).await.unwrap_err();
+		assert_eq!(subscribed.code(), Code::InvalidArgument, "account-less {old}");
+	}
+	assert!(fx.follows(user).await.is_empty());
 
-	let sent = fx.service.emit(as_service(emit(user, "account:money-movement"))).await.unwrap().into_inner();
-	assert!(sent.delivered, "{sent:?}");
-	assert_eq!(
-		fx.inbox_topics(user).await,
-		vec!["bank:money-movement".to_owned()],
-		"an emit on the old key lands under the new one"
-	);
-
-	// `invest:` reaches the invest scope's members only, whichever key named it.
-	let sub = fx.notifications.subscriber_for_user(user, &email, true).await.unwrap();
-	fx.notifications.set_topic_subscription(sub.id, "invest:fund:quy-nhon", true, true).await.unwrap();
-	let outside = fx.service.emit(as_service(emit(user, "fund:quy-nhon"))).await.unwrap().into_inner();
-	assert!(!outside.delivered, "not a member of invest yet: {outside:?}");
-	sqlx::query("INSERT INTO scope_members (scope, user_id, joined_at, joined_by, lifecycle_sequence, sequence, permissions) VALUES ('invest', $1, 0, 'grant', 0, 1, '{}')")
-		.bind(user)
-		.execute(&fx.pool)
-		.await
-		.unwrap();
-	let inside = fx.service.emit(as_service(emit(user, "fund:quy-nhon"))).await.unwrap().into_inner();
-	assert!(inside.delivered, "{inside:?}");
-	assert_eq!(fx.inbox_topics(user).await.last().map(String::as_str), Some("invest:fund:quy-nhon"));
+	let unknown = fx.service.emit(as_service(emit(user, "fund:quy-nhon"))).await.unwrap_err();
+	assert_eq!(unknown.code(), Code::InvalidArgument, "an emit on a dropped alias");
+	let trace = fx.service.emit(as_service(emit(user, "account:money-movement"))).await.unwrap_err();
+	assert_eq!(trace.code(), Code::PermissionDenied, "the trace topic is written by this plane alone");
+	assert!(fx.inbox_topics(user).await.is_empty());
 
 	// The trace topic is still this plane's, written whatever anyone follows, shown in the
 	// platform inbox and filterable there — and nobody follows it.
@@ -254,27 +236,6 @@ async fn a_moved_key_stands_for_its_new_one() {
 	for built_in in TOPICS {
 		assert_eq!(offered.contains(&built_in.key), built_in.followable, "{}", built_in.key);
 	}
-
-	// The account-less path takes the old key too, and a one-click unsubscribe by it.
-	let address = format!("anon-moved-{}@example.com", Uuid::new_v4());
-	fx.service.subscribe_anonymous(as_service(subscribe(&address, "fund:quy-nhon"))).await.unwrap();
-	assert_eq!(fx.followed(&address).await, vec!["invest:fund:quy-nhon".to_owned()]);
-	let token: String = sqlx::query_scalar("SELECT unsubscribe_token FROM notification_subscribers WHERE user_id IS NULL AND lower(email) = lower($1)")
-		.bind(&address)
-		.fetch_one(&fx.pool)
-		.await
-		.unwrap();
-	let left = fx
-		.service
-		.unsubscribe(as_service(UnsubscribeRequest {
-			token,
-			topic: "fund:quy-nhon".into(),
-		}))
-		.await
-		.unwrap()
-		.into_inner();
-	assert!(left.unsubscribed);
-	assert!(fx.followed(&address).await.is_empty());
 }
 
 /// The migration that moves the keys, run over rows written under the old ones: every

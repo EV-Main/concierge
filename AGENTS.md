@@ -627,7 +627,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   binaries wrote. Every boot-time and outbox write has to stay correct while an older
   binary runs beside it. On the wire `seat_permissions` absent means "not stated" (a
   pre-0027 row) and present-but-empty means "this seat holds no `bank:*`"; field 12
-  `permissions` cannot tell the two apart and is deprecated.
+  `permissions` could not tell the two apart and is retired: reserved in `events.proto`
+  (#111), no longer filled.
 - **A tenant may let an alias delegate, and a delegate is a narrow, blind granter.** A
   catalog's `delegations` names, per alias, the aliases its holders may grant and revoke
   (`sa:admin` → `sa:operator`), and an alias that is delegated may delegate nothing itself:
@@ -667,7 +668,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   clients or their first grant in its namespace, and MEMBER_JOINED carries the identity
   snapshot as of the user's `row_version`, taken under the `users` row `FOR SHARE` so no
   lifecycle row can commit between the two. The lifecycle stream then serves a client only
-  rows past that snapshot, with `seat_permissions` absent and `permissions` empty;
+  rows past that snapshot, with `seat_permissions` absent;
   `kyc_level` is carried (D5). GRANTS_CHANGED re-states the concrete set `GetMe` would
   answer that tenant's client (persisted seat, never break-glass), written in the SAME
   transaction as the grant, the revocation, the catalog publication or the ROLE_CHANGED
@@ -749,8 +750,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   An emit on a scope's topic reaches its active members only, and a topic published with
   `default_subscribed` follows every account that never touched it — which is why switching
   a topic off is a row of its own (`notification_topic_optouts`), not a missing one. The
-  old `fund:quy-nhon` / `account:money-movement` keys are aliases of their `invest:` / `bank:`
-  successors until the contract step; `account:money-movement` stays this plane's trace topic.
+  old `fund:quy-nhon` / `account:money-movement` keys are no longer aliases of their
+  `invest:` / `bank:` successors (dropped at the contract step); `account:money-movement`
+  stays this plane's trace topic.
   So the client credential opens `ScopeEvents`, `UserEvents`, `ScopeCatalogService` and
   `ScopeInboxService`, while a client's USER token is admitted by the auth layer on `GetMe`
   alone and is otherwise only that second proof on a scope-inbox write. The gRPC summary
