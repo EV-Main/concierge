@@ -226,6 +226,12 @@ impl RelyingParties {
 		Ok((registered && !client.disabled && !client.scope_closed).then_some(client))
 	}
 
+	/// The client, when `client_id` names an enabled one of a scope that is not closed —
+	/// the one `/auth/authorize` would serve, whatever the redirect.
+	pub async fn signing_in(&self, client_id: &str) -> Result<Option<ClientRecord>, DomainError> {
+		Ok(self.repo.client(client_id).await?.filter(|client| !client.disabled && !client.scope_closed))
+	}
+
 	/// Whether `user` may be signed into a client right now: an active account.
 	pub async fn admit(&self, user: UserId) -> Result<Admission, DomainError> {
 		Ok(match self.users.authz_record(user).await? {
@@ -619,6 +625,7 @@ mod tests {
 			namespace: "sa".into(),
 			scope: "sa".into(),
 			scope_closed: false,
+			display_name: "Service-Arb".into(),
 		};
 		assert!(check_registered_redirects(&client("https://sa.evinvest.ltd/auth/callback")).is_ok());
 		for bad in [

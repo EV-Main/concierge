@@ -1423,6 +1423,40 @@ async fn without_a_session_max_age_rides_through_the_login() {
 	assert_eq!(back["max_age"], "0");
 }
 
+/// The page names the app from the registry, never from the request.
+#[tokio::test]
+async fn the_confirmation_page_reads_the_apps_name_from_the_registry() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	sqlx::query("UPDATE tenants SET display_name = 'Test App' WHERE id = $1")
+		.bind(&fx.client.namespace)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	let read = |path: String| {
+		let router = router.clone();
+		async move {
+			let response = router.oneshot(HttpRequest::builder().uri(path).body(Body::empty()).unwrap()).await.unwrap();
+			let status = response.status();
+			let cache = response.headers().get(header::CACHE_CONTROL).map(|v| v.to_str().unwrap().to_owned());
+			let body: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap()).unwrap();
+			(status, cache, body)
+		}
+	};
+	let (status, cache, body) = read(format!("/auth/clients/{}", fx.client.id)).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(body, serde_json::json!({ "client_id": fx.client.id, "display_name": "Test App" }));
+	assert_eq!(cache.as_deref(), Some("public, max-age=300"));
+	assert_eq!(read("/auth/clients/no_such_client".into()).await.0, StatusCode::NOT_FOUND);
+	sqlx::query("UPDATE rp_clients SET disabled_at = 1 WHERE client_id = $1")
+		.bind(&fx.client.id)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	let (status, _, body) = read(format!("/auth/clients/{}", fx.client.id)).await;
+	assert_eq!((status, body), (StatusCode::NOT_FOUND, serde_json::json!({ "error": "unknown_client" })));
+}
+
 /// End to end: a token a real exchange minted after a confirmation trip, verified by the
 /// real client verifier, proves who asked on `Propose`; the ordinary sign-in token of the
 /// same person does not.

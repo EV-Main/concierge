@@ -51,6 +51,7 @@ struct ClientRow {
 	namespace: String,
 	scope: String,
 	scope_closed: bool,
+	display_name: String,
 }
 
 impl TryFrom<ClientRow> for ClientRecord {
@@ -66,6 +67,7 @@ impl TryFrom<ClientRow> for ClientRecord {
 			namespace: row.namespace,
 			scope: row.scope,
 			scope_closed: row.scope_closed,
+			display_name: row.display_name,
 		})
 	}
 }
@@ -99,7 +101,7 @@ struct SessionDbRow {
 impl RelyingPartyRepository for PgRelyingParties {
 	async fn client(&self, client_id: &str) -> Result<Option<ClientRecord>, DomainError> {
 		sqlx::query_as::<_, ClientRow>(
-			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace, t.id AS scope, t.state = 'closed' AS scope_closed \
+			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace, t.id AS scope, t.state = 'closed' AS scope_closed, t.display_name \
 			 FROM rp_clients c JOIN tenants t ON t.id = c.tenant_id WHERE c.client_id = $1",
 		)
 		.bind(client_id)
@@ -112,7 +114,7 @@ impl RelyingPartyRepository for PgRelyingParties {
 
 	async fn clients(&self) -> Result<Vec<ClientRecord>, DomainError> {
 		sqlx::query_as::<_, ClientRow>(
-			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace, t.id AS scope, t.state = 'closed' AS scope_closed \
+			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace, t.id AS scope, t.state = 'closed' AS scope_closed, t.display_name \
 			 FROM rp_clients c JOIN tenants t ON t.id = c.tenant_id ORDER BY c.client_id",
 		)
 		.fetch_all(&self.pool)

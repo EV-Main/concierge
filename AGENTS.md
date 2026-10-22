@@ -782,7 +782,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   (`rpconfirm:<session>:<client>:<PKCE challenge>`, start time, 600 s). The way back takes
   the trip once: a code carrying `auth_time` when it moved after the trip began (≤ 30 s
   ahead), else `access_denied`, so a dismissed confirmation never loops; no query flag
-  counts (`docs/SCOPES-AND-APPROVALS.md` §3.2). A new sign-in closes the
+  counts. `GET /auth/clients/{client_id}` gives that page the app's registered
+  `display_name` (`docs/SCOPES-AND-APPROVALS.md` §3.2). A new sign-in closes the
   browser's previous session and revokes its family, so its client sessions end with it
   (single logout below). A code is 256 random bits stored as a digest, lives
   `CODE_TTL_SECS` (60), is bound to client, redirect_uri, PKCE challenge, user and

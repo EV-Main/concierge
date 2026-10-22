@@ -270,6 +270,8 @@ pub struct ClientRecord {
 	/// refresh, as if disabled. A FROZEN scope's client keeps working — a direction has to
 	/// learn it was frozen.
 	pub scope_closed: bool,
+	/// Its scope's name as people read it (`tenants.display_name`); may be empty.
+	pub display_name: String,
 }
 
 /// A one-time authorization code to store (`rp_codes`). Only its digest is persisted.

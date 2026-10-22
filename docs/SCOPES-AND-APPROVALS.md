@@ -218,6 +218,12 @@ digits, anything else answers `error=invalid_request`; together with `prompt` it
   dismissed confirmation does not loop. Another session, another client or another PKCE
   challenge finds no trip; a hand-added query parameter changes nothing.
 
+`GET /api/auth/clients/{client_id}` names the app on that page: `200 {"client_id": "…",
+"display_name": "…"}` (the scope's `tenants.display_name`, possibly empty),
+`Cache-Control: public, max-age=300`; `404 {"error": "unknown_client"}` for a client
+`/auth/authorize` would not serve (unknown, disabled, of a closed scope). Public, no
+credentials, same-origin; the name is never taken from the query.
+
 Without `max_age` nothing changes but the claim. This is how a relying party proves its
 user confirmed just now (§5.2, D24(1)): authorize with `max_age=0`, exchange the code, and
 present that access token within 120 s of the confirmation.

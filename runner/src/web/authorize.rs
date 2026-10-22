@@ -27,7 +27,8 @@
 //! client cannot spend another's proof or pass an ordinary sign-in off as one.
 
 use axum::{
-	extract::{Query, State},
+	Json,
+	extract::{Path, Query, State},
 	http::{HeaderMap, HeaderValue, StatusCode, header},
 	response::{Html, IntoResponse, Response},
 };
@@ -238,6 +239,45 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 		}
 	};
 	(refreshed, answer).into_response()
+}
+
+/// Longest client id worth a lookup; registered ids are far shorter.
+const MAX_CLIENT_ID_LEN: usize = 64;
+
+/// `GET /auth/clients/{client_id}` (publicly `/api/auth/clients/{client_id}`) — the name of
+/// the app a confirmation is for, so the confirmation page can say who asks. Read from the
+/// registry, never from the request: a name taken from the query would let any link
+/// dress the platform's page up as any app. Public, no credentials, cacheable; a client
+/// `/auth/authorize` would not serve (unknown, disabled, of a closed scope) is the same 404.
+/// `display_name` may be empty: the scope never set one.
+pub async fn client_name(State(st): State<WebState>, Path(client_id): Path<String>) -> Response {
+	let st = &st.inner;
+	let unknown = || {
+		(
+			StatusCode::NOT_FOUND,
+			[(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=60"))],
+			Json(serde_json::json!({ "error": "unknown_client" })),
+		)
+			.into_response()
+	};
+	let Some(relying_parties) = st.relying_parties.as_ref() else {
+		return unknown();
+	};
+	if client_id.len() > MAX_CLIENT_ID_LEN {
+		return unknown();
+	}
+	match relying_parties.signing_in(&client_id).await {
+		Ok(Some(client)) => (
+			[(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=300"))],
+			Json(serde_json::json!({ "client_id": client.client_id, "display_name": client.display_name })),
+		)
+			.into_response(),
+		Ok(None) => unknown(),
+		Err(err) => {
+			tracing::error!(%err, "relying party: registry unreadable for a client name");
+			(StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "unavailable" }))).into_response()
+		}
+	}
 }
 
 /// The browser's `evinvest.ltd` session and the refresh family behind it, or `None` when

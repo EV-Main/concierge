@@ -43,9 +43,7 @@ mod turnstile;
 // The one session-store name tests exercise the persistence invariant through.
 use std::sync::Arc;
 
-/// Re-exported so the integration suite asserts against the cap the route actually
-/// enforces. A test that hard-coded the number would keep passing after someone raised
-/// it, and the number is what stands between one account and the vendor balance.
+/// Re-exported so the integration suite drives a confirmation trip as the route keys it.
 pub use authorize::{CONFIRM_PATH, TRIP_TTL_SECS, trip_key};
 use axum::{
 	Router,
@@ -56,6 +54,9 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use domain::users::UserId;
 use evconcierge_auth::{AuthService, oauth::OAuthProvider};
+/// Re-exported so the integration suite asserts against the cap the route actually
+/// enforces. A test that hard-coded the number would keep passing after someone raised
+/// it, and the number is what stands between one account and the vendor balance.
 pub use kyc::START_MAX_PER_WINDOW;
 /// Re-exported for the same reason: the suite drives the passkey sign-in up to this budget.
 pub use passkey::SIGN_IN_STARTS_PER_MINUTE;
@@ -300,6 +301,9 @@ pub fn router(state: WebState) -> Router {
 		// address registered for the client, carrying a code that is useless without the
 		// PKCE verifier the client kept.
 		.route("/auth/authorize", get(authorize::authorize))
+		// The name of the app the confirmation page (`authorize::CONFIRM_PATH`) asks for:
+		// public and same-origin, read from the registry (`web::authorize::client_name`).
+		.route("/auth/clients/{client_id}", get(authorize::client_name))
 		// Identity verification. `/kyc/callback/didit` is PUBLIC — it is reached by the
 		// vendor, not a browser, and authenticates itself with an HMAC over the body.
 		// Publicly both are seen under the conductor's `/api` prefix.
