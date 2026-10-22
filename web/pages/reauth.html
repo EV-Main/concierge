@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- The platform confirmation page, built to dist/reauth.html by scripts/build.mjs, which
+     fills the %…% names with the hashed files of the same build. Paths stay relative: the
+     page sits beside the bundles wherever concierge serves dist/. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Confirm it's you · EV</title>
+    <link rel="stylesheet" href="./%PAGE_CSS%" />
+    <script type="module" src="./%ELEMENT_JS%"></script>
+    <script type="module" src="./%PAGE_JS%"></script>
+  </head>
+  <body>
+    <main class="reauth-page">
+      <h1>Confirm it's you</h1>
+      <p>An app on the EV platform asks you to confirm it is you before it continues. When you finish, you go back to that app.</p>
+      <p id="reauth-refusal" class="reauth-refusal" role="alert" hidden>This confirmation link is not valid. Go back to the app and try again.</p>
+      <div id="reauth-mount"></div>
+    </main>
+  </body>
+</html>

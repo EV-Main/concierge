@@ -55,6 +55,33 @@ one per opening. The host retries its act once and drops `open` either way. Off 
 platform origin the dialog only says to confirm on the platform: the reauth routes refuse
 every other `Origin`.
 
+## The platform confirmation page
+
+`reauth.html` is the one page in `dist/`; concierge serves it at
+`/api/auth/mfe/reauth.html` with `no-store`, `frame-ancestors 'none'` and `no-referrer`
+(`runner/src/web/mfe.rs`). A relying party gets a fresh-sign-in proof by sending its user
+to `/api/auth/authorize?…&max_age=N` (D24(1)). When the session is older than `N`, the
+authorize route answers 302 to this page with
+`return_to=/api/auth/authorize?…&max_age=N&reauth=done` (`runner/src/web/authorize.rs`,
+`CONFIRM_PATH`). The page mounts `<mfe-concierge-reauth open>` from the same build and,
+on `ev:reauthenticated` or `ev:close`, calls `location.replace(return_to)`. It does not
+judge the outcome: the authorize route answers with a code or with `access_denied`.
+
+The page accepts `return_to` only if it is a relative path that starts with
+`/api/auth/authorize?` and contains no backslash and no control character (so no scheme,
+no `//` and no `/\` at the start), and only if it still resolves to that path on this
+origin (`src/shared/lib/authorize-return.ts`). Anything else shows a short error and
+navigates nowhere: the page runs signed in on the platform origin, and an open redirect
+there would lend the platform's address bar to a phishing link.
+
+The page is built from `pages/reauth.html` (template), `src/entries/reauth-page.ts` (the
+script, no React) and `styles/reauth-page.css` (kit tokens only); `scripts/build.mjs`
+fills in the hashed names. It is English only, and it loads no font: without a host, the
+kit's font chain falls back to the system sans.
+
+**Deploy order.** The concierge image with this page and the `max_age` handling ships
+first. Only then may invest send `max_age`: before it, a stale session lands on a 404.
+
 A new account confirms its address in the dialog through the ticket `password/signup`
 hands back (`/password/signup/confirm`, `/resend`), which needs no CSRF cookie and so
 works on every host; without a ticket the dialog sends the reader to the platform. An
@@ -79,7 +106,7 @@ it and refuses to build without it.
 ```sh
 npm ci
 npm run typecheck && npm run lint && npm run i18n:check
-npm run build          # → dist/<name>-<hash>.js + dist/registry.json
+npm run build          # → dist/<name>-<hash>.js + dist/registry.json + dist/reauth.html
 ```
 
 Build-time configuration (`scripts/config.mjs`, the only place it is read):
