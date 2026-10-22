@@ -64,9 +64,10 @@ pub struct Claims {
 	pub token_version: u64,
 	/// Unix seconds of the principal's last interactive authentication (password,
 	/// passkey, email code, OAuth). Unlike `iat` it survives a refresh, so a verifier
-	/// can ask "did the user just confirm?". Absent on tokens minted before the claim
-	/// existed and on relying-party/service tokens; absence means "no step-up signal",
-	/// never "authenticated at epoch".
+	/// can ask "did the user just confirm?". On a relying party's token it is the platform
+	/// session's at the moment the client was authorized, kept through every refresh.
+	/// Absent on tokens minted before the claim existed and on service tokens; absence
+	/// means "no step-up signal", never "authenticated at epoch".
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub auth_time: Option<u64>,
 }

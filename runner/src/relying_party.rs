@@ -153,6 +153,8 @@ pub enum Admission {
 pub struct Requester<'a> {
 	/// The `evinvest.ltd` refresh family the browser is signed in with.
 	pub upstream_family: &'a str,
+	/// That session's last interactive authentication, as its own access token states it.
+	pub auth_time: Option<u64>,
 	pub client_ip: &'a str,
 	pub user_agent: &'a str,
 }
@@ -246,6 +248,7 @@ impl RelyingParties {
 				user,
 				token_version,
 				upstream_family: from.upstream_family,
+				auth_time: from.auth_time,
 				issued_at: now,
 				expires_at: now + CODE_TTL_SECS,
 				client_ip: truncate(from.client_ip, 64),
@@ -352,8 +355,8 @@ impl RelyingParties {
 			})
 			.await
 			.map_err(unavailable)?;
-		let (user, token_version) = match outcome {
-			CodeOutcome::Redeemed { user, token_version } => (user, token_version),
+		let (user, token_version, auth_time) = match outcome {
+			CodeOutcome::Redeemed { user, token_version, auth_time } => (user, token_version, auth_time),
 			CodeOutcome::Replayed { client_id, user, revoked_sessions } => {
 				tracing::error!(%client_id, user_id = %user, revoked_sessions, "relying party: authorization code presented twice — the sessions it opened are revoked");
 				return Err(ClientGrantError::InvalidGrant);
@@ -399,6 +402,7 @@ impl RelyingParties {
 			user_id: user.to_string(),
 			audience: client.audience,
 			token_version,
+			auth_time,
 			session_id: session_id.to_string(),
 			refresh_token: format!("{session_id}.{secret}"),
 			refresh_expires_at: expires_at as u64,
@@ -465,6 +469,7 @@ impl RelyingParties {
 			user_id: session.user.to_string(),
 			audience: client.audience,
 			token_version,
+			auth_time: session.auth_time,
 			session_id: session_id.to_string(),
 			refresh_token: format!("{session_id}.{next}"),
 			refresh_expires_at: expires_at as u64,

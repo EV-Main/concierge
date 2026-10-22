@@ -283,6 +283,9 @@ pub struct NewCode<'a> {
 	/// The `evinvest.ltd` refresh family the browser was signed in with; the session
 	/// the code opens inherits it, so signing out there ends it.
 	pub upstream_family: &'a str,
+	/// That session's last interactive authentication (unix seconds). The session the
+	/// code opens keeps it, and every client access token carries it.
+	pub auth_time: Option<u64>,
 	pub issued_at: i64,
 	pub expires_at: i64,
 	pub client_ip: &'a str,
@@ -305,6 +308,7 @@ pub enum CodeOutcome {
 	Redeemed {
 		user: UserId,
 		token_version: u64,
+		auth_time: Option<u64>,
 	},
 	Unknown,
 	Expired,
@@ -338,6 +342,8 @@ pub struct SessionRow {
 	pub current_hash: Vec<u8>,
 	pub prev_hash: Option<Vec<u8>>,
 	pub token_version: u64,
+	/// Fixed when the session opened: a refresh re-mints the claim, never moves it.
+	pub auth_time: Option<u64>,
 	pub expires_at: i64,
 	pub absolute_expires_at: i64,
 	pub revoked: bool,

@@ -210,6 +210,11 @@ impl Fx {
 	/// A code for `user`, issued the way `/auth/authorize` issues one (admission included),
 	/// plus the PKCE verifier it is bound to.
 	async fn code_for(&self, user: UserId) -> (String, String) {
+		self.code_at(user, None).await
+	}
+
+	/// [`Self::code_for`] from a session last authenticated at `auth_time`.
+	async fn code_at(&self, user: UserId, auth_time: Option<u64>) -> (String, String) {
 		let client = self.record().await;
 		let Admission::Admitted { token_version } = self.rp.admit(user).await.unwrap() else {
 			panic!("the user must be admitted to be issued a code");
@@ -225,6 +230,7 @@ impl Fx {
 				token_version,
 				Requester {
 					upstream_family: &format!("fam-{}", Uuid::new_v4()),
+					auth_time,
 					client_ip: "203.0.113.7",
 					user_agent: "itest",
 				},
@@ -685,10 +691,10 @@ fn params(location: &str) -> std::collections::HashMap<String, String> {
 	form_urlencoded::parse(query.as_bytes()).into_owned().collect()
 }
 
-/// The access token a session minted under `token_version` carries. Unsigned: the route
-/// reads the claim from its own session store and never verifies it, so only the claims
-/// matter here.
-fn access_token_at(user: UserId, token_version: u64, exp: u64) -> String {
+/// The access token a session minted under `token_version`, last authenticated at
+/// `auth_time`, carries. Unsigned: the route reads the claims from its own session store
+/// and never verifies them, so only the claims matter here.
+fn access_token_with(user: UserId, token_version: u64, exp: u64, auth_time: Option<u64>) -> String {
 	let claims = Claims {
 		sub: user.to_string(),
 		iss: ISSUER.into(),
@@ -698,7 +704,7 @@ fn access_token_at(user: UserId, token_version: u64, exp: u64) -> String {
 		typ: TokenType::Access,
 		jti: None,
 		token_version,
-		auth_time: None,
+		auth_time,
 	};
 	let encode = |json: &str| URL_SAFE_NO_PAD.encode(json.as_bytes());
 	format!("{}.{}.unsigned", encode(r#"{"alg":"EdDSA","typ":"JWT"}"#), encode(&serde_json::to_string(&claims).unwrap()))
@@ -708,16 +714,27 @@ fn access_token_at(user: UserId, token_version: u64, exp: u64) -> String {
 /// locker entry pointing at it, as a Google sign-in leaves them. Returns the cookie and
 /// the refresh token.
 async fn signed_in_browser(fx: &Fx, user: UserId) -> Option<(String, String)> {
+	signed_in_browser_at(fx, user, None).await
+}
+
+/// [`signed_in_browser`] for a session last authenticated at `auth_time`.
+async fn signed_in_browser_at(fx: &Fx, user: UserId, auth_time: Option<u64>) -> Option<(String, String)> {
 	std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty())?;
 	let token_version = fx.users.find_by_id(user).await.unwrap().expect("user exists").token_version();
 	let refresh_token = fx.auth.open_family_for_tests(&user.to_string(), token_version).await.expect("open a refresh family");
+	Some((browser_session(user, token_version, &refresh_token, auth_time).await, refresh_token))
+}
+
+/// A locker entry for an existing family whose access token states `auth_time` — what a
+/// re-authentication leaves in the locker (`WebSessions::reauthenticated`, `reauth.rs`).
+async fn browser_session(user: UserId, token_version: u64, refresh_token: &str, auth_time: Option<u64>) -> String {
 	let sessions = web::WebSessions::from_env().await.expect("session store");
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 	let (id, ..) = sessions
 		.put(TokenResponse {
-			access_token: access_token_at(user, token_version, now as u64 + 900),
+			access_token: access_token_with(user, token_version, now as u64 + 900, auth_time),
 			access_expires_at: now + 900,
-			refresh_token: refresh_token.clone(),
+			refresh_token: refresh_token.to_owned(),
 			refresh_expires_at: now + 3600,
 			user: Some(UserSummary {
 				user_id: user.to_string(),
@@ -733,7 +750,7 @@ async fn signed_in_browser(fx: &Fx, user: UserId) -> Option<(String, String)> {
 		.await
 		.expect("open session")
 		.expect("token pair carries a user");
-	Some((format!("ev_session={id}"), refresh_token))
+	format!("ev_session={id}")
 }
 
 async fn session_cookie(fx: &Fx, user: UserId) -> Option<String> {
@@ -1198,4 +1215,148 @@ async fn the_registry_refuses_a_redirect_uri_of_the_wrong_shape() {
 	for good in ["https://rp.test/auth/callback", "https://rp.test:8443/cb?x=1", "https://rp.test?x=1"] {
 		register(good).await.unwrap_or_else(|e| panic!("{good:?}: {e}"));
 	}
+}
+
+// ─── auth_time and max_age (D24(1)) ──────────────────────────────────────────────
+
+fn now_secs() -> u64 {
+	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// A client proves a fresh confirmation with its own token, so the token carries the
+/// session's `auth_time` — and a refresh carries it on, never moves it: a later
+/// confirmation on the platform reaches the client only through a new authorization.
+#[tokio::test]
+async fn a_client_token_carries_the_sessions_auth_time_through_exchange_and_refresh() {
+	let fx = fixture!();
+	let user = fx.user().await;
+	let auth_time = now_secs() - 40;
+	let (code, verifier) = fx.code_at(user, Some(auth_time)).await;
+	let tokens = fx.exchange(&code, &verifier).await.expect("a fresh code redeems");
+	assert_eq!(claims_of(&tokens.access_token)["auth_time"], auth_time);
+
+	let refreshed = fx.refresh(&tokens.refresh_token).await.expect("refresh");
+	assert_eq!(claims_of(&refreshed.access_token)["auth_time"], auth_time, "a refresh keeps the original auth_time");
+	let again = fx.refresh(&refreshed.refresh_token).await.expect("refresh again");
+	assert_eq!(claims_of(&again.access_token)["auth_time"], auth_time);
+
+	// A code an older binary wrote carries none, and neither does its token.
+	let (code, verifier) = fx.code_for(user).await;
+	let tokens = fx.exchange(&code, &verifier).await.expect("a fresh code redeems");
+	assert!(claims_of(&tokens.access_token).get("auth_time").is_none());
+}
+
+/// The way `/auth/authorize` sends a browser to the confirmation and back: the public path
+/// of this route with the client's parameters and `reauth=done`.
+fn confirm_return(location: &str) -> String {
+	assert!(location.starts_with("/api/auth/mfe/reauth.html?return_to="), "{location}");
+	let return_to = params(location)["return_to"].clone();
+	assert!(return_to.starts_with("/api/auth/authorize?"), "the page only ever comes back here: {return_to}");
+	return_to
+}
+
+#[tokio::test]
+async fn max_age_sends_a_stale_session_to_confirm_and_the_confirmed_one_gets_a_code() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let user = fx.user().await;
+	let stale = now_secs() - 600;
+	let Some((cookie, refresh_token)) = signed_in_browser_at(&fx, user, Some(stale)).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let verifier = random(48);
+	let challenge = s256_challenge(&verifier);
+	let uri = format!("{}&max_age=0", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &challenge));
+
+	let answer = get(&router, &uri, Some(&cookie)).await;
+	assert_eq!(answer.status, StatusCode::FOUND);
+	let return_to = confirm_return(&answer.location.unwrap());
+	let back = params(&return_to);
+	assert_eq!(back["client_id"], fx.client.id);
+	assert_eq!(back["redirect_uri"], fx.client.redirect_uri);
+	assert_eq!(back["state"], "st-123");
+	assert_eq!(back["code_challenge"], challenge);
+	assert_eq!(back["max_age"], "0");
+	assert_eq!(back["reauth"], "done");
+	let codes = || async {
+		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rp_codes WHERE user_id = $1")
+			.bind(user.raw())
+			.fetch_one(&fx.pool)
+			.await
+			.unwrap()
+	};
+	assert_eq!(codes().await, 0, "no code before the confirmation");
+	let internal = return_to.strip_prefix("/api").unwrap().to_owned();
+
+	// Dismissed: the page comes back with the session as it was, and the client hears
+	// `access_denied` instead of the browser going round again.
+	let location = get(&router, &internal, Some(&cookie)).await.location.unwrap();
+	assert!(location.starts_with(&fx.client.redirect_uri), "{location}");
+	assert_eq!(params(&location)["error"], "access_denied");
+	assert_eq!(params(&location)["state"], "st-123");
+	assert_eq!(codes().await, 0);
+
+	// Confirmed: the locker now holds the session's moved `auth_time`. Two seconds back, so
+	// the last check below cannot land in the same second and meet `max_age=0`.
+	let token_version = fx.users.find_by_id(user).await.unwrap().unwrap().token_version();
+	let confirmed_at = now_secs() - 2;
+	let cookie = browser_session(user, token_version, &refresh_token, Some(confirmed_at)).await;
+	let location = get(&router, &internal, Some(&cookie)).await.location.unwrap();
+	let back = params(&location);
+	assert!(location.starts_with(&format!("{}?", fx.client.redirect_uri)), "{location}");
+	let tokens = fx.exchange(&back["code"], &verifier).await.expect("the code redeems");
+	assert_eq!(claims_of(&tokens.access_token)["auth_time"], confirmed_at, "the client's token states the confirmation");
+
+	// Without the way-back mark, `max_age=0` asks again even a session confirmed just now.
+	let location = get(&router, &uri, Some(&cookie)).await.location.unwrap();
+	confirm_return(&location);
+}
+
+#[tokio::test]
+async fn without_max_age_nothing_changes_and_with_it_the_age_is_checked() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let user = fx.user().await;
+	let stale = now_secs() - 600;
+	let Some(cookie) = signed_in_browser_at(&fx, user, Some(stale)).await.map(|(cookie, _)| cookie) else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let verifier = random(48);
+	let plain = authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&verifier));
+
+	let location = get(&router, &plain, Some(&cookie)).await.location.unwrap();
+	let tokens = fx.exchange(&params(&location)["code"], &verifier).await.expect("no max_age: a code as before");
+	assert_eq!(claims_of(&tokens.access_token)["auth_time"], stale, "and it states the session's auth_time");
+
+	let verifier = random(48);
+	let within = format!("{}&max_age=3600", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&verifier)));
+	let location = get(&router, &within, Some(&cookie)).await.location.unwrap();
+	assert!(params(&location).contains_key("code"), "ten minutes old meets max_age=3600: {location}");
+
+	let beyond = format!("{plain}&max_age=599");
+	confirm_return(&get(&router, &beyond, Some(&cookie)).await.location.unwrap());
+
+	for bad in ["", "-1", "abc", "1.5", "99999999999"] {
+		let location = get(&router, &format!("{plain}&max_age={bad}"), Some(&cookie)).await.location.unwrap();
+		assert!(location.starts_with(&fx.client.redirect_uri), "{bad:?}: {location}");
+		assert_eq!(params(&location)["error"], "invalid_request", "{bad:?}");
+	}
+
+	// A session that predates the claim meets no max_age.
+	let unclaimed = session_cookie(&fx, user).await.unwrap();
+	confirm_return(&get(&router, &format!("{plain}&max_age=3600"), Some(&unclaimed)).await.location.unwrap());
+}
+
+#[tokio::test]
+async fn without_a_session_max_age_rides_through_the_login() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let uri = format!("{}&max_age=0", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48))));
+	let location = get(&router, &uri, None).await.location.unwrap();
+	assert!(location.starts_with("/api/auth/login?returnTo="), "{location}");
+	let back = params(&params(&location)["returnTo"]);
+	assert_eq!(back["max_age"], "0", "a new sign-in meets it on the way back");
+	assert!(!back.contains_key("reauth"));
 }

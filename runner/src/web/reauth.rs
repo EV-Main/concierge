@@ -13,8 +13,9 @@
 //! session revoked elsewhere cannot be refreshed back into a fresh `auth_time`.
 //!
 //! The answer is `{"ok":true,"authTime":<unix seconds>}` and the access cookie is re-set
-//! to the token that carries it. Only the user's own access token gets the claim;
-//! relying-party and service tokens never carry `auth_time`.
+//! to the token that carries it. A relying party's token states the `auth_time` of the
+//! moment it was authorized and does not follow a later move: it gets a newer one only
+//! through `/auth/authorize` with `max_age` (`web::authorize`). Service tokens never carry it.
 
 use axum::{
 	Json,

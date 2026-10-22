@@ -107,10 +107,19 @@ impl Signer {
 	/// no verifier pinned to this plane's own audience (every RPC here but `GetMe`, and
 	/// the money plane's BFF) will take it. The `jti` is `<session_id>:<uuid>` — the
 	/// refresh family it was issued under, so the one RPC it reaches can refuse it the
-	/// moment that family is revoked rather than at its expiry.
-	pub fn mint_client_access(&self, user_id: &str, audience: &str, token_version: u64, session_id: &str) -> Result<(String, u64), AuthError> {
+	/// moment that family is revoked rather than at its expiry. `auth_time` is the one the
+	/// runner stored for that family, never the client's.
+	pub fn mint_client_access(&self, user_id: &str, audience: &str, token_version: u64, session_id: &str, auth_time: Option<u64>) -> Result<(String, u64), AuthError> {
 		let ttl = self.access_ttl_secs.min(MAX_CLIENT_ACCESS_TTL_SECS);
-		self.mint_with_jti(user_id, audience, TokenType::Access, ttl, token_version, format!("{session_id}:{}", uuid::Uuid::new_v4()), None)
+		self.mint_with_jti(
+			user_id,
+			audience,
+			TokenType::Access,
+			ttl,
+			token_version,
+			format!("{session_id}:{}", uuid::Uuid::new_v4()),
+			auth_time,
+		)
 	}
 
 	/// Mint a step-up proof (`crate::stepup`): `typ=stepup` under the BFF's audience, for
@@ -313,7 +322,7 @@ mod tests {
 		let signer = Signer::try_new(&signing, &cfg).unwrap();
 		let (cache, _) = load_jwks(&signing).unwrap();
 
-		let (token, exp) = signer.mint_client_access("user-123", "sa", 4, "session-1").unwrap();
+		let (token, exp) = signer.mint_client_access("user-123", "sa", 4, "session-1", Some(1_700_000_000)).unwrap();
 		let claims = verify_token(
 			&token,
 			&cache,
@@ -325,6 +334,7 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(claims.token_version, 4);
+		assert_eq!(claims.auth_time, Some(1_700_000_000), "the family's auth_time, as the runner stored it");
 		assert!(claims.jti.as_deref().is_some_and(|jti| jti.starts_with("session-1:")));
 		assert!(exp - claims.iat <= MAX_CLIENT_ACCESS_TTL_SECS, "capped whatever AUTH_ACCESS_TTL_SECS says");
 

@@ -178,7 +178,41 @@ public and read-only: a scope origin gets `Access-Control-Allow-Origin` (no cred
 and `Vary: Origin`, files only (no index, no listing, no dotfile, nothing resolving
 outside the directory), esbuild-hashed names cached for a year and everything else for
 five minutes. With `WEB_MFE_DIR` unset or unreadable the route is not mounted and sign-in
-is unaffected; the image sets it only once `web/` exists in this repository.
+is unaffected; the image sets it only once `web/` exists in this repository. An `.html`
+file there is a platform page (the confirmation of §3.2): it is answered with
+`Cache-Control: no-store`, `Content-Security-Policy: frame-ancestors 'none'` and
+`Referrer-Policy: no-referrer`.
+
+### 3.2 Relying-party sign-in: `max_age` and `auth_time`
+
+A client's access token (`ExchangeCode`, `RefreshClientToken`) carries `auth_time`: the
+unix seconds of the `evinvest.ltd` session's last interactive authentication when
+`/auth/authorize` issued the code (migration 0047 keeps it on the code and on the client
+session). A refresh keeps it and never moves it, so a later confirmation on the platform
+reaches the client only through a new authorization. A session from before the claim
+gives a token without it.
+
+`GET /api/auth/authorize?…&max_age=N` (OIDC; `N` a non-negative integer of at most ten
+digits, anything else answers `error=invalid_request`) asks for a session whose
+`auth_time` is at most `N` seconds old:
+
+- no session: the ordinary login, coming back with `max_age` (a new sign-in meets it);
+- a session that meets it: a code, as without `max_age`;
+- an older one, or one without `auth_time`: a 302 to the confirmation page
+  `/api/auth/mfe/reauth.html?return_to=<this request, rebuilt, plus reauth=done>`. That page
+  runs the re-authentication of `/auth/reauth/*` (email code, password, passkey; it is on
+  `PUBLIC_ORIGIN`, the only origin those routes answer) and then navigates to `return_to`,
+  confirmed or dismissed. Not a new sign-in: that would end the browser's session and every
+  client session with it;
+- back with `reauth=done`: a code when the session's `auth_time` is now at most
+  `max(N, 60)` seconds old (60 s covers the round trip, which `max_age=0` would otherwise
+  never meet), else `error=access_denied` — never a second trip, so a dismissed or failed
+  confirmation does not loop. The same holds for a stale session coming back with
+  `auth_error`.
+
+Without `max_age` nothing changes. This is how a relying party proves its user
+confirmed just now (§5.2, D24(1)): authorize with `max_age=0`, exchange the code, and
+present that access token within 120 s.
 
 ---
 

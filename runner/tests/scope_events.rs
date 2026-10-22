@@ -205,6 +205,7 @@ impl Fx {
 				user,
 				token_version: 0,
 				upstream_family: "family",
+				auth_time: None,
 				issued_at: t,
 				expires_at: t + 60,
 				client_ip: "",

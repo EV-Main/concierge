@@ -102,7 +102,7 @@ impl AuthService {
 	/// Mint the access half of a relying party's pair for a decision the port made.
 	fn client_token_response(&self, grant: ClientGrant) -> Result<ClientTokenResponse, AuthError> {
 		let signer = self.engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
-		let (access_token, access_exp) = signer.mint_client_access(&grant.user_id, &grant.audience, grant.token_version, &grant.session_id)?;
+		let (access_token, access_exp) = signer.mint_client_access(&grant.user_id, &grant.audience, grant.token_version, &grant.session_id, grant.auth_time)?;
 		Ok(ClientTokenResponse {
 			access_token,
 			access_expires_at: access_exp as i64,

@@ -32,6 +32,11 @@ impl PgRelyingParties {
 	}
 }
 
+/// A unix instant as the BIGINT column stores it. Past `i64` is no time this plane minted.
+fn stored_instant(at: u64) -> Result<i64, DomainError> {
+	i64::try_from(at).map_err(|_| DomainError::Validation(format!("auth_time {at} is not a storable instant")))
+}
+
 fn repo_err(err: sqlx::Error) -> DomainError {
 	DomainError::Repository(err.to_string())
 }
@@ -72,6 +77,7 @@ struct CodeRow {
 	code_challenge: String,
 	user_id: Uuid,
 	token_version: i64,
+	auth_time: Option<i64>,
 	expires_at: i64,
 	redeemed_at: Option<i64>,
 }
@@ -83,6 +89,7 @@ struct SessionDbRow {
 	current_hash: Vec<u8>,
 	prev_hash: Option<Vec<u8>>,
 	token_version: i64,
+	auth_time: Option<i64>,
 	expires_at: i64,
 	absolute_expires_at: i64,
 	revoked_at: Option<i64>,
@@ -151,8 +158,8 @@ impl RelyingPartyRepository for PgRelyingParties {
 			.await
 			.map_err(repo_err)?;
 		sqlx::query(
-			"INSERT INTO rp_codes (code_hash, client_id, redirect_uri, code_challenge, user_id, token_version, upstream_family, issued_at, expires_at, client_ip, user_agent)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+			"INSERT INTO rp_codes (code_hash, client_id, redirect_uri, code_challenge, user_id, token_version, upstream_family, issued_at, expires_at, client_ip, user_agent, auth_time)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
 		)
 		.bind(code.code_hash)
 		.bind(code.client_id)
@@ -165,6 +172,7 @@ impl RelyingPartyRepository for PgRelyingParties {
 		.bind(code.expires_at)
 		.bind(code.client_ip)
 		.bind(code.user_agent)
+		.bind(code.auth_time.map(stored_instant).transpose()?)
 		.execute(&mut *tx)
 		.await
 		.map_err(repo_err)?;
@@ -174,7 +182,7 @@ impl RelyingPartyRepository for PgRelyingParties {
 	async fn claim_code(&self, claim: CodeClaim<'_>) -> Result<CodeOutcome, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let row: Option<CodeRow> = sqlx::query_as(
-			"SELECT client_id, redirect_uri, code_challenge, user_id, token_version, expires_at, redeemed_at
+			"SELECT client_id, redirect_uri, code_challenge, user_id, token_version, auth_time, expires_at, redeemed_at
 			 FROM rp_codes WHERE code_hash = $1 FOR UPDATE",
 		)
 		.bind(claim.code_hash)
@@ -231,6 +239,7 @@ impl RelyingPartyRepository for PgRelyingParties {
 		Ok(CodeOutcome::Redeemed {
 			user: UserId::from_raw(row.user_id),
 			token_version: row.token_version as u64,
+			auth_time: row.auth_time.and_then(|at| u64::try_from(at).ok()),
 		})
 	}
 
@@ -241,8 +250,8 @@ impl RelyingPartyRepository for PgRelyingParties {
 		// reading the pre-commit version and opening a session nothing then revokes.
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let opened = sqlx::query(
-			"INSERT INTO rp_sessions (id, client_id, user_id, code_hash, current_hash, token_version, upstream_family, created_at, last_used_at, expires_at, absolute_expires_at, client_ip, user_agent)
-			 SELECT $1, $2, $3, $4, $5, $6, c.upstream_family, $7, $7, $8, $9, c.client_ip, c.user_agent
+			"INSERT INTO rp_sessions (id, client_id, user_id, code_hash, current_hash, token_version, upstream_family, created_at, last_used_at, expires_at, absolute_expires_at, client_ip, user_agent, auth_time)
+			 SELECT $1, $2, $3, $4, $5, $6, c.upstream_family, $7, $7, $8, $9, c.client_ip, c.user_agent, c.auth_time
 			 FROM rp_codes c WHERE c.code_hash = $4 AND c.replayed_at IS NULL AND c.expires_at > $7
 			 FOR SHARE OF c",
 		)
@@ -271,7 +280,7 @@ impl RelyingPartyRepository for PgRelyingParties {
 
 	async fn session(&self, id: Uuid) -> Result<Option<SessionRow>, DomainError> {
 		let row: Option<SessionDbRow> =
-			sqlx::query_as("SELECT client_id, user_id, current_hash, prev_hash, token_version, expires_at, absolute_expires_at, revoked_at FROM rp_sessions WHERE id = $1")
+			sqlx::query_as("SELECT client_id, user_id, current_hash, prev_hash, token_version, auth_time, expires_at, absolute_expires_at, revoked_at FROM rp_sessions WHERE id = $1")
 				.bind(id)
 				.fetch_optional(&self.pool)
 				.await
@@ -282,6 +291,7 @@ impl RelyingPartyRepository for PgRelyingParties {
 			current_hash: row.current_hash,
 			prev_hash: row.prev_hash,
 			token_version: row.token_version as u64,
+			auth_time: row.auth_time.and_then(|at| u64::try_from(at).ok()),
 			expires_at: row.expires_at,
 			absolute_expires_at: row.absolute_expires_at,
 			revoked: row.revoked_at.is_some(),

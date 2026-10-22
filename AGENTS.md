@@ -247,9 +247,12 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   list; a foreign `Origin` is refused), CSRF-checked and `signed_in_live`. Adding or removing a
   passkey needs an `auth_time` within 300 s (`403 reauth_required`), so a stolen session cannot
   plant a factor and then re-authenticate with it. One budget per account
-  (`REAUTH_ATTEMPTS_PER_WINDOW` per five minutes) across all five. `auth_time` stays in the
-  user's access token only: relying-party and service tokens never carry it, and neither
-  `GetMe` nor `UserSummary` reports it — a consumer reads it from the token it verifies.
+  (`REAUTH_ATTEMPTS_PER_WINDOW` per five minutes) across all five. `auth_time` is carried by
+  the user's access token and by a relying party's: the latter states the platform
+  session's `auth_time` when `/auth/authorize` issued the code (stored on `rp_codes` and
+  `rp_sessions`, 0047) and a refresh never moves it, so a client sees a new confirmation
+  only through a new authorization (`max_age`, below). Service tokens never carry it, and
+  neither `GetMe` nor `UserSummary` reports it — a consumer reads it from the token it verifies.
 - **A trusted host's page can ask the account to confirm ONE operation, and gets a proof for exactly that operation** (`web::stepup`, `/auth/stepup/{options,verify}`, publicly under `/api/auth/stepup/*`; `docs/STEPUP-PROOF.md`). Reauth stays `PUBLIC_ORIGIN`-only and moves `auth_time`; this moves nothing: a ceremony kept in process binds the account, the bank's `intent_hash`, the asking `Origin` and the method (≤ 120 s, spent once), and a passkey assertion (keys older than the session only, relying party = `PUBLIC_ORIGIN`'s host, origins = `PUBLIC_ORIGIN` + the flag's) or a mailed `stepup` code (Turnstile, the page's summary quoted in the mail under a "not checked by us" label) yields a `typ=stepup`, `aud=banking-bff` JWT of ≤ 120 s that no access verifier parses (`evconcierge_auth::stepup`; `Claims` is untouched). A password is never accepted. `STEPUP_PROOF_ORIGINS` (exact origins; empty = not mounted, 404; production: https, no path, no pattern, `PUBLIC_ORIGIN` or under it, else the boot is refused) is the whole allowlist, with `Sec-Fetch-Site` `same-origin|same-site`, JSON-only bodies and its own preflight (`Max-Age` 60); there is no CSRF token because the `__Host-` cookie is unreadable from another host. The bank spends the `jti` (shared store) — this plane cannot, and ceremonies are in process, so one replica or a sticky route.
 - **KYC has exactly one writer**: the `User` aggregate's `set_kyc_level` and the
   `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
@@ -766,7 +769,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   travel back as `error=…&state=…`. With no session it sends the browser through the
   ordinary `/api/auth/login?returnTo=` (a same-origin path), so the Google client never
   learns a client exists. `prompt` is `select_account` — the same trip for a browser already
-  signed in, to switch accounts — or the request is refused. A new sign-in closes the
+  signed in, to switch accounts — or the request is refused. `max_age=N` (OIDC) sends a
+  session whose `auth_time` is older than N seconds (or absent) to the confirmation page
+  `/api/auth/mfe/reauth.html?return_to=<this request + reauth=done>` — the ordinary
+  re-authentication on `PUBLIC_ORIGIN`, never a new sign-in, which would end the client
+  sessions — and on the way back issues the code when `auth_time` is within
+  `max(N, 60)` s, else answers `access_denied`, so a dismissed confirmation never loops
+  (`docs/SCOPES-AND-APPROVALS.md` §3.2). A new sign-in closes the
   browser's previous session and revokes its family, so its client sessions end with it
   (single logout below). A code is 256 random bits stored as a digest, lives
   `CODE_TTL_SECS` (60), is bound to client, redirect_uri, PKCE challenge, user and
