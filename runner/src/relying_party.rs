@@ -153,6 +153,9 @@ pub enum Admission {
 pub struct Requester<'a> {
 	/// The `evinvest.ltd` refresh family the browser is signed in with.
 	pub upstream_family: &'a str,
+	/// That session's `auth_time` when it ended a confirmation trip this request began
+	/// (`web::authorize`), else `None`: no other `auth_time` may reach the client.
+	pub auth_time: Option<u64>,
 	pub client_ip: &'a str,
 	pub user_agent: &'a str,
 }
@@ -223,6 +226,12 @@ impl RelyingParties {
 		Ok((registered && !client.disabled && !client.scope_closed).then_some(client))
 	}
 
+	/// The client, when `client_id` names an enabled one of a scope that is not closed —
+	/// the one `/auth/authorize` would serve, whatever the redirect.
+	pub async fn signing_in(&self, client_id: &str) -> Result<Option<ClientRecord>, DomainError> {
+		Ok(self.repo.client(client_id).await?.filter(|client| !client.disabled && !client.scope_closed))
+	}
+
 	/// Whether `user` may be signed into a client right now: an active account.
 	pub async fn admit(&self, user: UserId) -> Result<Admission, DomainError> {
 		Ok(match self.users.authz_record(user).await? {
@@ -246,6 +255,7 @@ impl RelyingParties {
 				user,
 				token_version,
 				upstream_family: from.upstream_family,
+				auth_time: from.auth_time,
 				issued_at: now,
 				expires_at: now + CODE_TTL_SECS,
 				client_ip: truncate(from.client_ip, 64),
@@ -352,8 +362,8 @@ impl RelyingParties {
 			})
 			.await
 			.map_err(unavailable)?;
-		let (user, token_version) = match outcome {
-			CodeOutcome::Redeemed { user, token_version } => (user, token_version),
+		let (user, token_version, auth_time) = match outcome {
+			CodeOutcome::Redeemed { user, token_version, auth_time } => (user, token_version, auth_time),
 			CodeOutcome::Replayed { client_id, user, revoked_sessions } => {
 				tracing::error!(%client_id, user_id = %user, revoked_sessions, "relying party: authorization code presented twice — the sessions it opened are revoked");
 				return Err(ClientGrantError::InvalidGrant);
@@ -399,6 +409,7 @@ impl RelyingParties {
 			user_id: user.to_string(),
 			audience: client.audience,
 			token_version,
+			auth_time,
 			session_id: session_id.to_string(),
 			refresh_token: format!("{session_id}.{secret}"),
 			refresh_expires_at: expires_at as u64,
@@ -465,6 +476,7 @@ impl RelyingParties {
 			user_id: session.user.to_string(),
 			audience: client.audience,
 			token_version,
+			auth_time: session.auth_time,
 			session_id: session_id.to_string(),
 			refresh_token: format!("{session_id}.{next}"),
 			refresh_expires_at: expires_at as u64,
@@ -564,6 +576,15 @@ impl Authenticate for ClientTokenAuthenticator {
 	}
 }
 
+/// The same check as the restricted half of the auth layer, as an approval asks it: whose
+/// token a relying party presents to prove who asked for a proposal (D24(1)).
+#[async_trait::async_trait]
+impl crate::ports::UserTokenVerifier for ClientTokenAuthenticator {
+	async fn verify(&self, token: &str) -> Result<Claims, AuthError> {
+		self.authenticate(token.to_owned()).await
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -604,6 +625,7 @@ mod tests {
 			namespace: "sa".into(),
 			scope: "sa".into(),
 			scope_closed: false,
+			display_name: "Service-Arb".into(),
 		};
 		assert!(check_registered_redirects(&client("https://sa.evinvest.ltd/auth/callback")).is_ok());
 		for bad in [

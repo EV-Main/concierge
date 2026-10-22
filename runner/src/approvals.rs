@@ -784,16 +784,28 @@ impl Approvals {
 #[derive(Clone)]
 pub struct ApprovalExecution {
 	callers: ServiceCallers,
-	/// `None` where this plane verifies no tokens: a proposal presenting one is refused.
+	/// This plane's own access tokens, presented by the bridge. `None` where this plane
+	/// verifies no tokens: a proposal presenting one is refused.
 	user_tokens: Option<Arc<dyn crate::ports::UserTokenVerifier>>,
+	/// A relying party's own access tokens, presented by that client. `None` where no
+	/// client is registered.
+	client_tokens: Option<Arc<dyn crate::ports::UserTokenVerifier>>,
 	approvals: Arc<dyn ApprovalRepository>,
 	catalogs: Arc<dyn ScopeCatalogRepository>,
 }
 
 impl ApprovalExecution {
-	/// This plane's verifier, for the user token a proposer presents beside `requested_by`.
+	/// This plane's verifier, for the user token the bridge presents beside `requested_by`.
 	pub fn with_user_tokens(mut self, tokens: Arc<dyn crate::ports::UserTokenVerifier>) -> Self {
 		self.user_tokens = Some(tokens);
+		self
+	}
+
+	/// The relying parties' verifier, for the user token a client presents beside
+	/// `requested_by`: the client's own, never this plane's (a client cannot obtain one) and
+	/// never another client's.
+	pub fn with_client_tokens(mut self, tokens: Arc<dyn crate::ports::UserTokenVerifier>) -> Self {
+		self.client_tokens = Some(tokens);
 		self
 	}
 
@@ -801,6 +813,7 @@ impl ApprovalExecution {
 		Self {
 			callers,
 			user_tokens: None,
+			client_tokens: None,
 			approvals,
 			catalogs,
 		}
@@ -821,22 +834,35 @@ impl ApprovalExecution {
 }
 
 impl ApprovalExecution {
-	/// The account the proposer proved asked for it: the subject of this plane's own access
-	/// token, presented in `x-ev-user-token` beside `requested_by` (D24(1)). No token: the
-	/// name is information and proves nothing. Whether it is `requested_by`'s, and still
-	/// speaks for an active account, is decided where the proposal is opened.
-	async fn proven_initiator(&self, token: &Option<String>, requested_by: &str) -> Result<Option<crate::ports::ProvenInitiator>, Status> {
+	/// The account the proposer proved asked for it: the subject of an access token
+	/// presented in `x-ev-user-token` beside `requested_by` (D24(1)) — this plane's own from
+	/// the bridge, the client's own from a relying party (its audience, a live session of
+	/// that client). Both carry the session's `auth_time` and are held to the same rules. No
+	/// token: the name is information and proves nothing. Whether it is `requested_by`'s,
+	/// and still speaks for an active account, is decided where the proposal is opened.
+	async fn proven_initiator(&self, caller: &ServiceCaller, token: &Option<String>, requested_by: &str) -> Result<Option<crate::ports::ProvenInitiator>, Status> {
 		let Some(token) = token else { return Ok(None) };
 		if requested_by.is_empty() {
 			return Err(Status::invalid_argument("a user token proves who asked: name them in requested_by"));
 		}
-		let tokens = self.user_tokens.as_ref().ok_or_else(|| Status::unauthenticated("no user token can be verified on this plane"))?;
+		let verifier = match caller {
+			ServiceCaller::Bridge => self.user_tokens.as_ref(),
+			ServiceCaller::Client(_) => self.client_tokens.as_ref(),
+		};
+		let tokens = verifier.ok_or_else(|| Status::unauthenticated("no user token can be verified on this plane"))?;
 		let claims = tokens.verify(token).await.map_err(|err| match err {
 			evconcierge_auth::AuthError::Unavailable => Status::unavailable("user token not verifiable now"),
 			_ => Status::unauthenticated("invalid user token"),
 		})?;
 		if !claims.is_access() {
 			return Err(Status::unauthenticated("invalid user token"));
+		}
+		// The client verifier admits every client's audience; a client speaks only with a
+		// token issued to itself, as on a scope inbox write.
+		if let ServiceCaller::Client(client) = caller
+			&& claims.aud != client.audience
+		{
+			return Err(Status::permission_denied("the user token was issued to another client"));
 		}
 		let user = Uuid::parse_str(&claims.sub).map_err(|_| Status::unauthenticated("invalid user token"))?;
 		// Fresh: a token kept from a session an hour ago proves the service could act as
@@ -932,7 +958,7 @@ impl ApprovalExecutionService for ApprovalExecution {
 		if !req.requested_by.is_empty() {
 			rules::check_auth_subject("requested_by", &req.requested_by).map_err(invalid)?;
 		}
-		let proven = self.proven_initiator(&request_token, &req.requested_by).await?;
+		let proven = self.proven_initiator(&caller, &request_token, &req.requested_by).await?;
 		let fields = req.fields.into_iter().map(field_from).collect::<Result<Vec<_>, _>>()?;
 		let fields = rules::check_fields(&kind, fields).map_err(invalid)?;
 		let payload_hash = hex(&Sha256::digest(rules::payload_preimage(&kind.name, &req.scope, &req.subject_ref, &fields)));

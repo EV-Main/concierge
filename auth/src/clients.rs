@@ -50,6 +50,11 @@ pub struct ClientGrant {
 	pub audience: String,
 	/// The user's `token_version` at this decision, stamped on the access token.
 	pub token_version: u64,
+	/// The `auth_time` of a confirmation this client asked for (`max_age`), fixed when the
+	/// client session opened; `None` for every other sign-in. A refresh carries it on and
+	/// never moves it, so a client proves a fresh re-authentication only through a new
+	/// authorization.
+	pub auth_time: Option<u64>,
 	/// The refresh family, carried in the access token's `jti` so a revoked family ends
 	/// its access tokens at the one RPC they reach instead of at their expiry.
 	pub session_id: String,

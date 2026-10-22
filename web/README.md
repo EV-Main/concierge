@@ -55,6 +55,44 @@ one per opening. The host retries its act once and drops `open` either way. Off 
 platform origin the dialog only says to confirm on the platform: the reauth routes refuse
 every other `Origin`.
 
+## The platform confirmation page
+
+`reauth.html` is the one page in `dist/`; concierge serves it at
+`/api/auth/mfe/reauth.html` with `no-store`, `no-referrer` and a full CSP (no inline
+script; `runner/src/web/mfe.rs`). A relying party gets a fresh-sign-in proof by sending
+its user to `/api/auth/authorize?…&max_age=N` (D24(1)). When the session is older than
+`N`, the authorize route records a confirmation trip and answers 302 to this page with
+`return_to` set to the same authorize request, rebuilt with its `max_age`
+(`runner/src/web/authorize.rs`, `CONFIRM_PATH`, `confirm_url`). Only a trip that
+concierge started yields a code with `auth_time`; nothing in `return_to` marks the way
+back. The page mounts `<mfe-concierge-reauth open>` from the same build and, on
+`ev:reauthenticated` or `ev:close`, calls `location.replace(return_to)`. It does not
+judge the outcome: the authorize route answers with a code or with `access_denied`.
+
+The page accepts `return_to` only if it is a relative path that starts with
+`/api/auth/authorize?` and contains no backslash and no control character (so no scheme,
+no `//` and no `/\` at the start), if it still resolves to that path on this origin, and
+if it names exactly one `client_id` (`src/shared/lib/authorize-return.ts`). Anything else
+shows a short error and navigates nowhere: the page runs signed in on the platform
+origin, and an open redirect there would lend the platform's address bar to a phishing
+link.
+
+The page names the app that asks. It takes the `client_id` from the checked `return_to`
+only, never a name from the query, and asks `GET /api/auth/clients/{client_id}`
+(same-origin, no credentials; `src/shared/api/client-name.ts`). A `display_name` shows as
+"<name> asks you to confirm it's you", written as text. An empty name, a 503, a failed
+request or a timeout keep the generic line and open the dialog. A 404 means concierge
+would not serve the client at authorize, so the page says the link is not valid and does
+not open the dialog.
+
+The page is built from `pages/reauth.html` (template), `src/entries/reauth-page.ts` (the
+script, no React) and `styles/reauth-page.css` (kit tokens only); `scripts/build.mjs`
+fills in the hashed names. It is English only, and it loads no font: without a host, the
+kit's font chain falls back to the system sans.
+
+**Deploy order.** The concierge image with this page and the `max_age` handling ships
+first. Only then may invest send `max_age`: before it, a stale session lands on a 404.
+
 A new account confirms its address in the dialog through the ticket `password/signup`
 hands back (`/password/signup/confirm`, `/resend`), which needs no CSRF cookie and so
 works on every host; without a ticket the dialog sends the reader to the platform. An
@@ -79,7 +117,7 @@ it and refuses to build without it.
 ```sh
 npm ci
 npm run typecheck && npm run lint && npm run i18n:check
-npm run build          # → dist/<name>-<hash>.js + dist/registry.json
+npm run build          # → dist/<name>-<hash>.js + dist/registry.json + dist/reauth.html
 ```
 
 Build-time configuration (`scripts/config.mjs`, the only place it is read):

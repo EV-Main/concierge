@@ -22,7 +22,7 @@ use axum::{
 	extract::{Path as UrlPath, Request, State},
 	http::{
 		HeaderValue, StatusCode, Uri,
-		header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ORIGIN, VARY, X_CONTENT_TYPE_OPTIONS},
+		header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ORIGIN, REFERRER_POLICY, VARY, X_CONTENT_TYPE_OPTIONS},
 	},
 	response::{IntoResponse, Response},
 	routing::get,
@@ -91,6 +91,13 @@ async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<Stri
 	response
 }
 
+/// What a page here may load: its own bundles and the plane's routes, Turnstile (the
+/// re-authentication code asks for a human), and the inline `<style>` the elements insert
+/// and the `style` attributes React writes — hence `'unsafe-inline'` for styles, never for
+/// scripts. `data:` images are the tokens' inline brand mark.
+const PAGE_CSP: &str = "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; \
+	style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'";
+
 fn describe(mut response: Response, name: &str) -> Response {
 	let status = response.status();
 	let headers = response.headers_mut();
@@ -99,6 +106,14 @@ fn describe(mut response: Response, name: &str) -> Response {
 		if status != StatusCode::NOT_MODIFIED && matches!(extension(name), Some("js" | "mjs")) {
 			headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"));
 		}
+	}
+	// A page here is a platform page that asks for a password, a code or a passkey (the
+	// confirmation `web::authorize` sends a browser to): never framed, never cached, and its
+	// URL — which carries a client's authorize request — never sent on as a Referer.
+	if matches!(extension(name), Some("html")) {
+		headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+		headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(PAGE_CSP));
+		headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
 	}
 	headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
 	response
@@ -166,6 +181,27 @@ mod tests {
 		] {
 			assert!(!is_hashed(plain), "{plain}");
 		}
+	}
+
+	#[test]
+	fn a_page_is_never_framed_cached_or_referred() {
+		let page = describe(StatusCode::OK.into_response(), "reauth.html");
+		assert_eq!(page.headers()[CACHE_CONTROL], "no-store");
+		let csp = page.headers()[CONTENT_SECURITY_POLICY].to_str().unwrap();
+		for directive in [
+			"default-src 'self'",
+			"base-uri 'none'",
+			"object-src 'none'",
+			"frame-ancestors 'none'",
+			"script-src 'self' https://challenges.cloudflare.com;",
+		] {
+			assert!(csp.contains(directive), "{directive} in {csp}");
+		}
+		assert!(!csp.contains("script-src 'self' 'unsafe-inline'"), "no inline script: {csp}");
+		assert_eq!(page.headers()[REFERRER_POLICY], "no-referrer");
+		let bundle = describe(StatusCode::OK.into_response(), "reauth-ABCD2345.js");
+		assert_eq!(bundle.headers()[CACHE_CONTROL], IMMUTABLE);
+		assert!(bundle.headers().get(CONTENT_SECURITY_POLICY).is_none());
 	}
 
 	#[test]

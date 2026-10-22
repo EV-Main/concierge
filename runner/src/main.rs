@@ -276,8 +276,8 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	verifier_config.assert_plane().context("verifier config carries a cross-plane identity")?;
 	let verifier_config_audiences = verifier_config.audiences.clone();
 	let verifier = Verifier::try_new(verifier_config).context("failed to build the inbound token verifier")?;
-	// The same verifier proves who asked for a money decision when its proposer presents
-	// that person's token (`approvals`, D24(1)).
+	// The same verifier proves who asked for a money decision when the bridge presents
+	// that person's token (`approvals`, D24(1)); a client's proof goes to the client verifier.
 	let approval_user_tokens: Arc<dyn concierge::ports::UserTokenVerifier> = Arc::new(verifier.clone());
 
 	// `tonic-web` (`GrpcWebLayer` + `accept_http1`) lets browser/WASM clients reach
@@ -337,7 +337,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// This plane's own approvals (`concierge:*`) are carried out by this loop once passed:
 	// there is no other proposer to pull them.
 	tokio::spawn(concierge::approvals::run_executor(approval_repo.clone(), std::time::Duration::from_secs(30)));
-	let approval_execution = concierge::approvals::ApprovalExecution::new(service_callers.clone(), approval_repo.clone(), catalog_repo.clone()).with_user_tokens(approval_user_tokens);
+	let mut approval_execution = concierge::approvals::ApprovalExecution::new(service_callers.clone(), approval_repo.clone(), catalog_repo.clone()).with_user_tokens(approval_user_tokens);
+	// A relying party proves who asked with that person's token issued to IT (D24(1)): the
+	// client verifier, never this plane's, which no client token passes.
+	if let Some(client_tokens) = &client_tokens {
+		approval_execution = approval_execution.with_client_tokens(Arc::new(client_tokens.clone()));
+	}
 
 	// The TLS listener for the same seam (banking#199, phase 2). Validated and READ here,
 	// before anything is served: a half-configured listener or an unreadable PEM is a

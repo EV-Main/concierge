@@ -178,7 +178,60 @@ public and read-only: a scope origin gets `Access-Control-Allow-Origin` (no cred
 and `Vary: Origin`, files only (no index, no listing, no dotfile, nothing resolving
 outside the directory), esbuild-hashed names cached for a year and everything else for
 five minutes. With `WEB_MFE_DIR` unset or unreadable the route is not mounted and sign-in
-is unaffected; the image sets it only once `web/` exists in this repository.
+is unaffected; the image sets it only once `web/` exists in this repository. An `.html`
+file there is a platform page (the confirmation of §3.2): it is answered with
+`Cache-Control: no-store`, `Referrer-Policy: no-referrer` and `Content-Security-Policy:
+default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src
+https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'` (Turnstile
+for the mailed code; inline styles because the elements insert their `<style>`).
+
+### 3.2 Relying-party sign-in: `max_age` and `auth_time`
+
+`auth_time` reaches a client's access token (`ExchangeCode`, `RefreshClientToken`) ONLY
+from a code issued at the end of a confirmation trip this request began: it is the
+`evinvest.ltd` session's `auth_time` after the person confirmed (migration 0047 keeps it
+on the code and on the client session; a refresh keeps it and never moves it). Every other
+code — a sign-in without `max_age`, a session that meets `max_age` by itself — gives
+tokens WITHOUT the claim, which no proof accepts. So an `auth_time` this client did not
+ask for (a new sign-in, a re-authentication for banking) never reaches its tokens: a
+client cannot spend a proof meant for someone else or pass an ordinary sign-in off as
+one (security review of #193, F1).
+
+`GET /api/auth/authorize?…&max_age=N` (OIDC; `N` a non-negative integer of at most ten
+digits, anything else answers `error=invalid_request`; together with `prompt` it is
+`invalid_request`, because the chooser leads to a new sign-in):
+
+- no session: the ordinary login, coming back with `max_age`. A new sign-in is not a
+  confirmation — a provider can complete it with a remembered account and no act of the
+  person — so the new session is sent to confirm as below;
+- a session whose `auth_time` is at most `N` seconds old (`N > 0`): a code without the
+  claim. `max_age=0` is met by no session;
+- otherwise: the plane stores a trip — key `rpconfirm:<session id>:<client_id>:<PKCE
+  challenge>`, value the session's re-authentication count at that moment, 600 s — and
+  answers a 302 to
+  `/api/auth/mfe/reauth.html?return_to=<this request, rebuilt from its parameters>`. That
+  page runs the re-authentication of `/auth/reauth/*` (email code, password, passkey;
+  `PUBLIC_ORIGIN` only) and navigates to `return_to`, confirmed or dismissed;
+- back with a trip under that key (taken once, so a second return is a new request): a
+  code carrying `auth_time` when the session re-authenticated during the trip (every
+  successful `/auth/reauth/*` counts one, `rpreauths:<session id>`, kept as long as the
+  session) and that `auth_time` is at most 30 s ahead of the clock, else
+  `error=access_denied`. Counted, not timed: a passkey can confirm in the second the trip
+  began, and a re-authentication just before the trip, in that same second, must not
+  count. Never a second trip, so a
+  dismissed confirmation does not loop. Another session, another client or another PKCE
+  challenge finds no trip; a hand-added query parameter changes nothing.
+
+`GET /api/auth/clients/{client_id}` names the app on that page: `200 {"client_id": "…",
+"display_name": "…"}` (the scope's `tenants.display_name`, possibly empty),
+`Cache-Control: public, max-age=300`; `404 {"error": "unknown_client"}` for a client
+`/auth/authorize` would not serve (unknown, disabled, of a closed scope). Public, no
+credentials, same-origin; the name is never taken from the query.
+
+Without `max_age` nothing changes but the claim. This is how a relying party proves its
+user confirmed just now (§5.2, D24(1)): authorize with `max_age=0`, exchange the code, and
+present that access token within 120 s of the confirmation.
 
 ---
 
@@ -345,8 +398,21 @@ containment is never slower than the grant).
   one opening a grant for another leaves a roster of one, so that grant is decided by a
   single owner.
 - **A proven initiator of a money decision does not decide it** (D24(1)): a proposer may
-  present, in metadata `x-ev-user-token`, an access token of this plane that `requested_by`
-  holds (banking forwards the owner's). Verified as every RPC here verifies one, its `sub`
+  present, in metadata `x-ev-user-token`, an access token that `requested_by` holds. Which
+  token depends on who proposes:
+  - **the bridge** (banking) presents an access token of this plane (banking forwards the
+    owner's), verified as every RPC here verifies one;
+  - **a relying party** (invest's `invest:fee_policy`) presents the person's token issued to
+    ITSELF: verified by the client verifier as `GetMe` verifies it (a live client session),
+    and its `aud` must be the calling client's audience. A token of this plane is refused
+    `UNAUTHENTICATED` (a client cannot hold one, and the client verifier does not know its
+    audience); another client's token is refused `PERMISSION_DENIED` ("the user token was
+    issued to another client"). A client token carries `auth_time` only when its code was
+    issued at the end of a confirmation trip the client asked for
+    (`/api/auth/authorize?…&max_age=0`, §3.2), kept through every refresh; any other
+    client token has none and is refused `reauth_required`.
+
+  Either way, its `sub`
   must be `requested_by`, the account still active at that token's `token_version`, the
   token minted no more than 120 s before the call, its `auth_time` no more than 120 s
   before the call too (concierge#171), neither claim dated more than 30 s after the call
@@ -355,10 +421,12 @@ containment is never slower than the grant).
   `approval_initiator_proofs`: the token's SHA-256, and the SHA-256 of
   `reauth:<user id>:<auth_time>`. So one token proves one request, and so does one
   re-authentication: every refresh inside the window mints another token with the same
-  `auth_time`. A young token alone is not
+  `auth_time` — of this plane or of a client, since a client token states the platform
+  session's `auth_time`. A young token alone is not
   enough: a refresh mints one and keeps the session's old `auth_time`, so it shows only
   that the session was alive. The person re-authenticates first (`/auth/reauth/*` moves
-  `auth_time` to now and re-sets `ev_access`), and the proposer then presents that token.
+  `auth_time` to now and re-sets `ev_access`; a relying party gets there through
+  `max_age`), and the proposer then presents that token.
   Every refusal of the proof itself is `FAILED_PRECONDITION` with a message that starts
   with `reauth_required: `: a token or an `auth_time` older than 120 s or more than 30 s
   ahead, a missing `auth_time`, and a spent proof ("this proof was already spent"). A

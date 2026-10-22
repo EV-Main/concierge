@@ -145,3 +145,37 @@ for (const element of ELEMENTS) {
 const checked = parseRegistry(registry);
 if (!checked.ok) throw new Error(`registry.json would not parse: ${checked.error}`);
 writeFileSync(path.join(DIST, "registry.json"), `${JSON.stringify(registry, null, 2)}\n`);
+
+// The platform confirmation page, dist/reauth.html: the address concierge's authorize
+// route sends a browser to when a client asks for `max_age` (runner/src/web/authorize.rs,
+// CONFIRM_PATH). It loads the element's bundle from the registry above, its own script and
+// its own sheet; every file it names is hashed, so only the page itself is short-lived.
+const HASHED = /^[A-Za-z0-9-]+-[A-Z0-9]{8}\.(?:js|css)$/;
+
+async function emitHashed(entryPoints, options = {}) {
+  const result = await build({ ...common, ...options, entryPoints, entryNames: "[name]-[hash]", outdir: DIST, minify: true, legalComments: "none", metafile: true });
+  const [output, ...rest] = Object.keys(result.metafile.outputs);
+  if (!output || rest.length > 0) throw new Error(`expected one file for ${Object.keys(entryPoints).join(", ")}, got ${Object.keys(result.metafile.outputs).join(", ")}`);
+  return path.basename(output);
+}
+
+{
+  const element = registry.find((entry) => entry.tag === "mfe-concierge-reauth");
+  if (!element) throw new Error("reauth.html needs the mfe-concierge-reauth bundle");
+  const pageCssIn = path.join(WORK, "reauth-page.out.css");
+  const run = spawnSync(path.join(ROOT, "node_modules/.bin/tailwindcss"), ["-i", path.join(ROOT, "styles/reauth-page.css"), "-o", pageCssIn], { cwd: ROOT, encoding: "utf8" });
+  if (run.status !== 0) throw new Error(`tailwindcss failed for reauth-page:\n${run.stderr}`);
+  const files = {
+    "%ELEMENT_JS%": path.basename(element.scriptUrl),
+    "%PAGE_JS%": await emitHashed({ "reauth-page": path.join(ROOT, "src/entries/reauth-page.ts") }),
+    "%PAGE_CSS%": await emitHashed({ "reauth-page": pageCssIn }, { target: CSS_TARGET }),
+  };
+  let html = readFileSync(path.join(ROOT, "pages/reauth.html"), "utf8");
+  for (const [slot, file] of Object.entries(files)) {
+    if (!HASHED.test(file)) throw new Error(`reauth.html: unexpected file name ${file}`);
+    if (!html.includes(slot)) throw new Error(`reauth.html: the template has no ${slot}`);
+    html = html.replaceAll(slot, file);
+  }
+  writeFileSync(path.join(DIST, "reauth.html"), html);
+  console.log(`reauth.html  ${Object.values(files).join("  ")}`);
+}

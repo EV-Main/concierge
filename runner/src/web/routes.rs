@@ -527,7 +527,7 @@ impl Caller {
 			role: fresh.user.role.clone(),
 			role_is_break_glass: fresh.user.role_is_break_glass,
 			minted_token_version: minted_token_version(&fresh.access_token),
-			auth_time: minted_claims(&fresh.access_token).and_then(|claims| claims.auth_time),
+			auth_time: minted_auth_time(&fresh.access_token),
 			access_token: fresh.access_token.clone(),
 			remaining_secs: fresh.remaining_secs,
 		})
@@ -570,6 +570,13 @@ pub(super) async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<O
 /// token that does not parse, which the caller refuses.
 pub(super) fn minted_token_version(token: &str) -> Option<u64> {
 	minted_claims(token).map(|claims| claims.token_version)
+}
+
+/// The session's last interactive authentication, read as [`minted_token_version`] is and
+/// sound for the same reason. A session store holds at most an older token than the
+/// family's (a re-authentication writes its token back), so this never runs ahead of it.
+pub(super) fn minted_auth_time(token: &str) -> Option<u64> {
+	minted_claims(token).and_then(|claims| claims.auth_time)
 }
 
 fn minted_claims(token: &str) -> Option<evconcierge_auth::Claims> {

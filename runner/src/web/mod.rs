@@ -299,6 +299,9 @@ pub fn router(state: WebState) -> Router {
 		// address registered for the client, carrying a code that is useless without the
 		// PKCE verifier the client kept.
 		.route("/auth/authorize", get(authorize::authorize))
+		// The name of the app the confirmation page (`authorize::CONFIRM_PATH`) asks for:
+		// public and same-origin, read from the registry (`web::authorize::client_name`).
+		.route("/auth/clients/{client_id}", get(authorize::client_name))
 		// Identity verification. `/kyc/callback/didit` is PUBLIC — it is reached by the
 		// vendor, not a browser, and authenticates itself with an HMAC over the body.
 		// Publicly both are seen under the conductor's `/api` prefix.

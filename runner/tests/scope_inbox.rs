@@ -181,6 +181,7 @@ impl Fx {
 				token_version,
 				Requester {
 					upstream_family: &format!("fam-{}", Uuid::new_v4()),
+					auth_time: None,
 					client_ip: "203.0.113.7",
 					user_agent: "itest",
 				},

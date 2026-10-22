@@ -56,6 +56,9 @@ struct Fx {
 	people: Approvals,
 	services: ApprovalExecution,
 	tokens: Arc<FakeTokens>,
+	/// The relying parties' verifier: a separate one, as in production, so a plane token
+	/// is unknown to it and a client token unknown to the plane's.
+	client_tokens: Arc<FakeTokens>,
 	repo: Arc<PgApprovals>,
 	clock: Arc<AtomicI64>,
 }
@@ -83,10 +86,14 @@ async fn setup() -> Option<Fx> {
 	let clock = Arc::new(AtomicI64::new(T0));
 	let repo = Arc::new(PgApprovals::with_fixed_time(pool.clone(), clock.clone()));
 	let tokens = Arc::new(FakeTokens::default());
+	let client_tokens = Arc::new(FakeTokens::default());
 	Some(Fx {
 		people: Approvals::new(users.clone(), Arc::new(BreakGlass::new(Vec::new())), repo.clone(), catalog_repo.clone()),
-		services: ApprovalExecution::new(callers.clone(), repo.clone(), catalog_repo.clone()).with_user_tokens(tokens.clone()),
+		services: ApprovalExecution::new(callers.clone(), repo.clone(), catalog_repo.clone())
+			.with_user_tokens(tokens.clone())
+			.with_client_tokens(client_tokens.clone()),
 		tokens,
+		client_tokens,
 		repo,
 		catalogs: ScopeCatalogs::new(callers, catalog_repo),
 		rp: PgRelyingParties::new(pool.clone()),
@@ -121,13 +128,18 @@ impl FakeTokens {
 	/// A token for `user` minted at `iat` for a session last authenticated at `auth_time`
 	/// (`None`: a session older than the claim).
 	fn mint_signed_in(&self, user: UserId, iat: i64, auth_time: Option<i64>) -> String {
+		self.mint_for("concierge", user, iat, auth_time)
+	}
+
+	/// A token under `audience`: a client's own when it names that client.
+	fn mint_for(&self, audience: &str, user: UserId, iat: i64, auth_time: Option<i64>) -> String {
 		let token = format!("token-{}", Uuid::new_v4());
 		self.issued.lock().unwrap().insert(
 			token.clone(),
 			Claims {
 				sub: user.to_string(),
 				iss: "https://auth.concierge.ev".into(),
-				aud: "concierge".into(),
+				aud: audience.into(),
 				exp: u64::MAX,
 				iat: u64::try_from(iat).unwrap(),
 				typ: TokenType::Access,
@@ -1833,6 +1845,27 @@ impl Fx {
 		self.services.propose(request).await.map(tonic::Response::into_inner)
 	}
 
+	/// The scope's own PLATFORM kind, proposed by its client for `asker` with `token`.
+	async fn client_grant(&self, scope: &Scope, asker: UserId, holder: UserId, token: Option<&str>) -> Result<Approval, tonic::Status> {
+		let request = as_client(
+			ProposeRequest {
+				kind: scope.kind("grant"),
+				requested_by: self.auth_subject(asker).await,
+				fields: vec![ApprovalFieldValue {
+					key: "holder".into(),
+					value: Some(Value::AuthSubject(self.auth_subject(holder).await)),
+				}],
+				..transfer(scope, "1")
+			},
+			scope,
+		);
+		let request = match token {
+			Some(token) => with_user_token(request, token),
+			None => request,
+		};
+		self.services.propose(request).await.map(tonic::Response::into_inner)
+	}
+
 	async fn db_now(&self) -> i64 {
 		sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::BIGINT")
 			.fetch_one(&self.pool)
@@ -2690,4 +2723,94 @@ async fn the_requester_is_told_each_outcome_once() {
 	let mails = fx.mails(&told(&left.id)).await;
 	assert_eq!(mails.len(), 1, "a lazy expiry is told without anybody touching the proposal");
 	assert_eq!(mails[0].2["outcome"], "expired");
+}
+
+/// D24(1) for a relying party (invest's fee policy): it holds no token of this plane, so it
+/// proves who asked with the person's token issued to ITSELF, after `max_age` made them
+/// confirm — held to the same freshness, the same spend-once rule and the same refusals.
+#[tokio::test]
+async fn a_client_proves_its_initiator_with_its_own_fresh_token() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let scope = fx.scope().await;
+	let holder = fx.user("holder").await;
+	fx.at(T0);
+	// The test client's audience is its id (`scope()` registers it so).
+	let own = |iat: i64, auth_time: Option<i64>| fx.client_tokens.mint_for(&scope.client, owners[0], iat, auth_time);
+
+	let named = fx.client_grant(&scope, owners[0], holder, None).await.expect("a name without a token");
+	assert_eq!(named.level, ApprovalLevel::Platform as i32);
+	assert!(!named.requested_by_proven);
+	assert_eq!(named.voters.len(), 3, "without a token nothing changes: the name is information");
+
+	let token = own(T0, Some(T0 - 5));
+	let proven = fx
+		.client_grant(&scope, owners[0], holder, Some(&token))
+		.await
+		.expect("the client's own fresh token proves who asked");
+	assert!(proven.requested_by_proven);
+	assert_eq!((proven.voters.len(), proven.threshold), (2, 2), "the two other owners decide");
+	assert_eq!(
+		code(fx.vote(owners[0], &proven.id, ApprovalVote::For).await),
+		Some(Code::PermissionDenied),
+		"the requester does not vote"
+	);
+
+	let reauth_required = |result: Result<Approval, tonic::Status>, why: &str| {
+		let refused = result.unwrap_err();
+		assert_eq!(refused.code(), Code::FailedPrecondition, "{why}: {}", refused.message());
+		assert!(refused.message().starts_with("reauth_required: "), "{why}: {}", refused.message());
+		refused.message().to_owned()
+	};
+	let spent = reauth_required(fx.client_grant(&scope, owners[0], holder, Some(&token)).await, "the same token twice");
+	assert!(spent.contains("already spent"), "{spent}");
+	let refreshed = own(T0, Some(T0 - 5));
+	let spent = reauth_required(fx.client_grant(&scope, owners[0], holder, Some(&refreshed)).await, "a refresh of the same confirmation");
+	assert!(spent.contains("already spent"), "{spent}");
+	reauth_required(
+		fx.client_grant(&scope, owners[0], holder, Some(&own(T0, Some(T0 - 121)))).await,
+		"a session confirmed more than 120 s ago",
+	);
+	reauth_required(fx.client_grant(&scope, owners[0], holder, Some(&own(T0, None))).await, "a token without auth_time");
+	reauth_required(
+		fx.client_grant(&scope, owners[0], holder, Some(&own(T0 - 121, Some(T0)))).await,
+		"a token minted more than 120 s ago",
+	);
+
+	let other = fx.scope().await;
+	let theirs = fx.client_tokens.mint_for(&other.client, owners[0], T0, Some(T0));
+	let refused = fx.client_grant(&scope, owners[0], holder, Some(&theirs)).await.unwrap_err();
+	assert_eq!(refused.code(), Code::PermissionDenied, "another client's token: {}", refused.message());
+	assert!(refused.message().contains("another client"), "{}", refused.message());
+
+	let plane = fx.tokens.mint(owners[0], T0);
+	assert_eq!(
+		code(fx.client_grant(&scope, owners[0], holder, Some(&plane)).await),
+		Some(Code::Unauthenticated),
+		"a client never presents this plane's token"
+	);
+
+	let kind = fx.bank_platform_kind(&scope).await;
+	assert_eq!(
+		code(fx.payment(&kind, &scope, Some(owners[0]), Some(&own(T0, Some(T0)))).await),
+		Some(Code::Unauthenticated),
+		"the bridge proves with this plane's tokens only"
+	);
+	let fresh = own(T0, Some(T0));
+	let refused = fx.client_grant(&scope, owners[1], holder, Some(&fresh)).await.unwrap_err();
+	assert_eq!(refused.code(), Code::PermissionDenied, "the token is not requested_by's: {}", refused.message());
+}
+
+/// The two-owner floor holds for a client's proof as for the bridge's.
+#[tokio::test]
+async fn a_client_proof_with_two_owners_is_refused() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(2).await;
+	let scope = fx.scope().await;
+	let holder = fx.user("holder").await;
+	fx.at(T0);
+	let token = fx.client_tokens.mint_for(&scope.client, owners[0], T0, Some(T0));
+	let refused = fx.client_grant(&scope, owners[0], holder, Some(&token)).await.unwrap_err();
+	assert_eq!(refused.code(), Code::FailedPrecondition);
+	assert!(refused.message().contains("not_enough_owners_besides_initiator"), "{}", refused.message());
 }
