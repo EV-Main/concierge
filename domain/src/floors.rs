@@ -126,10 +126,10 @@ const fn floor(parameter: &'static str, field_key: &'static str, test: Escalatio
 }
 
 /// §4.4 of the organisation plan: what leaves the platform, crosses scopes, seeds or
-/// sweeps capital, sets a compartment's limits or grants holdings is always the owners';
-/// inside a scope, [`MoneyCaps`] per operation and a day (1000 and 5000 USDT unless
-/// configured), a payout to one recipient
-/// a day, a valuation within 10 % and a fee change within its ceiling.
+/// sweeps capital, sets a compartment's limits, grants holdings or changes a fund's fees
+/// beyond its envelope is always the owners'; inside a scope, [`MoneyCaps`] per operation
+/// and a day (1000 and 5000 USDT unless configured), a payout to one recipient a day and a
+/// valuation within 10 %.
 const TABLE: &[(&str, KindFloor)] = &[
 	("bank:payment", KindFloor::Platform),
 	("bank:scope_transfer", KindFloor::Platform),
@@ -137,6 +137,10 @@ const TABLE: &[(&str, KindFloor)] = &[
 	("bank:treasury_surplus", KindFloor::Platform),
 	("bank:compartment_policy", KindFloor::Platform),
 	("invest:holder_grant", KindFloor::Platform),
+	// The owners decide every fee change beyond the house envelope (EV-Fund/invest#37,
+	// 2026-10-22). A scope-level floor escalating on `raises_ceiling` alone would leave a
+	// hurdle-only lowering, which raises no ceiling, to the scope's admins.
+	("invest:fee_policy", KindFloor::Platform),
 	(
 		"bank:account_transfer",
 		KindFloor::Scope(&[
@@ -163,10 +167,6 @@ const TABLE: &[(&str, KindFloor)] = &[
 	(
 		"invest:valuation_override",
 		KindFloor::Scope(&[floor("floor_deviation", "deviation", EscalationTest::AbsBpsAbove, Cap::Fixed("1000"), "")]),
-	),
-	(
-		"invest:fee_policy",
-		KindFloor::Scope(&[floor("floor_ceiling", "raises_ceiling", EscalationTest::FlagSet, Cap::Fixed(""), "")]),
 	),
 ];
 
@@ -351,6 +351,35 @@ mod tests {
 		let payment = kind("bank:payment", ApprovalLevel::Scope, vec![field("amount", FieldType::Amount)], vec![]);
 		assert!(check(&payment).is_err());
 		assert_eq!(floored(&payment).level, ApprovalLevel::Platform);
+	}
+
+	/// The shape the floor allowed before the owners' decision: SCOPE, escalating only when a
+	/// ceiling is raised. A hurdle-only lowering raises none, so this shape would leave it to
+	/// the scope's admins.
+	#[test]
+	fn a_fee_policy_change_is_the_owners() {
+		let fields = vec![
+			field("allocation", FieldType::Text),
+			field("proposed_hurdle", FieldType::Bps),
+			field("raises_ceiling", FieldType::Flag),
+		];
+		let ceiling = Escalation {
+			parameter: "ceiling".into(),
+			field_key: "raises_ceiling".into(),
+			test: EscalationTest::FlagSet,
+			default_threshold: String::new(),
+			currency: String::new(),
+		};
+		let at_scope = kind("invest:fee_policy", ApprovalLevel::Scope, fields.clone(), vec![ceiling]);
+		assert!(check(&at_scope).is_err(), "a scope-level publication is refused");
+		let stored = floored(&at_scope);
+		assert_eq!(stored.level, ApprovalLevel::Platform, "and a stored one goes to the owners");
+		assert!(stored.escalations.is_empty(), "a platform kind escalates nowhere");
+		assert_eq!(
+			check(&kind("invest:fee_policy", ApprovalLevel::Platform, fields, vec![])),
+			Ok(()),
+			"invest's own publication stands"
+		);
 	}
 
 	#[test]
