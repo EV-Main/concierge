@@ -32,8 +32,10 @@ pub struct RenderedEmail {
 }
 
 /// A notification's email copy. `target` is the finished URL; which cabinet it may name
-/// is decided by `notice_link::NoticeLinkBases::mail_target`, not here.
-pub fn notification(topic_label: &str, title: &str, body: &str, target: &str, occurred_at: i64, unsubscribe_url: &str) -> RenderedEmail {
+/// is decided by `notice_link::NoticeLinkBases::mail_target`, not here. `required` is the
+/// publisher's reason when the topic is a required notice: the footer then says why the
+/// mail came instead of "you follow", and the caller passes no unsubscribe target.
+pub fn notification(topic_label: &str, title: &str, body: &str, target: &str, occurred_at: i64, unsubscribe_url: &str, required: Option<&str>) -> RenderedEmail {
 	// The text part prints the link bare on its own line — see `one_line`.
 	let target = &one_line(target);
 
@@ -46,15 +48,23 @@ pub fn notification(topic_label: &str, title: &str, body: &str, target: &str, oc
 	inner.push_str(&detail_box(&[("Topic", topic_label.to_owned()), ("As of", fmt_ts(occurred_at))]));
 	inner.push_str(&button("Open your cabinet", target));
 
-	let footer = format!(
-		"You are receiving this because you follow {}. This message is a copy — it is already waiting in your cabinet.",
-		topic_label
-	);
+	let footer = match required {
+		Some(reason) => format!(
+			"You are receiving this because {topic_label} is a required notice, which cannot be switched off: {}. This message is a copy — it is already waiting in your cabinet.",
+			reason.trim_end_matches('.')
+		),
+		None => format!("You are receiving this because you follow {topic_label}. This message is a copy — it is already waiting in your cabinet."),
+	};
+	let unsubscribe_line = if unsubscribe_url.is_empty() {
+		String::new()
+	} else {
+		format!("Unsubscribe: {unsubscribe_url}\n")
+	};
 	RenderedEmail {
 		subject: format!("{topic_label} — {title}"),
 		html: shell(title, &card(&inner), &footer, unsubscribe_url, topic_label),
 		text: format!(
-			"{topic_label}\n\n{title}\n\n{body}\n\nAs of: {}\n\nOpen your cabinet: {target}\n\n—\n{footer}\nUnsubscribe: {unsubscribe_url}\n",
+			"{topic_label}\n\n{title}\n\n{body}\n\nAs of: {}\n\nOpen your cabinet: {target}\n\n—\n{footer}\n{unsubscribe_line}",
 			fmt_ts(occurred_at)
 		),
 	}
@@ -1665,6 +1675,7 @@ mod tests {
 			"https://evinvest.ltd/cabinet/funds/quy-nhon",
 			1_785_143_640,
 			"https://evinvest.ltd/u/tok",
+			None,
 		);
 		assert!(mail.subject.starts_with("Quy Nhon Fund —"), "subject leads with the topic so a threaded inbox groups sensibly");
 		assert!(mail.html.contains("&lt;this&gt;"), "body copy is HTML-escaped — emitters pass through arbitrary text");
@@ -1677,6 +1688,27 @@ mod tests {
 			mail.html.contains("https://evinvest.ltd/u/tok"),
 			"the unsubscribe target is rendered in the footer, not only in headers"
 		);
+	}
+
+	#[test]
+	fn a_required_notice_says_why_and_offers_no_unsubscribe() {
+		let mail = notification(
+			"Fee terms",
+			"New fee terms for Quy Nhon",
+			"",
+			"https://evinvest.ltd/cabinet/funds/quy-nhon",
+			1_785_143_640,
+			"",
+			Some("Fund holders are told before new fees bind."),
+		);
+		assert!(
+			mail.text
+				.contains("Fee terms is a required notice, which cannot be switched off: Fund holders are told before new fees bind. This message"),
+			"{}",
+			mail.text
+		);
+		assert!(!mail.text.contains("Unsubscribe") && !mail.html.contains("Unsubscribe"), "no unsubscribe line in either part");
+		assert!(!mail.text.contains("you follow"), "the member did not choose it");
 	}
 
 	#[test]

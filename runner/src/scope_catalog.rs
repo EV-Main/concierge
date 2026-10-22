@@ -203,6 +203,8 @@ impl ScopeCatalogService for ScopeCatalogs {
 					label: t.label,
 					description: t.description,
 					default_subscribed: t.default_subscribed,
+					required: t.required,
+					required_reason: t.required_reason,
 				})
 				.collect(),
 		};
@@ -210,7 +212,12 @@ impl ScopeCatalogService for ScopeCatalogs {
 		catalog.check(&namespace, &reserved).map_err(Status::invalid_argument)?;
 		let now = now_secs() as i64;
 		match self.catalogs.publish(&namespace, caller.publisher(), &catalog, now).await.map_err(unavailable)? {
-			PublishOutcome::Published => tracing::info!(%namespace, publisher = caller.publisher(), version = catalog.version, "scope catalog published"),
+			PublishOutcome::Published => {
+				// Logged by name: a required topic overrides every member's choice, so which
+				// ones a scope marks is something an operator should be able to find.
+				let required: Vec<&str> = catalog.notification_topics.iter().filter(|t| t.required).map(|t| t.topic.as_str()).collect();
+				tracing::info!(%namespace, publisher = caller.publisher(), version = catalog.version, ?required, "scope catalog published");
+			}
 			PublishOutcome::Unchanged => {}
 			PublishOutcome::Stale { stored } => {
 				tracing::warn!(%namespace, publisher = caller.publisher(), version = catalog.version, stored, "stale scope catalog refused");
@@ -241,6 +248,8 @@ impl ScopeCatalogService for ScopeCatalogs {
 					label: t.label,
 					description: t.description,
 					default_subscribed: t.default_subscribed,
+					required: t.required,
+					required_reason: t.required_reason,
 				})
 				.collect(),
 		}))

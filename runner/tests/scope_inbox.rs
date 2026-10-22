@@ -212,6 +212,23 @@ impl Fx {
 
 	/// [`Self::scope`] whose topic an account that never touched it follows.
 	async fn scope_publishing(&self, observers: &[&Scope], default_subscribed: bool) -> Scope {
+		self.scope_catalogued(observers, default_subscribed, false).await
+	}
+
+	/// The scope's one topic as its catalog version `version` publishes it.
+	async fn republish(&self, scope: &Scope, version: u64, required: bool) {
+		let catalog = ScopeCatalog {
+			version,
+			approval_kinds: Vec::new(),
+			notification_topics: vec![news(&scope.topic, false, required)],
+		};
+		PgScopeCatalogs::new(self.pool.clone())
+			.publish(&scope.id, &scope.client, &catalog, now())
+			.await
+			.expect("publish the catalog");
+	}
+
+	async fn scope_catalogued(&self, observers: &[&Scope], default_subscribed: bool, required: bool) -> Scope {
 		let tag = Uuid::new_v4().simple().to_string()[..12].to_string();
 		let scope = Scope {
 			id: format!("x_{tag}"),
@@ -241,12 +258,7 @@ impl Fx {
 		let catalog = ScopeCatalog {
 			version: 1,
 			approval_kinds: Vec::new(),
-			notification_topics: vec![NotificationTopic {
-				topic: scope.topic.clone(),
-				label: "News".into(),
-				description: String::new(),
-				default_subscribed,
-			}],
+			notification_topics: vec![news(&scope.topic, default_subscribed, required)],
 		};
 		PgScopeCatalogs::new(self.pool.clone())
 			.publish(&scope.id, &scope.client, &catalog, now())
@@ -289,6 +301,20 @@ impl Fx {
 			.fetch_one(&self.pool)
 			.await
 			.unwrap()
+	}
+}
+
+const REASON: &str = "Holders are told before new fee terms bind";
+
+/// The one topic every test scope publishes.
+fn news(topic: &str, default_subscribed: bool, required: bool) -> NotificationTopic {
+	NotificationTopic {
+		topic: topic.to_owned(),
+		label: "News".into(),
+		description: String::new(),
+		default_subscribed,
+		required,
+		required_reason: if required { REASON.into() } else { String::new() },
 	}
 }
 
@@ -722,6 +748,8 @@ async fn the_bridge_emits_the_bank_s_published_topics_to_anyone_following_them()
 		label: "Money".into(),
 		description: String::new(),
 		default_subscribed: false,
+		required: false,
+		required_reason: String::new(),
 	}])
 	.await;
 	let (user, email) = fx.user("bank-follower").await;
@@ -776,6 +804,8 @@ async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
 		label: "Money".into(),
 		description: String::new(),
 		default_subscribed: false,
+		required: false,
+		required_reason: String::new(),
 	}])
 	.await;
 	let (user, email) = fx.user("link-scope").await;
@@ -939,4 +969,146 @@ async fn a_default_topic_reaches_members_who_never_touched_it_until_they_switch_
 	let back = inbox.emit_scope_notification(as_client(emit(user, &scope.topic), &scope)).await.unwrap().into_inner();
 	assert!(back.delivered, "following again lifts the opt-out");
 	assert_eq!(fx.rows_on(user, &scope.topic).await, 2);
+}
+
+/// A required topic reaches every active member whatever they chose — an opt-out stored
+/// before it became required, both master switches off — in-app always and by mail to a
+/// verified address; a member cannot switch it off; nobody outside the scope gets it; and
+/// once a later catalog makes it ordinary again, the member's stored choice counts again.
+#[tokio::test]
+async fn a_required_topic_reaches_every_member_whatever_they_chose() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&scope]);
+	let (member, _) = fx.user("required-member").await;
+	let token = fx.token(&scope, member).await;
+	let settings = || as_client(GetScopeNotificationSettingsRequest { user_id: member.to_string() }, &scope);
+	let stance = |s: &NotificationSettingsMsg| {
+		let t = s.topics.iter().find(|t| t.topic == scope.topic).expect("the topic is offered");
+		(t.subscribed, t.email_enabled, t.required, t.required_reason.clone())
+	};
+	let optouts = || async {
+		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notification_topic_optouts o JOIN notification_subscribers s ON s.id = o.subscriber_id WHERE s.user_id = $1 AND o.topic = $2")
+			.bind(member)
+			.bind(&scope.topic)
+			.fetch_one(&fx.pool)
+			.await
+			.unwrap()
+	};
+
+	// Switched off while the topic was ordinary: nothing reaches the member.
+	inbox.set_scope_topic_subscription(on_behalf(unfollow(&scope.topic), &scope, &token)).await.unwrap();
+	assert!(!inbox.emit_scope_notification(as_client(emit(member, &scope.topic), &scope)).await.unwrap().into_inner().delivered);
+
+	fx.republish(&scope, 2, true).await;
+	let read = inbox.get_scope_notification_settings(settings()).await.unwrap().into_inner();
+	assert_eq!(stance(&read), (true, true, true, REASON.to_owned()), "shown as on and locked, with the reason");
+	let sent = inbox.emit_scope_notification(as_client(emit(member, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert_eq!((sent.delivered, sent.channels), (true, vec![1, 2]), "the old opt-out is ignored");
+	assert_eq!(optouts().await, 1, "and kept, untouched");
+
+	for (subscribed, email_enabled) in [(false, false), (true, false)] {
+		let change = SetScopeTopicSubscriptionRequest {
+			user_id: String::new(),
+			topic: scope.topic.clone(),
+			subscribed,
+			email_enabled,
+		};
+		let refused = inbox.set_scope_topic_subscription(on_behalf(change, &scope, &token)).await.unwrap_err();
+		assert_eq!(refused.code(), Code::FailedPrecondition, "{subscribed}/{email_enabled}: {refused:?}");
+		assert!(refused.message().starts_with("required_topic:"), "{refused:?}");
+	}
+
+	// Both master switches off: the notice is still written, mailed and shown.
+	let sub = fx.notifications.subscriber_of_user(member).await.unwrap().expect("a subscriber row");
+	fx.notifications.set_channel_enabled(sub.id, Some(false), Some(false)).await.unwrap();
+	let sent = inbox.emit_scope_notification(as_client(emit(member, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert_eq!((sent.delivered, sent.channels), (true, vec![1, 2]), "neither master switch silences it");
+	let page = inbox.list_scope_notifications(as_client(list(member), &scope)).await.unwrap().into_inner();
+	assert_eq!(page.notifications.len(), 2, "the in-app switch does not hide a required notice: {page:?}");
+	assert!(page.notifications.iter().all(|n| n.topic == scope.topic));
+	assert_eq!(page.unread_count, 2);
+	let unread = inbox
+		.get_scope_unread_count(as_client(GetScopeUnreadCountRequest { user_id: member.to_string() }, &scope))
+		.await
+		.unwrap()
+		.into_inner();
+	assert_eq!(unread.unread_count, 2);
+	let mails: i64 = sqlx::query_scalar("SELECT count(*) FROM notification_deliveries WHERE subscriber_id = $1 AND kind = 'notification'")
+		.bind(sub.id)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(mails, 2, "both required notices queued a mail");
+
+	// An address nobody proved gets no mail, and the notice is still delivered in-app.
+	let unverified = fx.users.resolve(common::google("required-unverified", false), 0).await.unwrap().id().raw();
+	fx.join(&scope, unverified).await;
+	let sent = inbox.emit_scope_notification(as_client(emit(unverified, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert_eq!((sent.delivered, sent.channels), (true, vec![1]), "in-app only");
+
+	// Nobody outside the scope.
+	let (outsider, _) = fx.user("required-outsider").await;
+	let stranger = inbox.emit_scope_notification(as_client(emit(outsider, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert!(!stranger.delivered && stranger.notification_id.is_empty(), "{stranger:?}");
+	assert_eq!(fx.rows_on(outsider, &scope.topic).await, 0);
+
+	// Ordinary again: the opt-out the member left stands, and the in-app switch hides the inbox.
+	fx.republish(&scope, 3, false).await;
+	let read = inbox.get_scope_notification_settings(settings()).await.unwrap().into_inner();
+	assert!(!stance(&read).0, "switched off, as the member left it");
+	assert_eq!((read.topics[0].required, read.topics[0].required_reason.as_str()), (false, ""));
+	let muted = inbox.emit_scope_notification(as_client(emit(member, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert!(!muted.delivered, "{muted:?}");
+	let page = inbox.list_scope_notifications(as_client(list(member), &scope)).await.unwrap().into_inner();
+	assert!(page.notifications.is_empty(), "{page:?}");
+	assert_eq!(fx.rows_on(member, &scope.topic).await, 2, "the rows stay, hidden");
+}
+
+/// An ordinary topic of a scope that also publishes a required one behaves as before: the
+/// opt-out holds and the in-app switch hides it.
+#[tokio::test]
+async fn an_ordinary_topic_beside_a_required_one_keeps_the_member_s_choice() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope(&[]).await;
+	let notice = format!("{}:notice", scope.id);
+	let catalog = ScopeCatalog {
+		version: 2,
+		approval_kinds: Vec::new(),
+		notification_topics: vec![news(&scope.topic, false, false), news(&notice, false, true)],
+	};
+	PgScopeCatalogs::new(fx.pool.clone()).publish(&scope.id, &scope.client, &catalog, now()).await.unwrap();
+	let inbox = fx.inbox(&[&scope]);
+	let (member, email) = fx.user("ordinary-member").await;
+	fx.join(&scope, member).await;
+
+	let quiet = inbox.emit_scope_notification(as_client(emit(member, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert!(!quiet.delivered, "never followed: {quiet:?}");
+	fx.follow(member, &email, &scope.topic).await;
+	let heard = inbox.emit_scope_notification(as_client(emit(member, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert_eq!((heard.delivered, heard.channels), (true, vec![1, 2]));
+	assert!(inbox.emit_scope_notification(as_client(emit(member, &notice), &scope)).await.unwrap().into_inner().delivered);
+
+	let sub = fx.notifications.subscriber_of_user(member).await.unwrap().unwrap();
+	fx.notifications.set_channel_enabled(sub.id, Some(false), Some(false)).await.unwrap();
+	let muted = inbox.emit_scope_notification(as_client(emit(member, &scope.topic), &scope)).await.unwrap().into_inner();
+	assert!(!muted.delivered && !muted.notification_id.is_empty(), "written, delivered on no channel: {muted:?}");
+	let page = inbox.list_scope_notifications(as_client(list(member), &scope)).await.unwrap().into_inner();
+	assert_eq!(
+		page.notifications.iter().map(|n| n.topic.as_str()).collect::<Vec<_>>(),
+		vec![notice.as_str()],
+		"with in-app off only the required notice shows"
+	);
+	let filtered = inbox
+		.list_scope_notifications(as_client(
+			ListScopeNotificationsRequest {
+				topic: scope.topic.clone(),
+				..list(member)
+			},
+			&scope,
+		))
+		.await
+		.unwrap()
+		.into_inner();
+	assert!(filtered.notifications.is_empty(), "the ordinary topic stays hidden: {filtered:?}");
 }

@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-	notification::{InboxView, current_key, follow_offered, settings_json, settings_of, subscriber_of},
+	notification::{InboxView, TopicChangeRefusal, check_topic_change, current_key, settings_json, settings_of, subscriber_of},
 	web::{
 		WebState,
 		routes::{Caller, session_user},
@@ -195,18 +195,23 @@ pub struct TopicChange {
 }
 
 /// `POST /auth/notifications/settings/topic` — a topic the request's inbox offers; answers
-/// that inbox's whole snapshot. A topic of another inbox is as unknown as a made-up one.
+/// that inbox's whole snapshot. A topic of another inbox is as unknown as a made-up one;
+/// switching a required topic (or its mail copy) off is `409 required_topic`.
 pub async fn set_topic(State(st): State<WebState>, Query(query): Query<ViewQuery>, jar: CookieJar, headers: HeaderMap, Json(body): Json<TopicChange>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed_in(st, &jar, &headers).await?;
 	let answer = async {
 		let view = inbox_view(st, &headers, &query, &user).await?;
 		let key = current_key(&body.topic);
-		if !follow_offered(st.notifications.as_ref(), &view, key)
+		match check_topic_change(st.notifications.as_ref(), &view, key, body.subscribed, body.email_enabled)
 			.await
 			.map_err(|e| internal("notification settings: topics not read", e))?
 		{
-			return Err(Refusal::new(StatusCode::BAD_REQUEST, "unknown_topic"));
+			Ok(()) => {}
+			Err(TopicChangeRefusal::Unknown) => return Err(Refusal::new(StatusCode::BAD_REQUEST, "unknown_topic")),
+			// 409: the request is well formed and the caller may make it; the topic's state
+			// is what refuses it.
+			Err(TopicChangeRefusal::Required) => return Err(Refusal::new(StatusCode::CONFLICT, "required_topic")),
 		}
 		let sub = subscriber_of(st.notifications.as_ref(), &user)
 			.await

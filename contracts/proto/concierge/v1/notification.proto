@@ -11,7 +11,9 @@ package concierge.v1;
 // DELIVERY MODEL. A notification fans out to at most two channels — the cabinet
 // inbox (in-app) and email. Both are opt-out: a subscriber may switch either or
 // BOTH off, in which case nothing is delivered and the emit is recorded as
-// suppressed. No channel is unconditional.
+// suppressed. The one exception is a scope's `required` topic (NotificationTopicSpec):
+// it reaches a recipient in-app and by mail to a verified address whatever they chose,
+// and cannot be switched off.
 //
 // INBOXES. Each direction (scope) has its own inbox, and the server decides which one a
 // call reads — never a request field (D21, docs/SCOPES-AND-APPROVALS.md §6). A user's
@@ -95,7 +97,9 @@ message EmitResponse {
   // The stored notification id; empty when the emit was deduped or suppressed.
   string notification_id = 1;
   // False when the subscriber has the topic off, both channels off, or does not
-  // exist — the call still succeeds, it simply delivered nothing.
+  // exist — the call still succeeds, it simply delivered nothing. On a `required` topic
+  // only a recipient outside the topic's inbox (not an active member of its scope, or no
+  // account) makes it false.
   bool delivered = 2;
   // Channels the notification was actually queued on.
   repeated Channel channels = 3;
@@ -167,6 +171,12 @@ message TopicSubscription {
   bool subscribed = 4;
   // Email copy for this topic. Only meaningful while `subscribed`.
   bool email_enabled = 5;
+  // The scope must give this notice (NotificationTopicSpec.required): `subscribed` and
+  // `email_enabled` read true, and switching either off is refused. A settings screen
+  // shows it as on and locked, with `required_reason`.
+  bool required = 6;
+  // Why it is required, in the publisher's words; empty unless `required`.
+  string required_reason = 7;
 }
 
 // The whole delivery surface in one authoritative snapshot.
@@ -185,6 +195,8 @@ message SetChannelEnabledRequest {
   bool enabled = 2;
 }
 
+// Switching a `required` topic off, or its email copy off, is FAILED_PRECONDITION with a
+// message that starts `required_topic:`; following it is accepted.
 message SetTopicSubscriptionRequest {
   string topic = 1;
   bool subscribed = 2;

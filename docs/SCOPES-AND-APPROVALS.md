@@ -856,7 +856,8 @@ Topics a direction emits on are published with its scope catalog
 (`NotificationTopicSpec`): `<namespace>:<segment>…`, a label and a description in plain
 text, and whether an account that never touched the topic receives it (default no). A
 service may emit only its own namespace's topics (`ScopeInboxService.EmitScopeNotification`). Topics a user cannot be without (the
-payment-consent trace, security notices) stay this plane's own. Today's
+payment-consent trace, security notices) stay this plane's own. A scope's own notice that its
+members must receive is a **required** topic of its catalog (below). Today's
 `fund:quy-nhon` and `account:money-movement` move to `invest:` and `bank:`; carrying the
 existing subscriptions across is the implementation's migration.
 
@@ -952,6 +953,43 @@ the offer when a later catalog withdraws them.
   and on emit, which creates the subscriber row as a trace does. Following again clears the
   opt-out. The subscription row is still deleted on unsubscribe, so the previous binary,
   which ignores the new table, keeps reading "not following".
+- **A required topic (decided 2026-10-22).** A scope publishes a notice its members must
+  receive — invest's `invest:fee-terms`: new fee terms on a held fund bind only after the
+  holders are told — as a topic with `required` set and a `required_reason`. Without it any
+  holder could switch the topic off, the notice would read "not delivered", and one holder
+  could block every fee change on their fund.
+  - *Who publishes one.* Whoever publishes the catalog: a relying party for its own scope,
+    the bridge token for `bank`. At most **3** per catalog, each with a reason of plain text
+    up to 120 bytes; a reason on an ordinary topic, a required topic without one, or a fourth
+    is `INVALID_ARGUMENT` at publish. A required topic is for a notice the scope owes its
+    members (terms, legal notices), never for news or marketing. Nothing here can tell the two
+    apart, so the guard is that it stays small and visible: the cap, the reason every member
+    reads beside the topic, `GetScopeCatalog`, and the publish log line that names the
+    required topics.
+  - *A member cannot switch it off.* `SetScopeTopicSubscription`, `SetTopicSubscription` and
+    `POST /auth/notifications/settings/topic` refuse to switch the topic or its mail copy off:
+    `FAILED_PRECONDITION` with a message that starts `required_topic:` on gRPC, `409
+    {"error":"required_topic"}` on the web. Following it is accepted, so a screen that writes
+    every row back does not fail. The settings read shows it with `subscribed` and
+    `email_enabled` true, `required` true and the `required_reason`.
+  - *Delivery.* An emit reaches every account its inbox reaches — a scope's ACTIVE members, any
+    account for `bank` — whatever they chose. A switch-off stored earlier is ignored, not
+    deleted. In-app always: the inbox row is written, and the read shows the required topics
+    even with the in-app channel off (the switch hides everything else). By mail when the
+    account's CURRENT address is verified, even with the email channel off; an unverified
+    address gets the in-app copy only. The email switch is overridden on purpose: the money
+    plane's fee notice (`FEE_POLICY_NOTICE`) already reaches the mailbox whatever the
+    preferences say, and a legal notice a member can silence by unsubscribing is one they can
+    say they never got. The mail carries no unsubscribe link and no `List-Unsubscribe`
+    header — a one-click target must work when offered, and this one would not — and its
+    footer says it is a required notice and why. `delivered` is false only for someone the
+    inbox does not reach (not an active member, or no account).
+  - *The catalog ratchet.* A newer version may make a topic required or ordinary again. A
+    publication writes only the catalog: the subscription and opt-out rows stay as the members
+    left them, are ignored while the topic is required, and count again once it is not.
+  - *Rollout.* A concierge from before the flag drops it from a publication (an unknown proto
+    field) and stores the topic as ordinary. A publisher sets `required` only against a
+    concierge that has it, and checks that `GetScopeCatalog` reads `required` back.
 - **The account-less subscribe takes a scope's topic** that a catalog in force publishes,
   under the same double opt-in; `default_subscribed` has no say there, the address asks by
   name. Its working door is this plane's web surface, not the RPC: `SubscribeAnonymous`,

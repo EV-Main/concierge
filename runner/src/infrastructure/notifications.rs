@@ -22,7 +22,7 @@
 //! sqlx feature set narrow (no `time`/`chrono` decode path).
 
 use async_trait::async_trait;
-use domain::error::DomainError;
+use domain::{error::DomainError, scope_catalog::TopicDelivery};
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
@@ -223,25 +223,34 @@ impl NotificationRepository for PgNotifications {
 		link: &str,
 		dedupe_key: &str,
 		occurred_at: i64,
-		default_subscribed: bool,
+		delivery: TopicDelivery,
 	) -> Result<EmitOutcome, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let required = delivery == TopicDelivery::Required;
 
-		let found = sqlx::query_as::<_, SubscriberRow>(
-			"SELECT id, user_id, email, email_verified, in_app_enabled, email_enabled, \
-			        (confirmed_at IS NOT NULL) AS confirmed, unsubscribe_token \
-			 FROM notification_subscribers WHERE user_id = $1",
-		)
-		.bind(user_id)
-		.fetch_optional(&mut *tx)
-		.await
-		.map_err(repo_err)?;
+		let found = if required {
+			// A required notice goes to the address the account holds NOW: the subscriber
+			// row copies it only when something touches the row, and a legal notice must not
+			// go to an address the member has since replaced.
+			None
+		} else {
+			sqlx::query_as::<_, SubscriberRow>(
+				"SELECT id, user_id, email, email_verified, in_app_enabled, email_enabled, \
+				        (confirmed_at IS NOT NULL) AS confirmed, unsubscribe_token \
+				 FROM notification_subscribers WHERE user_id = $1",
+			)
+			.bind(user_id)
+			.fetch_optional(&mut *tx)
+			.await
+			.map_err(repo_err)?
+		};
 		let sub = match found {
 			Some(sub) => sub,
 			// Never touched their notification settings ⇒ no subscriber row ⇒ nothing to
 			// deliver. Not an error: emitters fire for every user, not just followers.
-			None if !default_subscribed => return Ok(EmitOutcome::default()),
-			// A default topic follows them anyway; the row is made as `record` makes it.
+			None if delivery == TopicDelivery::OptIn => return Ok(EmitOutcome::default()),
+			// A default or required topic reaches them anyway; the row is made (or brought
+			// up to date) as `record` does it.
 			None => {
 				let account: Option<(Option<String>, bool)> = sqlx::query_as("SELECT email, email_verified FROM users WHERE id = $1")
 					.bind(user_id)
@@ -255,22 +264,28 @@ impl NotificationRepository for PgNotifications {
 			}
 		};
 
-		let (followed_email, opted_out): (Option<bool>, bool) = sqlx::query_as(
-			"SELECT (SELECT email_enabled FROM notification_subscriptions WHERE subscriber_id = $1 AND topic = $2), \
-			        EXISTS (SELECT 1 FROM notification_topic_optouts WHERE subscriber_id = $1 AND topic = $2)",
-		)
-		.bind(sub.id)
-		.bind(topic)
-		.fetch_one(&mut *tx)
-		.await
-		.map_err(repo_err)?;
-		let topic_email = match followed_email {
-			Some(email_enabled) => email_enabled,
-			// Followed by default, with its mail copy on as a fresh follow has it.
-			None if default_subscribed && !opted_out => true,
-			None => {
-				tx.commit().await.map_err(repo_err)?;
-				return Ok(EmitOutcome::default());
+		let topic_email = if required {
+			// No subscription or opt-out row is read: they stay as the member left them, and
+			// count again if a later catalog makes the topic ordinary.
+			true
+		} else {
+			let (followed_email, opted_out): (Option<bool>, bool) = sqlx::query_as(
+				"SELECT (SELECT email_enabled FROM notification_subscriptions WHERE subscriber_id = $1 AND topic = $2), \
+				        EXISTS (SELECT 1 FROM notification_topic_optouts WHERE subscriber_id = $1 AND topic = $2)",
+			)
+			.bind(sub.id)
+			.bind(topic)
+			.fetch_one(&mut *tx)
+			.await
+			.map_err(repo_err)?;
+			match followed_email {
+				Some(email_enabled) => email_enabled,
+				// Followed by default, with its mail copy on as a fresh follow has it.
+				None if delivery == TopicDelivery::ByDefault && !opted_out => true,
+				None => {
+					tx.commit().await.map_err(repo_err)?;
+					return Ok(EmitOutcome::default());
+				}
 			}
 		};
 
@@ -301,10 +316,12 @@ impl NotificationRepository for PgNotifications {
 		};
 		let notification_id: Uuid = row.try_get("id").map_err(repo_err)?;
 
-		let in_app = sub.in_app_enabled;
-		// Every one of these has to hold: the master switch, the per-topic copy, a
-		// confirmed opt-in, and an address we are actually allowed to mail.
-		let email = sub.email_enabled && topic_email && sub.confirmed && sub.email_verified && !sub.email.is_empty();
+		// A required notice is read whatever the in-app switch says (`notification::readable`),
+		// and mailed whatever the email switch says — the money plane's fee notice reaches
+		// the mailbox on the same terms. What still has to hold for any mail: a confirmed
+		// opt-in and an address we are actually allowed to mail.
+		let in_app = sub.in_app_enabled || required;
+		let email = (sub.email_enabled || required) && topic_email && sub.confirmed && sub.email_verified && !sub.email.is_empty();
 
 		if email {
 			sqlx::query(

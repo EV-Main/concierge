@@ -9,7 +9,10 @@ the EV identity plane. Server-side only: the client secret never reaches a brows
 - **`get_me`** — the one RPC a relying party's access token opens, and where the party
   re-reads `permissions`, the only thing it may gate on.
 - **`publish_catalog`** (permissions and aliases) and **`publish_scope_catalog`**
-  (approval kinds and notification topics), under the client credential.
+  (approval kinds and notification topics), under the client credential. A topic is a
+  `proto::NotificationTopicSpec`: `topic`, `label`, `description`, `default_subscribed`,
+  and `required` with its `required_reason` — a notice members cannot switch off, at most
+  3 per catalog (concierge `docs/SCOPES-AND-APPROVALS.md` §6).
 - **The direction's inbox** (`ScopeInboxService`): `list_scope_notifications` (an
   `InboxQuery`, 20 per page unless told otherwise), `scope_unread_count` and
   `scope_notification_settings` by concierge's `user_id`; `mark_scope_notifications_read`

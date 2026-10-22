@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 pub const MAX_KINDS: usize = 64;
 pub const MAX_TOPICS: usize = 64;
 pub const MAX_FIELDS: usize = 16;
+/// Required topics per catalog. A required topic reaches every member whatever they chose,
+/// so it is a scope's few legal notices, not a channel: a cap a reviewer can read at a
+/// glance keeps news from being published as one.
+pub const MAX_REQUIRED_TOPICS: usize = 3;
 
 const KIND_LABEL_BYTES: usize = 80;
 const KIND_DESCRIPTION_BYTES: usize = 500;
@@ -19,6 +23,7 @@ const FIELD_LABEL_BYTES: usize = 60;
 const TOPIC_BYTES: usize = 64;
 const TOPIC_LABEL_BYTES: usize = 60;
 const TOPIC_DESCRIPTION_BYTES: usize = 200;
+const REQUIRED_REASON_BYTES: usize = 120;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -100,6 +105,40 @@ pub struct NotificationTopic {
 	pub label: String,
 	pub description: String,
 	pub default_subscribed: bool,
+	/// A notice the scope must give its members (a fee change on a fund they hold): a
+	/// member cannot switch it off, and an emit reaches them in-app and by mail to a
+	/// verified address whatever they follow (`docs/SCOPES-AND-APPROVALS.md` §6). A
+	/// catalog stored before the flag existed reads it as `false`; an ordinary topic is
+	/// stored without it, so its JSON is what the previous binary wrote.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub required: bool,
+	/// Why the topic is required, in the publisher's words: what a member reads beside the
+	/// switch they cannot turn off. Set exactly when `required` is.
+	#[serde(default, skip_serializing_if = "String::is_empty")]
+	pub required_reason: String,
+}
+
+/// How an emit on a topic treats a member's choice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopicDelivery {
+	/// Only who follows it.
+	OptIn,
+	/// Who follows it, and every account that never touched it (`default_subscribed`).
+	ByDefault,
+	/// Every recipient, whatever they follow or switched off (`required`).
+	Required,
+}
+
+impl NotificationTopic {
+	pub fn delivery(&self) -> TopicDelivery {
+		if self.required {
+			TopicDelivery::Required
+		} else if self.default_subscribed {
+			TopicDelivery::ByDefault
+		} else {
+			TopicDelivery::OptIn
+		}
+	}
 }
 
 /// One publication. Kinds, fields and topics keep the order they were published in: it is
@@ -134,6 +173,12 @@ impl ScopeCatalog {
 				return Err(format!("notification topic `{}` is this plane's own", topic.topic));
 			}
 			topic.check(namespace)?;
+		}
+		let required = self.notification_topics.iter().filter(|t| t.required).count();
+		if required > MAX_REQUIRED_TOPICS {
+			return Err(format!(
+				"a scope catalog marks at most {MAX_REQUIRED_TOPICS} notification topics required, not {required}: a required topic is a notice members cannot switch off"
+			));
 		}
 		Ok(())
 	}
@@ -210,7 +255,15 @@ impl NotificationTopic {
 			return Err(format!("notification topic `{topic}` is not `{namespace}:<segment>…` of at most {TOPIC_BYTES} bytes"));
 		}
 		plain_text(&self.label, TOPIC_LABEL_BYTES, false).map_err(|why| format!("notification topic `{topic}` label {why}"))?;
-		plain_text(&self.description, TOPIC_DESCRIPTION_BYTES, true).map_err(|why| format!("notification topic `{topic}` description {why}"))
+		plain_text(&self.description, TOPIC_DESCRIPTION_BYTES, true).map_err(|why| format!("notification topic `{topic}` description {why}"))?;
+		// A reason is what a member is shown in place of the switch, so a required topic
+		// without one would be a switch that silently does nothing; a reason on an ordinary
+		// topic would tell members something that is not so.
+		plain_text(&self.required_reason, REQUIRED_REASON_BYTES, !self.required).map_err(|why| format!("notification topic `{topic}` required_reason {why}"))?;
+		if !self.required && !self.required_reason.is_empty() {
+			return Err(format!("notification topic `{topic}` gives a required_reason but is not required"));
+		}
+		Ok(())
 	}
 }
 
@@ -315,6 +368,16 @@ mod tests {
 			label: "Money movement".into(),
 			description: "Deposits and withdrawals".into(),
 			default_subscribed: false,
+			required: false,
+			required_reason: String::new(),
+		}
+	}
+
+	fn required(key: &str) -> NotificationTopic {
+		NotificationTopic {
+			required: true,
+			required_reason: "The fund's terms bind only after holders are told".into(),
+			..topic(key)
 		}
 	}
 
@@ -429,5 +492,40 @@ mod tests {
 		assert!(catalog(vec![], vec![topic(&format!("bank:{}", "a".repeat(60)))]).check("bank", &[]).is_err());
 		assert!(catalog(vec![], vec![topic("bank:")]).check("bank", &[]).is_err());
 		assert!(catalog(vec![], vec![topic("bank:Upper")]).check("bank", &[]).is_err());
+	}
+
+	#[test]
+	fn a_required_topic_gives_a_reason_and_a_catalog_marks_at_most_three() {
+		let three = (0..MAX_REQUIRED_TOPICS).map(|i| required(&format!("invest:notice{i}"))).collect();
+		assert_eq!(catalog(vec![], three).check("invest", &[]), Ok(()));
+		let four = (0..=MAX_REQUIRED_TOPICS).map(|i| required(&format!("invest:notice{i}"))).collect();
+		assert!(catalog(vec![], four).check("invest", &[]).is_err(), "over the cap");
+
+		let silent = NotificationTopic {
+			required_reason: String::new(),
+			..required("invest:fee-terms")
+		};
+		assert!(catalog(vec![], vec![silent]).check("invest", &[]).is_err(), "no reason");
+		let linked = NotificationTopic {
+			required_reason: "see https://evil.example".into(),
+			..required("invest:fee-terms")
+		};
+		assert!(catalog(vec![], vec![linked]).check("invest", &[]).is_err(), "a reason is plain text");
+		let stray = NotificationTopic {
+			required_reason: "Because".into(),
+			..topic("invest:news")
+		};
+		assert!(catalog(vec![], vec![stray]).check("invest", &[]).is_err(), "a reason on an ordinary topic");
+	}
+
+	#[test]
+	fn the_flag_round_trips_and_an_old_row_reads_as_not_required() {
+		let old = serde_json::json!({"topic": "invest:news", "label": "News", "description": "", "default_subscribed": true});
+		let read: NotificationTopic = serde_json::from_value(old.clone()).unwrap();
+		assert_eq!(read.delivery(), TopicDelivery::ByDefault);
+		assert_eq!(serde_json::to_value(&read).unwrap(), old, "an ordinary topic is stored as before");
+		let notice = required("invest:fee-terms");
+		let back: NotificationTopic = serde_json::from_value(serde_json::to_value(&notice).unwrap()).unwrap();
+		assert_eq!((back.delivery(), back), (TopicDelivery::Required, notice));
 	}
 }

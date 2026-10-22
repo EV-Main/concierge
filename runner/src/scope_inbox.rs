@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::{
 	notice_link::NoticeLinkBases,
-	notification::{EmitTarget, InboxView, emit_to, follow_offered, inbox_mark_read, inbox_page, inbox_unread, scope_topic, settings_of, subscriber_of, topic},
+	notification::{EmitTarget, InboxView, check_topic_change, emit_to, inbox_mark_read, inbox_page, inbox_unread, scope_topic, settings_of, subscriber_of, topic, topic_change_status},
 	ports::{NotificationRepository, UserDirectoryRepository},
 	relying_party::ClientTokenAuthenticator,
 	service_caller::{ClientCaller, ServiceCaller, ServiceCallers},
@@ -209,9 +209,10 @@ impl ScopeInboxService for ScopeInbox {
 	async fn set_scope_topic_subscription(&self, request: Request<SetScopeTopicSubscriptionRequest>) -> Result<Response<NotificationSettings>, Status> {
 		let (view, user) = self.writer(&request, &request.get_ref().user_id).await?;
 		let req = request.get_ref();
-		if !follow_offered(self.notifications.as_ref(), &view, &req.topic).await.map_err(domain_to_status)? {
-			return Err(Status::invalid_argument("unknown topic"));
-		}
+		check_topic_change(self.notifications.as_ref(), &view, &req.topic, req.subscribed, req.email_enabled)
+			.await
+			.map_err(domain_to_status)?
+			.map_err(topic_change_status)?;
 		let account = self
 			.users
 			.find_by_id(UserId::from_raw(user))
@@ -253,7 +254,7 @@ impl ScopeInboxService for ScopeInbox {
 		let target = EmitTarget {
 			topic: req.topic.clone(),
 			scope,
-			default_subscribed: published.default_subscribed,
+			delivery: published.delivery(),
 		};
 		Ok(Response::new(emit_to(self.notifications.as_ref(), &self.links, &target, &req).await?))
 	}

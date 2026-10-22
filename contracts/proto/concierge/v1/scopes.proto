@@ -47,7 +47,11 @@ service ScopeCatalogService {
   // commit; older than the stored one, or equal with different content,
   // FAILED_PRECONDITION; more than a day ahead of this plane's clock, INVALID_ARGUMENT.
   // INVALID_ARGUMENT as well for any name outside the caller's namespace, any spec
-  // ApprovalKindSpec or NotificationTopicSpec refuses, more than 64 kinds or 64 topics.
+  // ApprovalKindSpec or NotificationTopicSpec refuses, more than 64 kinds or 64 topics,
+  // or more than 3 topics marked `required`.
+  //
+  // A topic may go from not required to required and back with a newer version; the
+  // members' stored choices are kept either way and count again once it is not required.
   rpc PublishScopeCatalog(PublishScopeCatalogRequest) returns (PublishScopeCatalogResponse);
 
   // The catalog currently in force for the caller's namespace. NOT_FOUND before the
@@ -150,7 +154,7 @@ message GetScopeRequest {
 
 // One notification topic a scope's service defines. Account topics a user cannot be
 // without (the consent trace, security notices) stay this plane's own and are not
-// published here.
+// published here; a scope's own notices its members must receive are `required` topics.
 message NotificationTopicSpec {
   // `<namespace>:<segment>(:<segment>)*`, segments `[a-z0-9_-]+`, at most 64 bytes; the
   // namespace being the publisher's.
@@ -162,6 +166,17 @@ message NotificationTopicSpec {
   // Whether an account that never touched the topic receives it. False is the safe
   // reading of "nobody asked", and the default.
   bool default_subscribed = 4;
+  // A notice the scope must give its members, e.g. new fee terms on a fund they hold. A
+  // member cannot switch it off (SetScopeTopicSubscription and SetTopicSubscription answer
+  // FAILED_PRECONDITION `required_topic: …`), a switch-off stored earlier is ignored, and
+  // an emit reaches every recipient its inbox reaches: in-app even with the in-app channel
+  // off, and by mail to a verified address even with the email channel off. Still never
+  // anyone outside the scope. At most 3 per catalog; never for news or marketing, which
+  // members must be free to switch off. `default_subscribed` has no say on such a topic.
+  bool required = 5;
+  // Why the topic is required, shown to members beside it: plain text, at most 120
+  // bytes. Required when `required` is set, and empty otherwise (else INVALID_ARGUMENT).
+  string required_reason = 6;
 }
 
 message ScopeCatalog {

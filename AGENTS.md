@@ -755,7 +755,11 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   following a topic turns on mail, and a client secret alone must not do that to anyone.
   An emit on a scope's topic reaches its active members only, and a topic published with
   `default_subscribed` follows every account that never touched it — which is why switching
-  a topic off is a row of its own (`notification_topic_optouts`), not a missing one. The
+  a topic off is a row of its own (`notification_topic_optouts`), not a missing one. A topic
+  published `required` (at most 3 per catalog, each with a `required_reason`) cannot be
+  switched off — the switch-off is refused `required_topic`, an older opt-out is ignored but
+  kept — and an emit reaches every active member in-app and by mail to a verified address
+  whatever the master switches say (§6). The
   old `fund:quy-nhon` / `account:money-movement` keys are aliases of their `invest:` / `bank:`
   successors until the contract step; `account:money-movement` stays this plane's trace topic.
   So the client credential opens `ScopeEvents`, `UserEvents`, `ScopeCatalogService` and

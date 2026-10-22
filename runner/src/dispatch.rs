@@ -334,25 +334,33 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 		});
 	}
 
-	let rendered = match job.kind.as_str() {
+	let (rendered, unsubscribe_url) = match job.kind.as_str() {
 		"confirm" => {
 			let token = job.confirm_token.as_deref()?;
 			// The topic label is cosmetic here; a confirmation for a since-retired topic
 			// should still be completable.
 			let label = job.topic.as_deref().and_then(|key| topic_label(key, scoped)).unwrap_or("EV Investment");
-			templates::confirm_subscription(label, &format!("{origin}/api/auth/notifications/confirm?token={token}"), &unsubscribe_url)
+			let rendered = templates::confirm_subscription(label, &format!("{origin}/api/auth/notifications/confirm?token={token}"), &unsubscribe_url);
+			(rendered, unsubscribe_url)
 		}
 		_ => {
 			let topic_key = job.topic.as_deref()?;
 			let label = topic_label(topic_key, scoped).unwrap_or(topic_key);
-			templates::notification(
+			// A required notice offers no unsubscribe — neither link nor `List-Unsubscribe`:
+			// a one-click target must work when offered, and switching this topic off does
+			// not. Read from the catalogs in force, as the label is.
+			let required = scoped.iter().find(|t| t.topic == topic_key && t.required).map(|t| t.required_reason.as_str());
+			let unsubscribe_url = if required.is_some() { String::new() } else { unsubscribe_url };
+			let rendered = templates::notification(
 				label,
 				job.title.as_deref()?,
 				job.body.as_deref().unwrap_or(""),
 				&cfg.notice_links.mail_target(job.link.as_deref().unwrap_or("")),
 				job.occurred_at.unwrap_or_default(),
 				&unsubscribe_url,
-			)
+				required,
+			);
+			(rendered, unsubscribe_url)
 		}
 	};
 
@@ -706,6 +714,8 @@ mod tests {
 			label: label.to_owned(),
 			description: String::new(),
 			default_subscribed: false,
+			required: false,
+			required_reason: String::new(),
 		}
 	}
 
@@ -723,6 +733,54 @@ mod tests {
 		let built_in = crate::notification::TOPICS.first().expect("catalogue is not empty");
 		let shadow = [published(built_in.key, "Shadow")];
 		assert_eq!(topic_label(built_in.key, &shadow), Some(built_in.label), "a built-in topic keeps its own label");
+	}
+
+	/// A required notice is mailed without an unsubscribe target — no footer link and no
+	/// `List-Unsubscribe` — and says why it came; an ordinary topic's mail keeps both.
+	#[test]
+	fn a_required_notice_is_mailed_without_an_unsubscribe_target() {
+		let cfg = DispatcherConfig {
+			mail_from: "EV <noreply@evinvest.test>".into(),
+			cabinet_url: "https://evinvest.ltd/cabinet".into(),
+			notice_links: Arc::new(NoticeLinkBases::cabinet_only("https://evinvest.ltd/cabinet")),
+			public_origin: "https://evinvest.ltd".into(),
+			approvals_url: "https://evinvest.ltd/admin/approvals".into(),
+			daily_budget: i64::MAX,
+			interval: Duration::from_secs(60),
+		};
+		let job = |topic: &str| crate::infrastructure::notifications::DeliveryJob {
+			id: 1,
+			kind: "notification".into(),
+			recipient: "holder@example.com".into(),
+			attempts: 0,
+			unsubscribe_token: Some("tok".into()),
+			confirm_token: None,
+			topic: Some(topic.into()),
+			title: Some("New fee terms".into()),
+			body: Some(String::new()),
+			link: Some("/funds/quy-nhon".into()),
+			occurred_at: Some(1_785_143_640),
+			payload: None,
+		};
+		let scoped = [
+			NotificationTopic {
+				required: true,
+				required_reason: "Holders are told before new fees bind".into(),
+				..published("invest:fee-terms", "Fee terms")
+			},
+			published("invest:news", "News"),
+		];
+		let notice = render(&job("invest:fee-terms"), &cfg, &scoped).expect("renderable");
+		assert!(notice.unsubscribe_url.is_empty(), "no List-Unsubscribe header");
+		assert!(!notice.html.contains("unsubscribe?token=") && !notice.text.contains("Unsubscribe"));
+		assert!(
+			notice
+				.text
+				.contains("Fee terms is a required notice, which cannot be switched off: Holders are told before new fees bind.")
+		);
+		let news = render(&job("invest:news"), &cfg, &scoped).expect("renderable");
+		assert_eq!(news.unsubscribe_url, "https://evinvest.ltd/api/auth/notifications/unsubscribe?token=tok");
+		assert!(news.text.contains("you follow News"));
 	}
 
 	#[test]

@@ -654,6 +654,8 @@ fn topic_spec(key: &str, label: &str) -> NotificationTopicSpec {
 		label: label.into(),
 		description: "Marks and their reasons".into(),
 		default_subscribed: false,
+		required: false,
+		required_reason: String::new(),
 	}
 }
 
@@ -729,6 +731,46 @@ async fn a_scope_catalog_is_kept_per_version_and_never_rolls_back() {
 		fx.catalogs.get_scope_catalog(as_client(GetScopeCatalogRequest {}, &scope)).await.is_ok(),
 		"a closed scope's history stays readable"
 	);
+}
+
+/// A catalog marks at most three topics required, each with its reason; `GetScopeCatalog`
+/// reads them back as published.
+#[tokio::test]
+async fn a_scope_catalog_marks_at_most_three_required_topics() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope(&[], false).await;
+	let required = |key: &str| NotificationTopicSpec {
+		required: true,
+		required_reason: "Holders are told before new fee terms bind".into(),
+		..topic_spec(key, "Fee terms")
+	};
+
+	let fee_terms = scope.p("fee-terms");
+	let news = scope.p("news");
+	let one = publication(100, vec![], vec![required(&fee_terms), topic_spec(&news, "News")]);
+	assert_eq!(code(fx.catalogs.publish_scope_catalog(as_client(one, &scope)).await), None);
+	let got = fx.catalogs.get_scope_catalog(as_client(GetScopeCatalogRequest {}, &scope)).await.unwrap().into_inner();
+	let flags: Vec<_> = got.notification_topics.iter().map(|t| (t.topic.as_str(), t.required, t.required_reason.is_empty())).collect();
+	assert_eq!(flags, vec![(fee_terms.as_str(), true, false), (news.as_str(), false, true)]);
+
+	let four = (0..4).map(|i| required(&scope.p(&format!("notice{i}")))).collect();
+	assert_eq!(
+		code(fx.catalogs.publish_scope_catalog(as_client(publication(101, vec![], four), &scope)).await),
+		Some(Code::InvalidArgument),
+		"over the cap"
+	);
+	let silent = NotificationTopicSpec {
+		required_reason: String::new(),
+		..required(&fee_terms)
+	};
+	assert_eq!(
+		code(fx.catalogs.publish_scope_catalog(as_client(publication(101, vec![], vec![silent]), &scope)).await),
+		Some(Code::InvalidArgument),
+		"a required topic without a reason"
+	);
+	let three = (0..3).map(|i| required(&scope.p(&format!("notice{i}")))).collect();
+	assert_eq!(code(fx.catalogs.publish_scope_catalog(as_client(publication(101, vec![], three), &scope)).await), None);
+	fx.catalogs.publish_scope_catalog(as_client(publication(102, vec![], vec![]), &scope)).await.unwrap();
 }
 
 #[tokio::test]
