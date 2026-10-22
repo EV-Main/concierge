@@ -75,12 +75,19 @@ message EmitRequest {
   string kind = 3;
   string title = 4;
   string body = 5;
-  // Relative cabinet path the notification links to, e.g. "/funds/quy-nhon".
+  // Cabinet-relative path the notification links to, e.g. "/funds/quy-nhon". Never a
+  // host: a scheme, "//host" or a backslash prefix is INVALID_ARGUMENT, and so are
+  // whitespace and control characters. Which cabinet it opens in is `link_scope`'s.
   string link = 6;
   // Idempotency key, unique per subscriber. Re-emitting the same key is a no-op.
   string dedupe_key = 7;
   // Domain time of the underlying event, unix seconds. 0 ⇒ server clock.
   int64 occurred_at = 8;
+  // The scope whose cabinet `link` opens in, e.g. "invest" ([a-z][a-z0-9_]{0,31}, else
+  // INVALID_ARGUMENT). When this plane configures a base for it (`NOTICE_LINK_BASES`),
+  // the stored link — and so `Notification.link` — is that base plus `link`, an absolute
+  // URL. Empty, or a scope with no base, keeps `link` relative to `CABINET_URL`.
+  string link_scope = 9;
 }
 
 message EmitResponse {
@@ -99,6 +106,8 @@ message Notification {
   string kind = 3;
   string title = 4;
   string body = 5;
+  // A cabinet-relative path, or an absolute URL under a scope's cabinet when the emit
+  // named a configured `link_scope`. A reader must not prefix an absolute one.
   string link = 6;
   // Unix seconds.
   int64 occurred_at = 7;
