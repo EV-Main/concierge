@@ -846,7 +846,6 @@ async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
 	let outbox = Outbox::default();
 	let cfg = DispatcherConfig {
 		mail_from: "EV <noreply@evinvest.test>".into(),
-		cabinet_url: CABINET.into(),
 		notice_links: bases,
 		public_origin: "https://evinvest.ltd".into(),
 		approvals_url: "https://evinvest.ltd/admin/approvals".into(),

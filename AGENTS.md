@@ -51,8 +51,9 @@ never calls `banking`:
    `FEE_POLICY_APPROVAL` is a consilium kind (a seated owner, verified address,
    link + code), `FEE_POLICY_NOTICE` is addressed by identity to the one investor
    whose fund is repriced, traced in their inbox, and carries no code — its only
-   link is a cabinet-relative path the dispatcher hangs off `CABINET_URL`, so the
-   money plane names no host at all. Fee terms cross the wire as basis points and
+   link is a cabinet-relative path hung off `CABINET_URL`, or off the cabinet of the
+   scope its `link_scope` names (`NOTICE_LINK_BASES`), so the money plane names no
+   host at all. Fee terms cross the wire as basis points and
    closed vocabularies; the percentages are rendered here. `PAYMENT_OUTCOME` is the
    one two-armed rule: a payment that died waiting for consent (the link BURNED on
    five wrong codes, or was INVALIDATED under the subject) is told to the subject the

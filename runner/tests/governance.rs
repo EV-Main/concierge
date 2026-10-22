@@ -32,6 +32,7 @@ use concierge::{
 		notifications::PgNotifications,
 		users::PgUsers,
 	},
+	notice_link::NoticeLinkBases,
 	notification::RateLimiter,
 	ports::{GovernanceMailQueued, GovernanceRepository, NotificationDispatchRepository, NotificationRepository, UserDirectoryRepository},
 };
@@ -60,6 +61,8 @@ const T0: i64 = 1_800_000_000;
 const RELAY_TOKEN: &str = "relay-itest-token";
 /// The origin every emailed link must sit under, so the link checks are not what fails.
 const RELAY_ORIGIN: &str = "https://relay.example.test";
+/// `CABINET_URL` of the relay here.
+const CABINET: &str = "https://evinvest.ltd/cabinet";
 
 struct Fixture {
 	governance: Arc<PgGovernance>,
@@ -139,6 +142,10 @@ impl Fixture {
 
 	/// The same, accepting `per_hour` mails per recipient.
 	fn relay_allowing(&self, per_hour: u32) -> MailRelay {
+		self.relay_linking(per_hour, NoticeLinkBases::cabinet_only(CABINET))
+	}
+
+	fn relay_linking(&self, per_hour: u32, links: NoticeLinkBases) -> MailRelay {
 		MailRelay::new(
 			self.users.clone(),
 			self.governance.clone(),
@@ -146,6 +153,7 @@ impl Fixture {
 			Arc::new(RateLimiter::new(Duration::from_secs(3600), per_hour)),
 			Some(RELAY_TOKEN.to_owned()),
 			RELAY_ORIGIN.to_owned(),
+			Arc::new(links),
 		)
 	}
 
@@ -1985,6 +1993,7 @@ fn fee_policy_notice(addressee: UserId, subject: UserId) -> SendGovernanceMailRe
 			proposed: Some(proposed_terms()),
 			effective_at: T0 + 30 * 86_400,
 			link: "/funds/quy-nhon/fees".into(),
+			link_scope: String::new(),
 		}),
 		payment_outcome: None,
 	}
@@ -2201,6 +2210,45 @@ async fn a_fee_policy_notice_link_is_a_cabinet_path_and_nothing_else() {
 			.into_inner()
 			.enqueued
 	);
+}
+
+/// A fee notice names the scope whose cabinet its link opens in, as an emit does: a scope
+/// with a configured base gets the base, any other the plain path under `CABINET_URL`, and
+/// a malformed name is refused with nothing queued.
+#[tokio::test]
+async fn a_fee_policy_notice_links_into_its_scope_s_cabinet() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let relay = fx.relay_linking(
+		1_000,
+		NoticeLinkBases::parse(&["invest=https://invest.evinvest.ltd/cabinet".to_owned()], CABINET, "https://evinvest.ltd", true).unwrap(),
+	);
+	let notice = |link_scope: &str| {
+		let mut request = fee_policy_notice(investor, investor);
+		let mail = request.fee_policy_notice.as_mut().unwrap();
+		mail.link = "/invest/quy-nhon".into();
+		mail.link_scope = link_scope.into();
+		request
+	};
+	for (link_scope, stored) in [
+		("invest", "https://invest.evinvest.ltd/cabinet/invest/quy-nhon"),
+		("", "/invest/quy-nhon"),
+		("sa", "/invest/quy-nhon"),
+	] {
+		let request = notice(link_scope);
+		let key = request.dedupe_key.clone();
+		assert!(relay.send_governance_mail(relayed(request)).await.expect("queued").into_inner().enqueued, "{link_scope:?}");
+		assert_eq!(fx.payload(&key).await["link"], stored, "{link_scope:?}");
+	}
+	for bad in ["In-vest", "invest/x", "9invest"] {
+		let request = notice(bad);
+		let key = request.dedupe_key.clone();
+		let err = relay.send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{bad:?}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{bad:?}: nothing may be queued");
+	}
 }
 
 /// The fund line is a product slug, and `httpfund` is a legal one (banking#265): the

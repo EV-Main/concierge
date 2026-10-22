@@ -95,7 +95,8 @@ ev::settings! {
 		/// Origin the cabinet is served from; builds the links inside emails. A notice whose
 		/// `link_scope` has no entry in `notice_link_bases` links here too.
 		cabinet_url: String = "https://evinvest.ltd/cabinet",
-		/// Each scope's own cabinet, for the notices an emitter sends with `link_scope`
+		/// Each scope's own cabinet, for the notices an emitter (or the money plane's fee
+		/// notice) sends with `link_scope`
 		/// (comma-separated `scope=base`, e.g. `invest=https://invest.evinvest.ltd/cabinet`;
 		/// banking#580). Empty ⇒ every notice links under `cabinet_url`. A malformed entry
 		/// refuses the boot (`notice_link::NoticeLinkBases::parse`). Removing an entry later

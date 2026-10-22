@@ -46,9 +46,7 @@ const BATCH: i64 = 25;
 pub struct DispatcherConfig {
 	/// `From:` mailbox for outgoing mail.
 	pub mail_from: String,
-	/// Origin the cabinet is served from; builds links inside emails.
-	pub cabinet_url: String,
-	/// `cabinet_url` and the scope cabinets a stored notice link may point under, checked
+	/// `CABINET_URL` and the scope cabinets a stored notice link may point under, checked
 	/// again at send time against the configuration in force.
 	pub notice_links: Arc<NoticeLinkBases>,
 	/// `PUBLIC_ORIGIN`: the confirm/unsubscribe links are its `/api/auth/notifications/*`.
@@ -91,8 +89,8 @@ fn fee_terms(payload: &serde_json::Value, key: &str) -> Option<Option<templates:
 
 /// Render one of the typed governance mails from its stored payload. `None` for a kind
 /// this dispatcher does not know — permanent, so the caller parks rather than retries.
-/// `cabinet_url` is the origin a fee notice's cabinet-relative link hangs off.
-pub(crate) fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_url: &str) -> Option<templates::RenderedEmail> {
+/// `links` decides where a fee notice's stored link may point, as for any notice.
+pub(crate) fn governance_mail(kind: &str, payload: &serde_json::Value, links: &NoticeLinkBases) -> Option<templates::RenderedEmail> {
 	match kind {
 		"owner_removal_self_accept" => Some(templates::owner_removal_self_accept(
 			&text_field(payload, "initiator_email"),
@@ -222,9 +220,7 @@ pub(crate) fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_u
 			fee_terms(payload, "current")?.as_ref(),
 			&fee_terms(payload, "proposed")??,
 			int_field(payload, "effective_at"),
-			// The relay admitted only a path starting with a single `/` (or nothing), so
-			// joining onto the origin cannot leave it.
-			&format!("{}{}", cabinet_url.trim_end_matches('/'), text_field(payload, "link")),
+			&links.mail_target(&text_field(payload, "link")),
 		)),
 		// Every word was chosen by the relay from a closed set, and the ending and its reason
 		// were checked to agree; a row carrying anything else reached the queue some other
@@ -323,7 +319,7 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 	// Governance mail carries NO unsubscribe target, so the transport sets no
 	// List-Unsubscribe header: a security mail a recipient can switch off is not one.
 	if let Some(payload) = job.payload.as_ref()
-		&& let Some(rendered) = governance_mail(&job.kind, payload, &cfg.cabinet_url).or_else(|| approval_mail(&job.kind, payload, &cfg.approvals_url))
+		&& let Some(rendered) = governance_mail(&job.kind, payload, &cfg.notice_links).or_else(|| approval_mail(&job.kind, payload, &cfg.approvals_url))
 	{
 		return Some(OutgoingEmail {
 			to: job.recipient.clone(),
@@ -498,6 +494,10 @@ pub async fn run_hold_sweep(users: Arc<dyn crate::ports::UserDirectoryRepository
 mod tests {
 	use super::*;
 
+	fn cabinet(url: &str) -> NoticeLinkBases {
+		NoticeLinkBases::cabinet_only(url)
+	}
+
 	#[test]
 	fn backoff_grows_then_stops_growing() {
 		assert_eq!(backoff_secs(1), 60, "the first retry is a minute out, not immediate");
@@ -520,22 +520,48 @@ mod tests {
 			"effective_at": 1_785_143_640,
 			"link": "/funds/quy-nhon/fees",
 		});
-		let mail = governance_mail("fee_policy_notice", &payload, "https://cabinet.example/").expect("renderable");
+		let mail = governance_mail("fee_policy_notice", &payload, &cabinet("https://cabinet.example/")).expect("renderable");
 		assert!(mail.html.contains("https://cabinet.example/funds/quy-nhon/fees"), "one slash between origin and path");
 		assert!(mail.text.contains("none → 2%"));
 
 		let mut no_terms = payload.clone();
 		no_terms["proposed"] = serde_json::Value::Null;
 		assert!(
-			governance_mail("fee_policy_notice", &no_terms, "https://cabinet.example").is_none(),
+			governance_mail("fee_policy_notice", &no_terms, &cabinet("https://cabinet.example")).is_none(),
 			"a notice proposing nothing is unrenderable"
 		);
 		let mut half_terms = payload;
 		half_terms["proposed"] = serde_json::json!({"management_bps": 200});
 		assert!(
-			governance_mail("fee_policy_approval", &half_terms, "https://cabinet.example").is_none(),
+			governance_mail("fee_policy_approval", &half_terms, &cabinet("https://cabinet.example")).is_none(),
 			"so is a payload missing half its terms"
 		);
+	}
+
+	/// A fee notice the relay stored under a scope's base links there while the base is
+	/// configured, and to `CABINET_URL` itself once it is gone: the old host is no longer
+	/// trusted, and the relative part cannot be recovered without the old base.
+	#[test]
+	fn a_scoped_fee_notice_links_to_its_scope_while_the_base_is_configured() {
+		let payload = serde_json::json!({
+			"fund": "Quy Nhon Fund",
+			"current": null,
+			"proposed": {"management_bps": 200, "performance_bps": 2000, "hurdle_bps": 0, "basis": "invested_capital", "crystallization": "annual"},
+			"effective_at": 1_785_143_640,
+			"link": "https://invest.evinvest.ltd/cabinet/invest/quy-nhon",
+		});
+		let configured = NoticeLinkBases::parse(
+			&["invest=https://invest.evinvest.ltd/cabinet".to_owned()],
+			"https://evinvest.ltd/cabinet",
+			"https://evinvest.ltd",
+			true,
+		)
+		.unwrap();
+		let mail = governance_mail("fee_policy_notice", &payload, &configured).expect("renderable");
+		assert!(mail.html.contains("https://invest.evinvest.ltd/cabinet/invest/quy-nhon"), "the scope's cabinet");
+		let removed = governance_mail("fee_policy_notice", &payload, &cabinet("https://evinvest.ltd/cabinet")).expect("renderable");
+		assert!(!removed.html.contains("invest.evinvest.ltd"), "a base removed since is not trusted");
+		assert!(removed.html.contains("https://evinvest.ltd/cabinet"), "the platform cabinet instead");
 	}
 
 	/// One outcome row, three subjects: a row naming a fund with terms renders as fee terms,
@@ -552,7 +578,7 @@ mod tests {
 			"current": null,
 			"proposed": {"management_bps": 250, "performance_bps": 2000, "hurdle_bps": 800, "basis": "market_value", "crystallization": "quarterly"},
 		});
-		let mail = governance_mail("payout_outcome", &fee, "https://cabinet.example").expect("renderable");
+		let mail = governance_mail("payout_outcome", &fee, &cabinet("https://cabinet.example")).expect("renderable");
 		assert_eq!(mail.subject, "Fee terms executed — Quy Nhon Fund");
 		assert!(mail.text.contains("Management fee: none → 2.5%"));
 
@@ -562,7 +588,7 @@ mod tests {
 			"network": "Ethereum", "address": "0xabc", "amount": "12,500.00 USDT", "detail": "Broadcast.",
 			"tier": "", "source": "", "destination": "", "reason": "",
 		});
-		let mail = governance_mail("payout_outcome", &old_row, "https://cabinet.example").expect("renderable");
+		let mail = governance_mail("payout_outcome", &old_row, &cabinet("https://cabinet.example")).expect("renderable");
 		assert_eq!(
 			mail.subject, "Payout executed — 12,500.00 USDT on Ethereum",
 			"a row from before the fee description is what it was"
@@ -570,16 +596,22 @@ mod tests {
 
 		let mut half_terms = fee.clone();
 		half_terms["proposed"] = serde_json::json!({"management_bps": 250});
-		assert!(governance_mail("payout_outcome", &half_terms, "https://cabinet.example").is_none(), "half the terms is no mail");
+		assert!(
+			governance_mail("payout_outcome", &half_terms, &cabinet("https://cabinet.example")).is_none(),
+			"half the terms is no mail"
+		);
 		let mut no_terms = fee.clone();
 		no_terms["proposed"] = serde_json::Value::Null;
 		assert!(
-			governance_mail("payout_outcome", &no_terms, "https://cabinet.example").is_none(),
+			governance_mail("payout_outcome", &no_terms, &cabinet("https://cabinet.example")).is_none(),
 			"a fund proposing nothing is no mail"
 		);
 		let mut no_fund = fee;
 		no_fund["fund"] = serde_json::Value::String(String::new());
-		assert!(governance_mail("payout_outcome", &no_fund, "https://cabinet.example").is_none(), "terms for no fund are no mail");
+		assert!(
+			governance_mail("payout_outcome", &no_fund, &cabinet("https://cabinet.example")).is_none(),
+			"terms for no fund are no mail"
+		);
 	}
 
 	/// The fourth subject: a row naming a mark renders as a NAV mark, and a mark on no fund
@@ -595,14 +627,17 @@ mod tests {
 			"fund": "Quy Nhon Fund", "current": null, "proposed": null,
 			"mark": "5 000.00 USDT",
 		});
-		let mail = governance_mail("payout_outcome", &mark, "https://cabinet.example").expect("renderable");
+		let mail = governance_mail("payout_outcome", &mark, &cabinet("https://cabinet.example")).expect("renderable");
 		assert_eq!(mail.subject, "NAV mark invitation burned — Quy Nhon Fund");
 		assert!(mail.text.contains("Mark: 5 000.00 USDT"));
 		assert!(!mail.text.contains("Amount") && !mail.text.contains("Payment"), "a mark is not a payment");
 
 		let mut no_fund = mark;
 		no_fund["fund"] = serde_json::Value::String(String::new());
-		assert!(governance_mail("payout_outcome", &no_fund, "https://cabinet.example").is_none(), "a mark on no fund is no mail");
+		assert!(
+			governance_mail("payout_outcome", &no_fund, &cabinet("https://cabinet.example")).is_none(),
+			"a mark on no fund is no mail"
+		);
 	}
 
 	/// `current` has two absences: `null` is a fund that charged nothing and reads "none",
@@ -618,18 +653,18 @@ mod tests {
 			"tier": "", "source": "", "destination": "", "reason": "",
 			"current": null, "proposed": proposed,
 		});
-		let mail = governance_mail("payout_outcome", &outcome, "https://cabinet.example").expect("renderable");
+		let mail = governance_mail("payout_outcome", &outcome, &cabinet("https://cabinet.example")).expect("renderable");
 		assert!(mail.text.contains("Management fee: none → 2.5%"), "null is a fund that charged nothing");
 
 		let mut absent = outcome.clone();
 		absent.as_object_mut().expect("object").remove("current");
-		let mail = governance_mail("payout_outcome", &absent, "https://cabinet.example").expect("renderable");
+		let mail = governance_mail("payout_outcome", &absent, &cabinet("https://cabinet.example")).expect("renderable");
 		assert!(mail.text.contains("Management fee: none → 2.5%"), "so is a row with no `current` key at all");
 
 		let mut drifted = outcome;
 		drifted["current"] = serde_json::json!({"management_bps": "two percent"});
 		assert!(
-			governance_mail("payout_outcome", &drifted, "https://cabinet.example").is_none(),
+			governance_mail("payout_outcome", &drifted, &cabinet("https://cabinet.example")).is_none(),
 			"terms that fail to parse are not a fund that charged nothing"
 		);
 
@@ -640,12 +675,12 @@ mod tests {
 			"reason": "", "payload_hash": "", "threshold": 2, "owner_count": 3, "expires_at": 1_785_143_640,
 			"approval_url": "https://cabinet.example/a", "code": "123456",
 		});
-		assert!(governance_mail("fee_policy_approval", &approval, "https://cabinet.example").is_none());
+		assert!(governance_mail("fee_policy_approval", &approval, &cabinet("https://cabinet.example")).is_none());
 		let notice = serde_json::json!({
 			"fund": "Quy Nhon Fund", "current": 42, "proposed": proposed,
 			"effective_at": 1_785_143_640, "link": "/funds/quy-nhon/fees",
 		});
-		assert!(governance_mail("fee_policy_notice", &notice, "https://cabinet.example").is_none());
+		assert!(governance_mail("fee_policy_notice", &notice, &cabinet("https://cabinet.example")).is_none());
 	}
 
 	/// A cancelled consent renders for both readers and every ending, and carries nothing a
@@ -664,7 +699,7 @@ mod tests {
 		};
 		for audience in ["subject", "staff"] {
 			for (outcome, reason) in [("TOKEN_BURNED", "WRONG_CODES"), ("INVALIDATED", "SESSIONS_REVOKED"), ("INVALIDATED", "EMAIL_CHANGED")] {
-				let mail = governance_mail("payment_outcome", &row(audience, outcome, reason), "https://cabinet.example").expect("renderable");
+				let mail = governance_mail("payment_outcome", &row(audience, outcome, reason), &cabinet("https://cabinet.example")).expect("renderable");
 				let at = format!("{audience}/{outcome}/{reason}");
 				assert!(mail.subject.contains("1 200.00 USDT"), "{at}: {}", mail.subject);
 				assert!(!mail.html.contains("<a ") && !mail.html.contains("href"), "{at}: no link in the html");
@@ -681,11 +716,11 @@ mod tests {
 			(row("staff", "TOKEN_BURNED", "EMAIL_CHANGED"), "a reason that does not belong to its ending"),
 			(row("staff", "INVALIDATED", "WRONG_CODES"), "nor this one"),
 		] {
-			assert!(governance_mail("payment_outcome", &row, "https://cabinet.example").is_none(), "{why}");
+			assert!(governance_mail("payment_outcome", &row, &cabinet("https://cabinet.example")).is_none(), "{why}");
 		}
 		let mut no_reader = row("subject", "TOKEN_BURNED", "WRONG_CODES");
 		no_reader.as_object_mut().expect("object").remove("audience");
-		assert!(governance_mail("payment_outcome", &no_reader, "https://cabinet.example").is_none(), "no reader at all");
+		assert!(governance_mail("payment_outcome", &no_reader, &cabinet("https://cabinet.example")).is_none(), "no reader at all");
 	}
 
 	#[test]
@@ -741,7 +776,6 @@ mod tests {
 	fn a_required_notice_is_mailed_without_an_unsubscribe_target() {
 		let cfg = DispatcherConfig {
 			mail_from: "EV <noreply@evinvest.test>".into(),
-			cabinet_url: "https://evinvest.ltd/cabinet".into(),
 			notice_links: Arc::new(NoticeLinkBases::cabinet_only("https://evinvest.ltd/cabinet")),
 			public_origin: "https://evinvest.ltd".into(),
 			approvals_url: "https://evinvest.ltd/admin/approvals".into(),

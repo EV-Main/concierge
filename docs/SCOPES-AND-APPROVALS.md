@@ -877,6 +877,18 @@ the offer when a later catalog withdraws them.
   read (`ListNotifications`, `ListScopeNotifications`) return the notice with an empty
   link. The emit path is
   the same on both RPCs (`EmitScopeNotification`, `NotificationService.Emit`).
+- **The money plane's fee notice links the same way** (decided 2026-10-22).
+  `MailRelayService.SendGovernanceMail` with `FEE_POLICY_NOTICE` carries
+  `FeePolicyNoticeMail.link_scope` beside its `link`, on the kind's own message as every
+  governance mail carries its link. Only the bridge sends governance mail, so it may name any
+  scope; the name rule and its `INVALID_ARGUMENT` are the emit's. The relay stores the
+  finished link (`base + link`, or the path when the scope has no base), and the dispatcher
+  checks it again when it sends, so a base removed in between sends the mail to
+  `CABINET_URL` itself. banking sends `link_scope = "invest"` once its own `/invest/<service>`
+  page is gone (banking#584). `governance.proto` is vendored by banking
+  (`contracts/concierge-protos.txt`, `nix run .#concierge-pin-check`): at its next pin bump
+  banking copies it again and fills the new field in its `FeePolicyNoticeMail` struct
+  literal (or adds `..Default::default()`), or its build breaks.
 - **`default_subscribed` applies.** Switching a topic off writes a row to
   `notification_topic_optouts` (migration 0041) beside deleting the subscription, so "never
   touched" and "switched off" read differently. A default topic is followed — with its mail

@@ -2,7 +2,8 @@
 //!
 //! An emitter names a cabinet-RELATIVE path, never a host. A notice about a scope's
 //! business links to that scope's own cabinet, so the emitter may also name the scope
-//! (`EmitRequest.link_scope`), and this plane looks its base up in `NOTICE_LINK_BASES`.
+//! (`EmitRequest.link_scope`, `FeePolicyNoticeMail.link_scope`), and this plane looks its
+//! base up in `NOTICE_LINK_BASES`.
 //! The emit stores the finished absolute link, because the inbox row is read by the
 //! frontends as it is stored and no column holds the scope. Without a base the link stays
 //! relative and the mail joins it onto `CABINET_URL`, as before.
