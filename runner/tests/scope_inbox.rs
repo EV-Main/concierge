@@ -11,7 +11,17 @@ use std::{net::TcpListener, sync::Arc, time::Duration};
 mod common;
 
 use concierge::{
-	infrastructure::{db, grants::PgGrants, notifications::PgNotifications, relying_parties::PgRelyingParties, scope_catalogs::PgScopeCatalogs, users::PgUsers},
+	dispatch::{DispatcherConfig, drain_once},
+	infrastructure::{
+		db,
+		email::transport::{EmailTransport, OutgoingEmail},
+		grants::PgGrants,
+		notifications::PgNotifications,
+		relying_parties::PgRelyingParties,
+		scope_catalogs::PgScopeCatalogs,
+		users::PgUsers,
+	},
+	notice_link::NoticeLinkBases,
 	notification::{MAX_MARK_IDS, Notifications, RateLimiter, TOPICS},
 	ports::{NotificationRepository, RelyingPartyRepository, ScopeCatalogRepository, UserDirectoryRepository},
 	relying_party::{Admission, ClientTokenAuthenticator, RelyingParties, Requester, s256_challenge},
@@ -19,6 +29,7 @@ use concierge::{
 	service_caller::ServiceCallers,
 };
 use domain::{
+	error::DomainError,
 	scope_catalog::{NotificationTopic, ScopeCatalog},
 	users::UserId,
 };
@@ -718,6 +729,95 @@ async fn the_bridge_emits_the_bank_s_published_topics_to_anyone_following_them()
 	);
 	// The bridge still reads no scope's inbox.
 	assert_eq!(inbox.list_scope_notifications(as_bridge(list(user))).await.unwrap_err().code(), Code::PermissionDenied);
+}
+
+#[derive(Default)]
+struct Outbox(std::sync::Mutex<Vec<OutgoingEmail>>);
+
+#[async_trait::async_trait]
+impl EmailTransport for Outbox {
+	async fn send(&self, _from: &str, email: OutgoingEmail) -> Result<(), DomainError> {
+		self.0.lock().unwrap().push(email);
+		Ok(())
+	}
+}
+
+/// banking#580: a notice for a scope with a configured base links to that scope's
+/// cabinet, in the inbox row and in the mail; one without `link_scope` still links under
+/// `CABINET_URL`, and an emitter never gets to name a host itself.
+#[tokio::test]
+async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
+	let Some(fx) = setup().await else { return };
+	let bases = Arc::new(NoticeLinkBases::parse(&["invest=https://invest.evinvest.ltd/cabinet".to_owned()], "https://evinvest.ltd", true).unwrap());
+	let scope = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&scope]).with_link_bases(bases.clone());
+	let topic = "bank:link_scope_test".to_owned();
+	fx.publish_bank(&[NotificationTopic {
+		topic: topic.clone(),
+		label: "Wallet".into(),
+		description: String::new(),
+		default_subscribed: false,
+	}])
+	.await;
+	let (user, email) = fx.user("link-scope").await;
+	fx.follow(user, &email, &topic).await;
+
+	let notice = |link_scope: &str, title: &str| EmitRequest {
+		link: "/wallet/action/payment/42".into(),
+		link_scope: link_scope.into(),
+		title: title.into(),
+		..emit(user, &topic)
+	};
+	for (link_scope, title) in [("invest", "scoped"), ("", "unscoped"), ("sa", "no base")] {
+		let sent = inbox.emit_scope_notification(as_bridge(notice(link_scope, title))).await.unwrap().into_inner();
+		assert!(sent.delivered, "{link_scope:?}: {sent:?}");
+	}
+	let stored: Vec<(String, String)> =
+		sqlx::query_as("SELECT n.title, n.link FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.topic = $2 ORDER BY n.title")
+			.bind(user)
+			.bind(&topic)
+			.fetch_all(&fx.pool)
+			.await
+			.unwrap();
+	assert_eq!(
+		stored,
+		vec![
+			("no base".to_owned(), "/wallet/action/payment/42".to_owned()),
+			("scoped".to_owned(), "https://invest.evinvest.ltd/cabinet/wallet/action/payment/42".to_owned()),
+			("unscoped".to_owned(), "/wallet/action/payment/42".to_owned()),
+		]
+	);
+
+	for (link, link_scope) in [("https://attacker.example/x", ""), ("//attacker.example", "invest"), ("/wallet", "In-vest")] {
+		let mut bad = notice(link_scope, "refused");
+		bad.link = link.into();
+		let refused = inbox.emit_scope_notification(as_bridge(bad)).await.unwrap_err();
+		assert_eq!(refused.code(), Code::InvalidArgument, "{link:?} / {link_scope:?}: {refused:?}");
+	}
+
+	let outbox = Outbox::default();
+	let cfg = DispatcherConfig {
+		mail_from: "EV <noreply@evinvest.test>".into(),
+		cabinet_url: "https://evinvest.ltd/cabinet".into(),
+		notice_links: bases,
+		public_origin: "https://evinvest.ltd".into(),
+		approvals_url: "https://evinvest.ltd/admin/approvals".into(),
+		daily_budget: i64::MAX,
+		interval: Duration::from_secs(60),
+	};
+	while drain_once(&PgNotifications::new(fx.pool.clone()), &outbox, &cfg).await > 0 {}
+	let mails: Vec<OutgoingEmail> = outbox.0.lock().unwrap().iter().filter(|m| m.to == email).cloned().collect();
+	let target = |title: &str| {
+		let mail = mails.iter().find(|m| m.subject.ends_with(title)).unwrap_or_else(|| panic!("the {title:?} mail was sent"));
+		mail.text
+			.lines()
+			.find_map(|line| line.strip_prefix("Open your cabinet: "))
+			.expect("the text part carries the link")
+			.to_owned()
+	};
+	assert_eq!(target("— scoped"), "https://invest.evinvest.ltd/cabinet/wallet/action/payment/42");
+	assert_eq!(target("— unscoped"), "https://evinvest.ltd/cabinet/wallet/action/payment/42");
+	assert_eq!(target("— no base"), "https://evinvest.ltd/cabinet/wallet/action/payment/42");
 }
 
 fn unfollow(topic: &str) -> SetScopeTopicSubscriptionRequest {

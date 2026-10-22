@@ -38,6 +38,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
+	notice_link::NoticeLinkBases,
 	notification::{EmitTarget, InboxView, emit_to, follow_offered, inbox_mark_read, inbox_page, inbox_unread, scope_topic, settings_of, subscriber_of, topic},
 	ports::{NotificationRepository, UserDirectoryRepository},
 	relying_party::ClientTokenAuthenticator,
@@ -60,6 +61,7 @@ pub struct ScopeInbox {
 	/// a client audience and a live session. `None` where no client is configured — every
 	/// write is then refused.
 	user_tokens: Option<ClientTokenAuthenticator>,
+	links: Arc<NoticeLinkBases>,
 }
 
 /// Whose inbox, through which scope. `member` is `None` for anyone the scope may not show
@@ -76,7 +78,14 @@ impl ScopeInbox {
 			notifications,
 			users,
 			user_tokens,
+			links: Arc::default(),
 		}
+	}
+
+	/// `NOTICE_LINK_BASES`. Without it every `link_scope` falls back to `CABINET_URL`.
+	pub fn with_link_bases(mut self, links: Arc<NoticeLinkBases>) -> Self {
+		self.links = links;
+		self
 	}
 
 	async fn client<T>(&self, request: &Request<T>) -> Result<ClientCaller, Status> {
@@ -237,6 +246,6 @@ impl ScopeInboxService for ScopeInbox {
 			scope,
 			default_subscribed: published.default_subscribed,
 		};
-		Ok(Response::new(emit_to(self.notifications.as_ref(), &target, &req).await?))
+		Ok(Response::new(emit_to(self.notifications.as_ref(), &self.links, &target, &req).await?))
 	}
 }

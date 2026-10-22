@@ -92,8 +92,15 @@ ev::settings! {
 		smtp_password: Option<String>,
 		/// `From:` mailbox for outgoing mail.
 		mail_from: String = "EV Investment <notifications@evinvest.ltd>",
-		/// Origin the cabinet is served from; builds the links inside emails.
+		/// Origin the cabinet is served from; builds the links inside emails. A notice whose
+		/// `link_scope` has no entry in `notice_link_bases` links here too.
 		cabinet_url: String = "https://evinvest.ltd/cabinet",
+		/// Each scope's own cabinet, for the notices an emitter sends with `link_scope`
+		/// (comma-separated `scope=base`, e.g. `invest=https://invest.evinvest.ltd/cabinet`;
+		/// banking#580). Empty ⇒ every notice links under `cabinet_url`. A malformed entry
+		/// refuses the boot (`notice_link::NoticeLinkBases::parse`). Removing an entry later
+		/// sends that scope's already stored links to `cabinet_url` in mail.
+		notice_link_bases: Vec<String> = "",
 		/// The approvals page of the admin console; an approval mail links to
 		/// `<APPROVALS_URL>/<id>`. Configuration and never the proposer's: no service
 		/// chooses where a mail asking people to decide sends them.

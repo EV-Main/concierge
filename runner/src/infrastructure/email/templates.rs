@@ -31,15 +31,12 @@ pub struct RenderedEmail {
 	pub text: String,
 }
 
-/// A notification's email copy. `link` is a cabinet-relative path; `cabinet_url` is
-/// the origin it hangs off.
-pub fn notification(topic_label: &str, title: &str, body: &str, link: &str, occurred_at: i64, cabinet_url: &str, unsubscribe_url: &str) -> RenderedEmail {
-	let cabinet = cabinet_url.trim_end_matches('/');
-	let target = if link.is_empty() {
-		cabinet.to_owned()
-	} else {
-		format!("{cabinet}/{}", link.trim_start_matches('/'))
-	};
+/// A notification's email copy. `target` is the finished URL; which cabinet it may name
+/// is decided by `notice_link::NoticeLinkBases::mail_target`, not here.
+pub fn notification(topic_label: &str, title: &str, body: &str, target: &str, occurred_at: i64, unsubscribe_url: &str) -> RenderedEmail {
+	// The text part prints the link bare on its own line — see `one_line`. Rows written
+	// before emitters were held to a clean path can still carry a newline.
+	let target = &one_line(target);
 
 	let mut inner = String::new();
 	inner.push_str(&eyebrow(topic_label));
@@ -48,7 +45,7 @@ pub fn notification(topic_label: &str, title: &str, body: &str, link: &str, occu
 		inner.push_str(&paragraph(body));
 	}
 	inner.push_str(&detail_box(&[("Topic", topic_label.to_owned()), ("As of", fmt_ts(occurred_at))]));
-	inner.push_str(&button("Open your cabinet", &target));
+	inner.push_str(&button("Open your cabinet", target));
 
 	let footer = format!(
 		"You are receiving this because you follow {}. This message is a copy — it is already waiting in your cabinet.",
@@ -1665,17 +1662,16 @@ mod tests {
 			"Quy Nhon Fund",
 			"NAV is now $1.0842 per unit",
 			"Net asset value rose 1.4% <this> month.",
-			"/funds/quy-nhon",
+			"https://evinvest.ltd/cabinet/funds/quy-nhon",
 			1_785_143_640,
-			"https://evinvest.ltd/cabinet",
 			"https://evinvest.ltd/u/tok",
 		);
 		assert!(mail.subject.starts_with("Quy Nhon Fund —"), "subject leads with the topic so a threaded inbox groups sensibly");
 		assert!(mail.html.contains("&lt;this&gt;"), "body copy is HTML-escaped — emitters pass through arbitrary text");
 		assert!(!mail.text.is_empty(), "a text/plain alternative is always present; html-only mail scores as spam");
 		assert!(
-			mail.html.contains("https://evinvest.ltd/cabinet/funds/quy-nhon"),
-			"the relative link is joined onto the cabinet origin exactly once"
+			mail.html.contains("https://evinvest.ltd/cabinet/funds/quy-nhon") && mail.text.contains("Open your cabinet: https://evinvest.ltd/cabinet/funds/quy-nhon\n"),
+			"the target is rendered as given, in both parts"
 		);
 		assert!(
 			mail.html.contains("https://evinvest.ltd/u/tok"),

@@ -31,6 +31,7 @@ use crate::{
 		templates,
 		transport::{EmailTransport, OutgoingEmail},
 	},
+	notice_link::NoticeLinkBases,
 	notification::topic,
 	ports::NotificationDispatchRepository,
 };
@@ -47,6 +48,9 @@ pub struct DispatcherConfig {
 	pub mail_from: String,
 	/// Origin the cabinet is served from; builds links inside emails.
 	pub cabinet_url: String,
+	/// The scope cabinets a stored absolute notice link may point under, besides
+	/// `cabinet_url`; checked again at send time against the configuration in force.
+	pub notice_links: Arc<NoticeLinkBases>,
 	/// `PUBLIC_ORIGIN`: the confirm/unsubscribe links are its `/api/auth/notifications/*`.
 	pub public_origin: String,
 	/// The approvals page an approval mail links to, `<approvals_url>/<id>`.
@@ -345,9 +349,8 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 				label,
 				job.title.as_deref()?,
 				job.body.as_deref().unwrap_or(""),
-				job.link.as_deref().unwrap_or(""),
+				&cfg.notice_links.mail_target(&cfg.cabinet_url, job.link.as_deref().unwrap_or("")),
 				job.occurred_at.unwrap_or_default(),
-				&cfg.cabinet_url,
 				&unsubscribe_url,
 			)
 		}
