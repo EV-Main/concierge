@@ -43,6 +43,10 @@ mod turnstile;
 // The one session-store name tests exercise the persistence invariant through.
 use std::sync::Arc;
 
+/// Re-exported so the integration suite asserts against the cap the route actually
+/// enforces. A test that hard-coded the number would keep passing after someone raised
+/// it, and the number is what stands between one account and the vendor balance.
+pub use authorize::{CONFIRM_PATH, TRIP_TTL_SECS, trip_key};
 use axum::{
 	Router,
 	http::Method,
@@ -52,9 +56,6 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use domain::users::UserId;
 use evconcierge_auth::{AuthService, oauth::OAuthProvider};
-/// Re-exported so the integration suite asserts against the cap the route actually
-/// enforces. A test that hard-coded the number would keep passing after someone raised
-/// it, and the number is what stands between one account and the vendor balance.
 pub use kyc::START_MAX_PER_WINDOW;
 /// Re-exported for the same reason: the suite drives the passkey sign-in up to this budget.
 pub use passkey::SIGN_IN_STARTS_PER_MINUTE;

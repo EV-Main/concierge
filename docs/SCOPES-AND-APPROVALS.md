@@ -180,39 +180,47 @@ outside the directory), esbuild-hashed names cached for a year and everything el
 five minutes. With `WEB_MFE_DIR` unset or unreadable the route is not mounted and sign-in
 is unaffected; the image sets it only once `web/` exists in this repository. An `.html`
 file there is a platform page (the confirmation of §3.2): it is answered with
-`Cache-Control: no-store`, `Content-Security-Policy: frame-ancestors 'none'` and
-`Referrer-Policy: no-referrer`.
+`Cache-Control: no-store`, `Referrer-Policy: no-referrer` and `Content-Security-Policy:
+default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src
+https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'` (Turnstile
+for the mailed code; inline styles because the elements insert their `<style>`).
 
 ### 3.2 Relying-party sign-in: `max_age` and `auth_time`
 
-A client's access token (`ExchangeCode`, `RefreshClientToken`) carries `auth_time`: the
-unix seconds of the `evinvest.ltd` session's last interactive authentication when
-`/auth/authorize` issued the code (migration 0047 keeps it on the code and on the client
-session). A refresh keeps it and never moves it, so a later confirmation on the platform
-reaches the client only through a new authorization. A session from before the claim
-gives a token without it.
+`auth_time` reaches a client's access token (`ExchangeCode`, `RefreshClientToken`) ONLY
+from a code issued at the end of a confirmation trip this request began: it is the
+`evinvest.ltd` session's `auth_time` after the person confirmed (migration 0047 keeps it
+on the code and on the client session; a refresh keeps it and never moves it). Every other
+code — a sign-in without `max_age`, a session that meets `max_age` by itself — gives
+tokens WITHOUT the claim, which no proof accepts. So an `auth_time` this client did not
+ask for (a new sign-in, a re-authentication for banking) never reaches its tokens: a
+client cannot spend a proof meant for someone else or pass an ordinary sign-in off as
+one (security review of #193, F1).
 
 `GET /api/auth/authorize?…&max_age=N` (OIDC; `N` a non-negative integer of at most ten
-digits, anything else answers `error=invalid_request`) asks for a session whose
-`auth_time` is at most `N` seconds old:
+digits, anything else answers `error=invalid_request`; together with `prompt` it is
+`invalid_request`, because the chooser leads to a new sign-in):
 
-- no session: the ordinary login, coming back with `max_age` (a new sign-in meets it);
-- a session that meets it: a code, as without `max_age`;
-- an older one, or one without `auth_time`: a 302 to the confirmation page
-  `/api/auth/mfe/reauth.html?return_to=<this request, rebuilt, plus reauth=done>`. That page
-  runs the re-authentication of `/auth/reauth/*` (email code, password, passkey; it is on
-  `PUBLIC_ORIGIN`, the only origin those routes answer) and then navigates to `return_to`,
-  confirmed or dismissed. Not a new sign-in: that would end the browser's session and every
-  client session with it;
-- back with `reauth=done`: a code when the session's `auth_time` is now at most
-  `max(N, 60)` seconds old (60 s covers the round trip, which `max_age=0` would otherwise
-  never meet), else `error=access_denied` — never a second trip, so a dismissed or failed
-  confirmation does not loop. The same holds for a stale session coming back with
-  `auth_error`.
+- no session: the ordinary login, coming back with `max_age`. A new sign-in is not a
+  confirmation — a provider can complete it with a remembered account and no act of the
+  person — so the new session is sent to confirm as below;
+- a session whose `auth_time` is at most `N` seconds old (`N > 0`): a code without the
+  claim. `max_age=0` is met by no session;
+- otherwise: the plane stores a trip — key `rpconfirm:<session id>:<client_id>:<PKCE
+  challenge>`, value the start's unix seconds, 600 s — and answers a 302 to
+  `/api/auth/mfe/reauth.html?return_to=<this request, rebuilt from its parameters>`. That
+  page runs the re-authentication of `/auth/reauth/*` (email code, password, passkey;
+  `PUBLIC_ORIGIN` only) and navigates to `return_to`, confirmed or dismissed;
+- back with a trip under that key (taken once, so a second return is a new request): a
+  code carrying `auth_time` when the session's `auth_time` is after the trip's start and
+  at most 30 s ahead of the clock, else `error=access_denied` — never a second trip, so a
+  dismissed confirmation does not loop. Another session, another client or another PKCE
+  challenge finds no trip; a hand-added query parameter changes nothing.
 
-Without `max_age` nothing changes. This is how a relying party proves its user
-confirmed just now (§5.2, D24(1)): authorize with `max_age=0`, exchange the code, and
-present that access token within 120 s.
+Without `max_age` nothing changes but the claim. This is how a relying party proves its
+user confirmed just now (§5.2, D24(1)): authorize with `max_age=0`, exchange the code, and
+present that access token within 120 s of the confirmation.
 
 ---
 
@@ -388,10 +396,10 @@ containment is never slower than the grant).
     and its `aud` must be the calling client's audience. A token of this plane is refused
     `UNAUTHENTICATED` (a client cannot hold one, and the client verifier does not know its
     audience); another client's token is refused `PERMISSION_DENIED` ("the user token was
-    issued to another client"). A client token's `auth_time` is the platform session's at
-    the moment the client was authorized, kept through every refresh, so the client gets a
-    fresh one by sending the person to `/api/auth/authorize?…&max_age=0` (§3.2), which
-    has them confirm on the platform before it issues the code.
+    issued to another client"). A client token carries `auth_time` only when its code was
+    issued at the end of a confirmation trip the client asked for
+    (`/api/auth/authorize?…&max_age=0`, §3.2), kept through every refresh; any other
+    client token has none and is refused `reauth_required`.
 
   Either way, its `sub`
   must be `requested_by`, the account still active at that token's `token_version`, the

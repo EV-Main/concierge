@@ -14,13 +14,17 @@
 //! admits (a same-origin path). The Google client never learns a relying party exists.
 //! `prompt=select_account` sends a signed-in browser the same way, to switch accounts.
 //!
-//! `max_age=N` (OIDC) asks for a session whose `auth_time` is at most N seconds old. An
-//! older one is not signed in again — a new sign-in would end the browser's session and
-//! every client session with it — but sent to the confirmation page ([`CONFIRM_PATH`]),
-//! which runs the ordinary re-authentication (`/auth/reauth/*`, `PUBLIC_ORIGIN` only) and
-//! comes back here. The code then carries the moved `auth_time`, and so does every access
-//! token the client gets for it: that is how a client proves a fresh confirmation
-//! (`approvals`, D24(1)).
+//! `max_age=N` (OIDC) asks for a session whose `auth_time` is at most N seconds old;
+//! `max_age=0` always asks. An older one is not signed in again — a new sign-in would end
+//! the browser's session and every client session with it — but sent to the confirmation
+//! page ([`CONFIRM_PATH`]), which runs the ordinary re-authentication (`/auth/reauth/*`,
+//! `PUBLIC_ORIGIN` only) and comes back here. This route remembers the trip it started
+//! (session, client, PKCE challenge) and takes it back once; only a code issued at the
+//! end of a trip whose confirmation moved `auth_time` after it began carries `auth_time`,
+//! and with it every access token the client gets for it. That is how a client proves the
+//! person confirmed for IT (`approvals`, D24(1)): an `auth_time` this client did not ask
+//! for — a sign-in, a re-authentication for banking — never reaches its tokens, so a
+//! client cannot spend another's proof or pass an ordinary sign-in off as one.
 
 use axum::{
 	extract::{Query, State},
@@ -52,15 +56,12 @@ const MAX_STATE_LEN: usize = 512;
 /// (`mfe-concierge-reauth`) and then, confirmed or not, sends the browser to its
 /// `return_to` — always a path back to this route, built here.
 pub const CONFIRM_PATH: &str = "/api/auth/mfe/reauth.html";
-/// Marks the way back from [`CONFIRM_PATH`]: `reauth=done`. It only ever ends the trip —
-/// a session still too old is refused rather than sent round again — so a browser that
-/// adds it by hand gains nothing.
-const CONFIRMED_PARAM: &str = "reauth";
-const CONFIRMED_VALUE: &str = "done";
-/// How long after a confirmation the browser may take to come back with it. `max_age=0`
-/// is met by nothing, so without this window the round trip itself would make the
-/// confirmation too old.
-pub const CONFIRMED_WINDOW_SECS: i64 = 60;
+/// How long a confirmation trip may take. A trip not back by then is forgotten, and the
+/// browser that comes back later starts a new one.
+pub const TRIP_TTL_SECS: u64 = 600;
+/// How far ahead of this replica's clock a confirmation may be dated: the replica that
+/// moved `auth_time` may run a little ahead of this one.
+const CLOCK_SKEW_SECS: i64 = 30;
 /// Ten digits is over three hundred years; anything longer is not an age.
 const MAX_AGE_DIGITS: usize = 10;
 
@@ -78,8 +79,6 @@ pub struct AuthorizeQuery {
 	/// OIDC `max_age`, in seconds. A string, so a malformed one goes back to the client as
 	/// `invalid_request` instead of failing the whole request here.
 	max_age: Option<String>,
-	/// [`CONFIRMED_PARAM`]: set on the way back from the confirmation page.
-	reauth: Option<String>,
 	/// Set by the login callback when the sign-in itself failed or was cancelled.
 	auth_error: Option<String>,
 }
@@ -136,6 +135,11 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 		code_challenge,
 		max_age,
 	};
+	// The chooser leads to a new sign-in, which can complete without the person doing
+	// anything (a provider's remembered account), so it never stands in for a confirmation.
+	if q.prompt.is_some() && max_age.is_some() {
+		return back.error("invalid_request");
+	}
 	match q.prompt.as_deref() {
 		None => {}
 		// Google's chooser is on every login; the way back drops `prompt`, so it authorizes.
@@ -146,7 +150,7 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 	let session_id = jar.get(&st.cookies.session).map(|c| c.value().to_string());
 	let live = match session_id.as_deref() {
 		Some(id) => match live_session(st, id).await {
-			Ok(live) => live,
+			Ok(live) => live.map(|(fresh, family)| (id, fresh, family)),
 			Err(err) => {
 				tracing::error!(error = ?err, "relying party: session unreadable at authorize");
 				return back.error("temporarily_unavailable");
@@ -154,7 +158,7 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 		},
 		None => None,
 	};
-	let Some((fresh, upstream_family)) = live else {
+	let Some((session_id, fresh, upstream_family)) = live else {
 		// Coming back from a sign-in that failed or was cancelled: send the refusal to the
 		// client rather than start the login again, which would loop.
 		if q.auth_error.is_some() {
@@ -192,13 +196,29 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 			return (refreshed, back.error("temporarily_unavailable")).into_response();
 		}
 	};
+	let mut confirmed = None;
 	if let Some(max_age) = max_age {
-		let came_back = q.reauth.as_deref() == Some(CONFIRMED_VALUE) || q.auth_error.is_some();
-		match freshness(max_age, auth_time, now_secs(), came_back) {
-			Freshness::Fresh => {}
-			Freshness::Confirm => return (refreshed, redirect(&asked.confirm_url())).into_response(),
-			Freshness::Refused => {
-				tracing::info!(client_id = %client.client_id, user_id = %user, max_age, "relying party: authorize refused, the session was not confirmed recently enough");
+		let trip = trip_key(session_id, client_id, code_challenge);
+		let started = match st.sessions.take_trip(&trip).await {
+			Ok(started) => started,
+			Err(err) => {
+				tracing::error!(error = ?err, "relying party: confirmation trip unreadable at authorize");
+				return (refreshed, back.error("temporarily_unavailable")).into_response();
+			}
+		};
+		let now = now_secs();
+		match decide(max_age, auth_time, started, now) {
+			Decision::Code => {}
+			Decision::Confirmed(at) => confirmed = Some(at),
+			Decision::Confirm => {
+				if let Err(err) = st.sessions.start_trip(&trip, now, TRIP_TTL_SECS).await {
+					tracing::error!(error = ?err, "relying party: confirmation trip not stored at authorize");
+					return (refreshed, back.error("temporarily_unavailable")).into_response();
+				}
+				return (refreshed, redirect(&asked.confirm_url())).into_response();
+			}
+			Decision::Refused => {
+				tracing::info!(client_id = %client.client_id, user_id = %user, max_age, "relying party: authorize refused, the confirmation trip did not confirm");
 				return (refreshed, back.error("access_denied")).into_response();
 			}
 		}
@@ -206,7 +226,7 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 	let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
 	let requester = Requester {
 		upstream_family: &upstream_family,
-		auth_time,
+		auth_time: confirmed,
 		client_ip: &ip,
 		user_agent,
 	};
@@ -267,7 +287,7 @@ struct Asked<'a> {
 impl Asked<'_> {
 	/// The path back to this exact request. Rebuilt from the parsed parameters, never
 	/// copied from the raw query, so nothing the caller added rides along.
-	fn path(&self, confirmed: bool) -> String {
+	fn path(&self) -> String {
 		let mut back = form_urlencoded::Serializer::new(String::new());
 		back.append_pair("client_id", self.client_id)
 			.append_pair("redirect_uri", self.redirect_uri)
@@ -279,21 +299,19 @@ impl Asked<'_> {
 		if let Some(max_age) = self.max_age {
 			back.append_pair("max_age", &max_age.to_string());
 		}
-		if confirmed {
-			back.append_pair(CONFIRMED_PARAM, CONFIRMED_VALUE);
-		}
 		format!("{PUBLIC_PATH}?{}", back.finish())
 	}
 
-	/// The ordinary login, coming back here. A new sign-in stamps a new `auth_time`, so
-	/// it meets any `max_age` on the way back.
+	/// The ordinary login, coming back here with `max_age`. A new sign-in is no
+	/// confirmation — a provider can complete it without the person doing anything — so
+	/// `max_age=0` still sends the new session to confirm on the way back.
 	fn login_url(&self) -> String {
-		let login = form_urlencoded::Serializer::new(String::new()).append_pair("returnTo", &self.path(false)).finish();
+		let login = form_urlencoded::Serializer::new(String::new()).append_pair("returnTo", &self.path()).finish();
 		format!("{LOGIN_PATH}?{login}")
 	}
 
 	fn confirm_url(&self) -> String {
-		let confirm = form_urlencoded::Serializer::new(String::new()).append_pair("return_to", &self.path(true)).finish();
+		let confirm = form_urlencoded::Serializer::new(String::new()).append_pair("return_to", &self.path()).finish();
 		format!("{CONFIRM_PATH}?{confirm}")
 	}
 }
@@ -306,26 +324,40 @@ fn parse_max_age(raw: &str) -> Option<u64> {
 	raw.parse().ok()
 }
 
+/// The confirmation trip of one session, for one client and one authorize request (its
+/// PKCE challenge): what the browser that comes back must match.
+pub fn trip_key(session_id: &str, client_id: &str, code_challenge: &str) -> String {
+	format!("{session_id}:{client_id}:{code_challenge}")
+}
+
 #[derive(Debug, Eq, PartialEq)]
-enum Freshness {
-	Fresh,
-	/// Send the person to confirm it is them.
+enum Decision {
+	/// The session meets `max_age` by itself: a code, without `auth_time`.
+	Code,
+	/// Back from a trip that moved `auth_time` after it began: a code carrying it.
+	Confirmed(u64),
+	/// Send the person to confirm it is them, and remember the trip.
 	Confirm,
-	/// Back from the confirmation and still too old: refused, never sent round again.
+	/// Back from a trip that confirmed nothing: refused, never sent round again.
 	Refused,
 }
 
-/// Whether a session last authenticated at `auth_time` meets `max_age` at `now`. A session
-/// with no `auth_time` predates the claim and meets none. One dated ahead of `now` is
-/// fresh here; the proof it later backs is held to its own skew bound.
-fn freshness(max_age: u64, auth_time: Option<u64>, now: i64, came_back: bool) -> Freshness {
-	let age = auth_time.and_then(|at| i64::try_from(at).ok()).map(|at| now.saturating_sub(at));
+/// What `max_age` makes of a session last authenticated at `auth_time`, given the trip
+/// this request began at `started` (taken, so `None` when there was none). A session
+/// with no `auth_time` predates the claim and meets no `max_age`; `max_age=0` is met by
+/// no session, only by a trip.
+fn decide(max_age: u64, auth_time: Option<u64>, started: Option<i64>, now: i64) -> Decision {
+	let at = auth_time.and_then(|at| i64::try_from(at).ok());
+	if let Some(started) = started {
+		return match (auth_time, at) {
+			(Some(confirmed), Some(at)) if at > started && at <= now.saturating_add(CLOCK_SKEW_SECS) => Decision::Confirmed(confirmed),
+			_ => Decision::Refused,
+		};
+	}
 	let limit = i64::try_from(max_age).unwrap_or(i64::MAX);
-	match age {
-		Some(age) if age <= limit => Freshness::Fresh,
-		Some(age) if came_back && age <= CONFIRMED_WINDOW_SECS => Freshness::Fresh,
-		_ if came_back => Freshness::Refused,
-		_ => Freshness::Confirm,
+	match at {
+		Some(at) if max_age > 0 && now.saturating_sub(at) <= limit => Decision::Code,
+		_ => Decision::Confirm,
 	}
 }
 
@@ -383,17 +415,22 @@ mod tests {
 	}
 
 	#[test]
-	fn a_session_inside_max_age_is_fresh_and_an_older_one_confirms_once() {
+	fn only_a_trip_that_moved_auth_time_confirms() {
 		let at = |age: i64| Some(u64::try_from(NOW - age).unwrap());
-		assert_eq!(freshness(300, at(300), NOW, false), Freshness::Fresh);
-		assert_eq!(freshness(300, at(301), NOW, false), Freshness::Confirm);
-		assert_eq!(freshness(0, at(0), NOW, false), Freshness::Fresh);
-		assert_eq!(freshness(0, at(1), NOW, false), Freshness::Confirm, "max_age=0 asks even a session confirmed a second ago");
-		assert_eq!(freshness(0, None, NOW, false), Freshness::Confirm, "no auth_time meets no max_age");
-		// Back from the confirmation: the round trip is allowed for, a stale session is not.
-		assert_eq!(freshness(0, at(CONFIRMED_WINDOW_SECS), NOW, true), Freshness::Fresh);
-		assert_eq!(freshness(0, at(CONFIRMED_WINDOW_SECS + 1), NOW, true), Freshness::Refused);
-		assert_eq!(freshness(0, None, NOW, true), Freshness::Refused);
-		assert_eq!(freshness(u64::MAX, at(10_000), NOW, false), Freshness::Fresh);
+		// No trip yet.
+		assert_eq!(decide(300, at(300), None, NOW), Decision::Code);
+		assert_eq!(decide(300, at(301), None, NOW), Decision::Confirm);
+		assert_eq!(decide(0, at(0), None, NOW), Decision::Confirm, "max_age=0 asks even a session authenticated this second");
+		assert_eq!(decide(3600, None, None, NOW), Decision::Confirm, "no auth_time meets no max_age");
+		assert_eq!(decide(u64::MAX, at(10_000), None, NOW), Decision::Code);
+		// Back from a trip that began 20 s ago.
+		let started = Some(NOW - 20);
+		assert_eq!(decide(0, at(5), started, NOW), Decision::Confirmed(u64::try_from(NOW - 5).unwrap()));
+		assert_eq!(decide(0, at(20), started, NOW), Decision::Refused, "moved no later than the trip began");
+		assert_eq!(decide(0, at(600), started, NOW), Decision::Refused, "dismissed: the session is as it was");
+		assert_eq!(decide(3600, at(600), started, NOW), Decision::Refused, "a trip is answered by a confirmation, not by max_age");
+		assert_eq!(decide(0, None, started, NOW), Decision::Refused);
+		assert_eq!(decide(0, at(-30), started, NOW), Decision::Confirmed(u64::try_from(NOW + 30).unwrap()), "honest drift");
+		assert_eq!(decide(0, at(-31), started, NOW), Decision::Refused, "dated ahead of any honest clock");
 	}
 }

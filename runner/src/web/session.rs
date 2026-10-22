@@ -68,6 +68,9 @@ pub struct Reauthed {
 
 pub struct WebSessions {
 	store: Store,
+	/// The confirmation trips of `/auth/authorize` when there is no Redis: key → (started
+	/// at, expires at). With Redis they live there, so any replica can end a trip.
+	trips: Mutex<HashMap<String, (i64, i64)>>,
 	/// Per-session single-flight for the refresh path: two racing rotations of one
 	/// refresh token read as theft upstream and revoke the family. In-process — see
 	/// `single_flight` for the one-replica caveat.
@@ -87,8 +90,57 @@ impl WebSessions {
 		};
 		Ok(Self {
 			store,
+			trips: Mutex::new(HashMap::new()),
 			locks: KeyedLocks::default(),
 		})
+	}
+
+	/// Remember that `/auth/authorize` sent this browser to confirm, at `started_at`, for
+	/// `ttl_secs`. `key` names the session, the client and the request; a second start
+	/// under it restarts the trip.
+	pub async fn start_trip(&self, key: &str, started_at: i64, ttl_secs: u64) -> color_eyre::Result<()> {
+		match &self.store {
+			Store::InProcess(_) => {
+				let mut trips = self.trips.lock().await;
+				let now = now_secs();
+				trips.retain(|_, (_, expires)| *expires > now);
+				trips.insert(key.to_owned(), (started_at, now.saturating_add_unsigned(ttl_secs)));
+			}
+			Store::Redis(conn) => {
+				let mut conn = conn.clone();
+				let () = redis::cmd("SET")
+					.arg(Self::trip_key(key))
+					.arg(started_at)
+					.arg("EX")
+					.arg(ttl_secs)
+					.query_async(&mut conn)
+					.await
+					.context("confirmation trip start")?;
+			}
+		}
+		Ok(())
+	}
+
+	/// The start of the trip under `key`, ending it: a trip is taken once, so coming back
+	/// twice is a new request. GET and DEL in one script, not `GETDEL`, which older Redis
+	/// servers do not have.
+	pub async fn take_trip(&self, key: &str) -> color_eyre::Result<Option<i64>> {
+		match &self.store {
+			Store::InProcess(_) => {
+				let now = now_secs();
+				Ok(self.trips.lock().await.remove(key).filter(|(_, expires)| *expires > now).map(|(started, _)| started))
+			}
+			Store::Redis(conn) => {
+				let mut conn = conn.clone();
+				let script = redis::Script::new("local v = redis.call('GET', KEYS[1]) if v then redis.call('DEL', KEYS[1]) end return v");
+				let started: Option<i64> = script.key(Self::trip_key(key)).invoke_async(&mut conn).await.context("confirmation trip take")?;
+				Ok(started)
+			}
+		}
+	}
+
+	fn trip_key(key: &str) -> String {
+		format!("rpconfirm:{key}")
 	}
 
 	/// Open a session for a freshly exchanged token pair. Returns

@@ -196,8 +196,8 @@ service ApprovalExecutionService {
   // Metadata `x-ev-user-token`: optionally, `requested_by`'s own access token — from the
   // bridge, one of this plane (`typ=access`, verified as every RPC of this plane verifies
   // one); from a relying party, one issued to THAT client (`aud` = its audience, a live
-  // client session, as `GetMe` admits it; its `auth_time` is the platform session's when
-  // the client authorized, so ask for one with `max_age`) — `requested_by`
+  // client session, as `GetMe` admits it; it carries `auth_time` only when its code ended a
+  // confirmation the client asked for with `max_age`) — `requested_by`
   // required with it, minted no more than 120 seconds before the call, with an `auth_time`
   // no more than 120 seconds before the call — the person re-authenticated just now; a
   // refresh keeps the session's old `auth_time` — neither dated more than 30 seconds after

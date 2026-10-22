@@ -148,7 +148,9 @@ async fn setup() -> Option<Fx> {
 		.expect("publish the tenant's catalog");
 	repo.set_secret_hash(&client.id, Some(sha256(&client.secret).as_slice()), 1).await.expect("set the client secret");
 
-	let (provisioner, _rx) = provisioner_channel();
+	// Answered, so a re-authentication (`AuthService::reauthenticate`) can read the account.
+	let (provisioner, rx) = provisioner_channel();
+	tokio::spawn(concierge::directory::run_provisioner(rx, users.clone(), Arc::new(BreakGlass::new(Vec::new()))));
 	let auth = AuthService::try_new(auth_config(), provisioner).await.expect("auth service").with_client_grants(rp.clone());
 	Some(Fx {
 		pool,
@@ -525,6 +527,11 @@ async fn a_refresh_token_is_bound_to_its_client() {
 /// The composition `main::run` mounts: the plane's verifier on every service, the
 /// client verifier admitted on `GetMe` alone.
 async fn boot(fx: &Fx) -> Channel {
+	boot_at(fx).await.0
+}
+
+/// [`boot`], and the endpoint its JWKS is served at.
+async fn boot_at(fx: &Fx) -> (Channel, String) {
 	let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
 	let endpoint = format!("http://{addr}");
 	let plane = Verifier::try_new(VerifierConfig {
@@ -560,7 +567,7 @@ async fn boot(fx: &Fx) -> Channel {
 	});
 	for _ in 0..50 {
 		if let Ok(channel) = Channel::from_shared(endpoint.clone()).unwrap().connect().await {
-			return channel;
+			return (channel, endpoint);
 		}
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
@@ -1247,7 +1254,7 @@ async fn a_client_token_carries_the_sessions_auth_time_through_exchange_and_refr
 }
 
 /// The way `/auth/authorize` sends a browser to the confirmation and back: the public path
-/// of this route with the client's parameters and `reauth=done`.
+/// of this route with the client's parameters.
 fn confirm_return(location: &str) -> String {
 	assert!(location.starts_with("/api/auth/mfe/reauth.html?return_to="), "{location}");
 	let return_to = params(location)["return_to"].clone();
@@ -1255,30 +1262,32 @@ fn confirm_return(location: &str) -> String {
 	return_to
 }
 
+fn session_id(cookie: &str) -> &str {
+	cookie.trim_start_matches("ev_session=")
+}
+
+/// The authorize request with `max_age=0`, and the internal path the confirmation page
+/// sends the browser back to.
+async fn confirm_trip(fx: &Fx, router: &Router, cookie: &str, challenge: &str) -> (String, String) {
+	let uri = format!("{}&max_age=0", authorize_uri(&fx.client.id, &fx.client.redirect_uri, challenge));
+	let answer = get(router, &uri, Some(cookie)).await;
+	assert_eq!(answer.status, StatusCode::FOUND);
+	let return_to = confirm_return(&answer.location.unwrap());
+	(uri, return_to.strip_prefix("/api").unwrap().to_owned())
+}
+
 #[tokio::test]
-async fn max_age_sends_a_stale_session_to_confirm_and_the_confirmed_one_gets_a_code() {
+async fn max_age_sends_a_stale_session_to_confirm_and_only_a_confirmed_trip_stamps_auth_time() {
 	let fx = fixture!();
 	let router = router(&fx).await;
 	let user = fx.user().await;
 	let stale = now_secs() - 600;
-	let Some((cookie, refresh_token)) = signed_in_browser_at(&fx, user, Some(stale)).await else {
+	let Some((cookie, _)) = signed_in_browser_at(&fx, user, Some(stale)).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
 	let verifier = random(48);
 	let challenge = s256_challenge(&verifier);
-	let uri = format!("{}&max_age=0", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &challenge));
-
-	let answer = get(&router, &uri, Some(&cookie)).await;
-	assert_eq!(answer.status, StatusCode::FOUND);
-	let return_to = confirm_return(&answer.location.unwrap());
-	let back = params(&return_to);
-	assert_eq!(back["client_id"], fx.client.id);
-	assert_eq!(back["redirect_uri"], fx.client.redirect_uri);
-	assert_eq!(back["state"], "st-123");
-	assert_eq!(back["code_challenge"], challenge);
-	assert_eq!(back["max_age"], "0");
-	assert_eq!(back["reauth"], "done");
 	let codes = || async {
 		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rp_codes WHERE user_id = $1")
 			.bind(user.raw())
@@ -1286,57 +1295,108 @@ async fn max_age_sends_a_stale_session_to_confirm_and_the_confirmed_one_gets_a_c
 			.await
 			.unwrap()
 	};
-	assert_eq!(codes().await, 0, "no code before the confirmation");
-	let internal = return_to.strip_prefix("/api").unwrap().to_owned();
 
-	// Dismissed: the page comes back with the session as it was, and the client hears
+	let (uri, back_path) = confirm_trip(&fx, &router, &cookie, &challenge).await;
+	let back = params(&back_path);
+	assert_eq!(back["client_id"], fx.client.id);
+	assert_eq!(back["redirect_uri"], fx.client.redirect_uri);
+	assert_eq!(back["state"], "st-123");
+	assert_eq!(back["code_challenge"], challenge);
+	assert_eq!(back["max_age"], "0");
+	assert_eq!(codes().await, 0, "no code before the confirmation");
+
+	// Dismissed: the session is as it was, so the trip confirmed nothing; the client hears
 	// `access_denied` instead of the browser going round again.
-	let location = get(&router, &internal, Some(&cookie)).await.location.unwrap();
+	let location = get(&router, &back_path, Some(&cookie)).await.location.unwrap();
 	assert!(location.starts_with(&fx.client.redirect_uri), "{location}");
 	assert_eq!(params(&location)["error"], "access_denied");
 	assert_eq!(params(&location)["state"], "st-123");
 	assert_eq!(codes().await, 0);
 
-	// Confirmed: the locker now holds the session's moved `auth_time`. Two seconds back, so
-	// the last check below cannot land in the same second and meet `max_age=0`.
-	let token_version = fx.users.find_by_id(user).await.unwrap().unwrap().token_version();
-	let confirmed_at = now_secs() - 2;
-	let cookie = browser_session(user, token_version, &refresh_token, Some(confirmed_at)).await;
-	let location = get(&router, &internal, Some(&cookie)).await.location.unwrap();
-	let back = params(&location);
+	// A new trip, dated as if it began ten seconds ago (a person takes that long), and a
+	// REAL re-authentication of the same session: the code carries the moved `auth_time`.
+	confirm_trip(&fx, &router, &cookie, &challenge).await;
+	let began = i64::try_from(now_secs()).unwrap() - 10;
+	let sessions = web::WebSessions::from_env().await.unwrap();
+	sessions
+		.start_trip(&web::trip_key(session_id(&cookie), &fx.client.id, &challenge), began, web::TRIP_TTL_SECS)
+		.await
+		.unwrap();
+	let moved = sessions
+		.reauthenticated(session_id(&cookie), &user.to_string(), &fx.auth)
+		.await
+		.unwrap()
+		.expect("the session re-authenticates");
+	let location = get(&router, &back_path, Some(&cookie)).await.location.unwrap();
 	assert!(location.starts_with(&format!("{}?", fx.client.redirect_uri)), "{location}");
-	let tokens = fx.exchange(&back["code"], &verifier).await.expect("the code redeems");
-	assert_eq!(claims_of(&tokens.access_token)["auth_time"], confirmed_at, "the client's token states the confirmation");
+	let tokens = fx.exchange(&params(&location)["code"], &verifier).await.expect("the code redeems");
+	assert_eq!(claims_of(&tokens.access_token)["auth_time"], moved.auth_time, "the client's token states the confirmation");
 
-	// Without the way-back mark, `max_age=0` asks again even a session confirmed just now.
+	// The trip is spent: coming back again is a new request, and `max_age=0` asks again
+	// even a session confirmed just now.
 	let location = get(&router, &uri, Some(&cookie)).await.location.unwrap();
 	confirm_return(&location);
 }
 
+/// Security review of #193 (F1): an `auth_time` this client did not ask for never reaches
+/// its tokens — not a sign-in, not a re-authentication for something else, not a way-back
+/// mark added by hand.
 #[tokio::test]
-async fn without_max_age_nothing_changes_and_with_it_the_age_is_checked() {
+async fn only_a_trip_this_request_began_puts_auth_time_on_a_code() {
 	let fx = fixture!();
 	let router = router(&fx).await;
 	let user = fx.user().await;
-	let stale = now_secs() - 600;
-	let Some(cookie) = signed_in_browser_at(&fx, user, Some(stale)).await.map(|(cookie, _)| cookie) else {
+	let Some((cookie, _)) = signed_in_browser_at(&fx, user, Some(now_secs() - 5)).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
+
+	// Authenticated five seconds ago, no max_age: a code, and no claim on its token.
 	let verifier = random(48);
 	let plain = authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&verifier));
-
 	let location = get(&router, &plain, Some(&cookie)).await.location.unwrap();
-	let tokens = fx.exchange(&params(&location)["code"], &verifier).await.expect("no max_age: a code as before");
-	assert_eq!(claims_of(&tokens.access_token)["auth_time"], stale, "and it states the session's auth_time");
+	let tokens = fx.exchange(&params(&location)["code"], &verifier).await.expect("a code as before");
+	assert!(claims_of(&tokens.access_token).get("auth_time").is_none(), "{:?}", claims_of(&tokens.access_token));
 
+	// max_age met by the session itself: a code, still without the claim.
 	let verifier = random(48);
 	let within = format!("{}&max_age=3600", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&verifier)));
 	let location = get(&router, &within, Some(&cookie)).await.location.unwrap();
-	assert!(params(&location).contains_key("code"), "ten minutes old meets max_age=3600: {location}");
+	let tokens = fx.exchange(&params(&location)["code"], &verifier).await.expect("max_age met");
+	assert!(claims_of(&tokens.access_token).get("auth_time").is_none());
 
-	let beyond = format!("{plain}&max_age=599");
-	confirm_return(&get(&router, &beyond, Some(&cookie)).await.location.unwrap());
+	// The old way-back mark, with no trip behind it, starts a trip; it confirms nothing.
+	let marked = format!("{}&max_age=0&reauth=done", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48))));
+	confirm_return(&get(&router, &marked, Some(&cookie)).await.location.unwrap());
+
+	// A trip of another request (another PKCE challenge) or another session proves nothing
+	// for this one: back without a trip of its own, a stale session is sent to confirm.
+	let challenge = s256_challenge(&random(48));
+	let (_, back_path) = confirm_trip(&fx, &router, &cookie, &challenge).await;
+	let other = session_cookie(&fx, user).await.unwrap();
+	confirm_return(&get(&router, &back_path, Some(&other)).await.location.unwrap());
+
+	// The chooser never stands in for a confirmation.
+	let chooser = format!("{plain}&prompt=select_account&max_age=0");
+	let location = get(&router, &chooser, Some(&cookie)).await.location.unwrap();
+	assert!(location.starts_with(&fx.client.redirect_uri), "{location}");
+	assert_eq!(params(&location)["error"], "invalid_request");
+}
+
+#[tokio::test]
+async fn max_age_is_checked_and_a_malformed_one_goes_back_as_invalid_request() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let user = fx.user().await;
+	let Some(cookie) = signed_in_browser_at(&fx, user, Some(now_secs() - 600)).await.map(|(cookie, _)| cookie) else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let plain = authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48)));
+
+	let location = get(&router, &format!("{plain}&max_age=3600"), Some(&cookie)).await.location.unwrap();
+	assert!(params(&location).contains_key("code"), "ten minutes old meets max_age=3600: {location}");
+	confirm_return(&get(&router, &format!("{plain}&max_age=599"), Some(&cookie)).await.location.unwrap());
 
 	for bad in ["", "-1", "abc", "1.5", "99999999999"] {
 		let location = get(&router, &format!("{plain}&max_age={bad}"), Some(&cookie)).await.location.unwrap();
@@ -1349,6 +1409,9 @@ async fn without_max_age_nothing_changes_and_with_it_the_age_is_checked() {
 	confirm_return(&get(&router, &format!("{plain}&max_age=3600"), Some(&unclaimed)).await.location.unwrap());
 }
 
+/// A new sign-in is no confirmation: a provider can complete it without the person doing
+/// anything. So `max_age=0` rides through the login, and the new session is sent to
+/// confirm on the way back.
 #[tokio::test]
 async fn without_a_session_max_age_rides_through_the_login() {
 	let fx = fixture!();
@@ -1357,6 +1420,137 @@ async fn without_a_session_max_age_rides_through_the_login() {
 	let location = get(&router, &uri, None).await.location.unwrap();
 	assert!(location.starts_with("/api/auth/login?returnTo="), "{location}");
 	let back = params(&params(&location)["returnTo"]);
-	assert_eq!(back["max_age"], "0", "a new sign-in meets it on the way back");
-	assert!(!back.contains_key("reauth"));
+	assert_eq!(back["max_age"], "0");
+}
+
+/// End to end: a token a real exchange minted after a confirmation trip, verified by the
+/// real client verifier, proves who asked on `Propose`; the ordinary sign-in token of the
+/// same person does not.
+#[tokio::test]
+async fn a_real_client_token_from_a_trip_proves_the_initiator_and_a_plain_one_does_not() {
+	use concierge::{
+		approvals::ApprovalExecution,
+		infrastructure::{approvals::PgApprovals, scope_catalogs::PgScopeCatalogs},
+		scope_catalog::ScopeCatalogs,
+		service_caller::ServiceCallers,
+	};
+	use evconcierge_contracts::concierge::v1::{
+		ApprovalFieldType, ApprovalFieldValue, ApprovalKindSpec, ApprovalLevel, ProposeRequest, PublishScopeCatalogRequest, approval_execution_service_server::ApprovalExecutionService,
+		approval_field_value::Value as FieldValue, scope_catalog_service_server::ScopeCatalogService,
+	};
+	use tonic::metadata::MetadataValue;
+
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let user = fx.user().await;
+	let Some((cookie, _)) = signed_in_browser_at(&fx, user, Some(now_secs() - 600)).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let (_channel, endpoint) = boot_at(&fx).await;
+	let client_tokens = ClientTokenAuthenticator::new(
+		Verifier::try_new(VerifierConfig {
+			issuer: ISSUER.into(),
+			audiences: vec![fx.client.audience.clone()],
+			allowed_types: vec![TokenType::Access],
+			jwks_grpc_endpoint: endpoint,
+		})
+		.unwrap(),
+		fx.rp.clone(),
+	);
+	let callers = ServiceCallers::new(Some("test-bridge-token".into()), fx.repo.clone());
+	let catalogs = Arc::new(PgScopeCatalogs::new(fx.pool.clone()));
+	let services = ApprovalExecution::new(callers.clone(), Arc::new(PgApprovals::new(fx.pool.clone())), catalogs.clone()).with_client_tokens(Arc::new(client_tokens));
+	let as_client = |mut request: Request<ProposeRequest>| {
+		request.metadata_mut().insert("x-ev-client-id", MetadataValue::try_from(fx.client.id.as_str()).unwrap());
+		request
+			.metadata_mut()
+			.insert("authorization", MetadataValue::try_from(format!("Bearer {}", fx.client.secret)).unwrap());
+		request
+	};
+	let kind = format!("{}:policy", fx.client.namespace);
+	let mut publish = Request::new(PublishScopeCatalogRequest {
+		version: 100,
+		approval_kinds: vec![ApprovalKindSpec {
+			name: kind.clone(),
+			label: "Policy".into(),
+			description: String::new(),
+			level: ApprovalLevel::Platform as i32,
+			fields: vec![evconcierge_contracts::concierge::v1::ApprovalFieldSpec {
+				key: "note".into(),
+				label: "note".into(),
+				r#type: ApprovalFieldType::Text as i32,
+				required: true,
+			}],
+			escalations: vec![],
+			proposer: String::new(),
+		}],
+		notification_topics: vec![],
+	});
+	publish.metadata_mut().insert("x-ev-client-id", MetadataValue::try_from(fx.client.id.as_str()).unwrap());
+	publish
+		.metadata_mut()
+		.insert("authorization", MetadataValue::try_from(format!("Bearer {}", fx.client.secret)).unwrap());
+	ScopeCatalogs::new(callers, catalogs).publish_scope_catalog(publish).await.expect("publish the client's kind");
+	let auth_subject: String = sqlx::query_scalar("SELECT auth_subject FROM users WHERE id = $1")
+		.bind(user.raw())
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	let propose = |token: String| {
+		let mut request = as_client(Request::new(ProposeRequest {
+			kind: kind.clone(),
+			scope: fx.client.namespace.clone(),
+			subject_ref: format!("policy:{}", Uuid::new_v4()),
+			requested_by: auth_subject.clone(),
+			reason: "Fee change".into(),
+			fields: vec![ApprovalFieldValue {
+				key: "note".into(),
+				value: Some(FieldValue::Text("raise".into())),
+			}],
+			dedupe_key: Uuid::new_v4().to_string(),
+		}));
+		request.metadata_mut().insert("x-ev-user-token", MetadataValue::try_from(token).unwrap());
+		services.propose(request)
+	};
+
+	// The ordinary sign-in token carries no auth_time: it proves nothing.
+	let verifier = random(48);
+	let location = get(&router, &authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&verifier)), Some(&cookie))
+		.await
+		.location
+		.unwrap();
+	let plain = fx.exchange(&params(&location)["code"], &verifier).await.unwrap();
+	let refused = propose(plain.access_token).await.unwrap_err();
+	assert_eq!(refused.code(), Code::FailedPrecondition, "{}", refused.message());
+	assert!(refused.message().starts_with("reauth_required: "), "{}", refused.message());
+
+	// After a confirmation trip: the real verifier admits it and the proof is accepted —
+	// whatever the platform's owners then make of the roster, it is not the proof that fails.
+	let verifier = random(48);
+	let challenge = s256_challenge(&verifier);
+	let (_, back_path) = confirm_trip(&fx, &router, &cookie, &challenge).await;
+	let sessions = web::WebSessions::from_env().await.unwrap();
+	sessions
+		.start_trip(
+			&web::trip_key(session_id(&cookie), &fx.client.id, &challenge),
+			i64::try_from(now_secs()).unwrap() - 10,
+			web::TRIP_TTL_SECS,
+		)
+		.await
+		.unwrap();
+	sessions
+		.reauthenticated(session_id(&cookie), &user.to_string(), &fx.auth)
+		.await
+		.unwrap()
+		.expect("re-authenticated");
+	let location = get(&router, &back_path, Some(&cookie)).await.location.unwrap();
+	let confirmed = fx.exchange(&params(&location)["code"], &verifier).await.unwrap();
+	match propose(confirmed.access_token.clone()).await {
+		Ok(opened) => assert!(opened.into_inner().requested_by_proven, "the initiator is proven"),
+		Err(status) => {
+			assert_eq!(status.code(), Code::FailedPrecondition, "{}", status.message());
+			assert!(!status.message().contains("reauth_required"), "the proof itself held: {}", status.message());
+		}
+	}
 }

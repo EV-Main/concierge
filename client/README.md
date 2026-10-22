@@ -28,12 +28,13 @@ let tokens = concierge.exchange_code(&code, redirect_uri, &verifier).await?;
 let me = concierge.get_me(&tokens.access_token).await?;
 ```
 
-**A fresh confirmation** (D24(1); `docs/SCOPES-AND-APPROVALS.md` §3.2, §5.2). The
-access token carries `auth_time`, the platform session's last interactive authentication
-when the code was issued; a refresh keeps it and never moves it. To show that the person
-confirmed just now — the proof `ApprovalExecutionService.Propose` takes in
+**A fresh confirmation** (D24(1); `docs/SCOPES-AND-APPROVALS.md` §3.2, §5.2). An
+access token carries `auth_time` only when its code ended a confirmation that this
+authorization asked for; an ordinary sign-in gives a token without it, and a refresh
+keeps whatever the session had. To show that the person confirmed just now — the proof `ApprovalExecutionService.Propose` takes in
 `x-ev-user-token` to keep the requester off a `PLATFORM` roster — send the browser to
-`Authorize::url()` with `&max_age=0` appended. concierge then has the person confirm on
+`Authorize::url()` with `&max_age=0` appended (with `prompt: None`: the two together are
+`invalid_request`). concierge then has the person confirm on
 `evinvest.ltd` (email code, password or passkey) and comes back to the same `redirect_uri`
 with a code, or with `error=access_denied` when they dismissed it. Exchange the code and
 present that access token, with `requested_by` set to the person's `auth_subject`, within

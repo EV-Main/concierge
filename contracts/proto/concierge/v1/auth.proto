@@ -51,11 +51,11 @@ service AuthService {
   // fields, no KYC level) — and is refused (UNAUTHENTICATED) everywhere else, here and
   // on the money plane. Signing out of evinvest.ltd (Logout, RevokeSession, revoke-all)
   // revokes the client sessions that sign-in authorized. The refresh token is opaque and bound to the client.
-  // The access token carries `auth_time`: the unix seconds of the evinvest.ltd session's
-  // last interactive authentication when the code was issued (absent if that session
-  // predates the claim). Authorize with `max_age=N` to have the person confirm again
-  // when it is older than N seconds; that is how a client proves a fresh confirmation
-  // to ApprovalExecutionService.Propose.
+  // The access token carries `auth_time` ONLY when the code ended a confirmation that
+  // this authorization asked for (`max_age`, docs/SCOPES-AND-APPROVALS.md §3.2): the unix
+  // seconds of the evinvest.ltd session's re-authentication. Any other code gives tokens
+  // without it. That is how a client proves a fresh confirmation to
+  // ApprovalExecutionService.Propose.
   rpc ExchangeCode(ExchangeCodeRequest) returns (ClientTokenResponse);
 
   // Rotate a relying party's refresh token. The account is re-checked on EVERY rotation,

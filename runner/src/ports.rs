@@ -283,8 +283,8 @@ pub struct NewCode<'a> {
 	/// The `evinvest.ltd` refresh family the browser was signed in with; the session
 	/// the code opens inherits it, so signing out there ends it.
 	pub upstream_family: &'a str,
-	/// That session's last interactive authentication (unix seconds). The session the
-	/// code opens keeps it, and every client access token carries it.
+	/// The confirmation's `auth_time` (unix seconds), when the code ended a trip that asked
+	/// for one. The session the code opens keeps it, and its access tokens carry it.
 	pub auth_time: Option<u64>,
 	pub issued_at: i64,
 	pub expires_at: i64,

@@ -153,7 +153,8 @@ pub enum Admission {
 pub struct Requester<'a> {
 	/// The `evinvest.ltd` refresh family the browser is signed in with.
 	pub upstream_family: &'a str,
-	/// That session's last interactive authentication, as its own access token states it.
+	/// That session's `auth_time` when it ended a confirmation trip this request began
+	/// (`web::authorize`), else `None`: no other `auth_time` may reach the client.
 	pub auth_time: Option<u64>,
 	pub client_ip: &'a str,
 	pub user_agent: &'a str,
