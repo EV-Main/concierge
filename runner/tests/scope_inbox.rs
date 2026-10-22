@@ -838,6 +838,28 @@ async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
 	assert_eq!(target("— no base"), "https://evinvest.ltd/cabinet/wallet/action/payment/42");
 }
 
+/// A relying party links only into its own scope's cabinet; only the bridge names another.
+#[tokio::test]
+async fn a_client_names_only_its_own_scope_as_link_scope() {
+	let Some(fx) = setup().await else { return };
+	let sa = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&sa]);
+	let (member, email) = fx.user("link-scope-client").await;
+	fx.join(&sa, member).await;
+	fx.follow(member, &email, &sa.topic).await;
+
+	let mut foreign = emit(member, &sa.topic);
+	foreign.link = "/wallet".into();
+	foreign.link_scope = "invest".into();
+	assert_eq!(inbox.emit_scope_notification(as_client(foreign, &sa)).await.unwrap_err().code(), Code::PermissionDenied);
+	assert_eq!(fx.rows_on(member, &sa.topic).await, 0, "nothing is written");
+
+	let mut own = emit(member, &sa.topic);
+	own.link = "/wallet".into();
+	own.link_scope = sa.id.clone();
+	assert!(inbox.emit_scope_notification(as_client(own, &sa)).await.unwrap().into_inner().delivered);
+}
+
 /// A row written before the emit rule held only a length check, or under a base removed
 /// since, reaches the reader without its link: a cabinet renders an absolute one as given.
 #[tokio::test]

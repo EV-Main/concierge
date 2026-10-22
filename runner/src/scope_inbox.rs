@@ -234,6 +234,15 @@ impl ScopeInboxService for ScopeInbox {
 			ServiceCaller::Client(client) => Some(client.scope.clone()),
 		};
 		let req = request.into_inner();
+		// A relying party speaks for its own scope only, so it must not send its users into
+		// another direction's cabinet. The bridge is free: a wallet notice of `bank` is about
+		// money held for a scope, and that scope's cabinet is where it is read.
+		if let ServiceCaller::Client(client) = &caller
+			&& !req.link_scope.is_empty()
+			&& req.link_scope != client.scope
+		{
+			return Err(Status::permission_denied("a relying party links only into its own scope's cabinet"));
+		}
 		let ours = topic(&req.topic).is_none() && req.topic.split_once(':').is_some_and(|(namespace, _)| namespace == caller.namespace());
 		if !ours {
 			return Err(Status::permission_denied("a service emits only its own namespace's topics"));

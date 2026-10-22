@@ -864,7 +864,9 @@ the offer when a later catalog withdraws them.
   cabinet path: one leading `/` (not `//` or `/\`), printable ASCII without spaces, else
   `INVALID_ARGUMENT` — the rule the money plane's fee notice link already had
   (`notice_link::cabinet_path`), so an emitter never names a host. `link_scope` names the
-  cabinet (`[a-z][a-z0-9_]{0,31}`, else `INVALID_ARGUMENT`). When `NOTICE_LINK_BASES` has a
+  cabinet (`[a-z][a-z0-9_]{0,31}`, else `INVALID_ARGUMENT`). A relying party may name only
+  its own scope, else `PERMISSION_DENIED`; the bridge token names any, because a `bank`
+  notice is about money held for a scope and is read in that scope's cabinet. When `NOTICE_LINK_BASES` has a
   base for it, the emit stores the absolute link `base + link`; otherwise the link stays
   relative and the mail joins it onto `CABINET_URL`. A stored link is checked again
   whenever it leaves this plane (`notice_link::NoticeLinkBases`), because rows outlive both

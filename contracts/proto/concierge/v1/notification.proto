@@ -84,7 +84,8 @@ message EmitRequest {
   // Domain time of the underlying event, unix seconds. 0 ⇒ server clock.
   int64 occurred_at = 8;
   // The scope whose cabinet `link` opens in, e.g. "invest" ([a-z][a-z0-9_]{0,31}, else
-  // INVALID_ARGUMENT). When this plane configures a base for it (`NOTICE_LINK_BASES`),
+  // INVALID_ARGUMENT). A relying party may name only its own scope (else
+  // PERMISSION_DENIED); the bridge token may name any. When this plane configures a base for it (`NOTICE_LINK_BASES`),
   // the stored link — and so `Notification.link` — is that base plus `link`, an absolute
   // URL. Empty, or a scope with no base, keeps `link` relative to `CABINET_URL`.
   string link_scope = 9;
