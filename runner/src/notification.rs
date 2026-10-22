@@ -495,19 +495,13 @@ pub struct Notifications {
 }
 
 impl Notifications {
-	pub fn new(notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, limiter: Arc<RateLimiter>) -> Self {
+	pub fn new(notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, limiter: Arc<RateLimiter>, links: Arc<NoticeLinkBases>) -> Self {
 		Self {
 			notifications,
 			users,
 			limiter,
-			links: Arc::default(),
+			links,
 		}
-	}
-
-	/// `NOTICE_LINK_BASES`. Without it every `link_scope` falls back to `CABINET_URL`.
-	pub fn with_link_bases(mut self, links: Arc<NoticeLinkBases>) -> Self {
-		self.links = links;
-		self
 	}
 
 	/// A user's token reads the platform inbox: a scope's own surface signs its users in
@@ -635,6 +629,7 @@ pub fn settings_json(settings: &NotificationSettings) -> serde_json::Value {
 /// ([`crate::scope_inbox`]), so the two can never page or filter differently.
 pub(crate) async fn inbox_page(
 	notifications: &dyn NotificationRepository,
+	links: &NoticeLinkBases,
 	sub: &SubscriberRow,
 	view: &InboxView,
 	req: &ListNotificationsRequest,
@@ -682,7 +677,7 @@ pub(crate) async fn inbox_page(
 				kind: r.kind,
 				title: r.title,
 				body: r.body,
-				link: r.link,
+				link: links.inbox_link(&r.link),
 				occurred_at: r.occurred_at,
 				created_at: r.created_at,
 				read_at: r.read_at,
@@ -763,7 +758,7 @@ impl NotificationService for Notifications {
 		let sub = self.caller(&request).await?;
 		let req = request.get_ref();
 
-		Ok(Response::new(inbox_page(self.notifications.as_ref(), &sub, &view, req).await?))
+		Ok(Response::new(inbox_page(self.notifications.as_ref(), &self.links, &sub, &view, req).await?))
 	}
 
 	async fn get_unread_count(&self, request: Request<GetUnreadCountRequest>) -> Result<Response<GetUnreadCountResponse>, Status> {

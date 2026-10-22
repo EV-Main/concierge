@@ -7,9 +7,10 @@
 //! frontends as it is stored and no column holds the scope. Without a base the link stays
 //! relative and the mail joins it onto `CABINET_URL`, as before.
 //!
-//! The property kept: a mail never links outside `CABINET_URL` or a configured base. The
-//! host comes only from this plane's configuration, and the dispatcher re-checks a stored
-//! absolute link against the configuration in force when it sends.
+//! The property kept: neither a mail nor an inbox read links outside `CABINET_URL` or a
+//! configured base. The host comes only from this plane's configuration, and a stored
+//! absolute link is checked again against the configuration in force whenever it leaves
+//! this plane — rows outlive both the emit rule and the configuration.
 //!
 //! `Result<_, Status>` is tonic's handler error, so the large-err lint does not apply.
 #![allow(clippy::result_large_err)]
@@ -22,9 +23,11 @@ use webauthn_rs::prelude::Url;
 /// The column CHECK `notifications_link_len` (migration 0008), counted in characters.
 const LINK_MAX_CHARS: usize = 512;
 
-/// `NOTICE_LINK_BASES`, parsed: one cabinet base per scope.
-#[derive(Clone, Debug, Default)]
+/// `CABINET_URL` and `NOTICE_LINK_BASES`, parsed: the cabinets a notice may link into.
+#[derive(Clone, Debug)]
 pub struct NoticeLinkBases {
+	/// `CABINET_URL` without a trailing slash: a relative link's cabinet.
+	cabinet: String,
 	/// `(scope, base)`; a base has no trailing slash. A handful of scopes, so a list.
 	bases: Vec<(String, String)>,
 }
@@ -37,7 +40,7 @@ impl NoticeLinkBases {
 	/// host follows the `STEPUP_PROOF_ORIGINS` rule: in production `https`, no port, and
 	/// `PUBLIC_ORIGIN`'s host or a host under it; outside production also loopback. `main`
 	/// is refused, because the root scope's cabinet is `CABINET_URL` itself.
-	pub fn parse(raw: &[String], public_origin: &str, production: bool) -> color_eyre::Result<Self> {
+	pub fn parse(raw: &[String], cabinet_url: &str, public_origin: &str, production: bool) -> color_eyre::Result<Self> {
 		let public = Url::parse(public_origin).context("PUBLIC_ORIGIN is not a URL")?;
 		let public_host = public.host_str().ok_or_else(|| color_eyre::eyre::eyre!("PUBLIC_ORIGIN has no host"))?.to_owned();
 		let mut bases: Vec<(String, String)> = Vec::new();
@@ -79,7 +82,18 @@ impl NoticeLinkBases {
 			}
 			bases.push((scope.to_owned(), base.to_owned()));
 		}
-		Ok(Self { bases })
+		Ok(Self {
+			bases,
+			..Self::cabinet_only(cabinet_url)
+		})
+	}
+
+	/// No scope bases: every link is under `cabinet_url`.
+	pub fn cabinet_only(cabinet_url: &str) -> Self {
+		Self {
+			cabinet: cabinet_url.trim_end_matches('/').to_owned(),
+			bases: Vec::new(),
+		}
 	}
 
 	pub fn base(&self, scope: &str) -> Option<&str> {
@@ -112,31 +126,67 @@ impl NoticeLinkBases {
 	/// The URL a notice mail links to.
 	///
 	/// A stored absolute link passes through unchanged only while it is under
-	/// `cabinet_url` or a base configured NOW, checked at a path boundary. Anything else
+	/// `CABINET_URL` or a base configured NOW, checked at a path boundary. Anything else
 	/// that is absolute — its base was removed from the configuration since, or the row
-	/// was never composed here — links to `cabinet_url` itself: the old host is not
+	/// was never composed here — links to `CABINET_URL` itself: the old host is not
 	/// trusted any longer, and the relative part cannot be recovered without the old
-	/// base. A cabinet path is joined onto `cabinet_url`. A row that is neither — or that
+	/// base. A cabinet path is joined onto `CABINET_URL`. A row that is neither — or that
 	/// carries any byte outside printable ASCII — was written before emitters were held to
-	/// [`cabinet_path`], and also links to `cabinet_url` itself.
-	pub fn mail_target(&self, cabinet_url: &str, stored: &str) -> String {
-		let cabinet = cabinet_url.trim_end_matches('/');
+	/// [`cabinet_path`], and also links to `CABINET_URL` itself.
+	pub fn mail_target(&self, stored: &str) -> String {
+		match self.kind(stored) {
+			Stored::Empty => self.cabinet.clone(),
+			Stored::Path => join(&self.cabinet, stored),
+			Stored::Trusted => stored.to_owned(),
+			Stored::Untrusted => {
+				tracing::warn!(link = stored, "a stored notice link is under no configured cabinet; the mail links to CABINET_URL");
+				self.cabinet.clone()
+			}
+		}
+	}
+
+	/// The link an inbox read returns: the same rule as [`Self::mail_target`], except that
+	/// a link that fails it is dropped rather than replaced — the reader keeps the notice
+	/// and loses only the click. The cabinets put their own origin in front of a path and
+	/// use an absolute link as given, so what leaves here is empty, a cabinet path, or a
+	/// URL under a cabinet configured now.
+	pub fn inbox_link(&self, stored: &str) -> String {
+		match self.kind(stored) {
+			Stored::Empty => String::new(),
+			Stored::Path | Stored::Trusted => stored.to_owned(),
+			Stored::Untrusted => {
+				tracing::warn!(link = stored, "a stored notice link is under no configured cabinet; the inbox returns no link");
+				String::new()
+			}
+		}
+	}
+
+	fn kind(&self, stored: &str) -> Stored {
+		if stored.is_empty() {
+			return Stored::Empty;
+		}
 		if !stored.bytes().all(|b| b.is_ascii_graphic()) {
-			tracing::warn!(link = stored, "a stored notice link carries a non-printable byte; the mail links to CABINET_URL");
-			return cabinet.to_owned();
+			return Stored::Untrusted;
 		}
 		if cabinet_path(stored).is_ok() {
-			return join(cabinet, stored);
+			return Stored::Path;
 		}
-		let trusted = std::iter::once(cabinet)
+		let trusted = std::iter::once(self.cabinet.as_str())
 			.chain(self.bases.iter().map(|(_, base)| base.as_str()))
 			.any(|base| is_under(base, stored));
-		if trusted {
-			return stored.to_owned();
-		}
-		tracing::warn!(link = stored, "a stored notice link is under no configured cabinet base; the mail links to CABINET_URL");
-		cabinet.to_owned()
+		if trusted { Stored::Trusted } else { Stored::Untrusted }
 	}
+}
+
+/// What a stored link is, judged against the configuration in force.
+enum Stored {
+	Empty,
+	/// A cabinet path: relative to `CABINET_URL`.
+	Path,
+	/// Absolute, under `CABINET_URL` or a configured base.
+	Trusted,
+	/// Anything else: a row from before the emit rule, or a base removed since.
+	Untrusted,
 }
 
 /// A CABINET-RELATIVE path, the only link an emitter may send: the host is this plane's
@@ -188,7 +238,7 @@ mod tests {
 	use super::*;
 
 	fn parse(raw: &[&str], production: bool) -> color_eyre::Result<NoticeLinkBases> {
-		NoticeLinkBases::parse(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "https://evinvest.ltd", production)
+		NoticeLinkBases::parse(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>(), CABINET, "https://evinvest.ltd", production)
 	}
 
 	const CABINET: &str = "https://evinvest.ltd/cabinet";
@@ -287,10 +337,10 @@ mod tests {
 	fn the_mail_passes_a_configured_base_and_joins_everything_else_onto_the_cabinet() {
 		let bases = parse(&["invest=https://invest.evinvest.ltd/cabinet"], true).unwrap();
 		let invest = "https://invest.evinvest.ltd/cabinet/wallet/action/payment/1";
-		assert_eq!(bases.mail_target(CABINET, invest), invest);
-		assert_eq!(bases.mail_target(CABINET, "/wallet"), "https://evinvest.ltd/cabinet/wallet");
-		assert_eq!(bases.mail_target(&format!("{CABINET}/"), ""), CABINET);
-		assert_eq!(bases.mail_target(CABINET, "https://evinvest.ltd/cabinet/x"), "https://evinvest.ltd/cabinet/x");
+		assert_eq!(bases.mail_target(invest), invest);
+		assert_eq!(bases.mail_target("/wallet"), "https://evinvest.ltd/cabinet/wallet");
+		assert_eq!(NoticeLinkBases::cabinet_only(&format!("{CABINET}/")).mail_target(""), CABINET);
+		assert_eq!(bases.mail_target("https://evinvest.ltd/cabinet/x"), "https://evinvest.ltd/cabinet/x");
 		for foreign in [
 			"https://attacker.example/cabinet",
 			"https://invest.evinvest.ltd/cabinetx",
@@ -303,13 +353,44 @@ mod tests {
 			"/x\u{200B}https://phish.example/login",
 			"@phish.example/x",
 		] {
-			assert_eq!(bases.mail_target(CABINET, foreign), CABINET, "{foreign:?}");
+			assert_eq!(bases.mail_target(foreign), CABINET, "{foreign:?}");
+			assert_eq!(bases.inbox_link(foreign), "", "{foreign:?}");
 		}
 	}
 
 	#[test]
 	fn a_base_removed_from_the_configuration_sends_its_old_links_to_the_cabinet() {
 		let stored = parse(&["invest=https://invest.evinvest.ltd/cabinet"], true).unwrap().stored_link("invest", "/wallet").unwrap();
-		assert_eq!(NoticeLinkBases::default().mail_target(CABINET, &stored), CABINET);
+		let retired = NoticeLinkBases::cabinet_only(CABINET);
+		assert_eq!(retired.mail_target(&stored), CABINET);
+		assert_eq!(retired.inbox_link(&stored), "");
+	}
+
+	/// Rows written before the emit rule held only a length check, so an inbox read is the
+	/// last place a hostile one can be stopped before a cabinet renders it as a link.
+	#[test]
+	fn the_inbox_returns_a_path_or_a_configured_cabinet_and_drops_anything_else() {
+		let bases = parse(&["invest=https://invest.evinvest.ltd/cabinet"], true).unwrap();
+		for kept in [
+			"",
+			"/wallet",
+			"/wallet/action/payment/1?x=1",
+			"https://invest.evinvest.ltd/cabinet/wallet",
+			"https://evinvest.ltd/cabinet/x",
+		] {
+			assert_eq!(bases.inbox_link(kept), kept, "{kept:?}");
+		}
+		for dropped in [
+			"https://phish.example/login",
+			"javascript:alert(1)",
+			"data:text/html,x",
+			"funds/quy-nhon",
+			"@phish.example/x",
+			"/x\u{200B}y",
+			"/x y",
+			"https://sa.evinvest.ltd/cabinet/x",
+		] {
+			assert_eq!(bases.inbox_link(dropped), "", "{dropped:?}");
+		}
 	}
 }

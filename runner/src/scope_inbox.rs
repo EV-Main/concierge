@@ -72,20 +72,20 @@ struct Reader {
 }
 
 impl ScopeInbox {
-	pub fn new(callers: ServiceCallers, notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, user_tokens: Option<ClientTokenAuthenticator>) -> Self {
+	pub fn new(
+		callers: ServiceCallers,
+		notifications: Arc<dyn NotificationRepository>,
+		users: Arc<dyn UserDirectoryRepository>,
+		user_tokens: Option<ClientTokenAuthenticator>,
+		links: Arc<NoticeLinkBases>,
+	) -> Self {
 		Self {
 			callers,
 			notifications,
 			users,
 			user_tokens,
-			links: Arc::default(),
+			links,
 		}
-	}
-
-	/// `NOTICE_LINK_BASES`. Without it every `link_scope` falls back to `CABINET_URL`.
-	pub fn with_link_bases(mut self, links: Arc<NoticeLinkBases>) -> Self {
-		self.links = links;
-		self
 	}
 
 	async fn client<T>(&self, request: &Request<T>) -> Result<ClientCaller, Status> {
@@ -171,7 +171,7 @@ impl ScopeInboxService for ScopeInbox {
 			unread_only: req.unread_only,
 			topic: req.topic,
 		};
-		Ok(Response::new(inbox_page(self.notifications.as_ref(), &sub, &reader.view, &page).await?))
+		Ok(Response::new(inbox_page(self.notifications.as_ref(), &self.links, &sub, &reader.view, &page).await?))
 	}
 
 	async fn get_scope_unread_count(&self, request: Request<GetScopeUnreadCountRequest>) -> Result<Response<GetUnreadCountResponse>, Status> {

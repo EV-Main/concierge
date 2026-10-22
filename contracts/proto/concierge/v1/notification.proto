@@ -106,8 +106,10 @@ message Notification {
   string kind = 3;
   string title = 4;
   string body = 5;
-  // A cabinet-relative path, or an absolute URL under a scope's cabinet when the emit
-  // named a configured `link_scope`. A reader must not prefix an absolute one.
+  // It is empty, a path that starts with one '/', or an https:// URL under a cabinet this
+  // plane configures. A reader uses a link that starts with https:// as given and puts its
+  // cabinet in front of any other link. A stored link outside those cabinets is returned
+  // empty.
   string link = 6;
   // Unix seconds.
   int64 occurred_at = 7;

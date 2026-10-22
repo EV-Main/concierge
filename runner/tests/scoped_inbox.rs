@@ -321,7 +321,12 @@ async fn a_user_token_on_grpc_reads_the_platform_inbox() {
 	let bank = bank_topic(&pool).await;
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let repo = Arc::new(PgNotifications::new(pool.clone()));
-	let service = Notifications::new(repo.clone(), users.clone(), Arc::new(RateLimiter::new(std::time::Duration::from_secs(60), 10)));
+	let service = Notifications::new(
+		repo.clone(),
+		users.clone(),
+		Arc::new(RateLimiter::new(std::time::Duration::from_secs(60), 10)),
+		std::sync::Arc::new(concierge::notice_link::NoticeLinkBases::cabinet_only("https://evinvest.ltd/cabinet")),
+	);
 	let user = users.resolve(common::google("grpc", true), 0).await.unwrap();
 	let id = user.id().raw();
 	join(&pool, &a_scope, id).await;

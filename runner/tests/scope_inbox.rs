@@ -55,6 +55,7 @@ const BRIDGE_TOKEN: &str = "test-bridge-token";
 const TEST_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIKolOSMXwE+tafZkX+jkKYJbmJ066f4E12wAwTIkKps6\n-----END PRIVATE KEY-----\n";
 const TEST_JWK_X: &str = "Z6BCmq9-_wo9d7co5CDW84Wn0sAC3BA0XWK2AOstpV4";
 const ISSUER: &str = "https://auth.concierge.test";
+const CABINET: &str = "https://evinvest.ltd/cabinet";
 
 struct Fx {
 	pool: PgPool,
@@ -142,6 +143,10 @@ fn now() -> i64 {
 impl Fx {
 	/// The service as `main` mounts it, verifying the user tokens of `clients`.
 	fn inbox(&self, clients: &[&Scope]) -> ScopeInbox {
+		self.inbox_with(clients, Arc::new(NoticeLinkBases::cabinet_only(CABINET)))
+	}
+
+	fn inbox_with(&self, clients: &[&Scope], links: Arc<NoticeLinkBases>) -> ScopeInbox {
 		let verifier = Verifier::try_new(VerifierConfig {
 			issuer: ISSUER.into(),
 			audiences: clients.iter().map(|s| s.client.clone()).collect(),
@@ -154,6 +159,7 @@ impl Fx {
 			self.notifications.clone(),
 			self.users.clone(),
 			Some(ClientTokenAuthenticator::new(verifier, self.rp.clone())),
+			links,
 		)
 	}
 
@@ -609,6 +615,11 @@ impl Fx {
 	async fn publish_bank(&self, topics: &[NotificationTopic]) {
 		let catalogs = PgScopeCatalogs::new(self.pool.clone());
 		loop {
+			if let Some(current) = catalogs.current("bank").await.unwrap()
+				&& topics.iter().all(|t| current.notification_topics.contains(t))
+			{
+				return;
+			}
 			let mut catalog = catalogs.current("bank").await.unwrap().unwrap_or(ScopeCatalog {
 				version: 0,
 				approval_kinds: Vec::new(),
@@ -676,7 +687,12 @@ async fn a_service_emits_only_its_own_namespace_s_published_topics_to_members() 
 	assert_eq!(fx.rows_on(member, &mine.topic).await, 1, "no refused emit wrote anything");
 
 	// A `typ=service` token names no namespace, so it reaches no scope's topic at all.
-	let service = Notifications::new(fx.notifications.clone(), fx.users.clone(), Arc::new(RateLimiter::new(Duration::from_secs(60), 10)));
+	let service = Notifications::new(
+		fx.notifications.clone(),
+		fx.users.clone(),
+		Arc::new(RateLimiter::new(Duration::from_secs(60), 10)),
+		Arc::new(NoticeLinkBases::cabinet_only(CABINET)),
+	);
 	let mut unbound = Request::new(emit(member, &other.topic));
 	unbound.extensions_mut().insert(Claims {
 		iss: ISSUER.into(),
@@ -748,13 +764,15 @@ impl EmailTransport for Outbox {
 #[tokio::test]
 async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
 	let Some(fx) = setup().await else { return };
-	let bases = Arc::new(NoticeLinkBases::parse(&["invest=https://invest.evinvest.ltd/cabinet".to_owned()], "https://evinvest.ltd", true).unwrap());
+	let bases = Arc::new(NoticeLinkBases::parse(&["invest=https://invest.evinvest.ltd/cabinet".to_owned()], CABINET, "https://evinvest.ltd", true).unwrap());
 	let scope = fx.scope(&[]).await;
-	let inbox = fx.inbox(&[&scope]).with_link_bases(bases.clone());
-	let topic = "bank:link_scope_test".to_owned();
+	let inbox = fx.inbox_with(&[&scope], bases.clone());
+	// The topic of the bridge test beside it: each new `bank` topic bumps the shared
+	// catalog's version past the clock, which `scoped_inbox`'s publication must beat.
+	let topic = "bank:emit_test".to_owned();
 	fx.publish_bank(&[NotificationTopic {
 		topic: topic.clone(),
-		label: "Wallet".into(),
+		label: "Money".into(),
 		description: String::new(),
 		default_subscribed: false,
 	}])
@@ -798,7 +816,7 @@ async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
 	let outbox = Outbox::default();
 	let cfg = DispatcherConfig {
 		mail_from: "EV <noreply@evinvest.test>".into(),
-		cabinet_url: "https://evinvest.ltd/cabinet".into(),
+		cabinet_url: CABINET.into(),
 		notice_links: bases,
 		public_origin: "https://evinvest.ltd".into(),
 		approvals_url: "https://evinvest.ltd/admin/approvals".into(),
@@ -818,6 +836,32 @@ async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
 	assert_eq!(target("— scoped"), "https://invest.evinvest.ltd/cabinet/wallet/action/payment/42");
 	assert_eq!(target("— unscoped"), "https://evinvest.ltd/cabinet/wallet/action/payment/42");
 	assert_eq!(target("— no base"), "https://evinvest.ltd/cabinet/wallet/action/payment/42");
+}
+
+/// A row written before the emit rule held only a length check, or under a base removed
+/// since, reaches the reader without its link: a cabinet renders an absolute one as given.
+#[tokio::test]
+async fn an_inbox_read_drops_a_stored_link_under_no_configured_cabinet() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&scope]);
+	let (user, email) = fx.user("inbox-link").await;
+	fx.join(&scope, user).await;
+	let hostile = ["https://phish.example/login", "javascript:alert(1)", "https://invest.evinvest.ltd/cabinet/wallet"];
+	let kept = ["/wallet", "https://evinvest.ltd/cabinet/x"];
+	for link in hostile.iter().chain(kept.iter()) {
+		let id = fx.note(user, &email, &scope.topic).await;
+		sqlx::query("UPDATE notifications SET link = $2 WHERE id = $1")
+			.bind(id)
+			.bind(link)
+			.execute(&fx.pool)
+			.await
+			.unwrap();
+	}
+	let page = inbox.list_scope_notifications(as_client(list(user), &scope)).await.unwrap().into_inner();
+	let mut links: Vec<String> = page.notifications.into_iter().map(|n| n.link).collect();
+	links.sort();
+	assert_eq!(links, vec!["", "", "", "/wallet", "https://evinvest.ltd/cabinet/x"], "no base is configured here");
 }
 
 fn unfollow(topic: &str) -> SetScopeTopicSubscriptionRequest {

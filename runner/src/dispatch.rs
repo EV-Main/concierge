@@ -48,8 +48,8 @@ pub struct DispatcherConfig {
 	pub mail_from: String,
 	/// Origin the cabinet is served from; builds links inside emails.
 	pub cabinet_url: String,
-	/// The scope cabinets a stored absolute notice link may point under, besides
-	/// `cabinet_url`; checked again at send time against the configuration in force.
+	/// `cabinet_url` and the scope cabinets a stored notice link may point under, checked
+	/// again at send time against the configuration in force.
 	pub notice_links: Arc<NoticeLinkBases>,
 	/// `PUBLIC_ORIGIN`: the confirm/unsubscribe links are its `/api/auth/notifications/*`.
 	pub public_origin: String,
@@ -349,7 +349,7 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 				label,
 				job.title.as_deref()?,
 				job.body.as_deref().unwrap_or(""),
-				&cfg.notice_links.mail_target(&cfg.cabinet_url, job.link.as_deref().unwrap_or("")),
+				&cfg.notice_links.mail_target(job.link.as_deref().unwrap_or("")),
 				job.occurred_at.unwrap_or_default(),
 				&unsubscribe_url,
 			)

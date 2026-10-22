@@ -37,7 +37,12 @@ async fn setup() -> Option<Fx> {
 	db::migrate(&pool).await.expect("apply migrations");
 	let notifications = Arc::new(PgNotifications::new(pool.clone()));
 	let users = Arc::new(PgUsers::new(pool.clone()));
-	let service = Notifications::new(notifications.clone(), users.clone(), Arc::new(RateLimiter::new(Duration::from_secs(60), 1000)));
+	let service = Notifications::new(
+		notifications.clone(),
+		users.clone(),
+		Arc::new(RateLimiter::new(Duration::from_secs(60), 1000)),
+		std::sync::Arc::new(concierge::notice_link::NoticeLinkBases::cabinet_only("https://evinvest.ltd/cabinet")),
+	);
 	Some(Fx {
 		pool,
 		service,

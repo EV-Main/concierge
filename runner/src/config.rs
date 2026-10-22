@@ -99,7 +99,8 @@ ev::settings! {
 		/// (comma-separated `scope=base`, e.g. `invest=https://invest.evinvest.ltd/cabinet`;
 		/// banking#580). Empty ⇒ every notice links under `cabinet_url`. A malformed entry
 		/// refuses the boot (`notice_link::NoticeLinkBases::parse`). Removing an entry later
-		/// sends that scope's already stored links to `cabinet_url` in mail.
+		/// sends that scope's already stored links to `cabinet_url` in mail and
+		/// drops them from inbox reads.
 		notice_link_bases: Vec<String> = "",
 		/// The approvals page of the admin console; an approval mail links to
 		/// `<APPROVALS_URL>/<id>`. Configuration and never the proposer's: no service
