@@ -86,7 +86,7 @@ impl NoticeLinkBases {
 		self.bases.iter().find(|(s, _)| s == scope).map(|(_, base)| base.as_str())
 	}
 
-	/// The link an emit stores. `link` has passed [`relative_link`] already.
+	/// The link an emit stores. `link` has passed [`cabinet_path`] already.
 	///
 	/// A scope with no base keeps the relative link rather than refusing: the emitter
 	/// cannot know this plane's configuration, and `CABINET_URL` is the documented
@@ -116,10 +116,16 @@ impl NoticeLinkBases {
 	/// that is absolute — its base was removed from the configuration since, or the row
 	/// was never composed here — links to `cabinet_url` itself: the old host is not
 	/// trusted any longer, and the relative part cannot be recovered without the old
-	/// base. A relative link is joined onto `cabinet_url`, as it always was.
+	/// base. A cabinet path is joined onto `cabinet_url`. A row that is neither — or that
+	/// carries any byte outside printable ASCII — was written before emitters were held to
+	/// [`cabinet_path`], and also links to `cabinet_url` itself.
 	pub fn mail_target(&self, cabinet_url: &str, stored: &str) -> String {
 		let cabinet = cabinet_url.trim_end_matches('/');
-		if !is_absolute(stored) {
+		if !stored.bytes().all(|b| b.is_ascii_graphic()) {
+			tracing::warn!(link = stored, "a stored notice link carries a non-printable byte; the mail links to CABINET_URL");
+			return cabinet.to_owned();
+		}
+		if cabinet_path(stored).is_ok() {
 			return join(cabinet, stored);
 		}
 		let trusted = std::iter::once(cabinet)
@@ -133,34 +139,36 @@ impl NoticeLinkBases {
 	}
 }
 
-/// The emitter-side rule: a cabinet-relative path, or none. A host is this plane's to
-/// choose (`link_scope`), so anything a browser would read as leaving the path — a
-/// scheme, `//host`, a backslash that browsers turn into `/` — is refused. Whitespace and
-/// control characters are refused too: the mail's text part prints the link bare on its
-/// own line, and a newline there would add a second, foreign line.
-pub fn relative_link(raw: &str) -> Result<(), Status> {
-	if raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
-		return Err(Status::invalid_argument("link must not contain whitespace or control characters"));
+/// A CABINET-RELATIVE path, the only link an emitter may send: the host is this plane's
+/// to choose (`CABINET_URL`, or a base by `link_scope`). One leading `/` and printable
+/// ASCII only — `//host` is protocol-relative and `/\host` is what browsers make of it,
+/// so both are refused, and so is a path without the `/` (`@host/x`), which a reader that
+/// writes origin + link turns into another host. ASCII, because the mail's text part
+/// prints the link bare on its own line: an invisible character (U+200B, U+202E) folds
+/// to a space there and starts a second, foreign link on that line. The empty path means
+/// the cabinet's front page. The money plane's fee notice link is held to the same rule.
+pub fn cabinet_path(raw: &str) -> Result<String, Status> {
+	if raw.is_empty() {
+		return Ok(String::new());
 	}
-	if is_absolute(raw) {
-		return Err(Status::invalid_argument("link must be a cabinet-relative path; name the scope in link_scope for another cabinet"));
+	if raw.len() > LINK_MAX_CHARS {
+		return Err(Status::invalid_argument(format!("link must be at most {LINK_MAX_CHARS} bytes")));
 	}
-	Ok(())
-}
-
-/// What a browser resolves to another host or scheme: a scheme before the first `/`, `?`
-/// or `#` (RFC 3986 §4.2 forbids a `:` in a relative path's first segment for this
-/// reason), a leading `//`, or a backslash anywhere in the leading slashes.
-fn is_absolute(raw: &str) -> bool {
-	let head = raw.split(['/', '?', '#']).next().unwrap_or_default();
-	head.contains(':') || raw.trim_start_matches(['/', '\\']).len() + 1 < raw.len() || raw.starts_with('\\') || raw.starts_with("/\\")
+	if !raw.bytes().all(|b| b.is_ascii_graphic()) {
+		return Err(Status::invalid_argument("link must not contain whitespace or non-printable characters"));
+	}
+	let mut chars = raw.chars();
+	if chars.next() != Some('/') || matches!(chars.next(), Some('/' | '\\')) {
+		return Err(Status::invalid_argument("link must be a cabinet-relative path starting with a single '/'"));
+	}
+	Ok(raw.to_owned())
 }
 
 /// `link` is `base` or below it. The boundary is checked explicitly, as
 /// `MailRelay::check_origin` does: a bare `starts_with` would also accept
 /// `https://invest.evinvest.ltd.attacker.example`.
 fn is_under(base: &str, link: &str) -> bool {
-	if link.chars().any(|c| c.is_whitespace() || c.is_control()) {
+	if !link.bytes().all(|b| b.is_ascii_graphic()) {
 		return false;
 	}
 	link.strip_prefix(base)
@@ -234,8 +242,8 @@ mod tests {
 
 	#[test]
 	fn an_emitter_names_a_path_and_never_a_host() {
-		for ok in ["", "/wallet", "/wallet/action/payment/0b7c", "funds/quy-nhon", "/a?next=https://x", "/a#b"] {
-			assert!(relative_link(ok).is_ok(), "{ok:?}");
+		for ok in ["", "/wallet", "/wallet/action/payment/0b7c", "/invest/quy-nhon", "/a?next=https://x", "/a#b"] {
+			assert!(cabinet_path(ok).is_ok(), "{ok:?}");
 		}
 		for bad in [
 			"https://invest.evinvest.ltd/cabinet/wallet",
@@ -247,8 +255,13 @@ mod tests {
 			"///attacker.example",
 			"/wallet\nhttps://attacker.example",
 			"/wallet https://attacker.example",
+			"/x\u{200B}https://phish.example/login",
+			"/x\u{202E}",
+			"/x\u{FEFF}",
+			"@phish.example/x",
+			"funds/quy-nhon",
 		] {
-			assert!(relative_link(bad).is_err(), "{bad:?}");
+			assert!(cabinet_path(bad).is_err(), "{bad:?}");
 		}
 	}
 
@@ -284,7 +297,11 @@ mod tests {
 			"https://invest.evinvest.ltd/cabinet.attacker.example/x",
 			"https://invest.evinvest.ltd/cabinet//attacker.example",
 			"https://invest.evinvest.ltd/cabinet/x\nhttps://attacker.example",
+			"https://invest.evinvest.ltd/cabinet/x\u{200B}https://attacker.example",
 			"//attacker.example",
+			"/x\nhttps://attacker.example",
+			"/x\u{200B}https://phish.example/login",
+			"@phish.example/x",
 		] {
 			assert_eq!(bases.mail_target(CABINET, foreign), CABINET, "{foreign:?}");
 		}

@@ -55,7 +55,7 @@ use uuid::Uuid;
 use crate::{
 	authz::caller_gate,
 	infrastructure::notifications::SubscriberRow,
-	notice_link::{NoticeLinkBases, relative_link},
+	notice_link::{NoticeLinkBases, cabinet_path},
 	ports::{InboxTopics, NotificationRepository, UserDirectoryRepository},
 	service_caller::BANK_NAMESPACE,
 	support::domain_to_status,
@@ -267,10 +267,7 @@ pub(crate) fn emit_fields(req: &EmitRequest) -> Result<Uuid, Status> {
 	if req.body.chars().count() > 2000 {
 		return Err(Status::invalid_argument("body must be at most 2000 characters"));
 	}
-	if req.link.chars().count() > 512 {
-		return Err(Status::invalid_argument("link must be at most 512 characters"));
-	}
-	relative_link(&req.link)?;
+	cabinet_path(&req.link)?;
 	if req.dedupe_key.is_empty() || req.dedupe_key.chars().count() > 128 {
 		return Err(Status::invalid_argument("dedupe_key must be 1-128 characters"));
 	}

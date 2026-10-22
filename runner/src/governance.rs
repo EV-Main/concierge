@@ -69,6 +69,7 @@ use crate::{
 		email::templates::{breaks_or_hides, fmt_ts, pct_change},
 		governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision, UserProposalRecord},
 	},
+	notice_link::cabinet_path,
 	notification::{RateLimiter, now_secs},
 	ports::{Drained, GovernanceMailQueued, GovernanceRepository, LegacyKind, NotificationRepository, UserDirectoryRepository},
 	support::{authenticate_service, domain_to_status},
@@ -1313,29 +1314,6 @@ fn fee_terms(terms: &FeeTermsMsg, field: &str) -> Result<serde_json::Value, Stat
 /// nothing), so it maps to JSON `null` rather than being refused.
 fn current_fee_terms(terms: Option<&FeeTermsMsg>) -> Result<serde_json::Value, Status> {
 	terms.map_or(Ok(serde_json::Value::Null), |t| fee_terms(t, "current"))
-}
-
-/// A CABINET-RELATIVE path, for the one emailed link the money plane does not get to
-/// spell a host for. Where [`MailRelay::approval_link`] pins a URL to our origin, this
-/// admits no origin at all: one leading `/`, printable ASCII, nothing that a browser or
-/// a mail client would read as leaving the cabinet once it is hung off the cabinet's
-/// origin. `//host` is protocol-relative and `/\host` is what browsers make of it, so
-/// both are refused; the empty path means the cabinet's front page.
-fn cabinet_path(raw: &str) -> Result<String, Status> {
-	if raw.is_empty() {
-		return Ok(String::new());
-	}
-	if raw.len() > 512 {
-		return Err(Status::invalid_argument("link must be at most 512 bytes"));
-	}
-	if raw.chars().any(|c| c.is_whitespace() || !c.is_ascii_graphic()) {
-		return Err(Status::invalid_argument("link must not contain whitespace or non-printable characters"));
-	}
-	let mut chars = raw.chars();
-	if chars.next() != Some('/') || matches!(chars.next(), Some('/' | '\\')) {
-		return Err(Status::invalid_argument("link must be a cabinet-relative path starting with a single '/'"));
-	}
-	Ok(raw.to_owned())
 }
 
 /// Where the in-app trace of a mail addressed by IDENTITY — a payment consent, a fee

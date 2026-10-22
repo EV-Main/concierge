@@ -75,9 +75,9 @@ message EmitRequest {
   string kind = 3;
   string title = 4;
   string body = 5;
-  // Cabinet-relative path the notification links to, e.g. "/funds/quy-nhon". Never a
-  // host: a scheme, "//host" or a backslash prefix is INVALID_ARGUMENT, and so are
-  // whitespace and control characters. Which cabinet it opens in is `link_scope`'s.
+  // Cabinet-relative path the notification links to, e.g. "/funds/quy-nhon", or empty.
+  // It starts with one '/' (not "//" or "/\") and is printable ASCII without spaces;
+  // anything else is INVALID_ARGUMENT. Which cabinet it opens in is `link_scope`'s.
   string link = 6;
   // Idempotency key, unique per subscriber. Re-emitting the same key is a no-op.
   string dedupe_key = 7;

@@ -860,9 +860,10 @@ the offer when a later catalog withdraws them.
   account, as the platform inbox shows it to everyone. `NotificationService.Emit` with a
   `typ=service` token keeps this plane's own topics and refuses a scope's
   (`PERMISSION_DENIED`): that token names no namespace.
-- **A notice links into the cabinet of the scope it names** (banking#580). `link` is a
-  cabinet-relative path; a scheme, `//host`, a backslash prefix, whitespace or a control
-  character is `INVALID_ARGUMENT`, so an emitter never names a host. `link_scope` names the
+- **A notice links into the cabinet of the scope it names** (banking#580). `link` is empty or a
+  cabinet path: one leading `/` (not `//` or `/\`), printable ASCII without spaces, else
+  `INVALID_ARGUMENT` — the rule the money plane's fee notice link already had
+  (`notice_link::cabinet_path`), so an emitter never names a host. `link_scope` names the
   cabinet (`[a-z][a-z0-9_]{0,31}`, else `INVALID_ARGUMENT`). When `NOTICE_LINK_BASES` has a
   base for it, the emit stores the absolute link `base + link`, and the inbox returns it as
   stored; otherwise the link stays relative and the mail joins it onto `CABINET_URL`. The

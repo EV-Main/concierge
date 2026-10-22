@@ -34,8 +34,7 @@ pub struct RenderedEmail {
 /// A notification's email copy. `target` is the finished URL; which cabinet it may name
 /// is decided by `notice_link::NoticeLinkBases::mail_target`, not here.
 pub fn notification(topic_label: &str, title: &str, body: &str, target: &str, occurred_at: i64, unsubscribe_url: &str) -> RenderedEmail {
-	// The text part prints the link bare on its own line — see `one_line`. Rows written
-	// before emitters were held to a clean path can still carry a newline.
+	// The text part prints the link bare on its own line — see `one_line`.
 	let target = &one_line(target);
 
 	let mut inner = String::new();
@@ -1026,7 +1025,8 @@ const INITIATOR_NOTE_LABEL: &str = "Text entered by the requester (not written b
 ///
 /// The emailed LINK goes through this too: the text part prints it bare on a line of its
 /// own, so a newline inside it would end our link and start somebody else's on the next
-/// line. The relay refuses such a URL outright; this is the renderer's copy of the rule.
+/// line. The relay refuses such a URL outright, and a notice's link is printable ASCII
+/// before it gets here (`notice_link`); this is the renderer's copy of the rule.
 ///
 /// The HTML part escapes, so markup is already accounted for. The TEXT part does not: it
 /// is a `Label: value` block assembled by `format!`, and a newline inside a value forges
