@@ -50,6 +50,14 @@ impl ScopeState {
 	}
 }
 
+/// A scope's id as the registry writes it: `[a-z][a-z0-9_]{0,31}`. Mirrored by
+/// `tenants_id_format` (migration 0026). A name outside this shape can never match a
+/// registered scope, so anything keyed by one refuses it rather than storing a dead key.
+pub fn is_scope_name(raw: &str) -> bool {
+	let mut bytes = raw.bytes();
+	raw.len() <= 32 && bytes.next().is_some_and(|b| b.is_ascii_lowercase()) && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// A scope origin, exactly as a browser sends `Origin`: `https` only, a SUBdomain of
 /// [`SITE`] (the bare host is `PUBLIC_ORIGIN`, this plane's own, and never a scope's), a
 /// port 1-65535 only when non-default, nothing after the authority. No wildcard and
@@ -128,6 +136,16 @@ mod tests {
 			"",
 		] {
 			assert!(!is_sign_in_origin(bad), "{bad}");
+		}
+	}
+
+	#[test]
+	fn scope_names_follow_the_registry_id() {
+		for ok in ["invest", "sa", "a", "a_1", &"a".repeat(32)] {
+			assert!(is_scope_name(ok), "{ok}");
+		}
+		for bad in ["", "Invest", "1sa", "_sa", "in-vest", "in.vest", "in vest", "invest:x", &"a".repeat(33)] {
+			assert!(!is_scope_name(bad), "{bad}");
 		}
 	}
 
