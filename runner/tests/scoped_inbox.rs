@@ -94,39 +94,48 @@ async fn scope_with(pool: &PgPool, required: bool) -> Scope {
 /// The required `bank:` topic [`bank_topic`] publishes beside the ordinary one.
 const BANK_NOTICE: &str = "bank:notice_test";
 
-/// A `bank:` topic in the money plane's catalog. The catalog is shared, so every test here
-/// publishes the SAME catalog and the race between them is harmless; the version is the
-/// clock's seconds, as the money plane's own, so a real publication on a dev database
-/// still supersedes it. Suites in other binaries never run beside this one.
+/// A `bank:` topic in the money plane's catalog, and the required [`BANK_NOTICE`] beside it.
+/// The catalog is shared with every suite on the database, and `scope_inbox.rs` leaves it a
+/// second ahead of the clock just before this binary runs, so the topics are added to the
+/// catalog in force under a version past both, as that suite does; a race between the tests
+/// here ends in the same content.
 async fn bank_topic(pool: &PgPool) -> String {
 	const TOPIC: &str = "bank:inbox_test";
+	let mine = [
+		NotificationTopic {
+			topic: TOPIC.into(),
+			label: "Money".into(),
+			description: String::new(),
+			default_subscribed: false,
+			required: false,
+			required_reason: String::new(),
+		},
+		NotificationTopic {
+			topic: BANK_NOTICE.into(),
+			label: "Money notices".into(),
+			description: String::new(),
+			default_subscribed: false,
+			required: true,
+			required_reason: REASON.into(),
+		},
+	];
 	let catalogs = PgScopeCatalogs::new(pool.clone());
-	let catalog = ScopeCatalog {
-		version: now() as u64,
-		approval_kinds: Vec::new(),
-		notification_topics: vec![
-			NotificationTopic {
-				topic: TOPIC.into(),
-				label: "Money".into(),
-				description: String::new(),
-				default_subscribed: false,
-				required: false,
-				required_reason: String::new(),
-			},
-			NotificationTopic {
-				topic: BANK_NOTICE.into(),
-				label: "Money notices".into(),
-				description: String::new(),
-				default_subscribed: false,
-				required: true,
-				required_reason: REASON.into(),
-			},
-		],
-	};
-	catalogs.publish("bank", "bridge", &catalog, now()).await.expect("publish the bank catalog");
-	let current = catalogs.current("bank").await.unwrap().expect("a bank catalog is in force");
-	assert!(current.notification_topics.iter().any(|t| t.topic == TOPIC), "{current:?}");
-	TOPIC.into()
+	for _ in 0..10 {
+		let current = catalogs.current("bank").await.unwrap();
+		if current.as_ref().is_some_and(|c| mine.iter().all(|t| c.notification_topics.contains(t))) {
+			return TOPIC.into();
+		}
+		let mut catalog = current.unwrap_or(ScopeCatalog {
+			version: 0,
+			approval_kinds: Vec::new(),
+			notification_topics: Vec::new(),
+		});
+		catalog.notification_topics.retain(|t| mine.iter().all(|m| m.topic != t.topic));
+		catalog.notification_topics.extend(mine.iter().cloned());
+		catalog.version = catalog.version.max(now() as u64) + 1;
+		catalogs.publish("bank", "bridge", &catalog, now()).await.expect("publish the bank catalog");
+	}
+	panic!("the bank catalog never held this suite's topics");
 }
 
 async fn join(pool: &PgPool, scope: &Scope, user: Uuid) {
