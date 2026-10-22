@@ -43,8 +43,6 @@ mod turnstile;
 // The one session-store name tests exercise the persistence invariant through.
 use std::sync::Arc;
 
-/// Re-exported so the integration suite drives a confirmation trip as the route keys it.
-pub use authorize::{CONFIRM_PATH, TRIP_TTL_SECS, trip_key};
 use axum::{
 	Router,
 	http::Method,

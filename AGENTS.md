@@ -779,10 +779,11 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `/api/auth/mfe/reauth.html?return_to=<this request>` — the ordinary re-authentication on
   `PUBLIC_ORIGIN`, never a new sign-in, which would end the client sessions and which a
   provider can complete with no act of the person — after storing a trip
-  (`rpconfirm:<session>:<client>:<PKCE challenge>`, start time, 600 s). The way back takes
-  the trip once: a code carrying `auth_time` when it moved after the trip began (≤ 30 s
-  ahead), else `access_denied`, so a dismissed confirmation never loops; no query flag
-  counts. `GET /auth/clients/{client_id}` gives that page the app's registered
+  (`rpconfirm:<session>:<client>:<PKCE challenge>` = the session's re-authentication count
+  `rpreauths:<session>`, read in the same script; 600 s). The way back takes the trip once:
+  a code carrying `auth_time` when the count moved during the trip — counted, not timed,
+  since a passkey confirms within the trip's own second — and `auth_time` is ≤ 30 s ahead,
+  else `access_denied`, so a dismissed confirmation never loops; no query flag counts. `GET /auth/clients/{client_id}` gives that page the app's registered
   `display_name` (`docs/SCOPES-AND-APPROVALS.md` §3.2). A new sign-in closes the
   browser's previous session and revokes its family, so its client sessions end with it
   (single logout below). A code is 256 random bits stored as a digest, lives

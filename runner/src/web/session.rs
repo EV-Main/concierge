@@ -59,6 +59,25 @@ pub struct Fresh {
 	pub remaining_secs: i64,
 }
 
+/// A confirmation trip of `/auth/authorize`, taken: the session's re-authentication count
+/// when the trip began and now. It confirmed when the count moved in between — counted,
+/// not timed, so a confirmation in the same second as the trip's start counts and one
+/// just before it, in that same second, does not.
+#[derive(Clone, Copy, Debug)]
+pub struct Trip {
+	pub began_at: u64,
+	pub now: u64,
+}
+
+impl Trip {
+	pub fn confirmed(self) -> bool {
+		self.now > self.began_at
+	}
+}
+
+/// How long a session's re-authentication count lives at least: longer than any trip.
+const REAUTH_COUNT_MIN_TTL_SECS: i64 = 3600;
+
 /// A session whose `auth_time` just moved: what the route sets in the browser.
 pub struct Reauthed {
 	pub access_token: String,
@@ -68,9 +87,11 @@ pub struct Reauthed {
 
 pub struct WebSessions {
 	store: Store,
-	/// The confirmation trips of `/auth/authorize` when there is no Redis: key → (started
-	/// at, expires at). With Redis they live there, so any replica can end a trip.
-	trips: Mutex<HashMap<String, (i64, i64)>>,
+	/// Without Redis: the confirmation trips of `/auth/authorize` (key → (the session's
+	/// re-authentication count when it began, expires at)) and each session's count. With
+	/// Redis both live there, so any replica can start, confirm or end a trip.
+	trips: Mutex<HashMap<String, (u64, i64)>>,
+	reauths: Mutex<HashMap<String, u64>>,
 	/// Per-session single-flight for the refresh path: two racing rotations of one
 	/// refresh token read as theft upstream and revoke the family. In-process — see
 	/// `single_flight` for the one-replica caveat.
@@ -91,29 +112,34 @@ impl WebSessions {
 		Ok(Self {
 			store,
 			trips: Mutex::new(HashMap::new()),
+			reauths: Mutex::new(HashMap::new()),
 			locks: KeyedLocks::default(),
 		})
 	}
 
-	/// Remember that `/auth/authorize` sent this browser to confirm, at `started_at`, for
-	/// `ttl_secs`. `key` names the session, the client and the request; a second start
-	/// under it restarts the trip.
-	pub async fn start_trip(&self, key: &str, started_at: i64, ttl_secs: u64) -> color_eyre::Result<()> {
+	/// Remember that `/auth/authorize` sent session `session_id` to confirm, for `ttl_secs`,
+	/// together with how many re-authentications that session had at that moment. `key`
+	/// names the session, the client and the request; a second start under it restarts the
+	/// trip. The count is read and the trip written in one step, so a re-authentication
+	/// lands either before the trip (and does not confirm it) or after (and does).
+	pub async fn start_trip(&self, session_id: &str, key: &str, ttl_secs: u64) -> color_eyre::Result<()> {
 		match &self.store {
 			Store::InProcess(_) => {
+				let reauths = self.reauths.lock().await;
 				let mut trips = self.trips.lock().await;
 				let now = now_secs();
 				trips.retain(|_, (_, expires)| *expires > now);
-				trips.insert(key.to_owned(), (started_at, now.saturating_add_unsigned(ttl_secs)));
+				let count = reauths.get(session_id).copied().unwrap_or(0);
+				trips.insert(key.to_owned(), (count, now.saturating_add_unsigned(ttl_secs)));
 			}
 			Store::Redis(conn) => {
 				let mut conn = conn.clone();
-				let () = redis::cmd("SET")
-					.arg(Self::trip_key(key))
-					.arg(started_at)
-					.arg("EX")
+				let script = redis::Script::new("local c = redis.call('GET', KEYS[2]) or '0' redis.call('SET', KEYS[1], c, 'EX', ARGV[1]) return c");
+				let _count: String = script
+					.key(Self::trip_key(key))
+					.key(Self::reauths_key(session_id))
 					.arg(ttl_secs)
-					.query_async(&mut conn)
+					.invoke_async(&mut conn)
 					.await
 					.context("confirmation trip start")?;
 			}
@@ -121,26 +147,61 @@ impl WebSessions {
 		Ok(())
 	}
 
-	/// The start of the trip under `key`, ending it: a trip is taken once, so coming back
-	/// twice is a new request. GET and DEL in one script, not `GETDEL`, which older Redis
-	/// servers do not have.
-	pub async fn take_trip(&self, key: &str) -> color_eyre::Result<Option<i64>> {
+	/// The trip under `key`, ending it: a trip is taken once, so coming back twice is a new
+	/// request. GET and DEL in one script, not `GETDEL`, which older Redis servers do not have.
+	pub async fn take_trip(&self, session_id: &str, key: &str) -> color_eyre::Result<Option<Trip>> {
 		match &self.store {
 			Store::InProcess(_) => {
+				let reauths = self.reauths.lock().await;
 				let now = now_secs();
-				Ok(self.trips.lock().await.remove(key).filter(|(_, expires)| *expires > now).map(|(started, _)| started))
+				let taken = self.trips.lock().await.remove(key).filter(|(_, expires)| *expires > now);
+				Ok(taken.map(|(began_at, _)| Trip {
+					began_at,
+					now: reauths.get(session_id).copied().unwrap_or(0),
+				}))
 			}
 			Store::Redis(conn) => {
 				let mut conn = conn.clone();
-				let script = redis::Script::new("local v = redis.call('GET', KEYS[1]) if v then redis.call('DEL', KEYS[1]) end return v");
-				let started: Option<i64> = script.key(Self::trip_key(key)).invoke_async(&mut conn).await.context("confirmation trip take")?;
-				Ok(started)
+				let script = redis::Script::new("local v = redis.call('GET', KEYS[1]) if not v then return nil end redis.call('DEL', KEYS[1]) return {v, redis.call('GET', KEYS[2]) or '0'}");
+				let taken: Option<(u64, u64)> = script
+					.key(Self::trip_key(key))
+					.key(Self::reauths_key(session_id))
+					.invoke_async(&mut conn)
+					.await
+					.context("confirmation trip take")?;
+				Ok(taken.map(|(began_at, now)| Trip { began_at, now }))
 			}
 		}
 	}
 
+	/// Count a re-authentication of the session: every pending trip of it that began before
+	/// is now confirmed. Kept as long as the session, and never shorter than an hour, so a
+	/// pending trip cannot outlive the count it was measured against.
+	async fn count_reauth(&self, session_id: &str, expires_at: i64) -> color_eyre::Result<()> {
+		match &self.store {
+			Store::InProcess(_) => {
+				*self.reauths.lock().await.entry(session_id.to_owned()).or_default() += 1;
+			}
+			Store::Redis(conn) => {
+				let mut conn = conn.clone();
+				let script = redis::Script::new("local n = redis.call('INCR', KEYS[1]) redis.call('EXPIREAT', KEYS[1], ARGV[1]) return n");
+				let _count: i64 = script
+					.key(Self::reauths_key(session_id))
+					.arg(expires_at.max(now_secs() + REAUTH_COUNT_MIN_TTL_SECS))
+					.invoke_async(&mut conn)
+					.await
+					.context("re-authentication count")?;
+			}
+		}
+		Ok(())
+	}
+
 	fn trip_key(key: &str) -> String {
 		format!("rpconfirm:{key}")
+	}
+
+	fn reauths_key(session_id: &str) -> String {
+		format!("rpreauths:{session_id}")
 	}
 
 	/// Open a session for a freshly exchanged token pair. Returns
@@ -267,6 +328,7 @@ impl WebSessions {
 			if !self.store.set_access(id, &moved.access_token, moved.access_expires_at).await? {
 				return Ok(Err(tonic::Status::unauthenticated("no such session")));
 			}
+			self.count_reauth(id, s.refresh_expires_at).await?;
 			return Ok(Ok(Reauthed {
 				access_token: moved.access_token,
 				auth_time: moved.auth_time,

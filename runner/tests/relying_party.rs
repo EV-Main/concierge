@@ -1313,15 +1313,11 @@ async fn max_age_sends_a_stale_session_to_confirm_and_only_a_confirmed_trip_stam
 	assert_eq!(params(&location)["state"], "st-123");
 	assert_eq!(codes().await, 0);
 
-	// A new trip, dated as if it began ten seconds ago (a person takes that long), and a
-	// REAL re-authentication of the same session: the code carries the moved `auth_time`.
+	// A new trip and a REAL re-authentication of the same session, at once — as a passkey
+	// with autofill does it, most often in the second the trip began: the code carries the
+	// moved `auth_time`.
 	confirm_trip(&fx, &router, &cookie, &challenge).await;
-	let began = i64::try_from(now_secs()).unwrap() - 10;
 	let sessions = web::WebSessions::from_env().await.unwrap();
-	sessions
-		.start_trip(&web::trip_key(session_id(&cookie), &fx.client.id, &challenge), began, web::TRIP_TTL_SECS)
-		.await
-		.unwrap();
 	let moved = sessions
 		.reauthenticated(session_id(&cookie), &user.to_string(), &fx.auth)
 		.await
@@ -1335,6 +1331,48 @@ async fn max_age_sends_a_stale_session_to_confirm_and_only_a_confirmed_trip_stam
 	// The trip is spent: coming back again is a new request, and `max_age=0` asks again
 	// even a session confirmed just now.
 	let location = get(&router, &uri, Some(&cookie)).await.location.unwrap();
+	confirm_return(&location);
+}
+
+/// Stand run of #193: a confirmation finished in the second its trip began was refused.
+/// A trip is confirmed by a re-authentication DURING it, counted rather than timed: one
+/// right after the trip starts confirms it, and one right before — the same second, the
+/// same `auth_time` — does not.
+#[tokio::test]
+async fn a_confirmation_counts_by_order_not_by_the_second() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let user = fx.user().await;
+	let Some((cookie, _)) = signed_in_browser_at(&fx, user, Some(now_secs() - 600)).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let sessions = web::WebSessions::from_env().await.unwrap();
+	let reauth = || async {
+		sessions
+			.reauthenticated(session_id(&cookie), &user.to_string(), &fx.auth)
+			.await
+			.unwrap()
+			.expect("the session re-authenticates")
+	};
+
+	// Before the trip: the session is fresh, but nothing confirmed THIS trip.
+	reauth().await;
+	let (_, back_path) = confirm_trip(&fx, &router, &cookie, &s256_challenge(&random(48))).await;
+	let location = get(&router, &back_path, Some(&cookie)).await.location.unwrap();
+	assert_eq!(params(&location)["error"], "access_denied", "{location}");
+
+	// During the trip, with no time between the start and the proof.
+	let verifier = random(48);
+	let (_, back_path) = confirm_trip(&fx, &router, &cookie, &s256_challenge(&verifier)).await;
+	let moved = reauth().await;
+	let location = get(&router, &back_path, Some(&cookie)).await.location.unwrap();
+	assert!(location.starts_with(&format!("{}?", fx.client.redirect_uri)), "{location}");
+	let tokens = fx.exchange(&params(&location)["code"], &verifier).await.expect("the code redeems");
+	assert_eq!(claims_of(&tokens.access_token)["auth_time"], moved.auth_time);
+
+	// A taken trip is gone: the same way back again is a new request, and starts a new trip.
+	let location = get(&router, &back_path, Some(&cookie)).await.location.unwrap();
 	confirm_return(&location);
 }
 
@@ -1565,14 +1603,6 @@ async fn a_real_client_token_from_a_trip_proves_the_initiator_and_a_plain_one_do
 	let challenge = s256_challenge(&verifier);
 	let (_, back_path) = confirm_trip(&fx, &router, &cookie, &challenge).await;
 	let sessions = web::WebSessions::from_env().await.unwrap();
-	sessions
-		.start_trip(
-			&web::trip_key(session_id(&cookie), &fx.client.id, &challenge),
-			i64::try_from(now_secs()).unwrap() - 10,
-			web::TRIP_TTL_SECS,
-		)
-		.await
-		.unwrap();
 	sessions
 		.reauthenticated(session_id(&cookie), &user.to_string(), &fx.auth)
 		.await

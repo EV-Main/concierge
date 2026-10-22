@@ -208,13 +208,18 @@ digits, anything else answers `error=invalid_request`; together with `prompt` it
 - a session whose `auth_time` is at most `N` seconds old (`N > 0`): a code without the
   claim. `max_age=0` is met by no session;
 - otherwise: the plane stores a trip — key `rpconfirm:<session id>:<client_id>:<PKCE
-  challenge>`, value the start's unix seconds, 600 s — and answers a 302 to
+  challenge>`, value the session's re-authentication count at that moment, 600 s — and
+  answers a 302 to
   `/api/auth/mfe/reauth.html?return_to=<this request, rebuilt from its parameters>`. That
   page runs the re-authentication of `/auth/reauth/*` (email code, password, passkey;
   `PUBLIC_ORIGIN` only) and navigates to `return_to`, confirmed or dismissed;
 - back with a trip under that key (taken once, so a second return is a new request): a
-  code carrying `auth_time` when the session's `auth_time` is after the trip's start and
-  at most 30 s ahead of the clock, else `error=access_denied` — never a second trip, so a
+  code carrying `auth_time` when the session re-authenticated during the trip (every
+  successful `/auth/reauth/*` counts one, `rpreauths:<session id>`, kept as long as the
+  session) and that `auth_time` is at most 30 s ahead of the clock, else
+  `error=access_denied`. Counted, not timed: a passkey can confirm in the second the trip
+  began, and a re-authentication just before the trip, in that same second, must not
+  count. Never a second trip, so a
   dismissed confirmation does not loop. Another session, another client or another PKCE
   challenge finds no trip; a hand-added query parameter changes nothing.
 

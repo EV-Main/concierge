@@ -19,8 +19,9 @@
 //! the browser's session and every client session with it — but sent to the confirmation
 //! page ([`CONFIRM_PATH`]), which runs the ordinary re-authentication (`/auth/reauth/*`,
 //! `PUBLIC_ORIGIN` only) and comes back here. This route remembers the trip it started
-//! (session, client, PKCE challenge) and takes it back once; only a code issued at the
-//! end of a trip whose confirmation moved `auth_time` after it began carries `auth_time`,
+//! (session, client, PKCE challenge) with the session's re-authentication count, and
+//! takes it back once; only a code issued at the end of a trip during which the session
+//! re-authenticated (the count moved — counted, not timed) carries `auth_time`,
 //! and with it every access token the client gets for it. That is how a client proves the
 //! person confirmed for IT (`approvals`, D24(1)): an `auth_time` this client did not ask
 //! for — a sign-in, a re-authentication for banking — never reaches its tokens, so a
@@ -42,7 +43,7 @@ use crate::{
 	web::{
 		WebState, now_secs,
 		routes::{ClientIp, live_family_of, minted_auth_time, minted_token_version},
-		session::Fresh,
+		session::{Fresh, Trip},
 		sign_in::end_session,
 	},
 };
@@ -200,19 +201,19 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 	let mut confirmed = None;
 	if let Some(max_age) = max_age {
 		let trip = trip_key(session_id, client_id, code_challenge);
-		let started = match st.sessions.take_trip(&trip).await {
-			Ok(started) => started,
+		let taken = match st.sessions.take_trip(session_id, &trip).await {
+			Ok(taken) => taken,
 			Err(err) => {
 				tracing::error!(error = ?err, "relying party: confirmation trip unreadable at authorize");
 				return (refreshed, back.error("temporarily_unavailable")).into_response();
 			}
 		};
 		let now = now_secs();
-		match decide(max_age, auth_time, started, now) {
+		match decide(max_age, auth_time, taken, now) {
 			Decision::Code => {}
 			Decision::Confirmed(at) => confirmed = Some(at),
 			Decision::Confirm => {
-				if let Err(err) = st.sessions.start_trip(&trip, now, TRIP_TTL_SECS).await {
+				if let Err(err) = st.sessions.start_trip(session_id, &trip, TRIP_TTL_SECS).await {
 					tracing::error!(error = ?err, "relying party: confirmation trip not stored at authorize");
 					return (refreshed, back.error("temporarily_unavailable")).into_response();
 				}
@@ -366,7 +367,7 @@ fn parse_max_age(raw: &str) -> Option<u64> {
 
 /// The confirmation trip of one session, for one client and one authorize request (its
 /// PKCE challenge): what the browser that comes back must match.
-pub fn trip_key(session_id: &str, client_id: &str, code_challenge: &str) -> String {
+fn trip_key(session_id: &str, client_id: &str, code_challenge: &str) -> String {
 	format!("{session_id}:{client_id}:{code_challenge}")
 }
 
@@ -374,7 +375,8 @@ pub fn trip_key(session_id: &str, client_id: &str, code_challenge: &str) -> Stri
 enum Decision {
 	/// The session meets `max_age` by itself: a code, without `auth_time`.
 	Code,
-	/// Back from a trip that moved `auth_time` after it began: a code carrying it.
+	/// Back from a trip during which the session re-authenticated: a code carrying its
+	/// `auth_time`.
 	Confirmed(u64),
 	/// Send the person to confirm it is them, and remember the trip.
 	Confirm,
@@ -383,14 +385,16 @@ enum Decision {
 }
 
 /// What `max_age` makes of a session last authenticated at `auth_time`, given the trip
-/// this request began at `started` (taken, so `None` when there was none). A session
-/// with no `auth_time` predates the claim and meets no `max_age`; `max_age=0` is met by
-/// no session, only by a trip.
-fn decide(max_age: u64, auth_time: Option<u64>, started: Option<i64>, now: i64) -> Decision {
+/// this request began (taken, so `None` when there was none). A trip confirms when the
+/// session re-authenticated during it, whatever the clock says of the two — a passkey can
+/// finish in the second the trip began — and only with an `auth_time` no honest clock
+/// would date ahead. A session with no `auth_time` predates the claim and meets no
+/// `max_age`; `max_age=0` is met by no session, only by a trip.
+fn decide(max_age: u64, auth_time: Option<u64>, trip: Option<Trip>, now: i64) -> Decision {
 	let at = auth_time.and_then(|at| i64::try_from(at).ok());
-	if let Some(started) = started {
+	if let Some(trip) = trip {
 		return match (auth_time, at) {
-			(Some(confirmed), Some(at)) if at > started && at <= now.saturating_add(CLOCK_SKEW_SECS) => Decision::Confirmed(confirmed),
+			(Some(confirmed), Some(at)) if trip.confirmed() && at <= now.saturating_add(CLOCK_SKEW_SECS) => Decision::Confirmed(confirmed),
 			_ => Decision::Refused,
 		};
 	}
@@ -463,14 +467,20 @@ mod tests {
 		assert_eq!(decide(0, at(0), None, NOW), Decision::Confirm, "max_age=0 asks even a session authenticated this second");
 		assert_eq!(decide(3600, None, None, NOW), Decision::Confirm, "no auth_time meets no max_age");
 		assert_eq!(decide(u64::MAX, at(10_000), None, NOW), Decision::Code);
-		// Back from a trip that began 20 s ago.
-		let started = Some(NOW - 20);
-		assert_eq!(decide(0, at(5), started, NOW), Decision::Confirmed(u64::try_from(NOW - 5).unwrap()));
-		assert_eq!(decide(0, at(20), started, NOW), Decision::Refused, "moved no later than the trip began");
-		assert_eq!(decide(0, at(600), started, NOW), Decision::Refused, "dismissed: the session is as it was");
-		assert_eq!(decide(3600, at(600), started, NOW), Decision::Refused, "a trip is answered by a confirmation, not by max_age");
-		assert_eq!(decide(0, None, started, NOW), Decision::Refused);
-		assert_eq!(decide(0, at(-30), started, NOW), Decision::Confirmed(u64::try_from(NOW + 30).unwrap()), "honest drift");
-		assert_eq!(decide(0, at(-31), started, NOW), Decision::Refused, "dated ahead of any honest clock");
+		// Back from a trip: confirmed by the count, not by the clock.
+		let reauthed = Some(Trip { began_at: 3, now: 4 });
+		let untouched = Some(Trip { began_at: 3, now: 3 });
+		let same_second = Some(u64::try_from(NOW).unwrap());
+		assert_eq!(
+			decide(0, same_second, reauthed, NOW),
+			Decision::Confirmed(u64::try_from(NOW).unwrap()),
+			"confirmed in the second the trip began"
+		);
+		assert_eq!(decide(0, same_second, untouched, NOW), Decision::Refused, "authenticated this second, but not during the trip");
+		assert_eq!(decide(0, at(600), untouched, NOW), Decision::Refused, "dismissed: the session is as it was");
+		assert_eq!(decide(3600, at(600), untouched, NOW), Decision::Refused, "a trip is answered by a confirmation, not by max_age");
+		assert_eq!(decide(0, None, reauthed, NOW), Decision::Refused);
+		assert_eq!(decide(0, at(-30), reauthed, NOW), Decision::Confirmed(u64::try_from(NOW + 30).unwrap()), "honest drift");
+		assert_eq!(decide(0, at(-31), reauthed, NOW), Decision::Refused, "dated ahead of any honest clock");
 	}
 }
