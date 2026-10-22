@@ -389,7 +389,6 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		transport,
 		concierge::dispatch::DispatcherConfig {
 			mail_from: config.mail_from.clone(),
-			cabinet_url: config.cabinet_url.clone(),
 			notice_links: notice_links.clone(),
 			public_origin: config.public_origin.clone(),
 			approvals_url: config.approvals_url.clone(),
@@ -487,6 +486,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		// seams, so a second variable could only ever drift out of step with it.
 		Some(config.bridge_service_token.clone()),
 		config.public_origin.clone(),
+		notice_links.clone(),
 	);
 
 	// The TLS listener serves ONLY the service seams: the lifecycle pull and the mail push

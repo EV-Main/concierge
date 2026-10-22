@@ -990,7 +990,7 @@ mod tests {
 			status: KycStatus::KycExpired,
 		};
 		let payload = verdict_alert_payload("subject@example.com", &case, 1, 1_785_143_640);
-		let mail = crate::dispatch::governance_mail("kyc_verdict_alert", &payload, "https://cabinet.example/").expect("renderable");
+		let mail = crate::dispatch::governance_mail("kyc_verdict_alert", &payload, &crate::notice_link::NoticeLinkBases::cabinet_only("https://cabinet.example/")).expect("renderable");
 
 		// The address is how an operator finds the person: this mail carries no link and
 		// no code on purpose, so losing it makes the alert unactionable rather than ugly.
@@ -1007,7 +1007,8 @@ mod tests {
 		// A key the producer stopped writing must not render as a plausible mail.
 		let mut renamed = payload.clone();
 		renamed["subject"] = renamed["subject_email"].take();
-		let drifted = crate::dispatch::governance_mail("kyc_verdict_alert", &renamed, "https://cabinet.example/").expect("still renderable");
+		let drifted =
+			crate::dispatch::governance_mail("kyc_verdict_alert", &renamed, &crate::notice_link::NoticeLinkBases::cabinet_only("https://cabinet.example/")).expect("still renderable");
 		assert!(
 			!drifted.text.contains("subject@example.com"),
 			"a renamed key silently empties the field — which is why the assertions above exist"

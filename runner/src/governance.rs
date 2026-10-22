@@ -69,7 +69,7 @@ use crate::{
 		email::templates::{breaks_or_hides, fmt_ts, pct_change},
 		governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision, UserProposalRecord},
 	},
-	notice_link::cabinet_path,
+	notice_link::{NoticeLinkBases, cabinet_path},
 	notification::{RateLimiter, now_secs},
 	ports::{Drained, GovernanceMailQueued, GovernanceRepository, LegacyKind, NotificationRepository, UserDirectoryRepository},
 	support::{authenticate_service, domain_to_status},
@@ -868,6 +868,8 @@ pub struct MailRelay {
 	token: Option<Arc<str>>,
 	/// Origin every emailed link must sit under, without a trailing slash.
 	approval_origin: String,
+	/// The cabinets a fee notice may link into: `CABINET_URL`, or a scope's base.
+	links: Arc<NoticeLinkBases>,
 }
 
 impl MailRelay {
@@ -878,6 +880,7 @@ impl MailRelay {
 		limiter: Arc<RateLimiter>,
 		token: Option<String>,
 		approval_origin: String,
+		links: Arc<NoticeLinkBases>,
 	) -> Self {
 		Self {
 			users,
@@ -886,6 +889,7 @@ impl MailRelay {
 			limiter,
 			token: token.filter(|t| !t.is_empty()).map(|t| Arc::from(t.as_str())),
 			approval_origin: approval_origin.trim_end_matches('/').to_owned(),
+			links,
 		}
 	}
 
@@ -1590,7 +1594,9 @@ impl MailRelayService for MailRelay {
 					"current": current_fee_terms(mail.current.as_ref())?,
 					"proposed": fee_terms(proposed, "proposed")?,
 					"effective_at": mail.effective_at,
-					"link": cabinet_path(&mail.link)?,
+					// Stored finished, as an emit stores it; the dispatcher checks it again
+					// against the bases configured when the mail is sent.
+					"link": self.links.stored_link(&mail.link_scope, &cabinet_path(&mail.link)?)?,
 				});
 				("fee_policy_notice", payload, Recipient::Subject { subject, or_staff: false }, Some(notice))
 			}
