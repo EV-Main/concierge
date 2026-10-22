@@ -432,7 +432,9 @@ containment is never slower than the grant).
 table). Whatever a publisher's catalog says:
 
 - `bank:payment`, `bank:scope_transfer`, `bank:seed_capital`, `bank:treasury_surplus`,
-  `bank:compartment_policy` and `invest:holder_grant` are decided by the platform owners.
+  `bank:compartment_policy`, `invest:holder_grant` and `invest:fee_policy` are decided by
+  the platform owners. A fee change is the owners' whole (EV-Fund/invest#37, 2026-10-22):
+  an escalation on a raised ceiling alone would leave a hurdle-only lowering to the scope.
   So is any kind of the `bank` and `invest` namespaces the table does not name — an
   allow-list: a money kind added to a catalog before it is added here goes to the owners. A
   kind of those namespaces that moves no money is named in the table as unbounded.
@@ -442,8 +444,7 @@ table). Whatever a publisher's catalog says:
   split into single-recipient ones is still one distribution), when `distribution` (FLAG,
   a dividend to every holder) is set, when `over_scope_budget` (FLAG, the single daily scope
   budget) is set, and when `recipients` is 0.
-- `invest:valuation_override` escalates above 10 % (`deviation`, 1000 bps);
-  `invest:fee_policy` when `raises_ceiling` is set.
+- `invest:valuation_override` escalates above 10 % (`deviation`, 1000 bps).
 
 The two money caps — 1000 USDT per operation and 5000 USDT a day, one pair for both kinds —
 are defaults: the runner reads them at boot from `APPROVAL_FLOOR_PER_OPERATION_USDT` and
@@ -493,7 +494,7 @@ distribution to every holder of an allocation is a `bank:scope_payout` with
 | Kind | Level | Escalations (default) | Fields |
 | ---- | ----- | --------------------- | ------ |
 | `invest:valuation_override` | SCOPE | `max_deviation` ABS_BPS_ABOVE 1000 (10 %) | allocation (TEXT), mark (AMOUNT), deviation (BPS) — invest still refuses beyond the 50 % cap before proposing |
-| `invest:fee_policy` | SCOPE | `ceiling` FLAG_SET on raises_ceiling | allocation, basis, crystallization (TEXT); current and proposed management/performance/hurdle (BPS); raises_ceiling (FLAG) |
+| `invest:fee_policy` — a fund's fee terms beyond the house envelope, or a lower hurdle; published by invest | PLATFORM | — | allocation (TEXT, the fund); current_ and proposed_ management, performance, hurdle (BPS); current_ and proposed_ basis, crystallization (TEXT); raises_ceiling (FLAG, informs only); effective_from (TIMESTAMP); holders_notified (COUNT). The reason is the proposal's own `reason` |
 | `invest:holder_grant` | PLATFORM | — | allocation (TEXT), holder (USER), units (AMOUNT, unit code) |
 
 `concierge:*` — this plane's own, built in at catalog version 0 (listed by
