@@ -32,7 +32,7 @@ use domain::{
 	error::DomainError,
 	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
 	iam::{Catalog, Target},
-	scope_catalog::{ApprovalKind, ApprovalLevel, NotificationTopic, ScopeCatalog},
+	scope_catalog::{ApprovalKind, ApprovalLevel, NotificationTopic, ScopeCatalog, TopicDelivery},
 	users::{Email, ProfileFields, User, UserId, Username},
 };
 use uuid::Uuid;
@@ -1445,9 +1445,11 @@ pub trait NotificationRepository: Send + Sync {
 	async fn set_topic_subscription(&self, subscriber_id: Uuid, topic: &str, subscribed: bool, email_enabled: bool) -> Result<(), DomainError>;
 
 	/// Record a notification and queue its email copy if every gate allows it.
-	/// Idempotent on `(subscriber, dedupe_key)`. `default_subscribed` follows the topic for
-	/// an account that never touched it (no subscription, no opt-out), creating its
-	/// subscriber row if need be.
+	/// Idempotent on `(subscriber, dedupe_key)`. [`TopicDelivery::ByDefault`] follows the
+	/// topic for an account that never touched it (no subscription, no opt-out), creating
+	/// its subscriber row if need be. [`TopicDelivery::Required`] reaches the account
+	/// whatever it chose: in-app, and by mail to its current verified address with both
+	/// switches and any opt-out ignored.
 	#[allow(clippy::too_many_arguments)]
 	async fn emit(
 		&self,
@@ -1459,7 +1461,7 @@ pub trait NotificationRepository: Send + Sync {
 		link: &str,
 		dedupe_key: &str,
 		occurred_at: i64,
-		default_subscribed: bool,
+		delivery: TopicDelivery,
 	) -> Result<EmitOutcome, DomainError>;
 
 	/// Write an inbox entry REGARDLESS of what the user follows, and queue no email copy.

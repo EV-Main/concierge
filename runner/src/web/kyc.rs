@@ -42,6 +42,7 @@ use axum::{
 	response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::CookieJar;
+use domain::scope_catalog::TopicDelivery;
 use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -954,7 +955,11 @@ pub(crate) fn verdict_alert_payload(subject_email: &str, case: &KycCase, held: u
 /// successfully applied decision into a retry the provider will resend.
 async fn notify(st: &super::Inner, case: &KycCase, kind: &str, title: &str, body: &str) {
 	let dedupe_key = format!("kyc:{}:{}", case.id, case.status.as_str());
-	if let Err(e) = st.notifications.emit(case.user_id.raw(), TOPIC, kind, title, body, "", &dedupe_key, now_secs(), false).await {
+	if let Err(e) = st
+		.notifications
+		.emit(case.user_id.raw(), TOPIC, kind, title, body, "", &dedupe_key, now_secs(), TopicDelivery::OptIn)
+		.await
+	{
 		tracing::warn!(error = %e, case_id = %case.id, "kyc callback: could not emit the decision notice");
 	}
 }

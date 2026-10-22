@@ -53,6 +53,13 @@ fn now() -> i64 {
 /// A scope with one host and one published topic. Registered BEFORE the surface is built:
 /// the allowlist reads the registry once at construction.
 async fn scope(pool: &PgPool) -> Scope {
+	scope_with(pool, false).await
+}
+
+const REASON: &str = "Holders are told before new fee terms bind";
+
+/// [`scope`], its topic `required` or not.
+async fn scope_with(pool: &PgPool, required: bool) -> Scope {
 	let tag = Uuid::new_v4().simple().to_string()[..12].to_string();
 	let scope = Scope {
 		id: format!("i_{tag}"),
@@ -73,6 +80,8 @@ async fn scope(pool: &PgPool) -> Scope {
 			label: "News".into(),
 			description: String::new(),
 			default_subscribed: false,
+			required,
+			required_reason: if required { REASON.into() } else { String::new() },
 		}],
 	};
 	PgScopeCatalogs::new(pool.clone())
@@ -82,8 +91,11 @@ async fn scope(pool: &PgPool) -> Scope {
 	scope
 }
 
+/// The required `bank:` topic [`bank_topic`] publishes beside the ordinary one.
+const BANK_NOTICE: &str = "bank:notice_test";
+
 /// A `bank:` topic in the money plane's catalog. The catalog is shared, so every test here
-/// publishes the SAME topic and the race between them is harmless; the version is the
+/// publishes the SAME catalog and the race between them is harmless; the version is the
 /// clock's seconds, as the money plane's own, so a real publication on a dev database
 /// still supersedes it. Suites in other binaries never run beside this one.
 async fn bank_topic(pool: &PgPool) -> String {
@@ -92,12 +104,24 @@ async fn bank_topic(pool: &PgPool) -> String {
 	let catalog = ScopeCatalog {
 		version: now() as u64,
 		approval_kinds: Vec::new(),
-		notification_topics: vec![NotificationTopic {
-			topic: TOPIC.into(),
-			label: "Money".into(),
-			description: String::new(),
-			default_subscribed: false,
-		}],
+		notification_topics: vec![
+			NotificationTopic {
+				topic: TOPIC.into(),
+				label: "Money".into(),
+				description: String::new(),
+				default_subscribed: false,
+				required: false,
+				required_reason: String::new(),
+			},
+			NotificationTopic {
+				topic: BANK_NOTICE.into(),
+				label: "Money notices".into(),
+				description: String::new(),
+				default_subscribed: false,
+				required: true,
+				required_reason: REASON.into(),
+			},
+		],
 	};
 	catalogs.publish("bank", "bridge", &catalog, now()).await.expect("publish the bank catalog");
 	let current = catalogs.current("bank").await.unwrap().expect("a bank catalog is in force");
@@ -406,4 +430,71 @@ async fn a_user_token_on_grpc_reads_the_platform_inbox() {
 	let summary = summary.unwrap().into_inner();
 	assert_eq!(summary.notifications.len(), 3, "an owner's summary holds every namespace");
 	assert_eq!(summary.unread_count, 1);
+}
+
+/// Every door that switches a topic refuses to switch a required one off: the web settings
+/// route on a scope's host (`409 required_topic`) and `SetTopicSubscription` on the
+/// platform inbox (`FAILED_PRECONDITION`). Both show it as on and locked, with the reason,
+/// and both accept following it.
+#[tokio::test]
+async fn a_required_topic_is_locked_on_the_web_and_on_grpc() {
+	let Some(url) = common::database_url() else { return };
+	let pool = PgPool::connect(&url).await.unwrap();
+	let mine = scope_with(&pool, true).await;
+	bank_topic(&pool).await;
+	let fx = fixture!();
+	let (mut browser, id) = signed_in(&fx, "required").await;
+	join(&fx.pool, &mine, id).await;
+
+	let (status, body) = settings_from(&fx, &mine.origin, "", &mut browser).await;
+	assert_eq!(status, StatusCode::OK, "{body:?}");
+	let shown = &body["topics"][0];
+	assert_eq!(
+		(&shown["topic"], &shown["subscribed"], &shown["email_enabled"], &shown["required"], &shown["required_reason"]),
+		(&json!(mine.topic), &json!(true), &json!(true), &json!(true), &json!(REASON))
+	);
+	for (subscribed, email_enabled) in [(false, false), (true, false)] {
+		let refused = fx
+			.post(
+				"/auth/notifications/settings/topic",
+				&mine.origin,
+				json!({ "topic": mine.topic, "subscribed": subscribed, "email_enabled": email_enabled }),
+				&mut browser,
+			)
+			.await;
+		assert_eq!(
+			(refused.status, refused.body),
+			(StatusCode::CONFLICT, json!({ "error": "required_topic" })),
+			"{subscribed}/{email_enabled}"
+		);
+	}
+	let followed = fx
+		.post(
+			"/auth/notifications/settings/topic",
+			&mine.origin,
+			json!({ "topic": mine.topic, "subscribed": true, "email_enabled": true }),
+			&mut browser,
+		)
+		.await;
+	assert_eq!(followed.status, StatusCode::OK, "following a required topic is accepted: {:?}", followed.body);
+
+	let service = Notifications::new(
+		Arc::new(PgNotifications::new(fx.pool.clone())),
+		Arc::new(PgUsers::new(fx.pool.clone())),
+		Arc::new(RateLimiter::new(std::time::Duration::from_secs(60), 10)),
+		Arc::new(concierge::notice_link::NoticeLinkBases::cabinet_only("https://evinvest.ltd/cabinet")),
+	);
+	let change = |subscribed: bool| SetTopicSubscriptionRequest {
+		topic: BANK_NOTICE.into(),
+		subscribed,
+		email_enabled: subscribed,
+	};
+	let refused = service.set_topic_subscription(grpc(id, change(false), false)).await.unwrap_err();
+	assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+	assert!(refused.message().starts_with("required_topic:"), "{refused:?}");
+	let settings = service.set_topic_subscription(grpc(id, change(true), false)).await.unwrap().into_inner();
+	let notice = settings.topics.iter().find(|t| t.topic == BANK_NOTICE).expect("the platform inbox offers it");
+	assert!(notice.required && notice.subscribed && notice.email_enabled && notice.required_reason == REASON, "{notice:?}");
+	let ordinary = settings.topics.iter().find(|t| t.topic == "bank:inbox_test").expect("and the ordinary one");
+	assert!(!ordinary.required && ordinary.required_reason.is_empty(), "{ordinary:?}");
 }

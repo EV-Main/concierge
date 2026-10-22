@@ -39,7 +39,7 @@ use std::{
 use domain::{
 	authz::Notifications as NotificationPermission,
 	error::DomainError,
-	scope_catalog::NotificationTopic,
+	scope_catalog::{NotificationTopic, TopicDelivery},
 	users::{Email, User},
 };
 use evconcierge_auth::{Claims, claims_of};
@@ -234,9 +234,52 @@ pub async fn topic_offered(notifications: &dyn NotificationRepository, view: &In
 	Ok(view.shows(key) && topic_known(notifications, key).await?)
 }
 
-/// [`topic_followable`] within one inbox: what that inbox offers to follow.
-pub async fn follow_offered(notifications: &dyn NotificationRepository, view: &InboxView, key: &str) -> Result<bool, DomainError> {
-	Ok(view.shows(key) && topic_followable(notifications, key).await?)
+/// Why a member's change to one topic of an inbox is refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopicChangeRefusal {
+	/// Not a topic the inbox offers to follow: unknown, another inbox's, or a trace.
+	Unknown,
+	/// A required topic, and the change would switch it or its mail copy off.
+	Required,
+}
+
+/// The refusal text of [`TopicChangeRefusal::Required`] on gRPC (`FAILED_PRECONDITION`).
+/// The prefix is the stable part a client matches on, as `reauth_required: …` is.
+pub const REQUIRED_TOPIC: &str = "required_topic: this topic is a notice its scope must give its members; it cannot be switched off";
+
+/// Whether a member may set `key` to (`subscribed`, `email_enabled`) in `view`: what that
+/// inbox offers to follow ([`topic_followable`] within it), and never a required topic
+/// switched off. Following a required topic is accepted: a settings screen that writes
+/// every row back must not fail on the one it shows as locked. The one gate of the three
+/// doors — `SetTopicSubscription`, `SetScopeTopicSubscription` and the web settings route.
+pub async fn check_topic_change(
+	notifications: &dyn NotificationRepository,
+	view: &InboxView,
+	key: &str,
+	subscribed: bool,
+	email_enabled: bool,
+) -> Result<Result<(), TopicChangeRefusal>, DomainError> {
+	if !view.shows(key) {
+		return Ok(Err(TopicChangeRefusal::Unknown));
+	}
+	if let Some(built_in) = topic(key) {
+		return Ok(if built_in.followable { Ok(()) } else { Err(TopicChangeRefusal::Unknown) });
+	}
+	Ok(match scope_topic(notifications, key).await? {
+		Some(t) if t.required && !(subscribed && email_enabled) => Err(TopicChangeRefusal::Required),
+		Some(_) => Ok(()),
+		// A moved key's new name is taken before its scope publishes it (`topic_known`).
+		None if MOVED_TOPICS.iter().any(|m| m.to == key) => Ok(()),
+		None => Err(TopicChangeRefusal::Unknown),
+	})
+}
+
+/// [`TopicChangeRefusal`] as a gRPC status.
+pub fn topic_change_status(refusal: TopicChangeRefusal) -> Status {
+	match refusal {
+		TopicChangeRefusal::Unknown => Status::invalid_argument("unknown topic"),
+		TopicChangeRefusal::Required => Status::failed_precondition(REQUIRED_TOPIC),
+	}
 }
 
 /// The topic a scope's catalog in force publishes under `key`, if any. A key's namespace is
@@ -251,8 +294,8 @@ pub async fn scope_topic(notifications: &dyn NotificationRepository, key: &str) 
 pub(crate) struct EmitTarget {
 	pub topic: String,
 	pub scope: Option<String>,
-	/// The catalog's `default_subscribed`: an account that never touched the topic follows it.
-	pub default_subscribed: bool,
+	/// The catalog's word on who receives it beside its followers.
+	pub delivery: TopicDelivery,
 }
 
 /// The checks every emit makes on the message itself, whoever sends it. Checked here as
@@ -290,17 +333,7 @@ pub(crate) async fn emit_to(notifications: &dyn NotificationRepository, links: &
 	}
 	let occurred_at = if req.occurred_at > 0 { req.occurred_at } else { now_secs() };
 	let outcome = notifications
-		.emit(
-			user_id,
-			&target.topic,
-			&req.kind,
-			&req.title,
-			&req.body,
-			&link,
-			&req.dedupe_key,
-			occurred_at,
-			target.default_subscribed,
-		)
+		.emit(user_id, &target.topic, &req.kind, &req.title, &req.body, &link, &req.dedupe_key, occurred_at, target.delivery)
 		.await
 		.map_err(domain_to_status)?;
 	let mut channels = Vec::new();
@@ -576,24 +609,37 @@ pub async fn settings_of(
 		None => Vec::new(),
 	};
 	let scoped = notifications.scope_topics().await?;
+	// The last element is the reason of a required topic, `None` for an ordinary one.
 	let catalogue = TOPICS
 		.iter()
 		.filter(|t| t.followable)
-		.map(|t| (t.key, t.label, t.description, false))
-		.chain(scoped.iter().map(|t| (t.topic.as_str(), t.label.as_str(), t.description.as_str(), t.default_subscribed)))
+		.map(|t| (t.key, t.label, t.description, false, None))
+		.chain(scoped.iter().map(|t| {
+			(
+				t.topic.as_str(),
+				t.label.as_str(),
+				t.description.as_str(),
+				t.default_subscribed,
+				t.required.then_some(t.required_reason.as_str()),
+			)
+		}))
 		.filter(|(key, ..)| view.shows(key));
 	// A topic the subscriber never touched reads as its catalog's default; one it switched
-	// off has a row saying so, which is what lets the default apply at all.
+	// off has a row saying so, which is what lets the default apply at all. A required topic
+	// reads as followed with its mail copy whatever the rows say, because that is how an
+	// emit treats it.
 	let topics = catalogue
-		.map(|(key, label, description, default_subscribed)| {
+		.map(|(key, label, description, default_subscribed, required)| {
 			let row = held.iter().find(|s| s.topic == key);
-			let subscribed = row.map_or(default_subscribed, |r| r.subscribed);
+			let subscribed = required.is_some() || row.map_or(default_subscribed, |r| r.subscribed);
 			TopicSubscription {
 				topic: key.to_owned(),
 				label: label.to_owned(),
 				description: description.to_owned(),
 				subscribed,
-				email_enabled: row.filter(|r| r.subscribed).is_none_or(|r| r.email_enabled),
+				email_enabled: required.is_some() || row.filter(|r| r.subscribed).is_none_or(|r| r.email_enabled),
+				required: required.is_some(),
+				required_reason: required.unwrap_or_default().to_owned(),
 			}
 		})
 		.collect();
@@ -621,6 +667,8 @@ pub fn settings_json(settings: &NotificationSettings) -> serde_json::Value {
 			"description": t.description,
 			"subscribed": t.subscribed,
 			"email_enabled": t.email_enabled,
+			"required": t.required,
+			"required_reason": t.required_reason,
 		})).collect::<Vec<_>>(),
 	})
 }
@@ -636,9 +684,9 @@ pub(crate) async fn inbox_page(
 ) -> Result<ListNotificationsResponse, Status> {
 	// Switching the in-app channel off hides the inbox rather than deleting it:
 	// the record survives, so turning the channel back on restores history.
-	if !sub.in_app_enabled {
+	let Some(within) = readable(notifications, sub, view).await? else {
 		return Ok(ListNotificationsResponse::default());
-	}
+	};
 
 	let limit = match req.limit {
 		0 => DEFAULT_PAGE,
@@ -653,7 +701,6 @@ pub(crate) async fn inbox_page(
 		t if topic_offered(notifications, view, t).await.map_err(domain_to_status)? => Some(t),
 		_ => return Err(Status::invalid_argument("unknown topic")),
 	};
-	let within = view.topics();
 
 	// One extra row tells us whether a further page exists, with no second query.
 	let mut rows = notifications
@@ -688,12 +735,34 @@ pub(crate) async fn inbox_page(
 	})
 }
 
-/// Unread within `view`; nothing while the in-app channel is off.
+/// Unread within `view`; only the required topics' while the in-app channel is off.
 pub(crate) async fn inbox_unread(notifications: &dyn NotificationRepository, sub: &SubscriberRow, view: &InboxView) -> Result<u32, Status> {
-	if !sub.in_app_enabled {
+	let Some(within) = readable(notifications, sub, view).await? else {
 		return Ok(0);
+	};
+	Ok(notifications.unread_count(sub.id, &within).await.map_err(domain_to_status)? as u32)
+}
+
+/// What an inbox read of `view` shows `sub`. The in-app switch hides the inbox — all but
+/// the required topics within it, by the catalogs in force: the switch silences news, not
+/// a notice the member cannot switch off. `None` when nothing is left to show.
+async fn readable(notifications: &dyn NotificationRepository, sub: &SubscriberRow, view: &InboxView) -> Result<Option<InboxTopics>, Status> {
+	if sub.in_app_enabled {
+		return Ok(Some(view.topics()));
 	}
-	Ok(notifications.unread_count(sub.id, &view.topics()).await.map_err(domain_to_status)? as u32)
+	let keys: Vec<String> = notifications
+		.scope_topics()
+		.await
+		.map_err(domain_to_status)?
+		.into_iter()
+		.filter(|t| t.required && view.shows(&t.topic))
+		.map(|t| t.topic)
+		.collect();
+	Ok((!keys.is_empty()).then_some(InboxTopics::Within {
+		keys,
+		namespaces: Vec::new(),
+		except: Vec::new(),
+	}))
 }
 
 /// The most ids one mark-read names: bounds the `ANY($ids)` a caller can hand Postgres.
@@ -730,14 +799,14 @@ impl NotificationService for Notifications {
 			EmitTarget {
 				topic: moved.to.to_owned(),
 				scope: moved.scope.map(str::to_owned),
-				default_subscribed: published.is_some_and(|t| t.default_subscribed),
+				delivery: published.map_or(TopicDelivery::OptIn, |t| t.delivery()),
 			}
 		} else {
 			match topic(&req.topic) {
 				Some(t) if t.followable => EmitTarget {
 					topic: req.topic.clone(),
 					scope: None,
-					default_subscribed: false,
+					delivery: TopicDelivery::OptIn,
 				},
 				Some(_) => return Err(Status::permission_denied("a trace topic is written by this plane alone")),
 				// A `typ=service` token names no namespace, so a scope's topic is emitted only
@@ -806,9 +875,10 @@ impl NotificationService for Notifications {
 		let sub = self.caller(&request).await?;
 		let req = request.get_ref();
 		let key = current_key(&req.topic);
-		if !follow_offered(self.notifications.as_ref(), &view, key).await.map_err(domain_to_status)? {
-			return Err(Status::invalid_argument("unknown topic"));
-		}
+		check_topic_change(self.notifications.as_ref(), &view, key, req.subscribed, req.email_enabled)
+			.await
+			.map_err(domain_to_status)?
+			.map_err(topic_change_status)?;
 		self.notifications
 			.set_topic_subscription(sub.id, key, req.subscribed, req.email_enabled)
 			.await

@@ -45,6 +45,8 @@ service ScopeInboxService {
   // The settings snapshot with this inbox's topics only.
   rpc GetScopeNotificationSettings(GetScopeNotificationSettingsRequest) returns (NotificationSettings);
   // A topic outside this namespace's catalog in force is INVALID_ARGUMENT, as an unknown one.
+  // Switching a `required` topic off, or its email copy off, is FAILED_PRECONDITION
+  // `required_topic: …` (NotificationTopicSpec.required); following it is accepted.
   rpc SetScopeTopicSubscription(SetScopeTopicSubscriptionRequest) returns (NotificationSettings);
 
   // Emit one notification for one user on a topic of the CALLER's namespace — the client's
@@ -55,7 +57,8 @@ service ScopeInboxService {
   // NotificationService.Emit's. A scope's topic reaches only an ACTIVE member of the scope:
   // for anyone else nothing is written and `delivered` is false, as for a user who does not
   // follow the topic. A topic published with `default_subscribed` reaches every account
-  // that never touched it, until the user switches it off.
+  // that never touched it, until the user switches it off. A `required` topic reaches every
+  // active member whatever they chose: in-app, and by mail to a verified address.
   rpc EmitScopeNotification(EmitRequest) returns (EmitResponse);
 }
 

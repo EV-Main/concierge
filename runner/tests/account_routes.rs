@@ -64,7 +64,7 @@ async fn settings_read_every_topic_with_the_callers_choice() {
 	let first = topics[0].as_object().unwrap();
 	let mut keys: Vec<&str> = first.keys().map(String::as_str).collect();
 	keys.sort_unstable();
-	assert_eq!(keys, ["description", "email_enabled", "label", "subscribed", "topic"]);
+	assert_eq!(keys, ["description", "email_enabled", "label", "required", "required_reason", "subscribed", "topic"]);
 
 	let anonymous = fx.get("/auth/notifications/settings", &mut Browser::default()).await;
 	assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);

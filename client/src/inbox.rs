@@ -110,7 +110,9 @@ impl ConciergeClient {
 	}
 
 	/// Follow or leave a topic of this inbox, and say whether it may mail. A topic outside
-	/// the namespace's catalog is [`ConciergeError::Rejected`] with INVALID_ARGUMENT.
+	/// the namespace's catalog is [`ConciergeError::Rejected`] with INVALID_ARGUMENT;
+	/// switching a required topic (or its mail copy) off is `Rejected` with
+	/// FAILED_PRECONDITION and a message that starts `required_topic:`.
 	pub async fn set_scope_topic_subscription(&self, user_access_token: &str, topic: &str, subscribed: bool, email_enabled: bool) -> Result<NotificationSettings, ConciergeError> {
 		let request = self.as_user(
 			user_access_token,

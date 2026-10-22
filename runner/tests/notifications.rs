@@ -16,6 +16,7 @@ use concierge::{
 	infrastructure::{db, notifications::PgNotifications},
 	ports::{InboxTopics, NotificationDispatchRepository, NotificationRepository},
 };
+use domain::scope_catalog::TopicDelivery;
 use uuid::Uuid;
 
 async fn setup() -> Option<Arc<PgNotifications>> {
@@ -58,20 +59,29 @@ async fn emit_requires_a_subscription_and_dedupes() {
 	let sub = repo.subscriber_for_user(user, "emit@example.com", true).await.expect("subscriber");
 
 	// Not following yet ⇒ nothing is delivered, and it is not an error.
-	let none = repo.emit(user, TOPIC, "nav", "t", "b", "", "k1", 100, false).await.expect("emit without subscription");
+	let none = repo
+		.emit(user, TOPIC, "nav", "t", "b", "", "k1", 100, TopicDelivery::OptIn)
+		.await
+		.expect("emit without subscription");
 	assert!(none.notification_id.is_none(), "an unfollowed topic stores nothing");
 	assert!(!none.in_app && !none.email, "and delivers on no channel");
 
 	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
 
-	let first = repo.emit(user, TOPIC, "nav", "NAV updated", "body", "/funds/x", "k1", 100, false).await.expect("emit");
+	let first = repo
+		.emit(user, TOPIC, "nav", "NAV updated", "body", "/funds/x", "k1", 100, TopicDelivery::OptIn)
+		.await
+		.expect("emit");
 	assert!(first.notification_id.is_some(), "a followed topic stores the notification");
 	assert!(first.in_app, "in-app is on, so it is delivered there");
 	assert!(first.email, "email is on and the address is verified, so a copy is queued");
 	assert!(!first.deduped);
 
 	// The whole point of the unique dedupe index: an at-least-once retry is a no-op.
-	let retry = repo.emit(user, TOPIC, "nav", "NAV updated", "body", "/funds/x", "k1", 100, false).await.expect("retry emit");
+	let retry = repo
+		.emit(user, TOPIC, "nav", "NAV updated", "body", "/funds/x", "k1", 100, TopicDelivery::OptIn)
+		.await
+		.expect("retry emit");
 	assert!(retry.deduped, "the same dedupe key must not produce a second notification or a second email");
 	assert!(retry.notification_id.is_none());
 
@@ -90,12 +100,12 @@ async fn channels_gate_delivery_independently_and_may_both_be_off() {
 
 	// Email off, in-app on.
 	repo.set_channel_enabled(sub.id, None, Some(false)).await.expect("email off");
-	let a = repo.emit(user, TOPIC, "k", "t", "", "", "c1", 1, false).await.expect("emit");
+	let a = repo.emit(user, TOPIC, "k", "t", "", "", "c1", 1, TopicDelivery::OptIn).await.expect("emit");
 	assert!(a.in_app && !a.email, "the master email switch alone suppresses the copy");
 
 	// Both off — a supported state, not a broken record.
 	repo.set_channel_enabled(sub.id, Some(false), None).await.expect("in-app off");
-	let b = repo.emit(user, TOPIC, "k", "t", "", "", "c2", 1, false).await.expect("emit");
+	let b = repo.emit(user, TOPIC, "k", "t", "", "", "c2", 1, TopicDelivery::OptIn).await.expect("emit");
 	assert!(!b.in_app && !b.email, "with both channels off nothing is delivered");
 	assert!(b.notification_id.is_some(), "the durable record is still written — it anchors the dedupe key");
 
@@ -122,7 +132,9 @@ async fn inbox_paginates_by_keyset_and_marks_read() {
 	// Emitted back-to-back on purpose: they land in the same second, which is what makes
 	// the select list's `… AS created_at` alias shadow the ORDER BY and break the cursor.
 	for i in 0..5 {
-		repo.emit(user, TOPIC, "k", &format!("n{i}"), "", "", &format!("p{i}"), 100 + i, false).await.expect("emit");
+		repo.emit(user, TOPIC, "k", &format!("n{i}"), "", "", &format!("p{i}"), 100 + i, TopicDelivery::OptIn)
+			.await
+			.expect("emit");
 	}
 
 	let page1 = repo.list(sub.id, None, 2, false, None, &InboxTopics::Every).await.expect("page 1");
@@ -196,7 +208,7 @@ async fn unsubscribe_stops_email_without_touching_the_inbox() {
 	let user = Uuid::new_v4();
 	let sub = repo.subscriber_for_user(user, "unsub@example.com", true).await.expect("subscriber");
 	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
-	repo.emit(user, TOPIC, "k", "t", "", "", "u1", 1, false).await.expect("emit");
+	repo.emit(user, TOPIC, "k", "t", "", "", "u1", 1, TopicDelivery::OptIn).await.expect("emit");
 
 	assert!(repo.unsubscribe(&sub.unsubscribe_token, None).await.expect("unsubscribe"), "a known token unsubscribes");
 	assert!(
@@ -229,7 +241,7 @@ async fn delivery_queue_claims_leases_and_backs_off() {
 	// long lease keeps the drained rows out of the way for the rest of this test.
 	while !repo.claim_due(500, 3600).await.expect("drain the queue").is_empty() {}
 
-	repo.emit(user, TOPIC, "nav", "Queued", "body", "/x", "q1", 100, false).await.expect("emit");
+	repo.emit(user, TOPIC, "nav", "Queued", "body", "/x", "q1", 100, TopicDelivery::OptIn).await.expect("emit");
 
 	// The claim is a `FOR UPDATE SKIP LOCKED` CTE feeding an UPDATE … RETURNING, and
 	// the lease is `make_interval(secs => $2)` with a float bind — both runtime-only.
@@ -266,12 +278,15 @@ async fn switching_a_topic_off_is_remembered_and_following_it_again_clears_that(
 	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
 	assert!(repo.unsubscribe(&sub.unsubscribe_token, Some(TOPIC)).await.expect("one-click unsubscribe of one topic"));
 	assert_eq!(stance(repo.subscriptions(sub.id).await.unwrap()), vec![(TOPIC.to_owned(), false)], "switched off, and said so");
-	let muted = repo.emit(user, TOPIC, "k", "t", "", "", "o1", 1, true).await.expect("emit on a default topic");
+	let muted = repo
+		.emit(user, TOPIC, "k", "t", "", "", "o1", 1, TopicDelivery::ByDefault)
+		.await
+		.expect("emit on a default topic");
 	assert!(muted.notification_id.is_none(), "the default does not override a switch-off");
 
 	repo.set_topic_subscription(sub.id, TOPIC, true, false).await.expect("follow again");
 	assert_eq!(stance(repo.subscriptions(sub.id).await.unwrap()), vec![(TOPIC.to_owned(), true)]);
-	let heard = repo.emit(user, TOPIC, "k", "t", "", "", "o2", 1, false).await.expect("emit");
+	let heard = repo.emit(user, TOPIC, "k", "t", "", "", "o2", 1, TopicDelivery::OptIn).await.expect("emit");
 	assert!(heard.in_app && !heard.email, "the per-topic mail copy the follow chose");
 
 	// An account-less address that left a topic and asks for it again is following it.

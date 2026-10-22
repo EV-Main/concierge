@@ -116,6 +116,8 @@ impl Fx {
 				label: "News".into(),
 				description: String::new(),
 				default_subscribed: false,
+				required: false,
+				required_reason: String::new(),
 			}],
 		};
 		PgScopeCatalogs::new(self.pool.clone()).publish(&id, "test", &catalog, now()).await.expect("publish");
