@@ -91,7 +91,7 @@ ev::settings! {
 		#[required_in("production")]
 		smtp_password: Option<String>,
 		/// `From:` mailbox for outgoing mail.
-		mail_from: String = "EV Investment <notifications@evinvest.ltd>",
+		mail_from: String = "EV Investment <admin@evinvest.ltd>",
 		/// Origin the cabinet is served from; builds the links inside emails. A notice whose
 		/// `link_scope` has no entry in `notice_link_bases` links here too.
 		cabinet_url: String = "https://evinvest.ltd/cabinet",
@@ -108,9 +108,8 @@ ev::settings! {
 		approvals_url: String = "https://evinvest.ltd/admin/approvals",
 		/// The HUMAN mailbox handed to a user whose verification cannot run right now.
 		///
-		/// Deliberately not `mail_from`: that address is a SENDER nobody reads, so
-		/// printing it on an error screen would invite replies into a void. This one is
-		/// answered by a person.
+		/// Separate from `mail_from`, even while both are admin@: the sender may move to a
+		/// no-reply mailbox, and an error screen must keep naming one a person answers.
 		support_email: String = "admin@evinvest.ltd",
 		/// Trailing-24h send ceiling. Gmail's relay caps daily volume and throttles the
 		/// account past it, so the dispatcher stops SENDING (never queueing) at this
