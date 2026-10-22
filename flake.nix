@@ -171,10 +171,11 @@
               PUBLIC_ORIGIN = "https://evinvest.ltd";
               APP_ENV = "production";
               # Gmail rejects a From that isn't the authenticated mailbox, so this
-              # pair must stay in step with `mail_from`'s default; the sops
-              # `concierge_smtp_password` is that mailbox's App Password.
+              # pair must stay in step with `mail_from`'s default. The mailbox is
+              # admin@, shared with site_conductor and landing; devops maps its App
+              # Password (`site_conductor_smtp_password`) to SMTP_PASSWORD.
               SMTP_HOST = "smtp.gmail.com";
-              SMTP_USERNAME = "notifications@evinvest.ltd";
+              SMTP_USERNAME = "admin@evinvest.ltd";
             } // pkgs.lib.optionalAttrs hasWeb {
               # Unset (no web/ yet) leaves /auth/mfe/* unmounted, which the binary allows.
               WEB_MFE_DIR = webMfeDir;
