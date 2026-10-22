@@ -55,6 +55,7 @@ use uuid::Uuid;
 use crate::{
 	authz::caller_gate,
 	infrastructure::notifications::SubscriberRow,
+	notice_link::{NoticeLinkBases, cabinet_path},
 	ports::{InboxTopics, NotificationRepository, UserDirectoryRepository},
 	service_caller::BANK_NAMESPACE,
 	support::domain_to_status,
@@ -266,9 +267,7 @@ pub(crate) fn emit_fields(req: &EmitRequest) -> Result<Uuid, Status> {
 	if req.body.chars().count() > 2000 {
 		return Err(Status::invalid_argument("body must be at most 2000 characters"));
 	}
-	if req.link.chars().count() > 512 {
-		return Err(Status::invalid_argument("link must be at most 512 characters"));
-	}
+	cabinet_path(&req.link)?;
 	if req.dedupe_key.is_empty() || req.dedupe_key.chars().count() > 128 {
 		return Err(Status::invalid_argument("dedupe_key must be 1-128 characters"));
 	}
@@ -281,8 +280,9 @@ pub(crate) fn emit_fields(req: &EmitRequest) -> Result<Uuid, Status> {
 /// The write behind both emit RPCs. A scope's topic for someone who is not an active member
 /// of the scope writes nothing: its inbox is shown to members only, and the mail copy must
 /// not reach further than the inbox does.
-pub(crate) async fn emit_to(notifications: &dyn NotificationRepository, target: &EmitTarget, req: &EmitRequest) -> Result<EmitResponse, Status> {
+pub(crate) async fn emit_to(notifications: &dyn NotificationRepository, links: &NoticeLinkBases, target: &EmitTarget, req: &EmitRequest) -> Result<EmitResponse, Status> {
 	let user_id = emit_fields(req)?;
+	let link = links.stored_link(&req.link_scope, &req.link)?;
 	if let Some(scope) = &target.scope
 		&& !notifications.is_active_scope_member(scope, user_id).await.map_err(domain_to_status)?
 	{
@@ -296,7 +296,7 @@ pub(crate) async fn emit_to(notifications: &dyn NotificationRepository, target: 
 			&req.kind,
 			&req.title,
 			&req.body,
-			&req.link,
+			&link,
 			&req.dedupe_key,
 			occurred_at,
 			target.default_subscribed,
@@ -491,11 +491,17 @@ pub struct Notifications {
 	notifications: Arc<dyn NotificationRepository>,
 	users: Arc<dyn UserDirectoryRepository>,
 	limiter: Arc<RateLimiter>,
+	links: Arc<NoticeLinkBases>,
 }
 
 impl Notifications {
-	pub fn new(notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, limiter: Arc<RateLimiter>) -> Self {
-		Self { notifications, users, limiter }
+	pub fn new(notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, limiter: Arc<RateLimiter>, links: Arc<NoticeLinkBases>) -> Self {
+		Self {
+			notifications,
+			users,
+			limiter,
+			links,
+		}
 	}
 
 	/// A user's token reads the platform inbox: a scope's own surface signs its users in
@@ -623,6 +629,7 @@ pub fn settings_json(settings: &NotificationSettings) -> serde_json::Value {
 /// ([`crate::scope_inbox`]), so the two can never page or filter differently.
 pub(crate) async fn inbox_page(
 	notifications: &dyn NotificationRepository,
+	links: &NoticeLinkBases,
 	sub: &SubscriberRow,
 	view: &InboxView,
 	req: &ListNotificationsRequest,
@@ -670,7 +677,7 @@ pub(crate) async fn inbox_page(
 				kind: r.kind,
 				title: r.title,
 				body: r.body,
-				link: r.link,
+				link: links.inbox_link(&r.link),
 				occurred_at: r.occurred_at,
 				created_at: r.created_at,
 				read_at: r.read_at,
@@ -743,7 +750,7 @@ impl NotificationService for Notifications {
 				None => return Err(Status::invalid_argument("unknown topic")),
 			}
 		};
-		Ok(Response::new(emit_to(self.notifications.as_ref(), &target, &req).await?))
+		Ok(Response::new(emit_to(self.notifications.as_ref(), &self.links, &target, &req).await?))
 	}
 
 	async fn list_notifications(&self, request: Request<ListNotificationsRequest>) -> Result<Response<ListNotificationsResponse>, Status> {
@@ -751,7 +758,7 @@ impl NotificationService for Notifications {
 		let sub = self.caller(&request).await?;
 		let req = request.get_ref();
 
-		Ok(Response::new(inbox_page(self.notifications.as_ref(), &sub, &view, req).await?))
+		Ok(Response::new(inbox_page(self.notifications.as_ref(), &self.links, &sub, &view, req).await?))
 	}
 
 	async fn get_unread_count(&self, request: Request<GetUnreadCountRequest>) -> Result<Response<GetUnreadCountResponse>, Status> {

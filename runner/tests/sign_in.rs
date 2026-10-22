@@ -283,6 +283,7 @@ async fn the_code_leaves_in_a_mail_and_not_in_the_table() {
 	let cfg = DispatcherConfig {
 		mail_from: "EV <noreply@evinvest.test>".into(),
 		cabinet_url: format!("{ORIGIN}/cabinet"),
+		notice_links: std::sync::Arc::new(concierge::notice_link::NoticeLinkBases::cabinet_only(&format!("{ORIGIN}/cabinet"))),
 		public_origin: ORIGIN.into(),
 		approvals_url: format!("{ORIGIN}/admin/approvals"),
 		daily_budget: i64::MAX,

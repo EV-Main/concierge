@@ -11,7 +11,17 @@ use std::{net::TcpListener, sync::Arc, time::Duration};
 mod common;
 
 use concierge::{
-	infrastructure::{db, grants::PgGrants, notifications::PgNotifications, relying_parties::PgRelyingParties, scope_catalogs::PgScopeCatalogs, users::PgUsers},
+	dispatch::{DispatcherConfig, drain_once},
+	infrastructure::{
+		db,
+		email::transport::{EmailTransport, OutgoingEmail},
+		grants::PgGrants,
+		notifications::PgNotifications,
+		relying_parties::PgRelyingParties,
+		scope_catalogs::PgScopeCatalogs,
+		users::PgUsers,
+	},
+	notice_link::NoticeLinkBases,
 	notification::{MAX_MARK_IDS, Notifications, RateLimiter, TOPICS},
 	ports::{NotificationRepository, RelyingPartyRepository, ScopeCatalogRepository, UserDirectoryRepository},
 	relying_party::{Admission, ClientTokenAuthenticator, RelyingParties, Requester, s256_challenge},
@@ -19,6 +29,7 @@ use concierge::{
 	service_caller::ServiceCallers,
 };
 use domain::{
+	error::DomainError,
 	scope_catalog::{NotificationTopic, ScopeCatalog},
 	users::UserId,
 };
@@ -44,6 +55,7 @@ const BRIDGE_TOKEN: &str = "test-bridge-token";
 const TEST_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIKolOSMXwE+tafZkX+jkKYJbmJ066f4E12wAwTIkKps6\n-----END PRIVATE KEY-----\n";
 const TEST_JWK_X: &str = "Z6BCmq9-_wo9d7co5CDW84Wn0sAC3BA0XWK2AOstpV4";
 const ISSUER: &str = "https://auth.concierge.test";
+const CABINET: &str = "https://evinvest.ltd/cabinet";
 
 struct Fx {
 	pool: PgPool,
@@ -131,6 +143,10 @@ fn now() -> i64 {
 impl Fx {
 	/// The service as `main` mounts it, verifying the user tokens of `clients`.
 	fn inbox(&self, clients: &[&Scope]) -> ScopeInbox {
+		self.inbox_with(clients, Arc::new(NoticeLinkBases::cabinet_only(CABINET)))
+	}
+
+	fn inbox_with(&self, clients: &[&Scope], links: Arc<NoticeLinkBases>) -> ScopeInbox {
 		let verifier = Verifier::try_new(VerifierConfig {
 			issuer: ISSUER.into(),
 			audiences: clients.iter().map(|s| s.client.clone()).collect(),
@@ -143,6 +159,7 @@ impl Fx {
 			self.notifications.clone(),
 			self.users.clone(),
 			Some(ClientTokenAuthenticator::new(verifier, self.rp.clone())),
+			links,
 		)
 	}
 
@@ -598,6 +615,11 @@ impl Fx {
 	async fn publish_bank(&self, topics: &[NotificationTopic]) {
 		let catalogs = PgScopeCatalogs::new(self.pool.clone());
 		loop {
+			if let Some(current) = catalogs.current("bank").await.unwrap()
+				&& topics.iter().all(|t| current.notification_topics.contains(t))
+			{
+				return;
+			}
 			let mut catalog = catalogs.current("bank").await.unwrap().unwrap_or(ScopeCatalog {
 				version: 0,
 				approval_kinds: Vec::new(),
@@ -665,7 +687,12 @@ async fn a_service_emits_only_its_own_namespace_s_published_topics_to_members() 
 	assert_eq!(fx.rows_on(member, &mine.topic).await, 1, "no refused emit wrote anything");
 
 	// A `typ=service` token names no namespace, so it reaches no scope's topic at all.
-	let service = Notifications::new(fx.notifications.clone(), fx.users.clone(), Arc::new(RateLimiter::new(Duration::from_secs(60), 10)));
+	let service = Notifications::new(
+		fx.notifications.clone(),
+		fx.users.clone(),
+		Arc::new(RateLimiter::new(Duration::from_secs(60), 10)),
+		Arc::new(NoticeLinkBases::cabinet_only(CABINET)),
+	);
 	let mut unbound = Request::new(emit(member, &other.topic));
 	unbound.extensions_mut().insert(Claims {
 		iss: ISSUER.into(),
@@ -718,6 +745,145 @@ async fn the_bridge_emits_the_bank_s_published_topics_to_anyone_following_them()
 	);
 	// The bridge still reads no scope's inbox.
 	assert_eq!(inbox.list_scope_notifications(as_bridge(list(user))).await.unwrap_err().code(), Code::PermissionDenied);
+}
+
+#[derive(Default)]
+struct Outbox(std::sync::Mutex<Vec<OutgoingEmail>>);
+
+#[async_trait::async_trait]
+impl EmailTransport for Outbox {
+	async fn send(&self, _from: &str, email: OutgoingEmail) -> Result<(), DomainError> {
+		self.0.lock().unwrap().push(email);
+		Ok(())
+	}
+}
+
+/// banking#580: a notice for a scope with a configured base links to that scope's
+/// cabinet, in the inbox row and in the mail; one without `link_scope` still links under
+/// `CABINET_URL`, and an emitter never gets to name a host itself.
+#[tokio::test]
+async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
+	let Some(fx) = setup().await else { return };
+	let bases = Arc::new(NoticeLinkBases::parse(&["invest=https://invest.evinvest.ltd/cabinet".to_owned()], CABINET, "https://evinvest.ltd", true).unwrap());
+	let scope = fx.scope(&[]).await;
+	let inbox = fx.inbox_with(&[&scope], bases.clone());
+	// The topic of the bridge test beside it: each new `bank` topic bumps the shared
+	// catalog's version past the clock, which `scoped_inbox`'s publication must beat.
+	let topic = "bank:emit_test".to_owned();
+	fx.publish_bank(&[NotificationTopic {
+		topic: topic.clone(),
+		label: "Money".into(),
+		description: String::new(),
+		default_subscribed: false,
+	}])
+	.await;
+	let (user, email) = fx.user("link-scope").await;
+	fx.follow(user, &email, &topic).await;
+
+	let notice = |link_scope: &str, title: &str| EmitRequest {
+		link: "/wallet/action/payment/42".into(),
+		link_scope: link_scope.into(),
+		title: title.into(),
+		..emit(user, &topic)
+	};
+	for (link_scope, title) in [("invest", "scoped"), ("", "unscoped"), ("sa", "no base")] {
+		let sent = inbox.emit_scope_notification(as_bridge(notice(link_scope, title))).await.unwrap().into_inner();
+		assert!(sent.delivered, "{link_scope:?}: {sent:?}");
+	}
+	let stored: Vec<(String, String)> =
+		sqlx::query_as("SELECT n.title, n.link FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.topic = $2 ORDER BY n.title")
+			.bind(user)
+			.bind(&topic)
+			.fetch_all(&fx.pool)
+			.await
+			.unwrap();
+	assert_eq!(
+		stored,
+		vec![
+			("no base".to_owned(), "/wallet/action/payment/42".to_owned()),
+			("scoped".to_owned(), "https://invest.evinvest.ltd/cabinet/wallet/action/payment/42".to_owned()),
+			("unscoped".to_owned(), "/wallet/action/payment/42".to_owned()),
+		]
+	);
+
+	for (link, link_scope) in [("https://attacker.example/x", ""), ("//attacker.example", "invest"), ("/wallet", "In-vest")] {
+		let mut bad = notice(link_scope, "refused");
+		bad.link = link.into();
+		let refused = inbox.emit_scope_notification(as_bridge(bad)).await.unwrap_err();
+		assert_eq!(refused.code(), Code::InvalidArgument, "{link:?} / {link_scope:?}: {refused:?}");
+	}
+
+	let outbox = Outbox::default();
+	let cfg = DispatcherConfig {
+		mail_from: "EV <noreply@evinvest.test>".into(),
+		cabinet_url: CABINET.into(),
+		notice_links: bases,
+		public_origin: "https://evinvest.ltd".into(),
+		approvals_url: "https://evinvest.ltd/admin/approvals".into(),
+		daily_budget: i64::MAX,
+		interval: Duration::from_secs(60),
+	};
+	while drain_once(&PgNotifications::new(fx.pool.clone()), &outbox, &cfg).await > 0 {}
+	let mails: Vec<OutgoingEmail> = outbox.0.lock().unwrap().iter().filter(|m| m.to == email).cloned().collect();
+	let target = |title: &str| {
+		let mail = mails.iter().find(|m| m.subject.ends_with(title)).unwrap_or_else(|| panic!("the {title:?} mail was sent"));
+		mail.text
+			.lines()
+			.find_map(|line| line.strip_prefix("Open your cabinet: "))
+			.expect("the text part carries the link")
+			.to_owned()
+	};
+	assert_eq!(target("— scoped"), "https://invest.evinvest.ltd/cabinet/wallet/action/payment/42");
+	assert_eq!(target("— unscoped"), "https://evinvest.ltd/cabinet/wallet/action/payment/42");
+	assert_eq!(target("— no base"), "https://evinvest.ltd/cabinet/wallet/action/payment/42");
+}
+
+/// A relying party links only into its own scope's cabinet; only the bridge names another.
+#[tokio::test]
+async fn a_client_names_only_its_own_scope_as_link_scope() {
+	let Some(fx) = setup().await else { return };
+	let sa = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&sa]);
+	let (member, email) = fx.user("link-scope-client").await;
+	fx.join(&sa, member).await;
+	fx.follow(member, &email, &sa.topic).await;
+
+	let mut foreign = emit(member, &sa.topic);
+	foreign.link = "/wallet".into();
+	foreign.link_scope = "invest".into();
+	assert_eq!(inbox.emit_scope_notification(as_client(foreign, &sa)).await.unwrap_err().code(), Code::PermissionDenied);
+	assert_eq!(fx.rows_on(member, &sa.topic).await, 0, "nothing is written");
+
+	let mut own = emit(member, &sa.topic);
+	own.link = "/wallet".into();
+	own.link_scope = sa.id.clone();
+	assert!(inbox.emit_scope_notification(as_client(own, &sa)).await.unwrap().into_inner().delivered);
+}
+
+/// A row written before the emit rule held only a length check, or under a base removed
+/// since, reaches the reader without its link: a cabinet renders an absolute one as given.
+#[tokio::test]
+async fn an_inbox_read_drops_a_stored_link_under_no_configured_cabinet() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope(&[]).await;
+	let inbox = fx.inbox(&[&scope]);
+	let (user, email) = fx.user("inbox-link").await;
+	fx.join(&scope, user).await;
+	let hostile = ["https://phish.example/login", "javascript:alert(1)", "https://invest.evinvest.ltd/cabinet/wallet"];
+	let kept = ["/wallet", "https://evinvest.ltd/cabinet/x"];
+	for link in hostile.iter().chain(kept.iter()) {
+		let id = fx.note(user, &email, &scope.topic).await;
+		sqlx::query("UPDATE notifications SET link = $2 WHERE id = $1")
+			.bind(id)
+			.bind(link)
+			.execute(&fx.pool)
+			.await
+			.unwrap();
+	}
+	let page = inbox.list_scope_notifications(as_client(list(user), &scope)).await.unwrap().into_inner();
+	let mut links: Vec<String> = page.notifications.into_iter().map(|n| n.link).collect();
+	links.sort();
+	assert_eq!(links, vec!["", "", "", "/wallet", "https://evinvest.ltd/cabinet/x"], "no base is configured here");
 }
 
 fn unfollow(topic: &str) -> SetScopeTopicSubscriptionRequest {

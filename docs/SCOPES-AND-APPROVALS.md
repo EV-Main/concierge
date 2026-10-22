@@ -860,6 +860,22 @@ the offer when a later catalog withdraws them.
   account, as the platform inbox shows it to everyone. `NotificationService.Emit` with a
   `typ=service` token keeps this plane's own topics and refuses a scope's
   (`PERMISSION_DENIED`): that token names no namespace.
+- **A notice links into the cabinet of the scope it names** (banking#580). `link` is empty or a
+  cabinet path: one leading `/` (not `//` or `/\`), printable ASCII without spaces, else
+  `INVALID_ARGUMENT` — the rule the money plane's fee notice link already had
+  (`notice_link::cabinet_path`), so an emitter never names a host. `link_scope` names the
+  cabinet (`[a-z][a-z0-9_]{0,31}`, else `INVALID_ARGUMENT`). A relying party may name only
+  its own scope, else `PERMISSION_DENIED`; the bridge token names any, because a `bank`
+  notice is about money held for a scope and is read in that scope's cabinet. When `NOTICE_LINK_BASES` has a
+  base for it, the emit stores the absolute link `base + link`; otherwise the link stays
+  relative and the mail joins it onto `CABINET_URL`. A stored link is checked again
+  whenever it leaves this plane (`notice_link::NoticeLinkBases`), because rows outlive both
+  the emit rule and the configuration: it passes only as a cabinet path or as an absolute
+  link under `CABINET_URL` or a base configured NOW. Anything else — a row from before the
+  rule, a base removed since — makes the mail link to `CABINET_URL` itself, and an inbox
+  read (`ListNotifications`, `ListScopeNotifications`) return the notice with an empty
+  link. The emit path is
+  the same on both RPCs (`EmitScopeNotification`, `NotificationService.Emit`).
 - **`default_subscribed` applies.** Switching a topic off writes a row to
   `notification_topic_optouts` (migration 0041) beside deleting the subscription, so "never
   touched" and "switched off" read differently. A default topic is followed — with its mail

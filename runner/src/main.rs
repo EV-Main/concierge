@@ -136,6 +136,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	let dev_redirects = relying_party::parse_dev_redirects(&std::env::var("RP_DEV_REDIRECT_URIS").unwrap_or_default(), config.app_env == "production")?;
 	let dev_origins = web::origins::DevOrigins::parse(&std::env::var("SCOPE_DEV_ORIGINS").unwrap_or_default(), config.app_env == "production")?;
 	let stepup_origins = web::stepup::parse_origins(&config.stepup_proof_origins, &config.public_origin, config.app_env == "production")?;
+	let notice_links = Arc::new(concierge::notice_link::NoticeLinkBases::parse(
+		&config.notice_link_bases,
+		&config.cabinet_url,
+		&config.public_origin,
+		config.app_env == "production",
+	)?);
 	let kyc_provider = build_kyc_provider(&config)?;
 	// Fail the BOOT, not the first start. A provider that cannot say where its session
 	// URLs live turns the redirect check into a no-op, and the whole point of that check
@@ -352,7 +358,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	let notification_repo: Arc<dyn concierge::ports::NotificationRepository> = pg_notifications.clone();
 	let dispatch_repo: Arc<dyn concierge::ports::NotificationDispatchRepository> = pg_notifications;
 	// A direction's own inbox, read by its backend with its client credential (D21).
-	let scope_inbox = concierge::scope_inbox::ScopeInbox::new(service_callers, notification_repo.clone(), users.clone(), client_tokens);
+	let scope_inbox = concierge::scope_inbox::ScopeInbox::new(service_callers, notification_repo.clone(), users.clone(), client_tokens, notice_links.clone());
 
 	// The ownership consilium. The broadcast channel is only an immediacy optimisation
 	// for the live feed — each stream ALSO re-reads the revision from Postgres on an
@@ -379,6 +385,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		concierge::dispatch::DispatcherConfig {
 			mail_from: config.mail_from.clone(),
 			cabinet_url: config.cabinet_url.clone(),
+			notice_links: notice_links.clone(),
 			public_origin: config.public_origin.clone(),
 			approvals_url: config.approvals_url.clone(),
 			daily_budget: config.notification_daily_email_budget,
@@ -539,7 +546,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			)))
 			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), grants, break_glass.clone()).with_grant_write_limiter(grant_write_limiter))))
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass.clone(), platform_repo))))
-			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users.clone(), subscribe_limiter))))
+			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users.clone(), subscribe_limiter, notice_links))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 			.add_service(auth.layer(ScopeRegistryServer::new(concierge::scopes::ScopeRegistry::new(scope_repo))))
 			.add_service(auth.layer(ApprovalServiceServer::new(concierge::approvals::Approvals::new(users, break_glass, approval_repo, catalog_repo))))

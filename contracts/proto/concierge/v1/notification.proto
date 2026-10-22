@@ -75,12 +75,20 @@ message EmitRequest {
   string kind = 3;
   string title = 4;
   string body = 5;
-  // Relative cabinet path the notification links to, e.g. "/funds/quy-nhon".
+  // Cabinet-relative path the notification links to, e.g. "/funds/quy-nhon", or empty.
+  // It starts with one '/' (not "//" or "/\") and is printable ASCII without spaces;
+  // anything else is INVALID_ARGUMENT. Which cabinet it opens in is `link_scope`'s.
   string link = 6;
   // Idempotency key, unique per subscriber. Re-emitting the same key is a no-op.
   string dedupe_key = 7;
   // Domain time of the underlying event, unix seconds. 0 ⇒ server clock.
   int64 occurred_at = 8;
+  // The scope whose cabinet `link` opens in, e.g. "invest" ([a-z][a-z0-9_]{0,31}, else
+  // INVALID_ARGUMENT). A relying party may name only its own scope (else
+  // PERMISSION_DENIED); the bridge token may name any. When this plane configures a base for it (`NOTICE_LINK_BASES`),
+  // the stored link — and so `Notification.link` — is that base plus `link`, an absolute
+  // URL. Empty, or a scope with no base, keeps `link` relative to `CABINET_URL`.
+  string link_scope = 9;
 }
 
 message EmitResponse {
@@ -99,6 +107,10 @@ message Notification {
   string kind = 3;
   string title = 4;
   string body = 5;
+  // It is empty, a path that starts with one '/', or an https:// URL under a cabinet this
+  // plane configures. A reader uses a link that starts with https:// as given and puts its
+  // cabinet in front of any other link. A stored link outside those cabinets is returned
+  // empty.
   string link = 6;
   // Unix seconds.
   int64 occurred_at = 7;

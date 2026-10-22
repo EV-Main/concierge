@@ -35,6 +35,7 @@
 //!                     this plane's own `concierge:*` kinds
 //!   web             — the site-level auth HTTP surface (login/callback/session cookies)
 //!   notification    — the notification plane: subscribers, the in-app inbox, queued email
+//!   notice_link     — which cabinet a notice links to: `NOTICE_LINK_BASES` per scope
 //!   dispatch        — the background loops: draining the outbound email queue, and the
 //!                     hold sweep (a lapse must be a write, or the money plane never learns
 //!                     the account is unfrozen); with the approval executor, the only loops
@@ -52,6 +53,7 @@ pub mod genesis;
 pub mod governance;
 pub mod infrastructure;
 pub mod log;
+pub mod notice_link;
 pub mod notification;
 pub mod platform;
 pub mod ports;

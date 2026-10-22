@@ -38,6 +38,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
+	notice_link::NoticeLinkBases,
 	notification::{EmitTarget, InboxView, emit_to, follow_offered, inbox_mark_read, inbox_page, inbox_unread, scope_topic, settings_of, subscriber_of, topic},
 	ports::{NotificationRepository, UserDirectoryRepository},
 	relying_party::ClientTokenAuthenticator,
@@ -60,6 +61,7 @@ pub struct ScopeInbox {
 	/// a client audience and a live session. `None` where no client is configured — every
 	/// write is then refused.
 	user_tokens: Option<ClientTokenAuthenticator>,
+	links: Arc<NoticeLinkBases>,
 }
 
 /// Whose inbox, through which scope. `member` is `None` for anyone the scope may not show
@@ -70,12 +72,19 @@ struct Reader {
 }
 
 impl ScopeInbox {
-	pub fn new(callers: ServiceCallers, notifications: Arc<dyn NotificationRepository>, users: Arc<dyn UserDirectoryRepository>, user_tokens: Option<ClientTokenAuthenticator>) -> Self {
+	pub fn new(
+		callers: ServiceCallers,
+		notifications: Arc<dyn NotificationRepository>,
+		users: Arc<dyn UserDirectoryRepository>,
+		user_tokens: Option<ClientTokenAuthenticator>,
+		links: Arc<NoticeLinkBases>,
+	) -> Self {
 		Self {
 			callers,
 			notifications,
 			users,
 			user_tokens,
+			links,
 		}
 	}
 
@@ -162,7 +171,7 @@ impl ScopeInboxService for ScopeInbox {
 			unread_only: req.unread_only,
 			topic: req.topic,
 		};
-		Ok(Response::new(inbox_page(self.notifications.as_ref(), &sub, &reader.view, &page).await?))
+		Ok(Response::new(inbox_page(self.notifications.as_ref(), &self.links, &sub, &reader.view, &page).await?))
 	}
 
 	async fn get_scope_unread_count(&self, request: Request<GetScopeUnreadCountRequest>) -> Result<Response<GetUnreadCountResponse>, Status> {
@@ -225,6 +234,15 @@ impl ScopeInboxService for ScopeInbox {
 			ServiceCaller::Client(client) => Some(client.scope.clone()),
 		};
 		let req = request.into_inner();
+		// A relying party speaks for its own scope only, so it must not send its users into
+		// another direction's cabinet. The bridge is free: a wallet notice of `bank` is about
+		// money held for a scope, and that scope's cabinet is where it is read.
+		if let ServiceCaller::Client(client) = &caller
+			&& !req.link_scope.is_empty()
+			&& req.link_scope != client.scope
+		{
+			return Err(Status::permission_denied("a relying party links only into its own scope's cabinet"));
+		}
 		let ours = topic(&req.topic).is_none() && req.topic.split_once(':').is_some_and(|(namespace, _)| namespace == caller.namespace());
 		if !ours {
 			return Err(Status::permission_denied("a service emits only its own namespace's topics"));
@@ -237,6 +255,6 @@ impl ScopeInboxService for ScopeInbox {
 			scope,
 			default_subscribed: published.default_subscribed,
 		};
-		Ok(Response::new(emit_to(self.notifications.as_ref(), &target, &req).await?))
+		Ok(Response::new(emit_to(self.notifications.as_ref(), &self.links, &target, &req).await?))
 	}
 }
