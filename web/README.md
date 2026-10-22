@@ -58,21 +58,32 @@ every other `Origin`.
 ## The platform confirmation page
 
 `reauth.html` is the one page in `dist/`; concierge serves it at
-`/api/auth/mfe/reauth.html` with `no-store`, `frame-ancestors 'none'` and `no-referrer`
-(`runner/src/web/mfe.rs`). A relying party gets a fresh-sign-in proof by sending its user
-to `/api/auth/authorize?…&max_age=N` (D24(1)). When the session is older than `N`, the
-authorize route answers 302 to this page with
-`return_to=/api/auth/authorize?…&max_age=N&reauth=done` (`runner/src/web/authorize.rs`,
-`CONFIRM_PATH`). The page mounts `<mfe-concierge-reauth open>` from the same build and,
-on `ev:reauthenticated` or `ev:close`, calls `location.replace(return_to)`. It does not
+`/api/auth/mfe/reauth.html` with `no-store`, `no-referrer` and a full CSP (no inline
+script; `runner/src/web/mfe.rs`). A relying party gets a fresh-sign-in proof by sending
+its user to `/api/auth/authorize?…&max_age=N` (D24(1)). When the session is older than
+`N`, the authorize route records a confirmation trip and answers 302 to this page with
+`return_to` set to the same authorize request, rebuilt with its `max_age`
+(`runner/src/web/authorize.rs`, `CONFIRM_PATH`, `confirm_url`). Only a trip that
+concierge started yields a code with `auth_time`; nothing in `return_to` marks the way
+back. The page mounts `<mfe-concierge-reauth open>` from the same build and, on
+`ev:reauthenticated` or `ev:close`, calls `location.replace(return_to)`. It does not
 judge the outcome: the authorize route answers with a code or with `access_denied`.
 
 The page accepts `return_to` only if it is a relative path that starts with
 `/api/auth/authorize?` and contains no backslash and no control character (so no scheme,
-no `//` and no `/\` at the start), and only if it still resolves to that path on this
-origin (`src/shared/lib/authorize-return.ts`). Anything else shows a short error and
-navigates nowhere: the page runs signed in on the platform origin, and an open redirect
-there would lend the platform's address bar to a phishing link.
+no `//` and no `/\` at the start), if it still resolves to that path on this origin, and
+if it names exactly one `client_id` (`src/shared/lib/authorize-return.ts`). Anything else
+shows a short error and navigates nowhere: the page runs signed in on the platform
+origin, and an open redirect there would lend the platform's address bar to a phishing
+link.
+
+The page names the app that asks. It takes the `client_id` from the checked `return_to`
+only, never a name from the query, and asks `GET /api/auth/clients/{client_id}`
+(same-origin, no credentials; `src/shared/api/client-name.ts`). A `display_name` shows as
+"<name> asks you to confirm it's you", written as text. An empty name, a 503, a failed
+request or a timeout keep the generic line and open the dialog. A 404 means concierge
+would not serve the client at authorize, so the page says the link is not valid and does
+not open the dialog.
 
 The page is built from `pages/reauth.html` (template), `src/entries/reauth-page.ts` (the
 script, no React) and `styles/reauth-page.css` (kit tokens only); `scripts/build.mjs`
