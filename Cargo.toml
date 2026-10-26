@@ -33,7 +33,7 @@ ev = { version = "0.24.2", package = "ev_lib", default-features = false, feature
 evconcierge_auth = { path = "auth" }
 # `version` too: the published `evconcierge_client` and `evconcierge_projection` resolve it
 # from crates.io, where a bare path dependency cannot go.
-evconcierge_contracts = { version = "0.5.0", path = "contracts" }
+evconcierge_contracts = { version = "0.6.0", path = "contracts" }
 # argon2id for the passwords this plane checks itself.
 argon2 = { version = "0.5", features = ["std"] }
 # Passkeys (WebAuthn): discoverable sign-in needs `conditional-ui`.
