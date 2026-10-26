@@ -1,7 +1,8 @@
 //! Postgres adapter for second factors. Every write takes the account's
 //! `second_factor_guard` row first, `FOR UPDATE`: it is the account's lock for everything
 //! here, and the wrong-answer count it holds is read and written in the same transaction as
-//! the answer it counts.
+//! the answer it counts. A write that also moves the `users` row (a recovery, the owners'
+//! reset) takes that row before the guard.
 
 use async_trait::async_trait;
 use domain::{error::DomainError, users::UserId};
@@ -110,7 +111,7 @@ async fn confirmed_count(conn: &mut PgConnection, user: UserId) -> Result<i64, D
 
 /// Queue the account's security notice. Every account holding a factor has a verified
 /// address (enrolment demands it), so one without is refused rather than told nothing.
-async fn notice(conn: &mut PgConnection, user: UserId, event: SecurityEvent, label: Option<&str>, now: i64) -> Result<(), DomainError> {
+pub(super) async fn notice(conn: &mut PgConnection, user: UserId, event: SecurityEvent, label: Option<&str>, now: i64) -> Result<(), DomainError> {
 	let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1 AND email_verified")
 		.bind(user.raw())
 		.fetch_optional(&mut *conn)
@@ -144,6 +145,18 @@ async fn store_recovery(conn: &mut PgConnection, user: UserId, recovery: &[[u8; 
 			.map_err(repo_err)?;
 	}
 	Ok(())
+}
+
+/// Every factor and recovery code of the account, gone. Takes the guard first, as every
+/// writer here does; a caller holding the account's `users` row takes it before this.
+pub(super) async fn wipe(conn: &mut PgConnection, user: UserId, now: i64) -> Result<(), DomainError> {
+	guard(conn, user, now).await?;
+	sqlx::query("DELETE FROM second_factors WHERE user_id = $1")
+		.bind(user.raw())
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	store_recovery(conn, user, &[], now).await
 }
 
 #[derive(sqlx::FromRow)]
@@ -356,6 +369,9 @@ impl SecondFactorRepository for PgSecondFactors {
 
 	async fn recover(&self, user: UserId, code: [u8; 32], now: i64) -> Result<Attempt<()>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		// The `users` row before the guard: the owners' reset (`people::apply`) holds it
+		// while it wipes, and the two must not wait on each other.
+		let mut account = load_for_update(&mut tx, user).await?;
 		let g = guard(&mut tx, user, now).await?;
 		if let Some(until) = locked(&g, now) {
 			return Ok(Attempt::Locked { until });
@@ -374,13 +390,7 @@ impl SecondFactorRepository for PgSecondFactors {
 			tx.commit().await.map_err(repo_err)?;
 			return Ok(Attempt::Wrong);
 		}
-		sqlx::query("DELETE FROM second_factors WHERE user_id = $1")
-			.bind(user.raw())
-			.execute(&mut *tx)
-			.await
-			.map_err(repo_err)?;
-		store_recovery(&mut tx, user, &[], now).await?;
-		let mut account = load_for_update(&mut tx, user).await?;
+		wipe(&mut tx, user, now).await?;
 		account.revoke_tokens();
 		update_row(&mut tx, &account).await?;
 		drain_outbox(&mut tx, &mut account).await?;

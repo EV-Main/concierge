@@ -1884,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "evconcierge_client"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "evconcierge_contracts"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -1911,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "evconcierge_projection"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "evconcierge_contracts",

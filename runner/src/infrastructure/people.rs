@@ -1,6 +1,7 @@
 //! The decisions about PEOPLE inside `approvals`: who may be asked about, and what an
 //! executed decision writes (`concierge:owner_admission`, `owner_removal`, `user_suspension`,
-//! `user_reinstatement`, `admin_admission`; `docs/SCOPES-AND-APPROVALS.md` §5.3).
+//! `user_reinstatement`, `admin_admission`, `second_factor_reset`;
+//! `docs/SCOPES-AND-APPROVALS.md` §5.3).
 //!
 //! The effects are the legacy consilia's, written through the SAME identity helpers
 //! (`users::load_for_update`, `update_row`, `drain_outbox`), so there is one identity writer
@@ -27,21 +28,25 @@ use super::{
 	approvals::{repo_err, unseated},
 	users::{self, AdminAction},
 };
-use crate::ports::ApprovalRecord;
+use crate::ports::{ApprovalRecord, SecurityEvent};
 
 /// The facts a decision about `user` is measured against, as the row has them now.
 pub(super) async fn standing(conn: &mut PgConnection, user: UserId) -> Result<Option<PersonStanding>, DomainError> {
-	let row: Option<(String, String, bool, Option<String>)> = sqlx::query_as("SELECT role, status, email_verified, suspended_by FROM users WHERE id = $1")
-		.bind(user.raw())
-		.fetch_optional(conn)
-		.await
-		.map_err(repo_err)?;
-	row.map(|(role, status, verified, suspended_by)| {
+	let row: Option<(String, String, bool, Option<String>, bool)> = sqlx::query_as(
+		"SELECT role, status, email_verified, suspended_by, EXISTS (SELECT 1 FROM second_factors f WHERE f.user_id = users.id AND f.confirmed_at IS NOT NULL) \
+		 FROM users WHERE id = $1",
+	)
+	.bind(user.raw())
+	.fetch_optional(conn)
+	.await
+	.map_err(repo_err)?;
+	row.map(|(role, status, verified, suspended_by, second_factor)| {
 		Ok(PersonStanding {
 			role: Role::parse(&role)?,
 			active: UserStatus::parse(&status)? == UserStatus::Active,
 			verified,
 			governance_suspended: suspended_by.as_deref() == Some("governance"),
+			second_factor,
 		})
 	})
 	.transpose()
@@ -147,9 +152,16 @@ pub(super) async fn apply(conn: &mut PgConnection, record: &ApprovalRecord, effe
 		PersonEffect::Suspend => subject.suspend(),
 		PersonEffect::Reinstate => subject.enable(now),
 		PersonEffect::AdmitAdmin => subject.set_role(Role::Admin),
+		PersonEffect::ResetSecondFactor => {
+			super::second_factors::wipe(conn, user, now).await?;
+			subject.revoke_tokens();
+		}
 	}
 	users::update_row(conn, &subject).await?;
 	users::drain_outbox(conn, &mut subject).await?;
+	if effect == PersonEffect::ResetSecondFactor {
+		super::second_factors::notice(conn, user, SecurityEvent::Reset, None, now).await?;
+	}
 	// No human acted at execution, so the actor stays empty; who asked is in the detail.
 	let action = AdminAction::system(effect.audit_verb())
 		.with_reason(&record.reason)
