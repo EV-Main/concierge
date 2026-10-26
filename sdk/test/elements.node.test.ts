@@ -68,6 +68,14 @@ describe('conciergeEntry for reauth', () => {
   });
 });
 
+describe('conciergeEntry for stepup', () => {
+  const STEPUP: MfeEntry = { name: 'concierge.stepup', tag: 'mfe-concierge-stepup', kind: 'component', scriptUrl: '/auth/mfe/stepup.js' };
+
+  it('should_return_the_stepup_entry_whose_name_and_tag_match', () => {
+    expect(conciergeEntry([REAUTH, STEPUP], 'stepup')).toEqual({ ok: true, value: STEPUP });
+  });
+});
+
 describe('registry location', () => {
   it('should_point_at_the_concierge_registry_on_evinvest_ltd', () => {
     expect(CONCIERGE_REGISTRY_URL).toBe('https://evinvest.ltd/api/auth/mfe/registry.json');

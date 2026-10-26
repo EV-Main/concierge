@@ -32,7 +32,7 @@ export interface FactorChallenge {
   challenge: unknown;
 }
 
-export interface VerifyCeremony {
+export interface FactorCeremony {
   ceremony: string;
   factors: FactorChallenge[];
 }
@@ -94,12 +94,15 @@ function parseChallenge(raw: unknown): FactorChallenge | null {
   return id !== null && kind !== null && label !== undefined ? { id, kind, label, challenge: raw["challenge"] } : null;
 }
 
-function parseVerifyCeremony(raw: unknown): VerifyCeremony | null {
-  if (!isRecord(raw)) return null;
-  const ceremony = str(raw, "ceremony");
-  const factors = listOf(raw["factors"], parseChallenge);
-  return ceremony !== null && factors ? { ceremony, factors } : null;
-}
+/** The account's own routes name the handle `ceremony`, the step-up routes `ceremony_id`. */
+export const factorCeremonyAt =
+  (key: "ceremony" | "ceremony_id") =>
+  (raw: unknown): FactorCeremony | null => {
+    if (!isRecord(raw)) return null;
+    const ceremony = str(raw, key);
+    const factors = listOf(raw["factors"], parseChallenge);
+    return ceremony !== null && factors ? { ceremony, factors } : null;
+  };
 
 export const readSecondFactors = (api: AuthApi) => api.get("/methods", parseSummary);
 
@@ -107,7 +110,7 @@ export const startEnrolment = (api: AuthApi, label: string) => api.send("POST", 
 
 export const confirmEnrolment = (api: AuthApi, enrolment: string, response: unknown) => api.send("POST", "/second-factor/enrol/confirm", { enrolment, response }, parseConfirmed, true);
 
-export const verifyOptions = (api: AuthApi) => api.send("POST", "/second-factor/verify/options", {}, parseVerifyCeremony, true);
+export const verifyOptions = (api: AuthApi) => api.send("POST", "/second-factor/verify/options", {}, factorCeremonyAt("ceremony"), true);
 
 export const verifyFactor = (api: AuthApi, ceremony: string, factor: string, response: unknown) => api.send("POST", "/second-factor/verify", { ceremony, factor, response }, anyBody, true);
 

@@ -1,7 +1,8 @@
 # @evinvest/concierge
 
 Host wrappers for the **concierge microfrontends** — the sign-in dialog, the
-account page, the account chip and the re-authentication dialog — over
+account page, the account chip, the re-authentication dialog and the step-up
+dialog — over
 [`@evinvest/mfe`](https://www.npmjs.com/package/@evinvest/mfe). A host
 (invest cabinet, the SA panel, admin) mounts them; the elements themselves are
 built in this repo's `web/` and served from `https://evinvest.ltd/api/auth/mfe/`
@@ -16,8 +17,8 @@ npm install @evinvest/concierge @evinvest/mfe
 - `.` — server-safe core: registry constants, tags, the session shape, the
   RP-login and platform sign-out hrefs.
 - `./react` — `SignInDialog`, `AccountPage`, `AccountChip`, `ReauthDialog`,
-  `useSignInRequired`, `useReauthRequired` (a `"use client"` bundle; `react` is
-  an optional peer).
+  `StepupDialog`, `useSignInRequired`, `useReauthRequired`, `useStepup` (a
+  `"use client"` bundle; `react` is an optional peer).
 
 `@evinvest/mfe` is a **peer**: its loader caches loads per tag, so the host and
 this package must share one copy.
@@ -32,6 +33,7 @@ No network calls beyond the registry and the session; the elements do the rest.
 | Account page | `mfe-concierge-account` | `concierge.account` |
 | Account chip | `mfe-concierge-account-chip` | `concierge.account-chip` |
 | Re-authentication dialog | `mfe-concierge-reauth` | `concierge.reauth` |
+| Step-up dialog | `mfe-concierge-stepup` | `concierge.stepup` |
 
 ```ts
 import { conciergeEntry, fetchConciergeRegistry } from '@evinvest/concierge';
@@ -128,6 +130,51 @@ Element contract, host side:
 Both events bubble, are `composed` and carry no detail (`ReauthEventMap`). At
 most one of them fires per opening. `ReauthDialog` calls `onReauthenticated`
 before `onOpenChange(false)`.
+
+## Prove a second factor for one operation
+
+A money-plane page (on evinvest.ltd or a scope host concierge lists in
+`STEPUP_PROOF_ORIGINS`) that needs a second factor for ONE operation asks the
+element for a proof and sends it with the operation. The host's backend stored
+the operation's `intentHash` and names the least assurance it needs:
+
+```tsx
+'use client';
+import { StepupDialog, useStepup } from '@evinvest/concierge/react';
+
+const { requestProof, dialogProps } = useStepup();
+
+async function withdraw() {
+  const { intentHash, minAal } = await post('/api/withdrawals/intent', body); // the host's own BFF
+  const proof = await requestProof(intentHash, minAal);
+  if (proof === null) return;                               // dismissed: leave it undone
+  await post('/api/withdrawals', { intentHash, proof });
+}
+
+<StepupDialog scriptUrl={stepup.scriptUrl} {...dialogProps} />;
+```
+
+`requestProof` resolves with the proof after the element reports
+`ev:stepup-proof`, and `null` on `ev:close` or when the host unmounts. A call
+for the same operation while the dialog is open shares its answer; a call for
+another one rejects, because a proof is good for one `intentHash` only. The
+host never learns which kinds of factor the account has: the picker and the
+per-kind forms are the element's. With no factor that gives `minAal`, the
+element enrols one in place on evinvest.ltd and, on a scope host, links to the
+platform's account page and offers to ask again.
+
+Element contract, host side:
+
+| | Name | Meaning |
+| --- | --- | --- |
+| attribute | `open` | present while the dialog is open; only the host sets or removes it |
+| attribute | `intent-hash` | the operation's hash, 64 lowercase hex; required |
+| attribute | `min-aal` | the least assurance level, an integer; required, no default (missing or malformed, the dialog says so and asks nothing) |
+| event | `ev:stepup-proof` | detail `{ proof, expiresAt }` (unix seconds) (`STEPUP_PROOF_EVENT`, `StepupProofDetail`) |
+| event | `ev:close` | dismissed by the user (`CLOSE_EVENT`) |
+
+Both events bubble and are `composed` (`StepupEventMap`). At most one of them
+fires per opening. `StepupDialog` calls `onProof` before `onOpenChange(false)`.
 
 ## Account page and chip
 

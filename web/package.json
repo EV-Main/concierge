@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "The identity plane's microfrontends: <mfe-concierge-sign-in>, <mfe-concierge-account>, <mfe-concierge-account-chip> and <mfe-concierge-reauth>. Self-registering ESM bundles with their own React, built to dist/ and served by concierge under /auth/mfe/*.",
+  "description": "The identity plane's microfrontends: <mfe-concierge-sign-in>, <mfe-concierge-account>, <mfe-concierge-account-chip>, <mfe-concierge-reauth> and <mfe-concierge-stepup>. Self-registering ESM bundles with their own React, built to dist/ and served by concierge under /auth/mfe/*.",
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit -p .",

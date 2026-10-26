@@ -4,11 +4,10 @@ import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, List
 import { useEffect, useState, type ComponentType } from "react";
 
 import { useElement } from "../../../shared/element/element-context";
-import { readSecondFactors, recover, removeFactor, replaceRecoveryCodes, startEnrolment, type Factor, type Offer, type SecondFactors } from "../api/second-factor-api";
+import { readSecondFactors, recover, removeFactor, replaceRecoveryCodes, type Factor, type SecondFactors } from "../api/second-factor-api";
 import { useGuardedAct } from "../model/use-guarded-act";
 import { kindName } from "./answer-form";
-import { EnrolLabel } from "./enrol-label";
-import { EnrolOffer } from "./enrol-offer";
+import { Enrolment, type ReauthSlotProps } from "./enrolment";
 import { FactorStep } from "./factor-step";
 import { RecoverForm } from "./recover-form";
 import { RecoveryCodes } from "./recovery-codes";
@@ -16,15 +15,9 @@ import { secondFactorRefusal } from "./refusal";
 import { RemoveLast } from "./remove-last";
 import { SessionEnded } from "./session-ended";
 
-export interface ReauthSlotProps {
-  sub: string;
-  onConfirmed: () => void;
-  onCancel: () => void;
-}
-
 type Loaded = { kind: "loading" } | { kind: "off" } | { kind: "failed" } | { kind: "ready"; held: SecondFactors };
 
-type Panel = null | { kind: "label" } | { kind: "offer"; offer: Offer } | { kind: "codes"; codes: string[] } | { kind: "removeLast"; factor: string } | { kind: "recover" } | { kind: "ended" };
+type Panel = null | { kind: "enrol" } | { kind: "codes"; codes: string[] } | { kind: "removeLast"; factor: string } | { kind: "recover" } | { kind: "ended" };
 
 const dateOf = (secs: number) => new Date(secs * 1000).toLocaleDateString();
 
@@ -62,12 +55,6 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
 
   if (loaded.kind === "loading" || loaded.kind === "off") return null;
 
-  const enrol = (label: string) =>
-    gate.start(async () => {
-      const answer = await startEnrolment(api, label);
-      if (answer.ok) setPanel({ kind: "offer", offer: answer.body });
-      return answer;
-    });
   const remove = (factor: string) =>
     gate.start(async () => {
       const answer = await removeFactor(api, factor);
@@ -98,7 +85,7 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
   };
 
   const addButton = (
-    <Button variant="outline" size="sm" disabled={locked || panel !== null} onClick={() => open({ kind: "label" })}>
+    <Button variant="outline" size="sm" disabled={locked || panel !== null} onClick={() => open({ kind: "enrol" })}>
       {t("auth.secondFactor.add", "Add authenticator app")}
     </Button>
   );
@@ -158,15 +145,13 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
               </ListRow>
             </>
           )}
-          {panel?.kind === "label" && <EnrolLabel busy={locked} onStart={(label) => void enrol(label)} onCancel={() => setPanel(null)} />}
-          {panel?.kind === "offer" && (
-            <EnrolOffer
-              offer={panel.offer}
-              onEnrolled={(codes) => {
-                setPanel(codes ? { kind: "codes", codes } : null);
+          {panel?.kind === "enrol" && (
+            <Enrolment
+              reauth={Reauth}
+              onEnrolled={() => {
+                setPanel(null);
                 reload();
               }}
-              onRestart={() => setPanel({ kind: "label" })}
               onCancel={() => setPanel(null)}
             />
           )}

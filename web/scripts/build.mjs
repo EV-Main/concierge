@@ -32,6 +32,7 @@ const ELEMENTS = [
   { id: "account", name: "concierge.account", tag: "mfe-concierge-account", kind: "page" },
   { id: "account-chip", name: "concierge.account-chip", tag: "mfe-concierge-account-chip", kind: "component" },
   { id: "reauth", name: "concierge.reauth", tag: "mfe-concierge-reauth", kind: "component" },
+  { id: "stepup", name: "concierge.stepup", tag: "mfe-concierge-stepup", kind: "component" },
 ];
 
 const readJson = (file) => JSON.parse(readFileSync(file, "utf8"));
