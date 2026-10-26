@@ -303,29 +303,6 @@ mod passkeys {
 		);
 	}
 
-	/// Age the session's sign-in by `secs` as if it were that old: the family's `auth_time`
-	/// in Redis, and the stored access token expired so the next read mints one carrying it.
-	/// `false` (the test returns) when no Redis is configured.
-	async fn age_session(browser: &Browser, secs: i64) -> bool {
-		let Some(url) = std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty()) else {
-			return false;
-		};
-		let mut conn = redis::Client::open(url).unwrap().get_multiplexed_async_connection().await.unwrap();
-		let key = format!("websess:{}", browser.get("ev_session").unwrap());
-		let refresh: String = redis::cmd("HGET").arg(&key).arg("refresh_token").query_async(&mut conn).await.unwrap();
-		let family = refresh.split('.').next().unwrap();
-		let old = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - secs;
-		let _: () = redis::cmd("HSET")
-			.arg(format!("refresh:fam:{family}"))
-			.arg("auth_time")
-			.arg(old)
-			.query_async(&mut conn)
-			.await
-			.unwrap();
-		let _: () = redis::cmd("HSET").arg(&key).arg("access_expires_at").arg(0).query_async(&mut conn).await.unwrap();
-		true
-	}
-
 	#[tokio::test]
 	async fn changing_passkeys_needs_a_fresh_auth_time_that_re_auth_restores() {
 		let fx = fixture!();
@@ -333,7 +310,7 @@ mod passkeys {
 		let mut browser = Browser::default();
 		fx.sign_in_with_code(&email, &mut browser).await;
 		register(&fx, &mut browser).await;
-		if !age_session(&browser, 3600).await {
+		if !common::web::age_session(&browser, 3600).await {
 			return;
 		}
 		let stale = fx.post("/auth/passkey/register/options", ORIGIN, json!({}), &mut browser).await;
