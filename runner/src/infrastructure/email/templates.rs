@@ -1023,6 +1023,10 @@ pub fn security_notice(event: &str, label: Option<&str>, at: i64) -> Option<Rend
 			"Your second factors were reset with a recovery code",
 			"A recovery code was used on your account: every second factor and recovery code was removed and every session was signed out.",
 		),
+		"reset" => (
+			"Your second factors were reset by the platform owners",
+			"The platform owners decided to reset your account's second factors: every second factor and recovery code was removed and every session was signed out. Sign in and add a new one.",
+		),
 		_ => return None,
 	};
 	let warn = "If this was not you, sign in now, sign out of other sessions and contact support: someone holds your sign-in.";

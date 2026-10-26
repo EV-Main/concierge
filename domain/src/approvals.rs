@@ -76,6 +76,10 @@ pub const OWNER_REMOVAL: &str = "concierge:owner_removal";
 pub const USER_SUSPENSION: &str = "concierge:user_suspension";
 pub const USER_REINSTATEMENT: &str = "concierge:user_reinstatement";
 pub const ADMIN_ADMISSION: &str = "concierge:admin_admission";
+/// Remove every second factor of an account whose person lost them and their recovery
+/// codes: it re-arms the money plane on the sign-in alone, so it is a judgement about who
+/// the person is, and the owners make it.
+pub const SECOND_FACTOR_RESET: &str = "concierge:second_factor_reset";
 /// The unanimity the owner consilia demand: every owner on the roster, which is what the
 /// roster's quorum comes to at 100 %.
 pub const UNANIMOUS_QUORUM_BPS: u32 = 10_000;
@@ -333,6 +337,12 @@ pub fn builtin_kinds() -> Vec<ApprovalKind> {
 		person_kind(USER_SUSPENSION, "Suspend an account", "Freeze an account until the owners lift it.", &field),
 		person_kind(USER_REINSTATEMENT, "Reinstate an account", "Lift a suspension the owners imposed.", &field),
 		person_kind(ADMIN_ADMISSION, "Appoint an admin", "Grant the admin role to an account.", &field),
+		person_kind(
+			SECOND_FACTOR_RESET,
+			"Reset an account's second factors",
+			"Remove every second factor and recovery code of an account whose person lost them, and sign it out everywhere.",
+			&field,
+		),
 		ApprovalKind {
 			name: PLATFORM_POLICY.into(),
 			label: "Change the platform's approval policy".into(),
@@ -405,6 +415,8 @@ pub enum PersonEffect {
 	/// Lift such a verdict.
 	Reinstate,
 	AdmitAdmin,
+	/// Every second factor and recovery code gone, every session ended.
+	ResetSecondFactor,
 }
 
 impl PersonEffect {
@@ -415,6 +427,7 @@ impl PersonEffect {
 			Self::Suspend => USER_SUSPENSION,
 			Self::Reinstate => USER_REINSTATEMENT,
 			Self::AdmitAdmin => ADMIN_ADMISSION,
+			Self::ResetSecondFactor => SECOND_FACTOR_RESET,
 		}
 	}
 
@@ -426,6 +439,7 @@ impl PersonEffect {
 			Self::Suspend => "suspended_by_approval",
 			Self::Reinstate => "reinstated_by_approval",
 			Self::AdmitAdmin => "admin_granted_by_approval",
+			Self::ResetSecondFactor => "second_factor_reset_by_approval",
 		}
 	}
 
@@ -437,6 +451,7 @@ impl PersonEffect {
 			Self::Suspend => "ApprovalService.ProposeUserSuspension",
 			Self::Reinstate => "ApprovalService.ProposeUserReinstatement",
 			Self::AdmitAdmin => "ApprovalService.ProposeAdminAdmission",
+			Self::ResetSecondFactor => "ApprovalService.ProposeSecondFactorReset",
 		}
 	}
 
@@ -456,6 +471,8 @@ pub struct PersonStanding {
 	pub verified: bool,
 	/// Suspended by the owners' verdict (not by one admin's hold).
 	pub governance_suspended: bool,
+	/// Holds a confirmed second factor.
+	pub second_factor: bool,
 }
 
 /// Why `effect` cannot be carried out against `subject` as they stand, if it cannot.
@@ -497,6 +514,12 @@ pub fn person_inapplicable(effect: PersonEffect, subject: PersonStanding, owners
 				// Nothing left to lift, or a hold one admin could lift anyway: either way the
 				// owners' verdict would not be what freed this account.
 				Some("the account is no longer suspended by the owners")
+			},
+		PersonEffect::ResetSecondFactor =>
+			if subject.second_factor {
+				None
+			} else {
+				Some("the account holds no second factor")
 			},
 		PersonEffect::AdmitAdmin => match subject.role {
 			// Writing `admin` over `owner` would be an expulsion with no removal decision,
@@ -1726,6 +1749,7 @@ mod tests {
 			active: true,
 			verified: true,
 			governance_suspended: false,
+			second_factor: false,
 		}
 	}
 
@@ -1754,6 +1778,7 @@ mod tests {
 			PersonEffect::Suspend,
 			PersonEffect::Reinstate,
 			PersonEffect::AdmitAdmin,
+			PersonEffect::ResetSecondFactor,
 		] {
 			let kind = kinds.iter().find(|k| k.name == effect.kind()).unwrap_or_else(|| panic!("{} is built in", effect.kind()));
 			assert_eq!(kind.level, ApprovalLevel::Platform);
@@ -1819,6 +1844,13 @@ mod tests {
 		assert!(at(PersonEffect::Reinstate, standing(Role::Investor), 2).is_some());
 		assert!(at(PersonEffect::Suspend, verdict, 2).is_some(), "already suspended");
 		assert!(at(PersonEffect::Suspend, standing(Role::Investor), 2).is_none());
+		// A reset needs something to reset.
+		let holder = PersonStanding {
+			second_factor: true,
+			..standing(Role::Investor)
+		};
+		assert!(at(PersonEffect::ResetSecondFactor, holder, 2).is_none());
+		assert!(at(PersonEffect::ResetSecondFactor, standing(Role::Investor), 2).is_some(), "no factor to reset");
 		// `admin` over `owner` would be an expulsion by another door.
 		assert!(at(PersonEffect::AdmitAdmin, standing(Role::Owner), 3).is_some());
 		assert!(at(PersonEffect::AdmitAdmin, standing(Role::Admin), 3).is_some());

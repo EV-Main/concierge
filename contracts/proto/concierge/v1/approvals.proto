@@ -134,6 +134,10 @@ service ApprovalService {
   //                          half of the owners besides the opener.
   // ProposeUserReinstatement — lift a suspension the owners imposed. Same quorum.
   // ProposeAdminAdmission  — grant `Role::Admin`. Same quorum.
+  // ProposeSecondFactorReset — remove every second factor and recovery code of an account
+  //                          whose person lost them, and end its sessions (`token_version`
+  //                          moves: SESSIONS_REVOKED). Same quorum. Refused (and void at
+  //                          execution) when the account holds no factor.
   //
   // `Role::Owner` is written by exactly two things: genesis and this plane's executor of an
   // executed `concierge:owner_admission`.
@@ -142,6 +146,7 @@ service ApprovalService {
   rpc ProposeUserSuspension(ProposePersonDecisionRequest) returns (Approval);
   rpc ProposeUserReinstatement(ProposePersonDecisionRequest) returns (Approval);
   rpc ProposeAdminAdmission(ProposePersonDecisionRequest) returns (Approval);
+  rpc ProposeSecondFactorReset(ProposePersonDecisionRequest) returns (Approval);
 
   // The owner roster (the seat holders, suspended ones included), for a caller holding the
   // permission to grant roles — the same gate as GovernanceService.ListOwners.

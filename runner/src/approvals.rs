@@ -576,6 +576,10 @@ impl ApprovalService for Approvals {
 		self.propose_person(rules::PersonEffect::AdmitAdmin, request).await
 	}
 
+	async fn propose_second_factor_reset(&self, request: Request<ProposePersonDecisionRequest>) -> Result<Response<Approval>, Status> {
+		self.propose_person(rules::PersonEffect::ResetSecondFactor, request).await
+	}
+
 	async fn list_owners(&self, request: Request<ListPlatformOwnersRequest>) -> Result<Response<PlatformOwnerList>, Status> {
 		require_permission(self.users.as_ref(), &self.break_glass, &request, Roles::Grant).await?;
 		Ok(Response::new(self.owner_list().await?))
@@ -662,7 +666,7 @@ impl ApprovalService for Approvals {
 }
 
 impl Approvals {
-	/// The five decisions about a person share one shape: an owner names an account and a
+	/// The decisions about a person share one shape: an owner names an account and a
 	/// reason, and the platform's other owners decide.
 	async fn propose_person(&self, effect: rules::PersonEffect, request: Request<ProposePersonDecisionRequest>) -> Result<Response<Approval>, Status> {
 		let caller = self.caller(&request).await?;

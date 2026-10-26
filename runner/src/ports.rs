@@ -1978,6 +1978,8 @@ pub enum SecurityEvent {
 	FactorRemoved,
 	RecoveryCodesReplaced,
 	Recovered,
+	/// The owners reset the account's factors (`concierge:second_factor_reset`).
+	Reset,
 }
 
 /// Second factors and the recovery codes beside them. Every method is one transaction, and
