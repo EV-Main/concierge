@@ -106,6 +106,9 @@ v_utils = { version = "=2.15.54", features = ["io", "macros", "cli", "xdg"] }
 [workspace.lints.rust]
 unused_features = "allow"
 
+[workspace.lints.cargo]
+non_kebab_case_bins = "allow"
+
 # smaller target/: trim debuginfo (deps need none), keep line tables for backtraces
 [profile.dev]
 debug = "line-tables-only"
