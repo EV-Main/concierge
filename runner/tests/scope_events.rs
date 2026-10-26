@@ -12,7 +12,9 @@ use std::{
 };
 
 use concierge::{
+	authz::BreakGlass,
 	bridge::Bridge,
+	directory::Directory,
 	infrastructure::{
 		db,
 		grants::PgGrants,
@@ -33,10 +35,11 @@ use domain::{
 	iam::{Catalog, Target},
 	users::UserId,
 };
+use evconcierge_auth::{Claims, RestrictedCaller, TokenType};
 use evconcierge_contracts::concierge::v1::{
-	ApprovalEscalation, ApprovalFieldSpec, ApprovalFieldType, ApprovalKindSpec, ApprovalLevel, EscalationTest, GetScopeCatalogRequest, NotificationTopicSpec, PublishScopeCatalogRequest,
-	PullScopeEventsRequest, PullUserLifecycleRequest, ScopeEvent, scope_catalog_service_server::ScopeCatalogService, scope_event::Kind, scope_events_server::ScopeEvents as _,
-	user_events_server::UserEvents, user_lifecycle_event::Kind as LifecycleKind,
+	ApprovalEscalation, ApprovalFieldSpec, ApprovalFieldType, ApprovalKindSpec, ApprovalLevel, EscalationTest, GetMeRequest, GetScopeCatalogRequest, NotificationTopicSpec,
+	PublishScopeCatalogRequest, PullScopeEventsRequest, PullUserLifecycleRequest, ScopeEvent, scope_catalog_service_server::ScopeCatalogService, scope_event::Kind,
+	scope_events_server::ScopeEvents as _, user_directory_server::UserDirectory, user_events_server::UserEvents, user_lifecycle_event::Kind as LifecycleKind,
 };
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -55,6 +58,7 @@ struct Fx {
 	events: ScopeEvents,
 	bridge: Bridge,
 	catalogs: ScopeCatalogs,
+	directory: Directory,
 }
 
 #[derive(Clone)]
@@ -82,6 +86,7 @@ async fn setup() -> Option<Fx> {
 		events: ScopeEvents::new(callers.clone(), Arc::new(PgScopeEvents::new(pool.clone()))),
 		bridge: Bridge::new(pool.clone(), Some(BRIDGE_TOKEN.into())),
 		catalogs: ScopeCatalogs::new(callers, Arc::new(PgScopeCatalogs::new(pool.clone()))),
+		directory: Directory::new(Arc::new(PgUsers::new(pool.clone())), Arc::new(PgGrants::new(pool.clone())), Arc::new(BreakGlass::new(Vec::new()))),
 		pool,
 	})
 }
@@ -142,12 +147,21 @@ impl Fx {
 
 	/// Publish the tenant catalog with `operator` meaning `operator`.
 	async fn publish(&self, scope: &Scope, version: u64, operator: &[&str]) {
+		self.publish_with_everyone(scope, version, operator, &[]).await;
+	}
+
+	/// As [`Self::publish`], with an `everyone` alias of `everyone` unless that is empty.
+	async fn publish_with_everyone(&self, scope: &Scope, version: u64, operator: &[&str], everyone: &[&str]) {
 		let all = ["work:leads:read", "work:leads:edit", "admin:sources:manage"];
 		let set = |names: &[&str]| names.iter().map(|n| scope.p(n)).collect::<BTreeSet<_>>();
+		let mut aliases = BTreeMap::from([(scope.p("operator"), set(operator)), (scope.p("admin"), set(&all))]);
+		if !everyone.is_empty() {
+			aliases.insert(scope.p("everyone"), set(everyone));
+		}
 		let catalog = Catalog {
 			version,
 			permissions: set(&all),
-			aliases: BTreeMap::from([(scope.p("operator"), set(operator)), (scope.p("admin"), set(&all))]),
+			aliases,
 			delegations: BTreeMap::new(),
 		};
 		self.grants.publish(&scope.id, &scope.client, &catalog, now()).await.expect("publish the tenant catalog");
@@ -227,6 +241,26 @@ impl Fx {
 			})
 			.await
 			.expect("open the session")
+	}
+
+	/// `GetMe.permissions` as `scope`'s client sees them, or the user's own session (`None`).
+	async fn get_me(&self, user: UserId, scope: Option<&Scope>) -> Vec<String> {
+		let mut request = Request::new(GetMeRequest {});
+		request.extensions_mut().insert(Claims {
+			sub: user.to_string(),
+			iss: "https://auth.concierge.ev".into(),
+			aud: scope.map_or_else(|| "concierge".to_owned(), |s| s.client.clone()),
+			exp: u64::MAX,
+			iat: 0,
+			typ: TokenType::Access,
+			jti: None,
+			token_version: 0,
+			auth_time: None,
+		});
+		if scope.is_some() {
+			request.extensions_mut().insert(RestrictedCaller);
+		}
+		self.directory.get_me(request).await.unwrap().into_inner().permissions
 	}
 
 	async fn scope_head(&self) -> i64 {
@@ -449,6 +483,39 @@ async fn a_seat_change_restates_the_set_where_granting_seats_hold_all() {
 	let mine = of_user(&events, user);
 	assert_eq!(kinds(&mine), [Kind::GrantsChanged]);
 	assert_eq!(mine[0].grants.as_ref().unwrap().permissions.len(), 3, "a granting seat holds the whole namespace here");
+}
+
+#[tokio::test]
+async fn every_member_holds_the_everyone_alias_until_a_republish_drops_it() {
+	let Some(fx) = setup().await else { return };
+	let scope = fx.scope(&[], false).await;
+	let (member, outsider) = (fx.user("everyone").await, fx.user("outsider").await);
+	assert!(fx.sign_in(&scope, member).await);
+	let start = fx.scope_head().await;
+	let read = vec![scope.p("work:leads:read")];
+
+	fx.publish_with_everyone(&scope, 2, &["work:leads:read", "work:leads:edit"], &["work:leads:read"]).await;
+	let late = fx.user("late").await;
+	assert!(fx.sign_in(&scope, late).await);
+	assert_eq!(fx.get_me(member, Some(&scope)).await, read, "held with no grant row");
+	assert!(fx.get_me(member, None).await.contains(&read[0]), "a member's own session agrees");
+	assert!(!fx.get_me(outsider, None).await.contains(&read[0]), "everyone means the scope's members");
+
+	fx.publish(&scope, 3, &["work:leads:read", "work:leads:edit"]).await;
+	assert!(fx.get_me(member, Some(&scope)).await.is_empty(), "the republish takes it back");
+
+	let events = fx.pull_all(start, |r| as_client(r, &scope)).await;
+	let sets = |user| {
+		of_user(&events, user)
+			.iter()
+			.filter(|e| e.kind() == Kind::GrantsChanged)
+			.map(|e| e.grants.as_ref().unwrap().permissions.clone())
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(sets(member), [read.clone(), vec![]], "both publications are re-stated to every member");
+	assert_eq!(kinds(&of_user(&events, late)), [Kind::MemberJoined, Kind::GrantsChanged, Kind::GrantsChanged]);
+	assert_eq!(sets(late), [read, vec![]], "a member who joins later holds it from their first set");
+	assert!(of_user(&events, outsider).is_empty());
 }
 
 #[tokio::test]

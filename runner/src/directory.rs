@@ -173,10 +173,11 @@ impl Directory {
 				self.grants.catalogs().await?
 			}
 		};
-		let targets = self.grants.targets_of(user).await?;
+		let (targets, member_of) = self.grants.holdings_of(user).await?;
 		for tenant in &tenants {
 			let ours: Vec<Target> = targets.iter().filter(|t| t.namespace() == tenant.namespace).cloned().collect();
-			held.extend(iam::resolve(seat, tenant.granting_seats_hold_all, &ours, &tenant.catalog).into_iter().map(str::to_owned));
+			let member = member_of.contains(&tenant.namespace);
+			held.extend(iam::resolve(seat, tenant.granting_seats_hold_all, member, &ours, &tenant.catalog).into_iter().map(str::to_owned));
 		}
 		Ok(held.into_iter().collect())
 	}

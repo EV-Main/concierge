@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 
 pub use concierge_iam::Catalog;
-use concierge_iam::{ADMIN_ALIAS, Pattern};
+use concierge_iam::{ADMIN_ALIAS, EVERYONE_ALIAS, Pattern};
 
 use crate::{
 	authz::{Iam, Role},
@@ -64,14 +64,20 @@ impl Target {
 	}
 }
 
-/// Everything `seat` and `targets` let a user do inside `catalog`'s namespace. A seat that
-/// may grant there holds all of it only in a tenant that says so
-/// (`tenants.granting_seats_hold_all`); elsewhere it holds what someone else granted it.
-pub fn resolve<'c>(seat: Role, granting_seats_hold_all: bool, targets: &[Target], catalog: &'c Catalog) -> BTreeSet<&'c str> {
+/// Everything `seat` and `targets` let a user do inside `catalog`'s namespace, plus the
+/// `everyone` alias when they are a `member` of its scope. A seat that may grant there holds
+/// all of it only in a tenant that says so (`tenants.granting_seats_hold_all`); elsewhere it
+/// holds what someone else granted it.
+pub fn resolve<'c>(seat: Role, granting_seats_hold_all: bool, member: bool, targets: &[Target], catalog: &'c Catalog) -> BTreeSet<&'c str> {
 	if granting_seats_hold_all && seat.may(Iam::Grant) {
 		return catalog.permissions.iter().map(String::as_str).collect();
 	}
-	targets.iter().flat_map(|t| t.grants(catalog)).collect()
+	let everyone = catalog
+		.aliases
+		.iter()
+		.filter(|(name, _)| member && name.split_once(':').is_some_and(|(_, name)| name == EVERYONE_ALIAS))
+		.flat_map(|(_, members)| members.iter().map(String::as_str));
+	targets.iter().flat_map(|t| t.grants(catalog)).chain(everyone).collect()
 }
 
 /// The aliases a holder of `targets` may grant and revoke in `catalog`'s namespace.
@@ -113,7 +119,7 @@ mod tests {
 
 	fn check(seat: Role, raw: &[&str], expected: &[&str]) {
 		let catalog = catalog();
-		assert_eq!(resolve(seat, true, &targets(raw), &catalog), expected.iter().copied().collect(), "{seat:?} {raw:?}");
+		assert_eq!(resolve(seat, true, false, &targets(raw), &catalog), expected.iter().copied().collect(), "{seat:?} {raw:?}");
 	}
 
 	#[test]
@@ -129,7 +135,19 @@ mod tests {
 		check(Role::Investor, &["sa:gone", "sa:work:gone:*"], &[]);
 		check(Role::Operator, &[], &[]);
 		check(Role::Admin, &[], &["sa:admin:sources:manage", "sa:work:leads:edit", "sa:work:leads:read"]);
-		assert!(resolve(Role::Admin, false, &[], &catalog()).is_empty(), "a tenant that does not trust seats");
+		assert!(resolve(Role::Admin, false, false, &[], &catalog()).is_empty(), "a tenant that does not trust seats");
+	}
+
+	#[test]
+	fn a_member_holds_the_everyone_alias() {
+		let mut catalog = catalog();
+		catalog.aliases.insert("sa:everyone".into(), ["sa:work:leads:read".into()].into());
+		let operator = targets(&["sa:operator"]);
+		assert_eq!(resolve(Role::Investor, false, true, &[], &catalog), ["sa:work:leads:read"].into());
+		assert!(resolve(Role::Investor, false, false, &[], &catalog).is_empty(), "not a member");
+		assert_eq!(resolve(Role::Investor, false, true, &operator, &catalog), ["sa:work:leads:edit", "sa:work:leads:read"].into());
+		catalog.aliases.remove("sa:everyone");
+		assert!(resolve(Role::Investor, false, true, &[], &catalog).is_empty(), "republished without it");
 	}
 
 	#[test]
