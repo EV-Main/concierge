@@ -20,7 +20,7 @@ use crate::{
 	claims::TokenType,
 	config::{AuthConfig, SigningConfig},
 	jwks::JwksCache,
-	stepup::{self, StepupClaims, StepupMethod, StepupProof},
+	stepup::{self, Aal, StepupClaims, StepupProof, legacy},
 };
 
 /// The ceiling on a relying party's access-token lifetime, whatever `AUTH_ACCESS_TTL_SECS`
@@ -123,14 +123,29 @@ impl Signer {
 	}
 
 	/// Mint a step-up proof (`crate::stepup`): `typ=stepup` under the BFF's audience, for
-	/// one account, one operation and one page, living `ttl_secs` (never past
-	/// [`stepup::MAX_TTL_SECS`]).
-	pub fn mint_stepup(&self, sub: &str, intent_hash: &[u8; 32], method: StepupMethod, origin: &str, ttl_secs: u64) -> Result<StepupProof, AuthError> {
-		self.mint_stepup_at(get_current_timestamp(), sub, intent_hash, method, origin, ttl_secs)
+	/// one account, one operation and one page, at the assurance `aal` the answer gave,
+	/// living `ttl_secs` (never past [`stepup::MAX_TTL_SECS`]).
+	pub fn mint_stepup(&self, sub: &str, intent_hash: &[u8; 32], aal: Aal, origin: &str, ttl_secs: u64) -> Result<StepupProof, AuthError> {
+		let now = get_current_timestamp();
+		let claims = StepupClaims {
+			sub: sub.to_owned(),
+			iss: self.issuer.clone(),
+			aud: stepup::AUDIENCE.to_owned(),
+			exp: now + ttl_secs.min(stepup::MAX_TTL_SECS),
+			iat: now,
+			typ: stepup::TYP.to_owned(),
+			intent_hash: stepup::hex32(intent_hash),
+			aal,
+			origin: origin.to_owned(),
+			jti: uuid::Uuid::new_v4().to_string(),
+		};
+		self.sign_stepup(&claims, claims.jti.clone(), claims.exp)
 	}
 
-	fn mint_stepup_at(&self, now: u64, sub: &str, intent_hash: &[u8; 32], method: StepupMethod, origin: &str, ttl_secs: u64) -> Result<StepupProof, AuthError> {
-		let claims = StepupClaims {
+	/// The 0.1 flavour of [`Self::mint_stepup`], naming the method (`stepup::legacy`).
+	pub fn mint_method_stepup(&self, sub: &str, intent_hash: &[u8; 32], method: legacy::StepupMethod, origin: &str, ttl_secs: u64) -> Result<StepupProof, AuthError> {
+		let now = get_current_timestamp();
+		let claims = legacy::MethodClaims {
 			sub: sub.to_owned(),
 			iss: self.issuer.clone(),
 			aud: stepup::AUDIENCE.to_owned(),
@@ -142,12 +157,12 @@ impl Signer {
 			origin: origin.to_owned(),
 			jti: uuid::Uuid::new_v4().to_string(),
 		};
-		let token = encode(&self.header(), &claims, &self.encoding).map_err(|_| AuthError::NotConfigured)?;
-		Ok(StepupProof {
-			token,
-			jti: claims.jti,
-			exp: claims.exp,
-		})
+		self.sign_stepup(&claims, claims.jti.clone(), claims.exp)
+	}
+
+	fn sign_stepup(&self, claims: &impl serde::Serialize, jti: String, exp: u64) -> Result<StepupProof, AuthError> {
+		let token = encode(&self.header(), claims, &self.encoding).map_err(|_| AuthError::NotConfigured)?;
+		Ok(StepupProof { token, jti, exp })
 	}
 
 	/// Mint an inter-service token for `service_name`. Returns `(token, exp_unix_secs)`.

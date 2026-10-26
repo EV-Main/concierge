@@ -13,7 +13,10 @@ use concierge::web::stepup::StepupDeps;
 use evconcierge_auth::{
 	TokenType, VerifyPolicy,
 	jwks::{JwksCache, verify_token},
-	stepup::{Expected, StepupError, StepupMethod, verify_stepup_proof},
+	stepup::{
+		StepupError,
+		legacy::{MethodClaims, StepupMethod, verify_method_proof},
+	},
 };
 use evconcierge_contracts::concierge::v1::Jwk;
 use serde_json::{Value, json};
@@ -179,13 +182,27 @@ fn jwks() -> JwksCache {
 	.unwrap()
 }
 
-fn expect<'a>(user: &'a str, origin: &'a str, hash: &'a [u8; 32]) -> Expected<'a> {
-	Expected {
-		intent_hash: hash,
-		sub: user,
-		origin,
-		methods: &[StepupMethod::Passkey, StepupMethod::EmailCode],
-	}
+/// What the money plane pinned to `evconcierge_auth` 0.1 expects of these proofs.
+struct Expect<'a> {
+	sub: &'a str,
+	origin: &'a str,
+	hash: &'a [u8; 32],
+}
+
+fn expect<'a>(sub: &'a str, origin: &'a str, hash: &'a [u8; 32]) -> Expect<'a> {
+	Expect { sub, origin, hash }
+}
+
+fn verify_stepup_proof(proof: &str, cache: &JwksCache, issuer: &str, expected: &Expect<'_>) -> Result<MethodClaims, StepupError> {
+	verify_method_proof(
+		proof,
+		cache,
+		issuer,
+		expected.hash,
+		expected.sub,
+		expected.origin,
+		&[StepupMethod::Passkey, StepupMethod::EmailCode],
+	)
 }
 
 fn access_cookie_claims(browser: &Browser) -> Value {

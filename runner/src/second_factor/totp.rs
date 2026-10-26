@@ -2,6 +2,7 @@
 //! parameters every such app computes, so none is offered as a choice.
 
 use data_encoding::BASE32_NOPAD;
+use evconcierge_auth::stepup::Aal;
 use hmac::{Hmac, Mac, digest::KeyInit};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
@@ -46,6 +47,8 @@ impl Factor for Totp {
 	type Offer = Offer;
 	type Pending = ();
 	type Response = Response;
+
+	const AAL: Aal = Aal::SECOND_FACTOR;
 
 	fn begin_enrol(account: &str) -> (Material, Offer) {
 		let mut secret = vec![0u8; SECRET_BYTES];

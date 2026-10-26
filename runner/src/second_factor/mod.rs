@@ -11,6 +11,7 @@ mod totp;
 
 use std::{any::Any, marker::PhantomData};
 
+use evconcierge_auth::stepup::Aal;
 pub(crate) use seal::Binding;
 pub use seal::SealKey;
 use serde::{Serialize, de::DeserializeOwned};
@@ -27,6 +28,8 @@ pub enum FactorKind {
 pub(crate) struct Wrong;
 
 pub(crate) trait Factor: 'static {
+	/// What a proof minted on this kind's answer says it gave (`evconcierge_auth::stepup`).
+	const AAL: Aal;
 	/// What is kept, sealed, for the factor: its secret and whatever state verification moves.
 	type Material: Serialize + DeserializeOwned;
 	/// What is kept, sealed, between the start of an enrolment and its proof.
@@ -94,6 +97,10 @@ impl FactorKind {
 		self.ops().verify(material, pending, response, now)
 	}
 
+	pub(crate) fn aal(self) -> Aal {
+		self.ops().aal()
+	}
+
 	fn ops(self) -> &'static dyn Ops {
 		match self {
 			Self::Totp => &As::<Totp>(PhantomData),
@@ -102,6 +109,7 @@ impl FactorKind {
 }
 
 trait Ops: Sync {
+	fn aal(&self) -> Aal;
 	fn begin_enrol(&self, account: &str) -> Enrolment;
 	fn finish_enrol(&self, enrolling: &[u8], response: Value, now: u64) -> Result<Checked, Corrupt>;
 	fn challenge(&self, material: &[u8]) -> Result<Challenged, Corrupt>;
@@ -111,6 +119,10 @@ trait Ops: Sync {
 struct As<F>(PhantomData<fn() -> F>);
 
 impl<F: Factor> Ops for As<F> {
+	fn aal(&self) -> Aal {
+		F::AAL
+	}
+
 	fn begin_enrol(&self, account: &str) -> Enrolment {
 		let (enrolling, offer) = F::begin_enrol(account);
 		Enrolment {
