@@ -69,9 +69,9 @@ message EmitRequest {
   // Topic key, e.g. "platform:announcements". Must be one of this plane's own; a scope's
   // topics (`invest:fund:quy-nhon`) are published through ScopeCatalogService and emitted
   // by their own namespace through ScopeInboxService.EmitScopeNotification — here they are
-  // PERMISSION_DENIED. A key that moved to a scope (`fund:quy-nhon`,
-  // `account:money-movement`) is still accepted and stored under its new key until the
-  // emitters have moved (docs/SCOPES-AND-APPROVALS.md §6).
+  // PERMISSION_DENIED. The keys that moved to a scope (`fund:quy-nhon`,
+  // `account:money-movement`) are no longer aliased: emit on the scope's own key
+  // (docs/SCOPES-AND-APPROVALS.md §6).
   string topic = 2;
   // Machine-readable event kind within the topic, e.g. "nav_updated".
   string kind = 3;

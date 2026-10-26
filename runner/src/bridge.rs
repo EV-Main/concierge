@@ -107,7 +107,6 @@ impl Bridge {
 		let events = rows
 			.into_iter()
 			.map(|row| UserLifecycleEvent {
-				permissions: Vec::new(),
 				seat_permissions: None,
 				..row.into_event()
 			})
@@ -155,7 +154,6 @@ impl OutboxRow {
 			token_version: self.token_version as u64,
 			// Absent (pre-role rows) → empty; the banking puller reads empty as 'investor'.
 			role: self.role.unwrap_or_default(),
-			permissions: self.permissions.clone().unwrap_or_default(),
 			seat_permissions: self.permissions.map(|bank| SeatPermissions { bank }),
 		}
 	}

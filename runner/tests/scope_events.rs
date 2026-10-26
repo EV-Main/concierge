@@ -352,7 +352,6 @@ async fn lifecycle_rows_are_redacted_for_a_client_and_start_after_the_join_snaps
 	);
 	for event in &mine {
 		assert!(event.seat_permissions.is_none(), "the money plane's seat set is not a direction's business");
-		assert!(event.permissions.is_empty());
 	}
 	assert_eq!(mine[0].kyc_level, 2, "KYC level is carried (D5)");
 
