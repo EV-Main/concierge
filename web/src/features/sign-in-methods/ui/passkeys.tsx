@@ -6,6 +6,7 @@ import { passkeysSupported } from "../../../shared/lib/webauthn";
 import { addPasskey, removePasskey, type SignInMethods } from "../api/methods-api";
 import { reauthMethods } from "../model/reauth";
 import { useReauthGate } from "../model/use-reauth-gate";
+import { ReauthMethods } from "./reauth-methods";
 import { ReauthReady } from "./reauth-ready";
 import { ReauthStep } from "./reauth-step";
 import { refusal } from "./refusal";
@@ -34,7 +35,11 @@ export function Passkeys({ methods, onChanged }: { methods: SignInMethods; onCha
           </Button>
         </ListRow>
       ))}
-      {gate.stage === "confirm" && <ReauthStep methods={confirmWith} onConfirmed={gate.confirmed} onCancel={gate.cancel} />}
+      {gate.stage === "confirm" && (
+        <ReauthStep sub={t("auth.reauth.sub", "You signed in a while ago. Confirm again to change your passkeys.")} onCancel={gate.cancel}>
+          <ReauthMethods methods={confirmWith} onConfirmed={gate.confirmed} />
+        </ReauthStep>
+      )}
       {gate.stage === "ready" && <ReauthReady busy={gate.busy} onProceed={gate.proceed} onCancel={gate.cancel} />}
       {gate.error && (
         <li role="alert" className="list-none py-3 text-xs text-accent-error">

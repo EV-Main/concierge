@@ -1,10 +1,9 @@
 import { useT } from "@evinvest/i18n/react";
-import { Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, Skeleton } from "@evinvest/uikit";
+import { Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@evinvest/uikit";
 import { useId, useRef } from "react";
 
 import { useElement } from "../../../shared/element/element-context";
-import { useReauthMethods } from "../model/use-reauth-methods";
-import { ReauthMethods } from "./reauth-methods";
+import { ReauthBody } from "./reauth-body";
 import { reauthRefusal } from "./refusal";
 
 export interface ReauthDialogProps {
@@ -12,21 +11,6 @@ export interface ReauthDialogProps {
   /** The plane accepted the proof and has already re-set `ev_access` with a fresh `auth_time`. */
   onConfirmed: () => void;
   onDismiss: () => void;
-}
-
-function ReauthBody({ onConfirmed }: { onConfirmed: () => void }) {
-  const t = useT();
-  const { api } = useElement();
-  const choice = useReauthMethods(api);
-  if (choice.kind === "loading") return <Skeleton className="h-24 w-full" />;
-  if (choice.kind === "failed") {
-    return (
-      <p role="alert" className="m-0 text-xs text-accent-error">
-        {reauthRefusal(t, choice.error)}
-      </p>
-    );
-  }
-  return <ReauthMethods methods={choice.methods} onConfirmed={onConfirmed} />;
 }
 
 /**

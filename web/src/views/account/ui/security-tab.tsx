@@ -3,8 +3,9 @@ import { dispatchSignOut } from "@evinvest/mfe";
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, ListRows } from "@evinvest/uikit";
 import { useState } from "react";
 
+import { SecondFactorCard } from "../../../features/second-factor";
 import { SessionsCard } from "../../../features/sessions";
-import { SignInMethodRows } from "../../../features/sign-in-methods";
+import { ReauthPrompt, SignInMethodRows } from "../../../features/sign-in-methods";
 import { anyBody } from "../../../shared/api/auth-api";
 import { useElement } from "../../../shared/element/element-context";
 import { signOutOnHost } from "../../../shared/element/host-sign-out";
@@ -28,6 +29,7 @@ export function SecurityTab({ onChanged }: { onChanged: () => void }) {
               </ListRows>
             </CardContent>
           </Card>
+          <SecondFactorCard reauth={ReauthPrompt} onSessionEnded={onChanged} />
           <SessionsCard />
         </>
       ) : (

@@ -363,6 +363,234 @@
     "en": "Use a passkey",
     "t": "Passkey verwenden"
   },
+  "auth.secondFactor.add": {
+    "en": "Add authenticator app",
+    "t": "Authenticator-App hinzufügen"
+  },
+  "auth.secondFactor.added": {
+    "en": "added {date}",
+    "t": "hinzugefügt am {date}"
+  },
+  "auth.secondFactor.another": {
+    "en": "Another authenticator",
+    "t": "Weiterer Authenticator"
+  },
+  "auth.secondFactor.codes.copy": {
+    "en": "Copy codes",
+    "t": "Codes kopieren"
+  },
+  "auth.secondFactor.codes.done": {
+    "en": "Done",
+    "t": "Fertig"
+  },
+  "auth.secondFactor.codes.download": {
+    "en": "Download .txt",
+    "t": ".txt herunterladen"
+  },
+  "auth.secondFactor.codes.left": {
+    "en": "{n} left · a new set replaces the old one",
+    "t": "noch {n} · ein neuer Satz ersetzt den alten"
+  },
+  "auth.secondFactor.codes.new": {
+    "en": "New codes",
+    "t": "Neue Codes"
+  },
+  "auth.secondFactor.codes.row": {
+    "en": "Recovery codes",
+    "t": "Wiederherstellungscodes"
+  },
+  "auth.secondFactor.codes.saved": {
+    "en": "I saved my recovery codes",
+    "t": "Ich habe meine Wiederherstellungscodes gespeichert"
+  },
+  "auth.secondFactor.codes.sub": {
+    "en": "Each one works once, in place of your authenticator. Keep them somewhere safe: we cannot show them again.",
+    "t": "Jeder Code funktioniert einmal, anstelle Ihres Authenticators. Bewahren Sie sie sicher auf: Wir können sie nicht noch einmal anzeigen."
+  },
+  "auth.secondFactor.codes.title": {
+    "en": "Your recovery codes",
+    "t": "Ihre Wiederherstellungscodes"
+  },
+  "auth.secondFactor.confirm": {
+    "en": "Turn on",
+    "t": "Aktivieren"
+  },
+  "auth.secondFactor.continue": {
+    "en": "Continue",
+    "t": "Weiter"
+  },
+  "auth.secondFactor.copied": {
+    "en": "Copied",
+    "t": "Kopiert"
+  },
+  "auth.secondFactor.copyFailed": {
+    "en": "Could not copy. Select the text instead.",
+    "t": "Kopieren fehlgeschlagen. Markieren Sie den Text stattdessen."
+  },
+  "auth.secondFactor.copyKey": {
+    "en": "Copy key",
+    "t": "Schlüssel kopieren"
+  },
+  "auth.secondFactor.ended": {
+    "en": "Your second factors were removed and every session of your account was signed out, this one included. Sign in again, then add a new authenticator.",
+    "t": "Ihre zweiten Faktoren wurden entfernt und alle Sitzungen Ihres Kontos abgemeldet, auch diese. Melden Sie sich erneut an und fügen Sie dann einen neuen Authenticator hinzu."
+  },
+  "auth.secondFactor.err.ceremonyExpired": {
+    "en": "That took too long. Enter a new code.",
+    "t": "Das hat zu lange gedauert. Geben Sie einen neuen Code ein."
+  },
+  "auth.secondFactor.err.emailUnverified": {
+    "en": "Verify your email before you add a second factor.",
+    "t": "Bestätigen Sie Ihre E-Mail-Adresse, bevor Sie einen zweiten Faktor hinzufügen."
+  },
+  "auth.secondFactor.err.enrolmentExpired": {
+    "en": "That took too long. Start adding the app again.",
+    "t": "Das hat zu lange gedauert. Fügen Sie die App erneut hinzu."
+  },
+  "auth.secondFactor.err.generic": {
+    "en": "Something went wrong. Try again.",
+    "t": "Etwas ist schiefgelaufen. Versuchen Sie es erneut."
+  },
+  "auth.secondFactor.err.invalidAnswer": {
+    "en": "That code is not right. Wait for the next one and try again.",
+    "t": "Dieser Code ist nicht richtig. Warten Sie auf den nächsten und versuchen Sie es erneut."
+  },
+  "auth.secondFactor.err.invalidKind": {
+    "en": "This kind of second factor is not supported.",
+    "t": "Diese Art von zweitem Faktor wird nicht unterstützt."
+  },
+  "auth.secondFactor.err.invalidLabel": {
+    "en": "Give it a name of 1–64 characters, on one line.",
+    "t": "Geben Sie einen Namen mit 1–64 Zeichen in einer Zeile ein."
+  },
+  "auth.secondFactor.err.invalidRecoveryCode": {
+    "en": "That recovery code is not right, or was used already.",
+    "t": "Dieser Wiederherstellungscode ist nicht richtig oder wurde bereits verwendet."
+  },
+  "auth.secondFactor.err.invalidRequest": {
+    "en": "That answer could not be read. Try again.",
+    "t": "Diese Antwort konnte nicht gelesen werden. Versuchen Sie es erneut."
+  },
+  "auth.secondFactor.err.locked": {
+    "en": "Too many wrong codes. Try again in a few minutes.",
+    "t": "Zu viele falsche Codes. Versuchen Sie es in einigen Minuten erneut."
+  },
+  "auth.secondFactor.err.none": {
+    "en": "Your account has no second factor yet.",
+    "t": "Ihr Konto hat noch keinen zweiten Faktor."
+  },
+  "auth.secondFactor.err.stillRequired": {
+    "en": "We could not confirm your second factor. Try again.",
+    "t": "Wir konnten Ihren zweiten Faktor nicht bestätigen. Versuchen Sie es erneut."
+  },
+  "auth.secondFactor.err.tooMany": {
+    "en": "Your account has as many second factors as it can hold. Remove one first.",
+    "t": "Ihr Konto hat bereits so viele zweite Faktoren wie möglich. Entfernen Sie zuerst einen."
+  },
+  "auth.secondFactor.err.unknownFactor": {
+    "en": "That authenticator is no longer on your account. Reload the page.",
+    "t": "Dieser Authenticator ist nicht mehr in Ihrem Konto. Laden Sie die Seite neu."
+  },
+  "auth.secondFactor.key": {
+    "en": "Setup key",
+    "t": "Einrichtungsschlüssel"
+  },
+  "auth.secondFactor.kind.totp": {
+    "en": "Authenticator app",
+    "t": "Authenticator-App"
+  },
+  "auth.secondFactor.labelField": {
+    "en": "Name, to tell it apart later",
+    "t": "Name, um ihn später zu unterscheiden"
+  },
+  "auth.secondFactor.lastUsed": {
+    "en": "last used {date}",
+    "t": "zuletzt verwendet am {date}"
+  },
+  "auth.secondFactor.lost": {
+    "en": "Lost your authenticator?",
+    "t": "Authenticator verloren?"
+  },
+  "auth.secondFactor.neverUsed": {
+    "en": "never used",
+    "t": "nie verwendet"
+  },
+  "auth.secondFactor.none": {
+    "en": "Withdrawals need a second factor. Add one before your first withdrawal.",
+    "t": "Auszahlungen erfordern einen zweiten Faktor. Fügen Sie einen vor Ihrer ersten Auszahlung hinzu."
+  },
+  "auth.secondFactor.qr": {
+    "en": "QR code for your authenticator app",
+    "t": "QR-Code für Ihre Authenticator-App"
+  },
+  "auth.secondFactor.reauthSub": {
+    "en": "You signed in a while ago. Confirm it is you to continue.",
+    "t": "Sie haben sich vor einer Weile angemeldet. Bestätigen Sie, dass Sie es sind, um fortzufahren."
+  },
+  "auth.secondFactor.recover.field": {
+    "en": "Recovery code",
+    "t": "Wiederherstellungscode"
+  },
+  "auth.secondFactor.recover.open": {
+    "en": "Use a recovery code",
+    "t": "Einen Wiederherstellungscode verwenden"
+  },
+  "auth.secondFactor.recover.sub": {
+    "en": "A recovery code removes all your second factors and signs you out everywhere, this device included. Add a new authenticator after you sign in again.",
+    "t": "Ein Wiederherstellungscode entfernt alle Ihre zweiten Faktoren und meldet Sie überall ab, auch auf diesem Gerät. Fügen Sie nach der erneuten Anmeldung einen neuen Authenticator hinzu."
+  },
+  "auth.secondFactor.recover.submit": {
+    "en": "Use recovery code",
+    "t": "Wiederherstellungscode verwenden"
+  },
+  "auth.secondFactor.removeAnyway": {
+    "en": "Remove anyway",
+    "t": "Trotzdem entfernen"
+  },
+  "auth.secondFactor.removeLast": {
+    "en": "This is your only second factor. Without one, withdrawals are refused until you add a new one. Your recovery codes stop working too.",
+    "t": "Dies ist Ihr einziger zweiter Faktor. Ohne ihn werden Auszahlungen abgelehnt, bis Sie einen neuen hinzufügen. Auch Ihre Wiederherstellungscodes verlieren ihre Gültigkeit."
+  },
+  "auth.secondFactor.restart": {
+    "en": "Start again",
+    "t": "Neu beginnen"
+  },
+  "auth.secondFactor.scan": {
+    "en": "Scan this code with your authenticator app, or type the key into it. Then enter the 6-digit code it shows.",
+    "t": "Scannen Sie diesen Code mit Ihrer Authenticator-App oder geben Sie den Schlüssel dort ein. Geben Sie dann den 6-stelligen Code ein, den sie anzeigt."
+  },
+  "auth.secondFactor.signInAgain": {
+    "en": "Sign in again",
+    "t": "Erneut anmelden"
+  },
+  "auth.secondFactor.step.sub": {
+    "en": "Changing your second factor needs a code from one you already have.",
+    "t": "Um Ihren zweiten Faktor zu ändern, brauchen Sie einen Code von einem, den Sie bereits haben."
+  },
+  "auth.secondFactor.step.title": {
+    "en": "Confirm with your second factor",
+    "t": "Mit Ihrem zweiten Faktor bestätigen"
+  },
+  "auth.secondFactor.step.which": {
+    "en": "Which second factor",
+    "t": "Welcher zweite Faktor"
+  },
+  "auth.secondFactor.sub": {
+    "en": "A code from an app on your phone, asked for before money leaves your account",
+    "t": "Ein Code aus einer App auf Ihrem Telefon, abgefragt, bevor Geld Ihr Konto verlässt"
+  },
+  "auth.secondFactor.title": {
+    "en": "Two-step verification",
+    "t": "Zwei-Schritt-Verifizierung"
+  },
+  "auth.secondFactor.totp.code": {
+    "en": "6-digit code from your authenticator app",
+    "t": "6-stelliger Code aus Ihrer Authenticator-App"
+  },
+  "auth.secondFactor.unsupported": {
+    "en": "This kind of second factor ({kind}) is not supported in this version. Reload the page, or use another one.",
+    "t": "Diese Art von zweitem Faktor ({kind}) wird in dieser Version nicht unterstützt. Laden Sie die Seite neu oder verwenden Sie einen anderen."
+  },
   "auth.signIn": {
     "en": "Sign in",
     "t": "Anmelden"
