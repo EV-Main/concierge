@@ -299,7 +299,9 @@ As implemented (`scope_events`, `bridge`, `infrastructure::scope_events`):
   moving (0031 bumps the scope's `version` for those);
 - `GRANTS_CHANGED` carries what `GetMe` answers that scope's client — by the PERSISTED seat;
   emergency access is per request and never on the stream — and is written only when the
-  set actually moved;
+  set actually moved. Every member holds the catalog's `<namespace>:everyone` alias without
+  a grant, so a publication that changes it re-states every member, and a new member's
+  first set already holds it;
 - a client is served lifecycle rows of a user only past the `lifecycle_sequence` its
   `MEMBER_JOINED` carried: history before the user became visible is not a direction's;
 - a filtered scan reads at most 5 000 rows per call, and the cursor moves past what it

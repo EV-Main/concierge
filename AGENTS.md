@@ -602,7 +602,11 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   so which one was in force when is a query. `GrantPermission` stores a target inside a
   tenant namespace — alias, permission or `*` pattern — as named, so a republished alias
   reaches every holder and a target the catalog dropped stays as an orphaned row granting
-  nothing. Nothing grants anything in `iam`/`concierge`/`bank`/`seat`, so no grant can reach a
+  nothing. A catalog's `<namespace>:everyone` alias is held by every MEMBER of the scope
+  (`scope_members`) with no grant row — in `GetMe` (a session sees it only for scopes it is a
+  member of) and on GRANTS_CHANGED alike, so dropping a permission from it is one
+  republication that re-states every member's set; it neither delegates nor is delegated,
+  since holding by everyone must never confer granting. Nothing grants anything in `iam`/`concierge`/`bank`/`seat`, so no grant can reach a
   seat's permissions, and NOBODY grants to their own account (`grants_not_to_self`, the rule
   `HoldUser` and `SetKycLevel` carry) — a grant made to oneself would outlive the seat that
   made it. Every seat is an account first and holds its own record (`concierge:self:*`,
