@@ -129,6 +129,12 @@ ev::settings! {
 		/// the routes are not mounted and answer 404. In production each must be an `https`
 		/// origin that is `PUBLIC_ORIGIN` or a host under it, with no path and no pattern.
 		stepup_proof_origins: Vec<String> = "",
+		/// The key second-factor material is sealed under: a file holding 32 random bytes,
+		/// standard base64 (`head -c 32 /dev/urandom | base64`). Unset ⇒
+		/// `/auth/second-factor/*` is not mounted and no account can enrol a factor. The FILE
+		/// is the secret; the path is not, so this field is not `#[secret]`. Losing the key
+		/// loses every enrolled factor: each account then recovers with a code.
+		second_factor_seal_key_file: Option<String>,
 		/// Account-less subscribe attempts allowed per client IP per window.
 		subscribe_rate_limit: u32 = "5",
 		subscribe_rate_window_secs: u64 = "3600",

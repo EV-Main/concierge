@@ -136,6 +136,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	let dev_redirects = relying_party::parse_dev_redirects(&std::env::var("RP_DEV_REDIRECT_URIS").unwrap_or_default(), config.app_env == "production")?;
 	let dev_origins = web::origins::DevOrigins::parse(&std::env::var("SCOPE_DEV_ORIGINS").unwrap_or_default(), config.app_env == "production")?;
 	let stepup_origins = web::stepup::parse_origins(&config.stepup_proof_origins, &config.public_origin, config.app_env == "production")?;
+	let seal_key = config.second_factor_seal_key_file.as_deref().map(concierge::second_factor::SealKey::from_file).transpose()?;
 	let notice_links = Arc::new(concierge::notice_link::NoticeLinkBases::parse(
 		&config.notice_link_bases,
 		&config.cabinet_url,
@@ -443,6 +444,10 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			stepup: (!stepup_origins.is_empty()).then_some(web::stepup::StepupDeps {
 				origins: stepup_origins,
 				ttl_secs: web::stepup::DEFAULT_TTL_SECS,
+			}),
+			second_factor: seal_key.map(|seal| web::second_factor::SecondFactorDeps {
+				seal,
+				store: Arc::new(infrastructure::second_factors::PgSecondFactors::new(pool.clone())),
 			}),
 		},
 		web::KycDeps {

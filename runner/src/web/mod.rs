@@ -33,6 +33,7 @@ pub mod origins;
 mod passkey;
 mod reauth;
 mod routes;
+pub mod second_factor;
 mod session;
 mod sign_in;
 mod signup;
@@ -140,6 +141,7 @@ impl WebState {
 		relying_parties: Option<Arc<RelyingParties>>,
 	) -> color_eyre::Result<Self> {
 		let stepup = sign_in.stepup.map(|deps| stepup::Stepup::new(deps, &public_origin)).transpose()?;
+		let second_factor = sign_in.second_factor.map(second_factor::SecondFactor::new);
 		Ok(Self {
 			inner: Arc::new(Inner {
 				auth,
@@ -158,6 +160,7 @@ impl WebState {
 				reauth_attempts: RateLimiter::new(std::time::Duration::from_secs(reauth::WINDOW_SECS), reauth::ATTEMPTS_PER_WINDOW),
 				subscribe_limiter: sign_in.subscribe_limiter,
 				stepup,
+				second_factor,
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
@@ -190,6 +193,9 @@ pub struct SignInDeps {
 	/// `None` ⇒ `/auth/stepup/*` is not mounted and answers 404 (`STEPUP_PROOF_ORIGINS`
 	/// unset): a host page can ask for nothing.
 	pub stepup: Option<stepup::StepupDeps>,
+	/// `None` ⇒ `/auth/second-factor/*` is not mounted and answers 404
+	/// (`SECOND_FACTOR_SEAL_KEY_FILE` unset): no account can enrol a factor.
+	pub second_factor: Option<second_factor::SecondFactorDeps>,
 }
 
 /// What the identity-verification routes need, gathered so the composition root hands
@@ -218,7 +224,7 @@ pub struct KycDeps {
 pub fn router(state: WebState) -> Router {
 	// The routes a scope's host may call — closed on purpose (`docs/SCOPES-AND-APPROVALS.md`
 	// §3.1). Everything acting on an open session (email verification, password set,
-	// passkey register/remove, sessions, username, methods, `/auth/me`, notification
+	// passkey register/remove, second factors, sessions, username, methods, `/auth/me`, notification
 	// settings, logout, `/kyc/*`) stays off this list: those carry the CSRF double-submit,
 	// or read the account, and a script on a scope host must be able to start a sign-in but
 	// never act for the account. A scope host proves a mailbox by signing in with a code,
@@ -254,10 +260,24 @@ pub fn router(state: WebState) -> Router {
 			.layer(stepup.cors()),
 		None => Router::new(),
 	};
+	// The account's second factors: `PUBLIC_ORIGIN` only, CSRF on every one
+	// (`web::second_factor`), mounted only where a seal key is configured.
+	let second_factor_posts = match state.inner.second_factor {
+		Some(_) => Router::new()
+			.route("/auth/second-factor/enrol/start", post(second_factor::enrol_start))
+			.route("/auth/second-factor/enrol/confirm", post(second_factor::enrol_confirm))
+			.route("/auth/second-factor/verify/options", post(second_factor::verify_options))
+			.route("/auth/second-factor/verify", post(second_factor::verify))
+			.route("/auth/second-factor/remove", post(second_factor::remove))
+			.route("/auth/second-factor/recovery-codes", post(second_factor::replace_recovery_codes))
+			.route("/auth/second-factor/recover", post(second_factor::recover)),
+		None => Router::new(),
+	};
 	Router::new()
 		.merge(scope_posts)
 		.merge(scope_reads)
 		.merge(stepup_posts)
+		.merge(second_factor_posts)
 		// k8s liveness/readiness probe target.
 		.route("/health", get(|| async { "ok" }))
 		.route("/auth/login", get(routes::login))
@@ -354,6 +374,7 @@ struct Inner {
 	passkey_sign_in_starts: RateLimiter,
 	subscribe_limiter: Arc<RateLimiter>,
 	stepup: Option<stepup::Stepup>,
+	second_factor: Option<second_factor::SecondFactor>,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
 	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/<provider>`.
 	public_origin: String,

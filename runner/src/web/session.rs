@@ -92,6 +92,8 @@ pub struct WebSessions {
 	/// Redis both live there, so any replica can start, confirm or end a trip.
 	trips: Mutex<HashMap<String, (u64, i64)>>,
 	reauths: Mutex<HashMap<String, u64>>,
+	/// Without Redis: until when each session counts as having just proved a second factor.
+	factor_fresh: Mutex<HashMap<String, i64>>,
 	/// Per-session single-flight for the refresh path: two racing rotations of one
 	/// refresh token read as theft upstream and revoke the family. In-process — see
 	/// `single_flight` for the one-replica caveat.
@@ -113,6 +115,7 @@ impl WebSessions {
 			store,
 			trips: Mutex::new(HashMap::new()),
 			reauths: Mutex::new(HashMap::new()),
+			factor_fresh: Mutex::new(HashMap::new()),
 			locks: KeyedLocks::default(),
 		})
 	}
@@ -194,6 +197,50 @@ impl WebSessions {
 			}
 		}
 		Ok(())
+	}
+
+	/// The session proved a second factor just now: for `ttl_secs` it may change the
+	/// account's factors (`web::second_factor`).
+	pub async fn mark_factor_fresh(&self, session_id: &str, ttl_secs: u64) -> color_eyre::Result<()> {
+		match &self.store {
+			Store::InProcess(_) => {
+				let mut fresh = self.factor_fresh.lock().await;
+				let now = now_secs();
+				fresh.retain(|_, until| *until > now);
+				fresh.insert(session_id.to_owned(), now.saturating_add_unsigned(ttl_secs));
+			}
+			Store::Redis(conn) => {
+				let mut conn = conn.clone();
+				let () = redis::cmd("SET")
+					.arg(Self::factor_fresh_key(session_id))
+					.arg(1)
+					.arg("EX")
+					.arg(ttl_secs)
+					.query_async(&mut conn)
+					.await
+					.context("second-factor freshness")?;
+			}
+		}
+		Ok(())
+	}
+
+	pub async fn factor_fresh(&self, session_id: &str) -> color_eyre::Result<bool> {
+		match &self.store {
+			Store::InProcess(_) => Ok(self.factor_fresh.lock().await.get(session_id).is_some_and(|until| *until > now_secs())),
+			Store::Redis(conn) => {
+				let mut conn = conn.clone();
+				let exists: bool = redis::cmd("EXISTS")
+					.arg(Self::factor_fresh_key(session_id))
+					.query_async(&mut conn)
+					.await
+					.context("second-factor freshness")?;
+				Ok(exists)
+			}
+		}
+	}
+
+	fn factor_fresh_key(session_id: &str) -> String {
+		format!("sffresh:{session_id}")
 	}
 
 	fn trip_key(key: &str) -> String {

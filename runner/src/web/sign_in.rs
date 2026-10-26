@@ -558,6 +558,10 @@ pub async fn methods(State(st): State<WebState>, jar: CookieJar) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed_in_read(st, &jar).await?;
 	let jar = caller.refreshed(st, jar);
+	let second_factor = match super::second_factor::summary(st, user.id()).await {
+		Ok(summary) => summary,
+		Err(refusal) => return Ok((jar, Err(refusal))),
+	};
 	let answer = match st.credentials.methods(user.id()).await {
 		Ok(methods) => Ok(Json(json!({
 			"email": user.email().as_str(),
@@ -566,6 +570,7 @@ pub async fn methods(State(st): State<WebState>, jar: CookieJar) -> Answered {
 			"password": methods.password,
 			"providers": methods.providers,
 			"passkeys": methods.passkeys.iter().map(|p| json!({ "id": p.credential_id, "name": p.name, "createdAt": p.created_at, "lastUsedAt": p.last_used_at })).collect::<Vec<_>>(),
+			"secondFactor": second_factor,
 		}))),
 		Err(e) => Err(internal("sign-in methods not read", e)),
 	};

@@ -554,7 +554,7 @@ pub fn payment_consent(
 /// plane a rendered "2.5%", because a string it renders is a string it can make say
 /// anything. Deserialised straight from the queued payload, which the relay wrote from
 /// the typed wire message after bounding every field.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct FeeTerms {
 	pub management_bps: u32,
 	pub performance_bps: u32,
@@ -725,7 +725,7 @@ pub fn fee_policy_notice(fund: &str, current: Option<&FeeTerms>, proposed: &FeeT
 
 /// Who a cancelled-consent mail is written for. The relay decides it from the identity
 /// record — the subject whose money it was, or a staff member — and stores it with the row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaymentOutcomeReader {
 	Subject,
 	Staff,
@@ -733,7 +733,7 @@ pub enum PaymentOutcomeReader {
 
 /// Why a consent was voided under its subject. Closed: this plane phrases each one itself,
 /// so no money-plane text ever stands inside a sentence of ours.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidationReason {
 	SessionsRevoked,
 	EmailChanged,
@@ -741,7 +741,7 @@ pub enum InvalidationReason {
 
 /// How a payment's consent died before the payment moved anything. A burn has exactly one
 /// cause, so it carries none; an invalidation carries which of its two it was.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConsentOutcome {
 	/// Five wrong codes on the consent page locked the link.
 	TokenBurned,
@@ -1006,7 +1006,50 @@ pub fn stepup_code(mail: &StepupMail<'_>) -> RenderedEmail {
 	}
 }
 
+/// A second factor of the account changed (`web::second_factor`). `None` for an `event`
+/// this build does not know, which the dispatcher parks rather than mails half-said.
+pub fn security_notice(event: &str, label: Option<&str>, at: i64) -> Option<RenderedEmail> {
+	let (title, what) = match event {
+		"factor_added" => (
+			"A second factor was added",
+			"A second factor was added to your account. It will be asked for before money leaves it.",
+		),
+		"factor_removed" => (
+			"A second factor was removed",
+			"A second factor was removed from your account. With none left, withdrawals are refused until you add one.",
+		),
+		"recovery_codes_replaced" => ("Your recovery codes were replaced", "New recovery codes were made for your account. The old ones no longer work."),
+		"recovered" => (
+			"Your second factors were reset with a recovery code",
+			"A recovery code was used on your account: every second factor and recovery code was removed and every session was signed out.",
+		),
+		_ => return None,
+	};
+	let warn = "If this was not you, sign in now, sign out of other sessions and contact support: someone holds your sign-in.";
+	let when = fmt_ts_utc(at);
+	let name = label.map(one_line);
+	let mut rows = vec![("Time", when.clone())];
+	if let Some(name) = &name {
+		rows.push(("Factor", name.clone()));
+	}
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Account"));
+	inner.push_str(&heading(title));
+	inner.push_str(&paragraph(what));
+	inner.push_str(&detail_box(&rows));
+	inner.push_str(&paragraph(warn));
+	let factor_line = name.map(|n| format!("Factor: {n}\n")).unwrap_or_default();
+	Some(RenderedEmail {
+		subject: format!("{title} on your EV Investment account"),
+		html: shell(title, &card(&inner), FOOTER_ACCOUNT, "", "Account"),
+		text: format!("{title}\n\n{what}\n\nTime: {when}\n{factor_line}\n{warn}\n\n—\n{FOOTER_ACCOUNT}\n"),
+	})
+}
+
 const FOOTER_CODE: &str = "You received this because this address was entered on evinvest.ltd. EV Investment never asks for this code by phone, chat or email.";
+
+const FOOTER_ACCOUNT: &str =
+	"You are receiving this because it concerns how your own account is protected. Security mail cannot be switched off — if it could, muting it would be the first thing an attacker did.";
 
 const FOOTER_SECURITY: &str =
 	"You are receiving this because you hold an owner seat. Security mail cannot be switched off — if it could, muting it would be the first thing an attacker did.";
@@ -1209,7 +1252,7 @@ fn shell(preheader: &str, body: &str, footer_context: &str, unsubscribe_url: &st
 /// words or a value set apart as somebody else's. A `USER` value is already the account's
 /// address, resolved when the row was queued; a link is never stored — it is built at send
 /// time from `APPROVALS_URL` and the id, so no row can point anywhere else.
-#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ApprovalMail {
 	pub approval_id: String,
 	pub kind: String,
@@ -1233,7 +1276,7 @@ pub struct ApprovalMail {
 	pub note: Option<ApprovalNote>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ApprovalMailField {
 	pub label: String,
 	pub value: ApprovalMailValue,
@@ -1241,7 +1284,7 @@ pub struct ApprovalMailField {
 
 /// `domain::approvals::FieldValue` with a `USER` resolved to an address: the mail never
 /// shows an `auth_subject`, which means nothing to a person.
-#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ApprovalMailValue {
 	Text(String),
@@ -1253,14 +1296,14 @@ pub enum ApprovalMailValue {
 	Count(u64),
 }
 
-#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ApprovalNote {
 	pub by: NoteAuthor,
 	pub text: String,
 }
 
 /// Whose words a note is. Closed, so the label above a note is always this plane's.
-#[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoteAuthor {
 	/// The roster member or owner who vetoed it.

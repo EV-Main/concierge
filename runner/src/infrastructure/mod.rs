@@ -43,4 +43,5 @@ pub mod relying_parties;
 pub mod scope_catalogs;
 pub mod scope_events;
 pub mod scopes;
+pub mod second_factors;
 pub mod users;
