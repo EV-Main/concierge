@@ -1,5 +1,6 @@
 //! The decisions about PEOPLE inside `approvals` (`concierge:owner_admission`,
-//! `owner_removal`, `user_suspension`, `user_reinstatement`, `admin_admission`) against a
+//! `owner_removal`, `user_suspension`, `user_reinstatement`, `admin_admission`,
+//! `second_factor_reset`) against a
 //! REAL Postgres: each kind end to end, and the invariants that make them safe to hand the
 //! seats to (`docs/SCOPES-AND-APPROVALS.md` §5.3).
 //!
@@ -88,7 +89,7 @@ fn state(approval: &Approval) -> ApprovalState {
 	ApprovalState::try_from(approval.state).unwrap()
 }
 
-/// The five decisions, named for the RPC that opens each.
+/// The decisions, named for the RPC that opens each.
 #[derive(Clone, Copy, Debug)]
 enum Decision {
 	Admit,
@@ -96,6 +97,7 @@ enum Decision {
 	Suspend,
 	Reinstate,
 	Admin,
+	ResetSecondFactor,
 }
 
 impl Decision {
@@ -106,6 +108,7 @@ impl Decision {
 			Self::Suspend => "concierge:user_suspension",
 			Self::Reinstate => "concierge:user_reinstatement",
 			Self::Admin => "concierge:admin_admission",
+			Self::ResetSecondFactor => "concierge:second_factor_reset",
 		}
 	}
 }
@@ -160,6 +163,7 @@ impl Fx {
 			Decision::Suspend => self.people.propose_user_suspension(request).await,
 			Decision::Reinstate => self.people.propose_user_reinstatement(request).await,
 			Decision::Admin => self.people.propose_admin_admission(request).await,
+			Decision::ResetSecondFactor => self.people.propose_second_factor_reset(request).await,
 		}
 		.map(tonic::Response::into_inner)
 	}
@@ -266,6 +270,71 @@ impl Fx {
 // ---------------------------------------------------------------------------------
 // Each kind, end to end.
 // ---------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_second_factor_reset_passes_on_a_majority_and_leaves_no_factor_no_code_and_no_session() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(4).await;
+	let subject = fx.user("lost-phone").await;
+	let bare = fx.user("no-factor").await;
+	fx.at(T0);
+	// What an enrolment leaves; the material is never read on this path.
+	sqlx::query("INSERT INTO second_factors (id, user_id, kind, label, material, created_at, confirmed_at) VALUES ($1, $2, 'totp', 'Phone', '\\x00', $3, $3)")
+		.bind(Uuid::new_v4())
+		.bind(subject.raw())
+		.bind(T0)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	sqlx::query("INSERT INTO second_factor_recovery_codes (user_id, digest, created_at) VALUES ($1, $2, $3)")
+		.bind(subject.raw())
+		.bind(vec![7u8; 32])
+		.bind(T0)
+		.execute(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(
+		fx.open(owners[0], Decision::ResetSecondFactor, bare).await.unwrap_err().code(),
+		Code::FailedPrecondition,
+		"nothing to reset"
+	);
+	let version = fx.users.find_by_id(subject).await.unwrap().unwrap().token_version();
+
+	let reset = fx.open(owners[0], Decision::ResetSecondFactor, subject).await.expect("an owner opens a reset");
+	assert_eq!(reset.kind, Decision::ResetSecondFactor.kind());
+	assert_eq!((reset.voters.len(), reset.threshold), (3, 2), "more than half of the owners besides the opener");
+	fx.carry(&owners[1..3], &reset.id).await;
+	fx.execute_at(T0 + 24 * HOUR - 1).await;
+	assert_eq!(
+		fx.count("SELECT count(*) FROM second_factors WHERE user_id = $1", subject.raw()).await,
+		1,
+		"nothing inside the veto delay"
+	);
+
+	fx.execute_at(T0 + 24 * HOUR).await;
+	assert_eq!(state(&fx.get(owners[0], &reset.id).await), ApprovalState::Executed);
+	assert_eq!(fx.count("SELECT count(*) FROM second_factors WHERE user_id = $1", subject.raw()).await, 0);
+	assert_eq!(fx.count("SELECT count(*) FROM second_factor_recovery_codes WHERE user_id = $1", subject.raw()).await, 0);
+	assert_eq!(fx.users.find_by_id(subject).await.unwrap().unwrap().token_version(), version + 1, "every session ends");
+	assert_eq!(
+		fx.count("SELECT count(*) FROM user_outbox WHERE user_id = $1 AND kind = 'SESSIONS_REVOKED'", subject.raw()).await,
+		1,
+		"and the money plane starts its cool-off"
+	);
+	let id = Uuid::parse_str(&reset.id).unwrap();
+	assert_eq!(
+		fx.count("SELECT count(*) FROM admin_action WHERE approval_id = $1 AND action = 'second_factor_reset_by_approval'", id)
+			.await,
+		1
+	);
+	let told: Vec<String> =
+		sqlx::query_scalar("SELECT payload->>'event' FROM notification_deliveries d JOIN users u ON u.email = d.recipient WHERE u.id = $1 AND d.kind = 'security_notice'")
+			.bind(subject.raw())
+			.fetch_all(&fx.pool)
+			.await
+			.unwrap();
+	assert_eq!(told, ["reset"]);
+}
 
 #[tokio::test]
 async fn an_owner_admission_needs_every_other_owner_and_seats_the_candidate_once() {
@@ -458,11 +527,18 @@ async fn only_an_active_owner_opens_and_nobody_opens_one_about_themselves() {
 	let (_lock, owners) = fx.owners(3).await;
 	let outsider = fx.user("outsider").await;
 	let subject = fx.user("subject").await;
-	for decision in [Decision::Admit, Decision::Remove, Decision::Suspend, Decision::Reinstate, Decision::Admin] {
+	for decision in [
+		Decision::Admit,
+		Decision::Remove,
+		Decision::Suspend,
+		Decision::Reinstate,
+		Decision::Admin,
+		Decision::ResetSecondFactor,
+	] {
 		let refused = fx.open(outsider, decision, subject).await.unwrap_err();
 		assert_eq!(refused.code(), Code::PermissionDenied, "{decision:?}: {}", refused.message());
 	}
-	for decision in [Decision::Remove, Decision::Suspend, Decision::Admin] {
+	for decision in [Decision::Remove, Decision::Suspend, Decision::Admin, Decision::ResetSecondFactor] {
 		let refused = fx.open(owners[0], decision, owners[0]).await.unwrap_err();
 		assert_ne!(refused.code(), Code::Ok, "{decision:?}");
 		assert!(
