@@ -153,6 +153,30 @@ impl Surface {
 		self.send(Method::POST, path, origin, Some(body), browser, true).await
 	}
 
+	/// A JSON `fetch` a page on `origin` makes with the browser's cookies: marked
+	/// `Sec-Fetch-Site: same-site` by the browser, and carrying no CSRF header, which a page
+	/// off `PUBLIC_ORIGIN` cannot read.
+	pub async fn page_post(&self, path: &str, origin: &str, body: Value, browser: &mut Browser) -> Answer {
+		let mut request = Request::builder()
+			.method(Method::POST)
+			.uri(path)
+			.header(header::ORIGIN, origin)
+			.header("sec-fetch-site", "same-site")
+			.header(header::CONTENT_TYPE, "application/json");
+		if !browser.cookies.is_empty() {
+			request = request.header(header::COOKIE, browser.header());
+		}
+		let response = self.router.clone().oneshot(request.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+		browser.absorb(response.headers());
+		let (status, headers) = (response.status(), response.headers().clone());
+		let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+		Answer {
+			status,
+			headers,
+			body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+		}
+	}
+
 	pub async fn get(&self, path: &str, browser: &mut Browser) -> Answer {
 		self.send(Method::GET, path, ORIGIN, None, browser, false).await
 	}

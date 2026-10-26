@@ -6,6 +6,7 @@
 //! compiles the other half unused — hence the blanket allowance.
 #![allow(dead_code)]
 
+pub mod factor;
 pub mod web;
 
 /// The environment marker that says "this database is disposable".

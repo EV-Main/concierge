@@ -1,9 +1,14 @@
-//! Step-up proofs: a short token saying "this account just confirmed THIS operation".
+//! Step-up proofs: a short token saying "this account just proved a second factor for THIS
+//! operation".
 //!
-//! Minted by the web surface's `/auth/stepup/verify` after a passkey assertion or a mailed
-//! code that was bound, on the server, to the hash of one operation. The money plane's
-//! BFF checks it with [`verify_stepup_proof`] against the same JWKS it reads access
-//! tokens with, and accepts it only for an `intent_hash` it stored itself.
+//! Minted by the web surface's `/auth/stepup/verify` after the account answered one of its
+//! second factors in a ceremony bound, on the server, to the hash of one operation. The
+//! money plane's BFF checks it with [`verify_stepup_proof`] against the same JWKS it reads
+//! access tokens with, and accepts it only for an `intent_hash` it stored itself.
+//!
+//! The proof names no factor: it says how much assurance the answer gave ([`Aal`]), never
+//! which kind of factor gave it, so a kind added to this plane changes nothing a verifier
+//! does. A verifier asks for a minimum level and gets that or more.
 //!
 //! It is deliberately NOT a [`Claims`](crate::Claims) token: `typ` is `"stepup"` (not a
 //! [`TokenType`](crate::TokenType), so every access/service verifier refuses it at parse)
@@ -16,7 +21,7 @@
 //! do it for them.
 
 use jsonwebtoken::{Algorithm, Validation, decode, decode_header, get_current_timestamp};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::jwks::JwksCache;
 
@@ -30,20 +35,24 @@ pub const MAX_TTL_SECS: u64 = 120;
 /// default of a minute would be half the proof's whole life.
 const LEEWAY_SECS: u64 = 5;
 
-/// How the account proved the operation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StepupMethod {
-	Passkey,
-	EmailCode,
-}
+/// The assurance an answer gave, numbered as NIST SP 800-63B numbers authenticator
+/// assurance levels. Ordered and numeric on the wire, so a level added later passes every
+/// verifier that asks for less.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct Aal(u8);
 
-impl StepupMethod {
-	pub fn as_str(self) -> &'static str {
-		match self {
-			Self::Passkey => "passkey",
-			Self::EmailCode => "email_code",
-		}
+impl Aal {
+	/// The account's sign-in and, on top of it, a second factor it enrolled.
+	pub const SECOND_FACTOR: Self = Self(2);
+
+	pub fn level(self) -> u8 {
+		self.0
+	}
+
+	/// The level a caller names on the wire; `None` for one no proof can carry.
+	pub fn named(level: u8) -> Option<Self> {
+		(level >= Self::SECOND_FACTOR.0).then_some(Self(level))
 	}
 }
 
@@ -61,7 +70,7 @@ pub struct StepupClaims {
 	/// The operation, as 64 lowercase hex characters (32 bytes) — the bank's own hash of
 	/// what it stored.
 	pub intent_hash: String,
-	pub method: StepupMethod,
+	pub aal: Aal,
 	/// The page the person confirmed on, as the browser reported it (`Origin`).
 	pub origin: String,
 	/// Unique per proof; the consumer spends it once.
@@ -82,10 +91,9 @@ pub struct Expected<'a> {
 	pub intent_hash: &'a [u8; 32],
 	pub sub: &'a str,
 	pub origin: &'a str,
-	/// The methods the bank accepts for THIS operation. A policy of the verifier, not of
-	/// the proof: a withdrawal that requires a passkey lists `[Passkey]` and a proof that
-	/// came from a mailed code is refused.
-	pub methods: &'a [StepupMethod],
+	/// The least assurance the bank accepts for THIS operation. A policy of the verifier,
+	/// not of the proof.
+	pub min_aal: Aal,
 }
 
 /// Why a proof was not accepted. Callers answer all of these alike to a client.
@@ -97,7 +105,8 @@ pub enum StepupError {
 	/// The signing key is not in the cache; refresh the JWKS once and retry.
 	#[error("unknown signing key: {0}")]
 	UnknownKid(String),
-	/// A genuine proof, but of another account, operation or page.
+	/// A genuine proof, but of another account, operation or page, or of less assurance
+	/// than the operation asks.
 	#[error("step-up proof is for another {0}")]
 	Mismatch(&'static str),
 }
@@ -130,13 +139,20 @@ pub fn parse_intent_hash(raw: &str) -> Option<[u8; 32]> {
 	Some(out)
 }
 
-/// Verify a proof against the cached JWKS and the operation the verifier holds.
-///
-/// Checks the signature (EdDSA, pinned), `iss`, `aud`, `exp`, `typ`, that the proof does
-/// not live longer than [`MAX_TTL_SECS`] nor reach past `now + MAX_TTL_SECS`, then that
-/// `sub`, `intent_hash` and `origin` are exactly the expected ones and `method` is allowed. On success the caller still owes the replay check:
-/// spend `jti` (until `exp`) in a shared store and refuse the proof if it was spent.
-pub fn verify_stepup_proof(token: &str, cache: &JwksCache, issuer: &str, expected: &Expected<'_>) -> Result<StepupClaims, StepupError> {
+/// The claims every flavour of proof shares, as the checks below read them.
+trait Bound: DeserializeOwned {
+	fn bound(&self) -> (&str, u64, u64, &str, &str, &str, &str);
+}
+
+impl Bound for StepupClaims {
+	fn bound(&self) -> (&str, u64, u64, &str, &str, &str, &str) {
+		(&self.typ, self.iat, self.exp, &self.jti, &self.sub, &self.intent_hash, &self.origin)
+	}
+}
+
+/// Signature (EdDSA, pinned), `iss`, `aud`, `exp`, `typ`, the lifetime, and that `sub`,
+/// `intent_hash` and `origin` are exactly these.
+fn verified<C: Bound>(token: &str, cache: &JwksCache, issuer: &str, intent_hash: &[u8; 32], sub: &str, origin: &str) -> Result<C, StepupError> {
 	let header = decode_header(token).map_err(|_| StepupError::Invalid)?;
 	if header.alg != Algorithm::EdDSA {
 		return Err(StepupError::Invalid);
@@ -149,27 +165,99 @@ pub fn verify_stepup_proof(token: &str, cache: &JwksCache, issuer: &str, expecte
 	validation.set_audience(&[AUDIENCE]);
 	validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
 	validation.leeway = LEEWAY_SECS;
-	let claims = decode::<StepupClaims>(token, key, &validation).map_err(|_| StepupError::Invalid)?.claims;
+	let claims = decode::<C>(token, key, &validation).map_err(|_| StepupError::Invalid)?.claims;
 
 	// A proof dated ahead of this verifier's clock, or ending later than a proof can live,
 	// was not minted by this plane's signer however well it is signed.
 	let now = get_current_timestamp();
-	if claims.typ != TYP || claims.jti.is_empty() || claims.exp.saturating_sub(claims.iat) > MAX_TTL_SECS || claims.iat > now + LEEWAY_SECS || claims.exp > now + MAX_TTL_SECS + LEEWAY_SECS {
+	let (typ, iat, exp, jti, claimed_sub, claimed_hash, claimed_origin) = claims.bound();
+	if typ != TYP || jti.is_empty() || exp.saturating_sub(iat) > MAX_TTL_SECS || iat > now + LEEWAY_SECS || exp > now + MAX_TTL_SECS + LEEWAY_SECS {
 		return Err(StepupError::Invalid);
 	}
-	if claims.sub != expected.sub {
+	if claimed_sub != sub {
 		return Err(StepupError::Mismatch("account"));
 	}
-	if claims.intent_hash != hex32(expected.intent_hash) {
+	if claimed_hash != hex32(intent_hash) {
 		return Err(StepupError::Mismatch("operation"));
 	}
-	if claims.origin != expected.origin {
+	if claimed_origin != origin {
 		return Err(StepupError::Mismatch("origin"));
 	}
-	if !expected.methods.contains(&claims.method) {
-		return Err(StepupError::Mismatch("method"));
+	Ok(claims)
+}
+
+/// Verify a proof against the cached JWKS and the operation the verifier holds.
+///
+/// Checks the signature (EdDSA, pinned), `iss`, `aud`, `exp`, `typ`, that the proof does
+/// not live longer than [`MAX_TTL_SECS`] nor reach past `now + MAX_TTL_SECS`, then that
+/// `sub`, `intent_hash` and `origin` are exactly the expected ones and `aal` is at least
+/// `min_aal`. A proof without `aal` (the passkey and mailed-code flavour of 0.1) is refused.
+/// On success the caller still owes the replay check: spend `jti` (until `exp`) in a shared
+/// store and refuse the proof if it was spent.
+pub fn verify_stepup_proof(token: &str, cache: &JwksCache, issuer: &str, expected: &Expected<'_>) -> Result<StepupClaims, StepupError> {
+	let claims: StepupClaims = verified(token, cache, issuer, expected.intent_hash, expected.sub, expected.origin)?;
+	if claims.aal < expected.min_aal {
+		return Err(StepupError::Mismatch("assurance"));
 	}
 	Ok(claims)
+}
+
+/// The proof of 0.1, still minted by the passkey and mailed-code step-up for a money plane
+/// pinned to that version, and read by nothing in this version but this plane's own tests.
+/// It goes with those two methods, once no verifier asks for them.
+pub mod legacy {
+	use serde::{Deserialize, Serialize};
+
+	#[cfg(feature = "test-support")]
+	use super::{JwksCache, StepupError};
+
+	/// How the account proved the operation, in a 0.1 proof.
+	#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+	#[serde(rename_all = "snake_case")]
+	pub enum StepupMethod {
+		Passkey,
+		EmailCode,
+	}
+
+	impl StepupMethod {
+		pub fn as_str(self) -> &'static str {
+			match self {
+				Self::Passkey => "passkey",
+				Self::EmailCode => "email_code",
+			}
+		}
+	}
+
+	/// The claims of a 0.1 proof: `method` where a proof now has `aal`.
+	#[derive(Clone, Debug, Deserialize, Serialize)]
+	pub struct MethodClaims {
+		pub sub: String,
+		pub iss: String,
+		pub aud: String,
+		pub exp: u64,
+		pub iat: u64,
+		pub typ: String,
+		pub intent_hash: String,
+		pub method: StepupMethod,
+		pub origin: String,
+		pub jti: String,
+	}
+
+	impl super::Bound for MethodClaims {
+		fn bound(&self) -> (&str, u64, u64, &str, &str, &str, &str) {
+			(&self.typ, self.iat, self.exp, &self.jti, &self.sub, &self.intent_hash, &self.origin)
+		}
+	}
+
+	/// The 0.1 verifier, as the pinned money plane runs it.
+	#[cfg(feature = "test-support")]
+	pub fn verify_method_proof(token: &str, cache: &JwksCache, issuer: &str, intent_hash: &[u8; 32], sub: &str, origin: &str, methods: &[StepupMethod]) -> Result<MethodClaims, StepupError> {
+		let claims: MethodClaims = super::verified(token, cache, issuer, intent_hash, sub, origin)?;
+		if !methods.contains(&claims.method) {
+			return Err(StepupError::Mismatch("method"));
+		}
+		Ok(claims)
+	}
 }
 
 #[cfg(test)]
@@ -229,18 +317,18 @@ mod tests {
 			intent_hash: &HASH,
 			sub: SUB,
 			origin: ORIGIN,
-			methods: &[StepupMethod::Passkey, StepupMethod::EmailCode],
+			min_aal: Aal::SECOND_FACTOR,
 		}
 	}
 
 	fn proof() -> String {
-		signer().mint_stepup(SUB, &HASH, StepupMethod::Passkey, ORIGIN, 120).unwrap().token
+		signer().mint_stepup(SUB, &HASH, Aal::SECOND_FACTOR, ORIGIN, 120).unwrap().token
 	}
 
 	#[test]
 	fn a_proof_verifies_for_exactly_its_operation() {
 		let claims = verify_stepup_proof(&proof(), &cache(), ISSUER, &expected()).unwrap();
-		assert_eq!((claims.sub.as_str(), claims.method, claims.origin.as_str()), (SUB, StepupMethod::Passkey, ORIGIN));
+		assert_eq!((claims.sub.as_str(), claims.aal, claims.origin.as_str()), (SUB, Aal::SECOND_FACTOR, ORIGIN));
 		assert_eq!(claims.intent_hash, hex32(&HASH));
 		assert_eq!(claims.aud, AUDIENCE);
 		assert!(claims.exp - claims.iat <= MAX_TTL_SECS);
@@ -264,16 +352,19 @@ mod tests {
 	}
 
 	#[test]
-	fn a_method_the_bank_does_not_allow_for_the_operation_is_refused() {
-		let token = signer().mint_stepup(SUB, &HASH, StepupMethod::EmailCode, ORIGIN, 120).unwrap().token;
-		let passkey_only = Expected {
-			methods: &[StepupMethod::Passkey],
-			..expected()
-		};
-		assert_eq!(verify_stepup_proof(&token, &cache(), ISSUER, &passkey_only).unwrap_err(), StepupError::Mismatch("method"));
-		assert!(verify_stepup_proof(&proof(), &cache(), ISSUER, &passkey_only).is_ok());
-		let none = Expected { methods: &[], ..expected() };
-		assert_eq!(verify_stepup_proof(&proof(), &cache(), ISSUER, &none).unwrap_err(), StepupError::Mismatch("method"));
+	fn a_proof_of_less_assurance_than_the_operation_asks_is_refused_and_more_passes() {
+		let higher = Aal::named(3).unwrap();
+		let wants_more = Expected { min_aal: higher, ..expected() };
+		assert_eq!(verify_stepup_proof(&proof(), &cache(), ISSUER, &wants_more).unwrap_err(), StepupError::Mismatch("assurance"));
+		let stronger = signer().mint_stepup(SUB, &HASH, higher, ORIGIN, 120).unwrap().token;
+		assert_eq!(verify_stepup_proof(&stronger, &cache(), ISSUER, &expected()).unwrap().aal, higher);
+		assert_eq!(Aal::named(1), None, "no proof is of a single factor");
+	}
+
+	#[test]
+	fn a_method_proof_of_0_1_is_no_proof_here() {
+		let legacy = signer().mint_method_stepup(SUB, &HASH, legacy::StepupMethod::Passkey, ORIGIN, 120).unwrap().token;
+		assert_eq!(verify_stepup_proof(&legacy, &cache(), ISSUER, &expected()).unwrap_err(), StepupError::Invalid);
 	}
 
 	#[test]
@@ -315,7 +406,7 @@ mod tests {
 			iat: now,
 			typ: TYP.into(),
 			intent_hash: hex32(&HASH),
-			method: StepupMethod::Passkey,
+			aal: Aal::SECOND_FACTOR,
 			origin: ORIGIN.into(),
 			jti: "j".into(),
 		};
@@ -326,7 +417,7 @@ mod tests {
 
 	#[test]
 	fn the_minter_clamps_the_lifetime() {
-		let minted = signer().mint_stepup(SUB, &HASH, StepupMethod::EmailCode, ORIGIN, 3600).unwrap();
+		let minted = signer().mint_stepup(SUB, &HASH, Aal::SECOND_FACTOR, ORIGIN, 3600).unwrap();
 		assert!(minted.exp <= get_current_timestamp() + MAX_TTL_SECS);
 	}
 
@@ -353,7 +444,7 @@ mod tests {
 			iat: get_current_timestamp(),
 			typ: TYP.into(),
 			intent_hash: hex32(&HASH),
-			method: StepupMethod::Passkey,
+			aal: Aal::SECOND_FACTOR,
 			origin: ORIGIN.into(),
 			jti: "j".into(),
 		};
@@ -388,8 +479,8 @@ mod tests {
 		let claims = serde_json::to_value(verify_stepup_proof(&proof(), &cache(), ISSUER, &expected()).unwrap()).unwrap();
 		let mut keys: Vec<_> = claims.as_object().unwrap().keys().cloned().collect();
 		keys.sort();
-		assert_eq!(keys, ["aud", "exp", "iat", "intent_hash", "iss", "jti", "method", "origin", "sub", "typ"]);
+		assert_eq!(keys, ["aal", "aud", "exp", "iat", "intent_hash", "iss", "jti", "origin", "sub", "typ"]);
 		assert_eq!(claims["typ"], "stepup");
-		assert_eq!(claims["method"], "passkey");
+		assert_eq!(claims["aal"], 2, "a number, so a higher level passes a verifier that asks for less");
 	}
 }

@@ -1,6 +1,6 @@
 # concierge web — the identity plane's microfrontends
 
-Four self-registering custom elements, each a single ESM file with its own React,
+Five self-registering custom elements, each a single ESM file with its own React,
 rendered in the host's light DOM with the shared `@evinvest/uikit` tokens. Hosts mount
 them through [`@evinvest/mfe`](https://github.com/EV-Main/lib/tree/main/ts/mfe) /
 `@evinvest/concierge` ([`../sdk`](../sdk)) (registry, loader, events, `apiVersion` 2).
@@ -11,6 +11,7 @@ them through [`@evinvest/mfe`](https://github.com/EV-Main/lib/tree/main/ts/mfe) 
 | `mfe-concierge-account` | `concierge.account` | page |
 | `mfe-concierge-account-chip` | `concierge.account-chip` | component |
 | `mfe-concierge-reauth` | `concierge.reauth` | component |
+| `mfe-concierge-stepup` | `concierge.stepup` | component |
 
 The attributes and events of each element are documented at the top of its entry,
 `src/entries/<name>.tsx`.
@@ -60,6 +61,23 @@ plane has accepted the proof and re-set `ev_access`, or `ev:close` when dismisse
 one per opening. The host retries its act once and drops `open` either way. Off the
 platform origin the dialog only says to confirm on the platform: the reauth routes refuse
 every other `Origin`.
+
+## Step-up: a second factor for one operation
+
+`mfe-concierge-stepup` is a dialog for a money-plane page, on the platform origin or a
+scope host listed in `STEPUP_PROOF_ORIGINS`, that needs the account to prove a second
+factor for ONE operation (`docs/STEPUP-PROOF.md`). The page sets `intent-hash` and
+`min-aal` (both required, no default) and `open`; the element runs
+`/api/auth/stepup/{options,verify}` and fires `ev:stepup-proof` with `{ proof, expiresAt }`,
+or `ev:close` — at most one per opening, as the reauth element. These two routes are the
+only session acts answered cross-origin: CORS and `Sec-Fetch-Site` stand in for the CSRF
+header, which a host could not read. A ceremony is spent by one answer, so every refusal
+opens the next before the reader types again.
+
+The factor picker and the per-kind forms are `features/second-factor`'s, so the page never
+learns which kinds the account holds. With no factor that gives `min-aal`, the platform
+origin enrols one in the dialog (the enrolment routes answer the platform only) and asks
+again; a scope host links to the platform's Security page and offers to ask again.
 
 ## The platform confirmation page
 

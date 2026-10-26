@@ -52,6 +52,9 @@ export const AUTH_ERRORS = [
   "ceremony_expired",
   "unknown_factor",
   "factor_locked",
+  "invalid_aal",
+  "invalid_intent",
+  "fetch_site",
   "unavailable",
   "internal",
 ] as const;

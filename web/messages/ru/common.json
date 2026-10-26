@@ -619,6 +619,46 @@
     "en": "Verify my email now",
     "t": "Подтвердить почту сейчас"
   },
+  "auth.stepup.err.origin": {
+    "en": "This site is not set up to ask for this confirmation. Contact its support.",
+    "t": "Этот сайт не настроен запрашивать такое подтверждение. Обратитесь в его поддержку."
+  },
+  "auth.stepup.err.request": {
+    "en": "This site asked for the confirmation in a form we cannot accept. Contact its support.",
+    "t": "Этот сайт запросил подтверждение в виде, который мы не можем принять. Обратитесь в его поддержку."
+  },
+  "auth.stepup.err.unavailable": {
+    "en": "Confirmations are not available right now. Try again later.",
+    "t": "Подтверждения сейчас недоступны. Попробуйте позже."
+  },
+  "auth.stepup.required": {
+    "en": "This operation needs two-step verification, and your account has no second factor for it yet.",
+    "t": "Для этой операции нужна двухэтапная проверка, а у вашего аккаунта пока нет подходящего второго фактора."
+  },
+  "auth.stepup.retry": {
+    "en": "Try again",
+    "t": "Попробовать ещё раз"
+  },
+  "auth.stepup.setUp": {
+    "en": "Set it up on evinvest.ltd",
+    "t": "Настроить на evinvest.ltd"
+  },
+  "auth.stepup.sub": {
+    "en": "Confirm this operation with your second factor.",
+    "t": "Подтвердите эту операцию вторым фактором."
+  },
+  "auth.stepup.subTotp": {
+    "en": "Confirm this operation with your authenticator app.",
+    "t": "Подтвердите эту операцию в приложении-аутентификаторе."
+  },
+  "auth.stepup.title": {
+    "en": "Confirm this operation",
+    "t": "Подтвердите операцию"
+  },
+  "auth.stepup.tryAgain": {
+    "en": "I've set it up — try again",
+    "t": "Я настроил — попробовать ещё раз"
+  },
   "auth.switchAccount": {
     "en": "Switch account",
     "t": "Сменить аккаунт"

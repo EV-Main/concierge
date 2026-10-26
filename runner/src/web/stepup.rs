@@ -40,11 +40,12 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 use color_eyre::eyre::{Context, bail, ensure};
 use domain::users::UserId;
-use evconcierge_auth::stepup::{self, StepupMethod, parse_intent_hash};
+use evconcierge_auth::stepup::{self, Aal, legacy::StepupMethod, parse_intent_hash};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use uuid::Uuid;
 use webauthn_rs::{
 	Webauthn,
 	prelude::{Passkey, PasskeyAuthentication, PublicKeyCredential, Url},
@@ -53,11 +54,13 @@ use webauthn_rs::{
 use crate::{
 	infrastructure::email::templates::breaks_or_hides,
 	notification::RateLimiter,
+	ports::Attempt,
 	web::{
 		Inner, WebState, now_secs,
 		passkey::{base64url, expired, rejected},
 		reauth::{eligible_passkeys, verified_address},
 		routes::ClientIp,
+		second_factor,
 		sign_in::{Answered, Halt, Refusal, Signed, code_refusal, human, internal, require_live, sent, signed_in_read},
 	},
 };
@@ -127,6 +130,8 @@ pub fn parse_origins(raw: &[String], public_origin: &str, production: bool) -> c
 }
 
 enum Kind {
+	/// The account's second factors, each with what its kind holds until the answer.
+	Factor(Vec<second_factor::Pending>),
 	Passkey(Box<PasskeyAuthentication>),
 	Email,
 }
@@ -309,9 +314,14 @@ async fn session(st: &Inner, jar: &CookieJar) -> Result<Signed, Halt> {
 pub struct OptionsBody {
 	/// 64 lowercase hex characters: the bank's hash of the operation it stored.
 	intent_hash: String,
-	/// `passkey` or `email_code`. Read as text so that any other word, a password included,
-	/// is told `invalid_method` rather than a parser's prose.
-	method: String,
+	/// The least assurance the operation asks for: the account's second factors that give
+	/// at least this much are offered. Never together with `method`.
+	#[serde(default)]
+	min_aal: Option<u8>,
+	/// The 0.1 step-up: `passkey` or `email_code`. Read as text so that any other word, a
+	/// password included, is told `invalid_method` rather than a parser's prose.
+	#[serde(default)]
+	method: Option<String>,
 	/// For `email_code` only: what the page says the operation is, quoted in the mail as the
 	/// page's own words.
 	#[serde(default)]
@@ -329,10 +339,16 @@ pub async fn options(State(st): State<WebState>, Extension(Asked(origin)): Exten
 	let answer = async {
 		let sp = st.stepup.as_ref().ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "not_found"))?;
 		let intent_hash = parse_intent_hash(&body.intent_hash).ok_or_else(|| invalid("invalid_intent"))?;
-		let method = match body.method.as_str() {
-			"passkey" => StepupMethod::Passkey,
-			"email_code" => StepupMethod::EmailCode,
-			_ => return Err(invalid("invalid_method")),
+		let method = match (body.min_aal, body.method.as_deref()) {
+			(Some(level), None) if body.summary.is_none() && body.turnstile_token.is_empty() => {
+				let min_aal = Aal::named(level).ok_or_else(|| invalid("invalid_aal"))?;
+				spend(sp, user.id())?;
+				return begin_factor(st, sp, user.id(), intent_hash, origin, min_aal).await;
+			}
+			(None, Some("passkey")) => StepupMethod::Passkey,
+			(None, Some("email_code")) => StepupMethod::EmailCode,
+			(None, Some(_)) => return Err(invalid("invalid_method")),
+			_ => return Err(invalid("invalid_request")),
 		};
 		spend(sp, user.id())?;
 		match method {
@@ -384,6 +400,20 @@ fn clean_summary(raw: Option<&str>) -> Result<String, Refusal> {
 	Ok(summary.to_owned())
 }
 
+async fn begin_factor(st: &Inner, sp: &Stepup, user: UserId, intent_hash: [u8; 32], origin: String, min_aal: Aal) -> Result<Json<Value>, Refusal> {
+	let second_factor::Challenges { offered, pending } = second_factor::challenge(st, user, min_aal).await?;
+	let (ceremony_id, expires_at) = sp
+		.begin(Ceremony {
+			user,
+			intent_hash,
+			origin,
+			born: Instant::now(),
+			kind: Kind::Factor(pending),
+		})
+		.await;
+	Ok(Json(json!({ "ceremony_id": ceremony_id, "factors": offered, "expires_at": expires_at })))
+}
+
 async fn begin_passkey(st: &Inner, sp: &Stepup, jar: &CookieJar, user: UserId, intent_hash: [u8; 32], origin: String) -> Result<Json<Value>, Refusal> {
 	let rows = eligible_passkeys(st, jar, user).await?;
 	let passkeys = rows
@@ -411,9 +441,12 @@ async fn begin_passkey(st: &Inner, sp: &Stepup, jar: &CookieJar, user: UserId, i
 #[serde(deny_unknown_fields)]
 pub struct VerifyBody {
 	ceremony_id: String,
-	/// The authenticator's assertion, for a passkey ceremony.
+	/// The factor answered, for a second-factor ceremony.
 	#[serde(default)]
-	response: Option<PublicKeyCredential>,
+	factor: Option<Uuid>,
+	/// The factor's answer, or the authenticator's assertion for a passkey ceremony.
+	#[serde(default)]
+	response: Option<Value>,
 	/// The mailed code, for an email ceremony.
 	#[serde(default)]
 	code: Option<String>,
@@ -428,14 +461,42 @@ pub async fn verify(State(st): State<WebState>, Extension(Asked(origin)): Extens
 	let answer = async {
 		let sp = st.stepup.as_ref().ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "not_found"))?;
 		spend(sp, user.id())?;
-		match (body.response, body.code) {
-			(Some(credential), None) => verify_passkey(st, sp, &jar, user.id(), &origin, &body.ceremony_id, &credential).await,
-			(None, Some(code)) => verify_code(st, sp, user.id(), &origin, &body.ceremony_id, &code).await,
+		match (body.factor, body.response, body.code) {
+			(Some(factor), Some(response), None) => verify_factor(st, sp, user.id(), &origin, &body.ceremony_id, factor, response).await,
+			(None, Some(response), None) => {
+				let credential: PublicKeyCredential = serde_json::from_value(response).map_err(|_| invalid("invalid_request"))?;
+				verify_passkey(st, sp, &jar, user.id(), &origin, &body.ceremony_id, &credential).await
+			}
+			(None, None, Some(code)) => verify_code(st, sp, user.id(), &origin, &body.ceremony_id, &code).await,
 			_ => Err(invalid("invalid_request")),
 		}
 	}
 	.await;
 	Ok((jar, answer))
+}
+
+async fn verify_factor(st: &Inner, sp: &Stepup, user: UserId, origin: &str, ceremony_id: &str, factor: Uuid, response: Value) -> Result<Json<Value>, Refusal> {
+	let lapsed = || invalid("ceremony_expired");
+	let ceremony = sp.take(ceremony_id).await.ok_or_else(lapsed)?;
+	let Kind::Factor(pending) = ceremony.kind else {
+		return Err(lapsed());
+	};
+	if ceremony.user != user || ceremony.origin != origin {
+		return Err(lapsed());
+	}
+	let (_, kind, pending) = pending.into_iter().find(|(id, ..)| *id == factor).ok_or_else(lapsed)?;
+	match second_factor::answer(st, user, factor, pending, response).await? {
+		Attempt::Accepted(()) => {
+			let aal = kind.aal();
+			let minted = st
+				.auth
+				.mint_stepup_proof(&user.to_string(), &ceremony.intent_hash, aal, &ceremony.origin, sp.ttl_secs())
+				.map_err(|e| internal("stepup: proof not minted", e))?;
+			tracing::info!(%user, origin = ceremony.origin, aal = aal.level(), jti = %minted.jti, "step-up proof issued");
+			Ok(Json(json!({ "proof": minted.token, "aal": aal.level(), "expires_at": minted.exp })))
+		}
+		other => Err(second_factor::refused(&other)),
+	}
 }
 
 async fn verify_passkey(st: &Inner, sp: &Stepup, jar: &CookieJar, user: UserId, origin: &str, ceremony_id: &str, credential: &PublicKeyCredential) -> Result<Json<Value>, Refusal> {
@@ -520,7 +581,7 @@ async fn verify_code(st: &Inner, sp: &Stepup, user: UserId, origin: &str, ceremo
 fn proof(st: &Inner, sp: &Stepup, user: UserId, intent_hash: &[u8; 32], origin: &str, method: StepupMethod) -> Result<Json<Value>, Refusal> {
 	let minted = st
 		.auth
-		.mint_stepup_proof(&user.to_string(), intent_hash, method, origin, sp.ttl_secs())
+		.mint_method_stepup_proof(&user.to_string(), intent_hash, method, origin, sp.ttl_secs())
 		.map_err(|e| internal("stepup: proof not minted", e))?;
 	tracing::info!(%user, origin, method = method.as_str(), jti = %minted.jti, "step-up proof issued");
 	Ok(Json(json!({ "proof": minted.token, "method": method.as_str(), "expires_at": minted.exp })))

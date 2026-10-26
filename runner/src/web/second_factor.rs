@@ -30,6 +30,7 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 use data_encoding::BASE32_NOPAD;
 use domain::{error::DomainError, users::UserId};
+use evconcierge_auth::stepup::Aal;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -67,7 +68,7 @@ struct Ceremony {
 	user: UserId,
 	born: Instant,
 	/// Each factor the options offered, with what its kind holds until the answer.
-	pending: Vec<(Uuid, FactorKind, Box<dyn Any + Send>)>,
+	pending: Vec<Pending>,
 }
 
 pub(super) struct SecondFactor {
@@ -158,7 +159,7 @@ async fn require_factor_fresh(st: &Inner, jar: &CookieJar) -> Result<(), Refusal
 }
 
 /// A refusal for every answer that was not accepted.
-fn refused<T>(attempt: &Attempt<T>) -> Refusal {
+pub(super) fn refused<T>(attempt: &Attempt<T>) -> Refusal {
 	match attempt {
 		Attempt::Accepted(_) => unreachable!("an accepted answer is not a refusal"),
 		Attempt::Wrong => invalid("invalid_answer"),
@@ -295,6 +296,50 @@ pub async fn enrol_confirm(State(st): State<WebState>, jar: CookieJar, headers: 
 	Ok((jar, answer))
 }
 
+/// What a factor holds between its challenge and its answer, by factor.
+pub(super) type Pending = (Uuid, FactorKind, Box<dyn Any + Send>);
+
+pub(super) struct Challenges {
+	/// What the page is shown: each factor's id, kind, label and challenge.
+	pub(super) offered: Vec<Value>,
+	pub(super) pending: Vec<Pending>,
+}
+
+/// Challenge every factor of the account that gives at least `min_aal`.
+/// `409 no_second_factor` when none does.
+pub(super) async fn challenge(st: &Inner, user: UserId, min_aal: Aal) -> Result<Challenges, Refusal> {
+	let sf = mounted(st)?;
+	let held = sf.store.sealed_factors(user).await.map_err(|e| internal("second factors not read", e))?;
+	let labels = sf.store.second_factors(user).await.map_err(|e| internal("second factors not read", e))?;
+	let mut offered = Vec::new();
+	let mut pending = Vec::new();
+	for row in held.into_iter().filter(|row| row.kind.aal() >= min_aal) {
+		let binding = Binding {
+			factor: row.id,
+			user,
+			kind: row.kind,
+		};
+		let material = sf.seal.open(&binding, &row.material).ok_or_else(|| internal("second factor: material does not open", row.id))?;
+		let challenged = row.kind.challenge(&material).map_err(|e| internal("second factor: not challenged", e))?;
+		let kind: &'static str = row.kind.into();
+		let label = labels.factors.iter().find(|f| f.id == row.id).map(|f| f.label.clone());
+		offered.push(json!({ "id": row.id, "kind": kind, "label": label, "challenge": challenged.challenge }));
+		pending.push((row.id, row.kind, challenged.pending));
+	}
+	if offered.is_empty() {
+		return Err(Refusal::new(StatusCode::CONFLICT, "no_second_factor"));
+	}
+	Ok(Challenges { offered, pending })
+}
+
+/// Check `response` against `factor`, counted by the account's guard.
+pub(super) async fn answer(st: &Inner, user: UserId, factor: Uuid, pending: Box<dyn Any + Send>, response: Value) -> Result<Attempt<()>, Refusal> {
+	let sf = mounted(st)?;
+	let now = now_secs();
+	let check = sf.check(user, move |kind, material| kind.verify(material, pending, response, now as u64));
+	sf.store.attempt(user, factor, check, now).await.map_err(|e| internal("second factor: answer not checked", e))
+}
+
 /// `POST /auth/second-factor/verify/options` — the account's factors and what each is
 /// challenged with, under one ceremony.
 pub async fn verify_options(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Answered {
@@ -303,26 +348,7 @@ pub async fn verify_options(State(st): State<WebState>, jar: CookieJar, headers:
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
 		let sf = mounted(st)?;
-		let held = sf.store.sealed_factors(user.id()).await.map_err(|e| internal("second factors not read", e))?;
-		if held.is_empty() {
-			return Err(Refusal::new(StatusCode::CONFLICT, "no_second_factor"));
-		}
-		let labels = sf.store.second_factors(user.id()).await.map_err(|e| internal("second factors not read", e))?;
-		let mut offered = Vec::new();
-		let mut pending = Vec::new();
-		for row in held {
-			let binding = Binding {
-				factor: row.id,
-				user: user.id(),
-				kind: row.kind,
-			};
-			let material = sf.seal.open(&binding, &row.material).ok_or_else(|| internal("second factor: material does not open", row.id))?;
-			let challenged = row.kind.challenge(&material).map_err(|e| internal("second factor: not challenged", e))?;
-			let kind: &'static str = row.kind.into();
-			let label = labels.factors.iter().find(|f| f.id == row.id).map(|f| f.label.clone());
-			offered.push(json!({ "id": row.id, "kind": kind, "label": label, "challenge": challenged.challenge }));
-			pending.push((row.id, row.kind, challenged.pending));
-		}
+		let Challenges { offered, pending } = challenge(st, user.id(), Aal::SECOND_FACTOR).await?;
 		let (ceremony, expires_at) = sf
 			.begin(Ceremony {
 				user: user.id(),
@@ -354,15 +380,7 @@ pub async fn verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderM
 		let sf = mounted(st)?;
 		let session = session_id(st, &jar)?;
 		let (_, pending) = sf.take(&body.ceremony, user.id(), body.factor).await.ok_or_else(|| invalid("ceremony_expired"))?;
-		let now = now_secs();
-		let response = body.response;
-		let check = sf.check(user.id(), move |kind, material| kind.verify(material, pending, response, now as u64));
-		match sf
-			.store
-			.attempt(user.id(), body.factor, check, now)
-			.await
-			.map_err(|e| internal("second factor: answer not checked", e))?
-		{
+		match answer(st, user.id(), body.factor, pending, body.response).await? {
 			Attempt::Accepted(()) => {
 				st.sessions
 					.mark_factor_fresh(&session, FACTOR_FRESH_SECS)

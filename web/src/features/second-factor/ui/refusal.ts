@@ -32,9 +32,33 @@ export function secondFactorRefusal(t: Translate, error: AuthError): string {
       return t("auth.err.reauthStill", "We could not confirm it is you. Try again.");
     case "second_factor_required":
       return t("auth.secondFactor.err.stillRequired", "We could not confirm your second factor. Try again.");
+    case "throttled":
+      return t("auth.reauth.err.throttled", "Too many attempts. Try again in a few minutes.");
     case "unauthenticated":
       return t("auth.err.sessionEnded", "Your session has ended. Sign in again.");
     default:
       return t("auth.secondFactor.err.generic", "Something went wrong. Try again.");
   }
+}
+
+/** Refusals of a step-up that are the asking site's set-up, not the reader's doing, say so. */
+export function stepupRefusal(t: Translate, error: AuthError): string {
+  switch (error) {
+    case "origin":
+    case "fetch_site":
+      return t("auth.stepup.err.origin", "This site is not set up to ask for this confirmation. Contact its support.");
+    case "invalid_aal":
+    case "invalid_intent":
+    case "invalid_request":
+      return t("auth.stepup.err.request", "This site asked for the confirmation in a form we cannot accept. Contact its support.");
+    case "unavailable":
+      return t("auth.stepup.err.unavailable", "Confirmations are not available right now. Try again later.");
+    default:
+      return secondFactorRefusal(t, error);
+  }
+}
+
+/** Refusals another ceremony could get past; the rest would only be refused again. */
+export function isRetryable(error: AuthError): boolean {
+  return !["origin", "fetch_site", "invalid_aal", "invalid_intent", "invalid_request", "unauthenticated"].includes(error);
 }

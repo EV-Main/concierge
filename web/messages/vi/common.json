@@ -619,6 +619,46 @@
     "en": "Verify my email now",
     "t": "Xác minh email ngay"
   },
+  "auth.stepup.err.origin": {
+    "en": "This site is not set up to ask for this confirmation. Contact its support.",
+    "t": "Trang này chưa được thiết lập để yêu cầu xác nhận này. Hãy liên hệ bộ phận hỗ trợ của trang."
+  },
+  "auth.stepup.err.request": {
+    "en": "This site asked for the confirmation in a form we cannot accept. Contact its support.",
+    "t": "Trang này yêu cầu xác nhận theo cách chúng tôi không thể chấp nhận. Hãy liên hệ bộ phận hỗ trợ của trang."
+  },
+  "auth.stepup.err.unavailable": {
+    "en": "Confirmations are not available right now. Try again later.",
+    "t": "Hiện không thể xác nhận. Hãy thử lại sau."
+  },
+  "auth.stepup.required": {
+    "en": "This operation needs two-step verification, and your account has no second factor for it yet.",
+    "t": "Thao tác này cần xác minh hai bước, và tài khoản của bạn chưa có yếu tố thứ hai phù hợp."
+  },
+  "auth.stepup.retry": {
+    "en": "Try again",
+    "t": "Thử lại"
+  },
+  "auth.stepup.setUp": {
+    "en": "Set it up on evinvest.ltd",
+    "t": "Thiết lập trên evinvest.ltd"
+  },
+  "auth.stepup.sub": {
+    "en": "Confirm this operation with your second factor.",
+    "t": "Xác nhận thao tác này bằng yếu tố thứ hai của bạn."
+  },
+  "auth.stepup.subTotp": {
+    "en": "Confirm this operation with your authenticator app.",
+    "t": "Xác nhận thao tác này bằng ứng dụng xác thực của bạn."
+  },
+  "auth.stepup.title": {
+    "en": "Confirm this operation",
+    "t": "Xác nhận thao tác này"
+  },
+  "auth.stepup.tryAgain": {
+    "en": "I've set it up — try again",
+    "t": "Tôi đã thiết lập — thử lại"
+  },
   "auth.switchAccount": {
     "en": "Switch account",
     "t": "Chuyển tài khoản"

@@ -12,3 +12,7 @@ export { useSignInRequired } from './use-sign-in-required';
 export type { SignInRequired, SignInRequiredOptions, StatusLike } from './use-sign-in-required';
 export { useReauthRequired } from './use-reauth-required';
 export type { ReauthRequired } from './use-reauth-required';
+export { StepupDialog } from './stepup-dialog';
+export type { StepupDialogProps, StepupRequest } from './stepup-dialog';
+export { useStepup } from './use-stepup';
+export type { Stepup } from './use-stepup';

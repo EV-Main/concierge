@@ -5,10 +5,11 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::web::{Answer, Browser, ORIGIN, Surface, address, surface, surface_with_second_factor};
-use hmac::{Hmac, Mac, digest::KeyInit};
+use common::{
+	factor::{app_code, error, refusal, wrong},
+	web::{Browser, ORIGIN, address, surface, surface_with_second_factor},
+};
 use serde_json::{Value, json};
-use sha1::Sha1;
 
 macro_rules! fixture {
 	() => {
@@ -17,114 +18,6 @@ macro_rules! fixture {
 			None => return,
 		}
 	};
-}
-
-fn now() -> u64 {
-	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-}
-
-/// What an authenticator app shows for `secret` (base32) `steps` thirty-second steps from now.
-fn app_code(secret: &str, steps: i64) -> String {
-	let key = data_encoding::BASE32_NOPAD.decode(secret.as_bytes()).unwrap();
-	let counter = (now() / 30).checked_add_signed(steps).unwrap();
-	let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(&key).unwrap();
-	mac.update(&counter.to_be_bytes());
-	let digest = mac.finalize().into_bytes();
-	let offset = (digest[19] & 0x0f) as usize;
-	let binary = u32::from_be_bytes([digest[offset] & 0x7f, digest[offset + 1], digest[offset + 2], digest[offset + 3]]);
-	format!("{:06}", binary % 1_000_000)
-}
-
-/// A wrong code that cannot collide with the right one in any accepted step.
-fn wrong(secret: &str) -> String {
-	let right: Vec<String> = (-1..=1).map(|s| app_code(secret, s)).collect();
-	(0..10).map(|d| d.to_string().repeat(6)).find(|c| !right.contains(c)).unwrap()
-}
-
-/// A signed-in account, its browser, and the secret of the authenticator it enrolled.
-struct Holder {
-	browser: Browser,
-	email: String,
-	user: uuid::Uuid,
-	secret: String,
-	factor: String,
-	recovery: Vec<String>,
-}
-
-fn refusal(answer: &Answer) -> (StatusCode, Value) {
-	(answer.status, answer.body.clone())
-}
-
-fn error(status: StatusCode, code: &str) -> (StatusCode, Value) {
-	(status, json!({ "error": code }))
-}
-
-impl Surface {
-	async fn signed_in(&self, tag: &str) -> (Browser, String) {
-		let email = address(tag);
-		let mut browser = Browser::default();
-		let signed = self.sign_in_with_code(&email, &mut browser).await;
-		assert_eq!(signed.status, StatusCode::OK, "{:?}", signed.body);
-		(browser, email)
-	}
-
-	async fn enrol_start(&self, browser: &mut Browser) -> Answer {
-		self.post("/auth/second-factor/enrol/start", ORIGIN, json!({ "kind": "totp", "label": "Phone" }), browser).await
-	}
-
-	async fn enrol(&self, browser: &mut Browser) -> (String, Answer) {
-		let started = self.enrol_start(browser).await;
-		assert_eq!(started.status, StatusCode::OK, "{:?}", started.body);
-		let secret = started.body["offer"]["secret"].as_str().unwrap().to_owned();
-		let confirmed = self
-			.post(
-				"/auth/second-factor/enrol/confirm",
-				ORIGIN,
-				json!({ "enrolment": started.body["enrolment"], "response": { "code": app_code(&secret, 0) } }),
-				browser,
-			)
-			.await;
-		(secret, confirmed)
-	}
-
-	async fn holder(&self, tag: &str) -> Holder {
-		let (mut browser, email) = self.signed_in(tag).await;
-		let (secret, confirmed) = self.enrol(&mut browser).await;
-		assert_eq!(confirmed.status, StatusCode::OK, "{:?}", confirmed.body);
-		let recovery = confirmed.body["recoveryCodes"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_owned()).collect();
-		let methods = self.get("/auth/methods", &mut browser).await;
-		let factor = methods.body["secondFactor"]["factors"][0]["id"].as_str().unwrap().to_owned();
-		let user = sqlx::query_scalar("SELECT id FROM users WHERE email = $1").bind(&email).fetch_one(&self.pool).await.unwrap();
-		Holder {
-			browser,
-			email,
-			user,
-			secret,
-			factor,
-			recovery,
-		}
-	}
-
-	/// Open a verification ceremony and answer `code` to the holder's factor.
-	async fn prove(&self, who: &mut Holder, code: &str) -> Answer {
-		let options = self.post("/auth/second-factor/verify/options", ORIGIN, json!({}), &mut who.browser).await;
-		assert_eq!(options.status, StatusCode::OK, "{:?}", options.body);
-		self.post(
-			"/auth/second-factor/verify",
-			ORIGIN,
-			json!({ "ceremony": options.body["ceremony"], "factor": who.factor, "response": { "code": code } }),
-			&mut who.browser,
-		)
-		.await
-	}
-
-	async fn notices(&self, email: &str) -> Vec<String> {
-		sqlx::query_scalar("SELECT payload->>'event' FROM notification_deliveries WHERE kind = 'security_notice' AND recipient = $1 ORDER BY id")
-			.bind(email)
-			.fetch_all(&self.pool)
-			.await
-			.unwrap()
-	}
 }
 
 #[tokio::test]
