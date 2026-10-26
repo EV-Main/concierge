@@ -1,6 +1,6 @@
 [package]
 name = "concierge_iam"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Permission scopes of the EV identity plane: derived catalogs, concrete permission sets, patterns"
 license = "BlueOak-1.0.0"
