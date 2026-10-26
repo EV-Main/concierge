@@ -577,7 +577,8 @@ executor loop once passed (D23).
 | `concierge:scope_policy_change` | PLATFORM | such a seat, or an admin of the scope | quorum_bps, delay_secs, ttl_secs, thresholds (COUNT), and one `threshold` TEXT field per override, `<kind>/<parameter>=<value>` — the values are in `payload_hash`; the whole policy is also `Approval.proposed_policy` | the scope's next policy `version`, checked again against the catalogs then in force; VOID if it no longer fits |
 
 The decisions about **people**, moved here from `GovernanceService` (expand step; the old
-service keeps working beside them until the contract step). All five are `PLATFORM`, in
+service keeps working beside them until the contract step), and the one about a person's
+second factors, which never had a legacy form. All six are `PLATFORM`, in
 scope `main`, with `account (USER)` and `reason (TEXT)` fields, opened over `ApprovalService`
 by an active persisted owner, who is kept off the roster, as is the account they are about
 (`Action::People`; subject_ref `user:<uuid>`, one live decision per kind and account).
@@ -589,6 +590,7 @@ by an active persisted owner, who is kept off the roster, as is the account they
 | `concierge:user_suspension` | more than half of the owners besides the opener | `suspended_by = governance`, no expiry |
 | `concierge:user_reinstatement` | as suspension | lifts a verdict the owners imposed; VOID if there is none |
 | `concierge:admin_admission` | as suspension | `Role::Admin`; VOID over an owner or an admin |
+| `concierge:second_factor_reset` | as suspension | every second factor and recovery code removed, `token_version` bumped (`SESSIONS_REVOKED`), a `security_notice` mailed; VOID if the account holds no factor |
 
 Unanimity is the quorum at 10000 bps over the frozen roster (`platform_quorum_bps`): the
 reason the legacy consilia were unanimous holds — a minority able to add or remove owners by
@@ -647,7 +649,7 @@ Review hardening of these kinds:
 `GovernanceService`); (3) only then admit owners through `approvals` — a legacy decision still
 open when an owner is seated that way is void, but the window is cleanest empty. To roll the
 binary back, close the openings, withdraw or veto the live `concierge:owner_*`,
-`user_suspension`, `user_reinstatement` and `admin_admission` decisions, and
+`user_suspension`, `user_reinstatement`, `admin_admission` and `second_factor_reset` decisions, and
 `UPDATE approvals SET action = NULL WHERE kind IN (...)` for any left, before starting the old
 binary: it cannot decode the `people` action.
 
