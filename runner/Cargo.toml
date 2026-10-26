@@ -24,6 +24,7 @@ axum-extra.workspace = true
 base64.workspace = true
 color-eyre.workspace = true
 concierge_iam.workspace = true
+data-encoding.workspace = true
 domain.workspace = true
 dotenvy.workspace = true
 ev = { workspace = true, features = ["analytics", "error_monitoring", "otel", "settings", "settings_drift"] }
@@ -36,9 +37,11 @@ lettre.workspace = true
 prost.workspace = true
 redis.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 rustls.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "migrate", "json"] }
 strum.workspace = true

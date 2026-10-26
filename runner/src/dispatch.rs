@@ -310,6 +310,21 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 		});
 	}
 
+	// Addressed to the account's verified address, like a code, and no more switchable off
+	// than one: it is how a person learns their factors changed under them.
+	if job.kind == "security_notice" {
+		let payload = job.payload.as_ref()?;
+		let label = text_field(payload, "label");
+		let rendered = templates::security_notice(&text_field(payload, "event"), (!label.is_empty()).then_some(label.as_str()), int_field(payload, "at"))?;
+		return Some(OutgoingEmail {
+			to: job.recipient.clone(),
+			subject: rendered.subject,
+			html: rendered.html,
+			text: rendered.text,
+			unsubscribe_url: String::new(),
+		});
+	}
+
 	let origin = cfg.public_origin.trim_end_matches('/');
 	// This plane's own pages (`web::notifications`), under the conductor's `/api/auth/*`
 	// rewrite; the unsubscribe URL is also the RFC 8058 one-click target the transport puts in

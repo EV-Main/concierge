@@ -62,6 +62,7 @@ pub mod scope_catalog;
 pub mod scope_events;
 pub mod scope_inbox;
 pub mod scopes;
+pub mod second_factor;
 pub mod service_caller;
 pub mod support;
 pub mod web;

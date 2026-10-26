@@ -133,6 +133,7 @@ pub fn sign_in_with_turnstile(pool: &sqlx::PgPool, turnstile: &str) -> concierge
 		),
 		subscribe_limiter: std::sync::Arc::new(concierge::notification::RateLimiter::new(std::time::Duration::from_secs(3600), SUBSCRIBES_PER_HOUR)),
 		stepup: None,
+		second_factor: None,
 	}
 }
 

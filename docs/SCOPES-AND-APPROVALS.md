@@ -132,7 +132,7 @@ They widen CORS for a **closed list** of sign-in routes and nothing else:
 
 | Accepts a scope origin | `PUBLIC_ORIGIN` only |
 | ---------------------- | -------------------- |
-| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`, `/auth/password/signup/resend`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user, permissions}`, never a token), `POST /auth/notifications/subscribe` (account-less; acts for no account) | everything acting on an open session or reading the account: `/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register/*`, `/auth/passkey/remove`, `/auth/sessions`, `/auth/username`, `/auth/methods`, `/auth/me`, `/auth/notifications/settings*`, `/auth/logout`, `/auth/logout/confirm`, `/kyc/*` |
+| `/auth/code/request`, `/auth/code/verify`, `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`, `/auth/password/signup/resend`, `/auth/passkey/signin/*`, `GET /auth/session` (answers `{authenticated, user, permissions}`, never a token), `POST /auth/notifications/subscribe` (account-less; acts for no account) | everything acting on an open session or reading the account: `/auth/email/verify/*`, `/auth/password/set`, `/auth/passkey/register/*`, `/auth/passkey/remove`, `/auth/second-factor/*`, `/auth/sessions`, `/auth/username`, `/auth/methods`, `/auth/me`, `/auth/notifications/settings*`, `/auth/logout`, `/auth/logout/confirm`, `/kyc/*` |
 
 Signing out on a scope host ends the `evinvest.ltd` session too when the host sends the
 browser — a top-level navigation, not a call — to

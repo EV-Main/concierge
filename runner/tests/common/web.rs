@@ -26,17 +26,45 @@ pub struct Surface {
 }
 
 pub async fn surface() -> Option<Surface> {
-	surface_with_stepup(None).await
+	surface_with(None, false).await
 }
 
 /// [`surface`] with `/auth/stepup/*` mounted for `stepup`'s origins.
 pub async fn surface_with_stepup(stepup: Option<web::stepup::StepupDeps>) -> Option<Surface> {
+	surface_with(stepup, false).await
+}
+
+/// [`surface`] with `/auth/second-factor/*` mounted under the suite's throwaway seal key,
+/// which every surface of the suite shares, as replicas do.
+pub async fn surface_with_second_factor(stepup: Option<web::stepup::StepupDeps>) -> Option<Surface> {
+	surface_with(stepup, true).await
+}
+
+/// A seal key file of 32 random bytes, as `SECOND_FACTOR_SEAL_KEY_FILE` names one: made
+/// once per suite.
+pub fn seal_key_file() -> &'static std::path::Path {
+	static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+	PATH.get_or_init(|| {
+		use base64::{Engine, engine::general_purpose::STANDARD};
+		let mut key = [0u8; 32];
+		getrandom::fill(&mut key).unwrap();
+		let path = std::env::temp_dir().join(format!("concierge-seal-{}", uuid::Uuid::new_v4().simple()));
+		std::fs::write(&path, STANDARD.encode(key)).unwrap();
+		path
+	})
+}
+
+async fn surface_with(stepup: Option<web::stepup::StepupDeps>, second_factor: bool) -> Option<Surface> {
 	let url = super::database_url()?;
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let mut sign_in = super::sign_in_with_turnstile(&pool, &super::stub_turnstile().await);
 	sign_in.stepup = stepup;
+	sign_in.second_factor = second_factor.then(|| web::second_factor::SecondFactorDeps {
+		seal: concierge::second_factor::SealKey::from_file(seal_key_file().to_str().unwrap()).expect("a fresh key file reads"),
+		store: Arc::new(concierge::infrastructure::second_factors::PgSecondFactors::new(pool.clone())),
+	});
 	sign_in.allowlist = Arc::new(SignInAllowlist::live(Arc::new(PgScopes::new(pool.clone())), ORIGIN).await.expect("read the scope registry"));
 	let state = web::WebState::try_new(
 		super::signing_auth(users.clone()).await,
@@ -59,7 +87,7 @@ pub async fn surface_with_stepup(stepup: Option<web::stepup::StepupDeps>) -> Opt
 	Some(Surface { router: web::router(state), pool })
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone, Default)]
 pub struct Browser {
 	pub cookies: Vec<(String, String)>,
 }
@@ -157,4 +185,27 @@ impl Surface {
 
 pub fn address(tag: &str) -> String {
 	format!("{tag}-{}@example.com", uuid::Uuid::new_v4().simple())
+}
+
+/// Age the session's sign-in by `secs` as if it were that old: the family's `auth_time`
+/// in Redis, and the stored access token expired so the next read mints one carrying it.
+/// `false` (the test returns) when no Redis is configured.
+pub async fn age_session(browser: &Browser, secs: i64) -> bool {
+	let Some(url) = std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty()) else {
+		return false;
+	};
+	let mut conn = redis::Client::open(url).unwrap().get_multiplexed_async_connection().await.unwrap();
+	let key = format!("websess:{}", browser.get("ev_session").unwrap());
+	let refresh: String = redis::cmd("HGET").arg(&key).arg("refresh_token").query_async(&mut conn).await.unwrap();
+	let family = refresh.split('.').next().unwrap();
+	let old = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - secs;
+	let _: () = redis::cmd("HSET")
+		.arg(format!("refresh:fam:{family}"))
+		.arg("auth_time")
+		.arg(old)
+		.query_async(&mut conn)
+		.await
+		.unwrap();
+	let _: () = redis::cmd("HSET").arg(&key).arg("access_expires_at").arg(0).query_async(&mut conn).await.unwrap();
+	true
 }

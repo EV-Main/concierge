@@ -27,33 +27,34 @@ fn with_database(url: &str, name: &str) -> String {
 
 #[tokio::test]
 async fn a_production_boot_with_a_test_turnstile_secret_leaves_the_database_untouched() {
-	refused_boot(TEST_TURNSTILE_SECRET, None, None, "TURNSTILE_SECRET").await;
+	refused_boot(&[("TURNSTILE_SECRET", TEST_TURNSTILE_SECRET)], "TURNSTILE_SECRET").await;
 }
 
 #[tokio::test]
 async fn a_production_boot_with_a_step_up_origin_outside_the_site_leaves_the_database_untouched() {
-	refused_boot("a-real-looking-turnstile-secret", Some("https://evinvest.test.evil.example"), None, "STEPUP_PROOF_ORIGINS").await;
+	refused_boot(&[("STEPUP_PROOF_ORIGINS", "https://evinvest.test.evil.example")], "STEPUP_PROOF_ORIGINS").await;
 }
 
 #[tokio::test]
 async fn a_production_boot_with_a_step_up_pattern_leaves_the_database_untouched() {
-	refused_boot("a-real-looking-turnstile-secret", Some("https://*.evinvest.test"), None, "STEPUP_PROOF_ORIGINS").await;
+	refused_boot(&[("STEPUP_PROOF_ORIGINS", "https://*.evinvest.test")], "STEPUP_PROOF_ORIGINS").await;
 }
 
 #[tokio::test]
 async fn a_production_boot_with_a_notice_link_base_outside_the_site_leaves_the_database_untouched() {
-	refused_boot(
-		"a-real-looking-turnstile-secret",
-		None,
-		Some("invest=https://evinvest.test.evil.example/cabinet"),
-		"NOTICE_LINK_BASES",
-	)
-	.await;
+	refused_boot(&[("NOTICE_LINK_BASES", "invest=https://evinvest.test.evil.example/cabinet")], "NOTICE_LINK_BASES").await;
 }
 
-/// Boot the binary as production with one invalid setting and assert it refuses, naming
-/// `expected`, before migrating anything.
-async fn refused_boot(turnstile_secret: &str, stepup_origins: Option<&str>, notice_link_bases: Option<&str>, expected: &str) {
+#[tokio::test]
+async fn a_boot_with_a_seal_key_that_is_not_32_bytes_leaves_the_database_untouched() {
+	let path = std::env::temp_dir().join(format!("concierge-short-seal-{}", uuid::Uuid::new_v4().simple()));
+	std::fs::write(&path, "c2l4dGVlbiBieXRlcyBvbmx5").unwrap();
+	refused_boot(&[("SECOND_FACTOR_SEAL_KEY_FILE", path.to_str().unwrap())], "SECOND_FACTOR_SEAL_KEY_FILE").await;
+}
+
+/// Boot the binary as production with `overrides` over an otherwise valid configuration
+/// and assert it refuses, naming `expected`, before migrating anything.
+async fn refused_boot(overrides: &[(&str, &str)], expected: &str) {
 	let Some(url) = common::database_url() else { return };
 	let name = format!("concierge_boot_{}", uuid::Uuid::new_v4().simple());
 	let mut admin = PgConnection::connect(&url).await.expect("connect to Postgres");
@@ -77,9 +78,7 @@ async fn refused_boot(turnstile_secret: &str, stepup_origins: Option<&str>, noti
 			("SMTP_HOST", "127.0.0.1"),
 			("SMTP_USERNAME", "boot"),
 			("SMTP_PASSWORD", "boot"),
-			("TURNSTILE_SECRET", turnstile_secret),
-			("STEPUP_PROOF_ORIGINS", stepup_origins.unwrap_or_default()),
-			("NOTICE_LINK_BASES", notice_link_bases.unwrap_or_default()),
+			("TURNSTILE_SECRET", "a-real-looking-turnstile-secret"),
 			("AUTH_SIGNING_KEY_PEM", "unused: refused before it is parsed"),
 			("AUTH_SIGNING_KID", "boot"),
 			("AUTH_JWKS_JSON", r#"{"keys":[]}"#),
@@ -87,6 +86,7 @@ async fn refused_boot(turnstile_secret: &str, stepup_origins: Option<&str>, noti
 			("GOOGLE_CLIENT_SECRET", "boot"),
 			("REDIS_URL", "redis://127.0.0.1:9/15"),
 		])
+		.envs(overrides.iter().copied())
 		.stdin(Stdio::null())
 		.output()
 		.expect("run the concierge binary");

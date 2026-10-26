@@ -1,16 +1,13 @@
 import { useT } from "@evinvest/i18n/react";
 import { Button } from "@evinvest/uikit";
-import { useEffect, useId, useRef } from "react";
-
-import type { ReauthMethod } from "../model/reauth";
-import { ReauthMethods } from "./reauth-methods";
+import { useEffect, useId, useRef, type ReactNode } from "react";
 
 /**
  * The confirmation the plane asks for before a sensitive act on an old session. It takes
  * focus when it opens, so a keyboard reader lands on it rather than on the button that
  * opened it; `onCancel` hands focus back to whoever asked.
  */
-export function ReauthStep({ methods, onConfirmed, onCancel }: { methods: ReauthMethod[]; onConfirmed: () => void; onCancel: () => void }) {
+export function ReauthStep({ sub, onCancel, children }: { sub: string; onCancel: () => void; children: ReactNode }) {
   const t = useT();
   const titleId = useId();
   const panel = useRef<HTMLElement>(null);
@@ -26,9 +23,9 @@ export function ReauthStep({ methods, onConfirmed, onCancel }: { methods: Reauth
           <h3 id={titleId} className="m-0 text-sm font-semibold">
             {t("auth.reauth.title", "Confirm it is you")}
           </h3>
-          <p className="m-0 text-xs text-ink-soft">{t("auth.reauth.sub", "You signed in a while ago. Confirm again to change your passkeys.")}</p>
+          <p className="m-0 text-xs text-ink-soft">{sub}</p>
         </div>
-        <ReauthMethods methods={methods} onConfirmed={onConfirmed} />
+        {children}
         <Button variant="ghost" size="sm" className="self-start" onClick={onCancel}>
           {t("auth.reauth.cancel", "Cancel")}
         </Button>

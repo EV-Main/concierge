@@ -61,7 +61,7 @@ fn own_origin(st: &Inner, headers: &HeaderMap) -> Result<(), Refusal> {
 }
 
 /// [`signed_in_live`] behind the origin check.
-async fn signed(st: &Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<Signed, Halt> {
+pub(super) async fn signed(st: &Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<Signed, Halt> {
 	own_origin(st, headers)?;
 	signed_in_live(st, jar, headers).await
 }

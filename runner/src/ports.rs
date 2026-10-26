@@ -1888,3 +1888,125 @@ pub trait CredentialRepository: Send + Sync {
 	/// unknown, spent, expired, outlived, or its account disabled — and nothing is mailed.
 	async fn resend_signup_code(&self, ticket_hash: &[u8], now: i64) -> Result<Option<CodeIssue>, DomainError>;
 }
+
+/// Confirmed second factors an account may hold. A person keeps one or two; the cap bounds
+/// what one stolen, factor-fresh session can plant.
+pub const MAX_SECOND_FACTORS: i64 = 5;
+/// How long an enrolment begun and not yet proven stays usable.
+pub const SECOND_FACTOR_ENROLMENT_TTL_SECS: i64 = 600;
+/// Wrong answers an account may give, across all its factors and recovery codes, per
+/// [`SECOND_FACTOR_WINDOW_SECS`] before every answer is refused for
+/// [`SECOND_FACTOR_LOCK_SECS`]; and per day, before every answer is refused until that day's
+/// window ends. A six-digit code with three steps accepted is one in 333 333 per guess.
+pub const SECOND_FACTOR_WRONG_PER_WINDOW: i32 = 5;
+pub const SECOND_FACTOR_WINDOW_SECS: i64 = 900;
+pub const SECOND_FACTOR_LOCK_SECS: i64 = 900;
+pub const SECOND_FACTOR_WRONG_PER_DAY: i32 = 20;
+pub const SECOND_FACTOR_DAY_SECS: i64 = 24 * 60 * 60;
+
+/// A confirmed factor, as the account's settings list it.
+pub struct SecondFactorRow {
+	pub id: Uuid,
+	pub kind: crate::second_factor::FactorKind,
+	pub label: String,
+	pub created_at: i64,
+	pub last_used_at: Option<i64>,
+}
+
+pub struct SecondFactors {
+	pub factors: Vec<SecondFactorRow>,
+	pub recovery_codes_left: i64,
+}
+
+/// A factor's material as stored: sealed to `id`, the account and `kind`.
+pub struct SealedFactor {
+	pub id: Uuid,
+	pub kind: crate::second_factor::FactorKind,
+	pub material: Vec<u8>,
+}
+
+/// What a check of one answer against one factor found.
+pub enum Verdict {
+	/// Proven; the material, sealed again, as it is kept from now on.
+	Right(Vec<u8>),
+	Wrong,
+	/// Not shaped as an answer of the factor's kind: nothing was guessed, nothing is counted.
+	Malformed,
+}
+
+/// Run inside the transaction that holds the factor's row, so the material it reads is the
+/// material it replaces.
+pub type Check = Box<dyn FnOnce(&SealedFactor) -> Result<Verdict, DomainError> + Send>;
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum Attempt<T> {
+	Accepted(T),
+	Wrong,
+	/// The account gave too many wrong answers; nothing is checked until `until`.
+	Locked {
+		until: i64,
+	},
+	/// No such factor (or enrolment, or code) of this account.
+	Unknown,
+	Malformed,
+}
+
+pub enum Enrolling {
+	Begun,
+	/// The account holds [`MAX_SECOND_FACTORS`] already.
+	Full,
+}
+
+/// What a confirmed enrolment changed.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Confirmed {
+	/// It is the account's first factor, and the recovery codes passed in are now its own.
+	pub first: bool,
+}
+
+/// What removing a factor left.
+pub struct Removed {
+	pub remaining: i64,
+}
+
+/// What a security notice tells the account. Each is mailed to its verified address in the
+/// transaction that makes the change.
+#[derive(Clone, Copy, Debug, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum SecurityEvent {
+	FactorAdded,
+	FactorRemoved,
+	RecoveryCodesReplaced,
+	Recovered,
+}
+
+/// Second factors and the recovery codes beside them. Every method is one transaction, and
+/// every check of an answer reads and writes the account's wrong-answer count in it.
+#[async_trait]
+pub trait SecondFactorRepository: Send + Sync {
+	async fn second_factors(&self, user: UserId) -> Result<SecondFactors, DomainError>;
+
+	/// The sealed material of each confirmed factor, to challenge them with.
+	async fn sealed_factors(&self, user: UserId) -> Result<Vec<SealedFactor>, DomainError>;
+
+	/// Keep an enrolment begun, unproven. The account's dead enrolments go first.
+	async fn begin_enrolment(&self, user: UserId, factor: SealedFactor, label: &str, now: i64) -> Result<Enrolling, DomainError>;
+
+	/// Prove an enrolment with its first answer and confirm it. `recovery` (digests) become
+	/// the account's codes when this is its first factor, and are dropped otherwise.
+	async fn confirm_enrolment(&self, user: UserId, enrolment: Uuid, check: Check, recovery: Vec<[u8; 32]>, now: i64) -> Result<Attempt<Confirmed>, DomainError>;
+
+	/// Check an answer against one confirmed factor.
+	async fn attempt(&self, user: UserId, factor: Uuid, check: Check, now: i64) -> Result<Attempt<()>, DomainError>;
+
+	/// `None` when the account holds no such factor. The last one takes the recovery codes
+	/// with it.
+	async fn remove(&self, user: UserId, factor: Uuid, now: i64) -> Result<Option<Removed>, DomainError>;
+
+	/// Replace the account's recovery codes. `false` when it holds no factor to recover.
+	async fn replace_recovery_codes(&self, user: UserId, recovery: Vec<[u8; 32]>, now: i64) -> Result<bool, DomainError>;
+
+	/// Spend a recovery code: every factor and code of the account goes, and its
+	/// `token_version` moves, ending every session (`SESSIONS_REVOKED`).
+	async fn recover(&self, user: UserId, code: [u8; 32], now: i64) -> Result<Attempt<()>, DomainError>;
+}

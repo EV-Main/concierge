@@ -47,6 +47,12 @@ Passkey add/remove on a session older than five minutes is answered `403 reauth_
 (`features/sign-in-methods`: email code, password, passkey — `/auth/reauth/*`) and
 retries the act once; a second `reauth_required` is shown as an error, not asked again.
 
+The second-factor card (`features/second-factor`, `/auth/second-factor/*`) does the same
+for its two guards: `reauth_required` opens the confirmation step above (composed in by
+`views/account`, since one feature does not import another), `second_factor_required` its
+own factor step, and the act is retried once after each. It renders nothing when
+`/auth/methods` answers `secondFactor: null`. The QR of an enrolment is drawn by `uqr`.
+
 `mfe-concierge-reauth` is the same confirmation as a dialog for a host on the platform
 origin whose own backend answers `403 reauth_required` (the admin console before it opens
 a payment, #171). The host sets `open`; the element fires `ev:reauthenticated` once the

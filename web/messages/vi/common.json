@@ -363,6 +363,234 @@
     "en": "Use a passkey",
     "t": "Dùng khóa truy cập"
   },
+  "auth.secondFactor.add": {
+    "en": "Add authenticator app",
+    "t": "Thêm ứng dụng xác thực"
+  },
+  "auth.secondFactor.added": {
+    "en": "added {date}",
+    "t": "thêm ngày {date}"
+  },
+  "auth.secondFactor.another": {
+    "en": "Another authenticator",
+    "t": "Ứng dụng xác thực khác"
+  },
+  "auth.secondFactor.codes.copy": {
+    "en": "Copy codes",
+    "t": "Sao chép mã"
+  },
+  "auth.secondFactor.codes.done": {
+    "en": "Done",
+    "t": "Xong"
+  },
+  "auth.secondFactor.codes.download": {
+    "en": "Download .txt",
+    "t": "Tải xuống .txt"
+  },
+  "auth.secondFactor.codes.left": {
+    "en": "{n} left · a new set replaces the old one",
+    "t": "còn {n} · bộ mới sẽ thay thế bộ cũ"
+  },
+  "auth.secondFactor.codes.new": {
+    "en": "New codes",
+    "t": "Mã mới"
+  },
+  "auth.secondFactor.codes.row": {
+    "en": "Recovery codes",
+    "t": "Mã khôi phục"
+  },
+  "auth.secondFactor.codes.saved": {
+    "en": "I saved my recovery codes",
+    "t": "Tôi đã lưu các mã khôi phục"
+  },
+  "auth.secondFactor.codes.sub": {
+    "en": "Each one works once, in place of your authenticator. Keep them somewhere safe: we cannot show them again.",
+    "t": "Mỗi mã dùng được một lần, thay cho ứng dụng xác thực. Hãy cất giữ ở nơi an toàn: chúng tôi không thể hiển thị lại."
+  },
+  "auth.secondFactor.codes.title": {
+    "en": "Your recovery codes",
+    "t": "Mã khôi phục của bạn"
+  },
+  "auth.secondFactor.confirm": {
+    "en": "Turn on",
+    "t": "Bật"
+  },
+  "auth.secondFactor.continue": {
+    "en": "Continue",
+    "t": "Tiếp tục"
+  },
+  "auth.secondFactor.copied": {
+    "en": "Copied",
+    "t": "Đã sao chép"
+  },
+  "auth.secondFactor.copyFailed": {
+    "en": "Could not copy. Select the text instead.",
+    "t": "Không sao chép được. Hãy tự chọn văn bản."
+  },
+  "auth.secondFactor.copyKey": {
+    "en": "Copy key",
+    "t": "Sao chép khóa"
+  },
+  "auth.secondFactor.ended": {
+    "en": "Your second factors were removed and every session of your account was signed out, this one included. Sign in again, then add a new authenticator.",
+    "t": "Các yếu tố thứ hai của bạn đã bị xóa và mọi phiên của tài khoản đã được đăng xuất, kể cả phiên này. Hãy đăng nhập lại, rồi thêm ứng dụng xác thực mới."
+  },
+  "auth.secondFactor.err.ceremonyExpired": {
+    "en": "That took too long. Enter a new code.",
+    "t": "Quá thời gian. Hãy nhập mã mới."
+  },
+  "auth.secondFactor.err.emailUnverified": {
+    "en": "Verify your email before you add a second factor.",
+    "t": "Hãy xác minh email trước khi thêm yếu tố thứ hai."
+  },
+  "auth.secondFactor.err.enrolmentExpired": {
+    "en": "That took too long. Start adding the app again.",
+    "t": "Quá thời gian. Hãy bắt đầu thêm ứng dụng lại."
+  },
+  "auth.secondFactor.err.generic": {
+    "en": "Something went wrong. Try again.",
+    "t": "Đã xảy ra lỗi. Hãy thử lại."
+  },
+  "auth.secondFactor.err.invalidAnswer": {
+    "en": "That code is not right. Wait for the next one and try again.",
+    "t": "Mã không đúng. Hãy chờ mã tiếp theo rồi thử lại."
+  },
+  "auth.secondFactor.err.invalidKind": {
+    "en": "This kind of second factor is not supported.",
+    "t": "Loại yếu tố thứ hai này không được hỗ trợ."
+  },
+  "auth.secondFactor.err.invalidLabel": {
+    "en": "Give it a name of 1–64 characters, on one line.",
+    "t": "Đặt tên dài 1–64 ký tự, trên một dòng."
+  },
+  "auth.secondFactor.err.invalidRecoveryCode": {
+    "en": "That recovery code is not right, or was used already.",
+    "t": "Mã khôi phục không đúng hoặc đã được dùng."
+  },
+  "auth.secondFactor.err.invalidRequest": {
+    "en": "That answer could not be read. Try again.",
+    "t": "Không đọc được câu trả lời. Hãy thử lại."
+  },
+  "auth.secondFactor.err.locked": {
+    "en": "Too many wrong codes. Try again in a few minutes.",
+    "t": "Quá nhiều mã sai. Hãy thử lại sau vài phút."
+  },
+  "auth.secondFactor.err.none": {
+    "en": "Your account has no second factor yet.",
+    "t": "Tài khoản của bạn chưa có yếu tố thứ hai."
+  },
+  "auth.secondFactor.err.stillRequired": {
+    "en": "We could not confirm your second factor. Try again.",
+    "t": "Chúng tôi không xác nhận được yếu tố thứ hai của bạn. Hãy thử lại."
+  },
+  "auth.secondFactor.err.tooMany": {
+    "en": "Your account has as many second factors as it can hold. Remove one first.",
+    "t": "Tài khoản của bạn đã có số yếu tố thứ hai tối đa. Hãy xóa bớt một cái trước."
+  },
+  "auth.secondFactor.err.unknownFactor": {
+    "en": "That authenticator is no longer on your account. Reload the page.",
+    "t": "Ứng dụng xác thực này không còn trong tài khoản của bạn. Hãy tải lại trang."
+  },
+  "auth.secondFactor.key": {
+    "en": "Setup key",
+    "t": "Khóa thiết lập"
+  },
+  "auth.secondFactor.kind.totp": {
+    "en": "Authenticator app",
+    "t": "Ứng dụng xác thực"
+  },
+  "auth.secondFactor.labelField": {
+    "en": "Name, to tell it apart later",
+    "t": "Tên, để phân biệt về sau"
+  },
+  "auth.secondFactor.lastUsed": {
+    "en": "last used {date}",
+    "t": "dùng lần cuối ngày {date}"
+  },
+  "auth.secondFactor.lost": {
+    "en": "Lost your authenticator?",
+    "t": "Mất ứng dụng xác thực?"
+  },
+  "auth.secondFactor.neverUsed": {
+    "en": "never used",
+    "t": "chưa từng dùng"
+  },
+  "auth.secondFactor.none": {
+    "en": "Withdrawals need a second factor. Add one before your first withdrawal.",
+    "t": "Rút tiền cần yếu tố thứ hai. Hãy thêm một yếu tố trước lần rút tiền đầu tiên."
+  },
+  "auth.secondFactor.qr": {
+    "en": "QR code for your authenticator app",
+    "t": "Mã QR cho ứng dụng xác thực của bạn"
+  },
+  "auth.secondFactor.reauthSub": {
+    "en": "You signed in a while ago. Confirm it is you to continue.",
+    "t": "Bạn đã đăng nhập từ trước. Hãy xác nhận đó là bạn để tiếp tục."
+  },
+  "auth.secondFactor.recover.field": {
+    "en": "Recovery code",
+    "t": "Mã khôi phục"
+  },
+  "auth.secondFactor.recover.open": {
+    "en": "Use a recovery code",
+    "t": "Dùng mã khôi phục"
+  },
+  "auth.secondFactor.recover.sub": {
+    "en": "A recovery code removes all your second factors and signs you out everywhere, this device included. Add a new authenticator after you sign in again.",
+    "t": "Mã khôi phục sẽ xóa mọi yếu tố thứ hai và đăng xuất bạn ở mọi nơi, kể cả thiết bị này. Hãy thêm ứng dụng xác thực mới sau khi đăng nhập lại."
+  },
+  "auth.secondFactor.recover.submit": {
+    "en": "Use recovery code",
+    "t": "Dùng mã khôi phục"
+  },
+  "auth.secondFactor.removeAnyway": {
+    "en": "Remove anyway",
+    "t": "Vẫn xóa"
+  },
+  "auth.secondFactor.removeLast": {
+    "en": "This is your only second factor. Without one, withdrawals are refused until you add a new one. Your recovery codes stop working too.",
+    "t": "Đây là yếu tố thứ hai duy nhất của bạn. Nếu không có, các lệnh rút tiền sẽ bị từ chối cho đến khi bạn thêm yếu tố mới. Các mã khôi phục cũng sẽ ngừng hoạt động."
+  },
+  "auth.secondFactor.restart": {
+    "en": "Start again",
+    "t": "Bắt đầu lại"
+  },
+  "auth.secondFactor.scan": {
+    "en": "Scan this code with your authenticator app, or type the key into it. Then enter the 6-digit code it shows.",
+    "t": "Quét mã này bằng ứng dụng xác thực, hoặc nhập khóa vào ứng dụng. Sau đó nhập mã 6 chữ số mà ứng dụng hiển thị."
+  },
+  "auth.secondFactor.signInAgain": {
+    "en": "Sign in again",
+    "t": "Đăng nhập lại"
+  },
+  "auth.secondFactor.step.sub": {
+    "en": "Changing your second factor needs a code from one you already have.",
+    "t": "Muốn thay đổi yếu tố thứ hai, bạn cần mã từ một yếu tố bạn đang có."
+  },
+  "auth.secondFactor.step.title": {
+    "en": "Confirm with your second factor",
+    "t": "Xác nhận bằng yếu tố thứ hai"
+  },
+  "auth.secondFactor.step.which": {
+    "en": "Which second factor",
+    "t": "Yếu tố thứ hai nào"
+  },
+  "auth.secondFactor.sub": {
+    "en": "A code from an app on your phone, asked for before money leaves your account",
+    "t": "Mã từ một ứng dụng trên điện thoại, được yêu cầu trước khi tiền rời khỏi tài khoản của bạn"
+  },
+  "auth.secondFactor.title": {
+    "en": "Two-step verification",
+    "t": "Xác minh hai bước"
+  },
+  "auth.secondFactor.totp.code": {
+    "en": "6-digit code from your authenticator app",
+    "t": "Mã 6 chữ số từ ứng dụng xác thực"
+  },
+  "auth.secondFactor.unsupported": {
+    "en": "This kind of second factor ({kind}) is not supported in this version. Reload the page, or use another one.",
+    "t": "Loại yếu tố thứ hai này ({kind}) không được hỗ trợ trong phiên bản này. Hãy tải lại trang, hoặc dùng yếu tố khác."
+  },
   "auth.signIn": {
     "en": "Sign in",
     "t": "Đăng nhập"
