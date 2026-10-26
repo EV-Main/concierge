@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "concierge_iam"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "concierge_iam_derive",
  "ev_lib",

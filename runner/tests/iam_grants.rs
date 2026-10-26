@@ -682,6 +682,24 @@ async fn nobody_grants_the_admin_alias_outside_an_approval() {
 /// scope admin is a seat's act). A publication that delegates it is refused; a catalog
 /// stored before that rule existed must hand nobody the alias either.
 #[tokio::test]
+async fn the_everyone_alias_neither_delegates_nor_is_delegated() {
+	let Some(fx) = setup().await else { return };
+	let invalid = |result: Result<(), ClientGrantError>| matches!(result, Err(ClientGrantError::InvalidCatalog(_)));
+	let leads = &PERMISSIONS[..2];
+	assert!(
+		invalid(fx.publish(5, &PERMISSIONS, &[("operator", leads, &[]), ("everyone", leads, &["operator"])]).await),
+		"every member would be a granter"
+	);
+	assert!(
+		invalid(fx.publish(5, &PERMISSIONS, &[("everyone", leads, &[]), ("admin", &PERMISSIONS, &["everyone"])]).await),
+		"held by being a member, never handed on"
+	);
+	fx.publish(5, &PERMISSIONS, &[("operator", leads, &[]), ("everyone", leads, &[]), ("admin", &PERMISSIONS, &["operator"])])
+		.await
+		.expect("an everyone alias that delegates nothing");
+}
+
+#[tokio::test]
 async fn no_catalog_hands_anyone_the_admin_alias() {
 	let Some(fx) = setup().await else { return };
 	let invalid = |result: Result<(), ClientGrantError>| matches!(result, Err(ClientGrantError::InvalidCatalog(_)));

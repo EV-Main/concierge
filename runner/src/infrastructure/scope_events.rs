@@ -184,11 +184,11 @@ async fn lock_tenant(conn: &mut PgConnection, scope: &str) -> Result<(String, bo
 		})
 }
 
-/// What `role` and `targets` hold in a tenant: the concrete set `GetMe` answers that
-/// tenant's relying party, by the persisted seat (emergency access is decided per request
-/// and is nobody's standing state).
+/// What a member with `role` and `targets` holds in a tenant: the concrete set `GetMe`
+/// answers that tenant's relying party, by the persisted seat (emergency access is decided
+/// per request and is nobody's standing state).
 fn concrete(role: Role, hold_all: bool, targets: &[Target], catalog: Option<&Catalog>) -> Vec<String> {
-	catalog.map_or_else(Vec::new, |catalog| iam::resolve(role, hold_all, targets, catalog).into_iter().map(str::to_owned).collect())
+	catalog.map_or_else(Vec::new, |catalog| iam::resolve(role, hold_all, true, targets, catalog).into_iter().map(str::to_owned).collect())
 }
 
 /// Re-state `user`'s concrete set in `scope` if it moved since the last event: one

@@ -112,7 +112,8 @@ impl Pattern {
 	}
 }
 
-/// Everything one namespace defines, as a client publishes it to concierge.
+/// Everything one namespace defines, as a client publishes it to concierge. Its
+/// `<namespace>:everyone` alias, if any, is held by every member of the scope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Catalog {
 	/// Monotonic per publisher: concierge refuses one older than what it holds.
@@ -125,12 +126,14 @@ pub struct Catalog {
 
 /// The alias whose holders are a scope's approval roster.
 pub const ADMIN_ALIAS: &str = "admin";
+/// The alias every member of the scope holds, without a grant.
+pub const EVERYONE_ALIAS: &str = "everyone";
 
 impl Catalog {
 	/// Every permission is concrete and in `namespace`, every alias is `<namespace>:<name>`
 	/// and names only permissions of this catalog, everything is within the size bounds,
 	/// and a delegated alias delegates nothing itself: a holder can never mint a peer, nor
-	/// someone who could mint them.
+	/// someone who could mint them. `<namespace>:everyone` neither delegates nor is delegated.
 	pub fn check(&self, namespace: &str) -> Result<(), String> {
 		if self.permissions.len() > MAX_PERMISSIONS || self.aliases.len() > MAX_ALIASES {
 			return Err(format!("a catalog holds at most {MAX_PERMISSIONS} permissions and {MAX_ALIASES} aliases"));
@@ -151,6 +154,10 @@ impl Catalog {
 				return Err(format!("alias `{name}` names `{stray}`, which this catalog does not define"));
 			}
 		}
+		let everyone = format!("{namespace}:{EVERYONE_ALIAS}");
+		if self.delegations.contains_key(&everyone) {
+			return Err(format!("`{everyone}` delegates, which would make every member of the scope a granter"));
+		}
 		for (name, delegates) in &self.delegations {
 			if !self.aliases.contains_key(name) || delegates.is_empty() {
 				return Err(format!("`{name}` delegates, but is no alias of this catalog or delegates nothing"));
@@ -162,6 +169,9 @@ impl Catalog {
 			// who could hand it on could fill that roster without the platform owners.
 			if delegates.contains(&format!("{namespace}:{ADMIN_ALIAS}")) {
 				return Err(format!("alias `{name}` delegates `{namespace}:{ADMIN_ALIAS}`, which only the platform owners grant"));
+			}
+			if delegates.contains(&everyone) {
+				return Err(format!("alias `{name}` delegates `{everyone}`, which is held by membership and never granted"));
 			}
 		}
 		Ok(())
@@ -339,6 +349,19 @@ mod tests {
 		let aliases: &[(&str, &[&str])] = &[("sa:admin", p), ("sa:lead", p)];
 		let handed_on = delegating(p, aliases, &[("sa:lead", &["sa:admin"])]);
 		assert!(handed_on.check("sa").is_err(), "the admin alias is the scope's approval roster");
+	}
+
+	#[test]
+	fn the_everyone_alias_neither_delegates_nor_is_delegated() {
+		let p = &["sa:work:leads:read"][..];
+		let aliases: &[(&str, &[&str])] = &[("sa:everyone", p), ("sa:operator", p), ("sa:admin", p)];
+		assert!(delegating(p, aliases, &[("sa:admin", &["sa:operator"])]).check("sa").is_ok());
+		for bad in [
+			delegating(p, aliases, &[("sa:everyone", &["sa:operator"])]),
+			delegating(p, aliases, &[("sa:admin", &["sa:everyone"])]),
+		] {
+			assert!(bad.check("sa").is_err(), "{bad:?}");
+		}
 	}
 
 	#[test]

@@ -19,6 +19,8 @@
 //! The audit row goes to `admin_action` in the same transaction, like every other
 //! operator decision about a person.
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use domain::{
 	authz::{Iam, Role},
@@ -402,13 +404,18 @@ impl GrantRepository for PgGrants {
 		))
 	}
 
-	async fn targets_of(&self, user: UserId) -> Result<Vec<Target>, DomainError> {
+	async fn holdings_of(&self, user: UserId) -> Result<(Vec<Target>, BTreeSet<String>), DomainError> {
 		let raw: Vec<String> = sqlx::query_scalar("SELECT target FROM grants WHERE user_id = $1 AND revoked_at IS NULL ORDER BY target")
 			.bind(user.raw())
 			.fetch_all(&self.pool)
 			.await
 			.map_err(repo_err)?;
-		raw.iter().map(|t| Target::parse(t)).collect()
+		let member_of: Vec<String> = sqlx::query_scalar("SELECT t.namespace FROM scope_members m JOIN tenants t ON t.id = m.scope WHERE m.user_id = $1")
+			.bind(user.raw())
+			.fetch_all(&self.pool)
+			.await
+			.map_err(repo_err)?;
+		Ok((raw.iter().map(|t| Target::parse(t)).collect::<Result<_, _>>()?, member_of.into_iter().collect()))
 	}
 
 	async fn catalogs(&self) -> Result<Vec<TenantCatalog>, DomainError> {

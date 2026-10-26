@@ -23,6 +23,8 @@
 //! nothing else, and so that no vendor type is reachable from a handler.
 //! [`KycCaseRepository`] persists the attempts the provider answers about.
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use domain::{
 	approvals::{Action, ApprovalState, Decision, Field, Outcome, PlatformPolicy, ScopePolicy, Vote as ApprovalVote},
@@ -233,8 +235,9 @@ pub trait GrantRepository: Send + Sync {
 	/// Every active grant inside `namespace`, oldest first. `None`: no such tenant.
 	async fn holders(&self, namespace: &str) -> Result<Option<Vec<GrantHolderRecord>>, DomainError>;
 
-	/// The active targets `user` holds, in every namespace.
-	async fn targets_of(&self, user: UserId) -> Result<Vec<Target>, DomainError>;
+	/// The active targets `user` holds, in every namespace, and the namespaces of the scopes
+	/// they are a member of.
+	async fn holdings_of(&self, user: UserId) -> Result<(Vec<Target>, BTreeSet<String>), DomainError>;
 
 	/// The current catalog of every tenant that has one.
 	async fn catalogs(&self) -> Result<Vec<TenantCatalog>, DomainError>;
@@ -455,7 +458,7 @@ pub trait ScopeRepository: Send + Sync {
 
 /// What a direction may hold about a person it can see (`ScopeMember`): never the
 /// identity document fields.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemberSnapshot {
 	pub email: String,
 	pub email_verified: bool,
