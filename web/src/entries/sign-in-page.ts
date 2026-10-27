@@ -15,10 +15,9 @@ import { leaveOnce, startAuthorizePage } from "../shared/lib/authorize-page";
 const TAG = "mfe-concierge-sign-in";
 const CANCELLED = "auth_error=cancelled";
 
-/** `return_to` with the refusal added; the checked value always has a query already. */
+/** `return_to` with the refusal added; the checked value always has a query and no fragment. */
 function cancelled(returnTo: string): string {
-  const hash = returnTo.indexOf("#");
-  return hash < 0 ? `${returnTo}&${CANCELLED}` : `${returnTo.slice(0, hash)}&${CANCELLED}${returnTo.slice(hash)}`;
+  return `${returnTo}&${CANCELLED}`;
 }
 
 function mountDialog(mount: HTMLElement, returnTo: string): void {

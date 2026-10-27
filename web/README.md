@@ -90,8 +90,9 @@ script; `runner/src/web/mfe.rs`). Pages are not elements, so they are not in
 Both pages share their first steps (`src/shared/lib/authorize-page.ts`).
 
 The page accepts `return_to` only if it is a relative path that starts with
-`/api/auth/authorize?` and contains no backslash and no control character (so no scheme,
-no `//` and no `/\` at the start), if it still resolves to that path on this origin, and
+`/api/auth/authorize?` and contains no backslash, no fragment and no control character (so
+no scheme, no `//` and no `/\` at the start; a fragment would ride authorize's 302 onto the
+client's `redirect_uri`), if it still resolves to that path on this origin, and
 if it names exactly one `client_id` (`src/shared/lib/authorize-return.ts`). Anything else
 shows a short error and navigates nowhere: the page runs on the platform origin, and an
 open redirect there would lend the platform's address bar to a phishing link.
