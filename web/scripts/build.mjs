@@ -147,11 +147,17 @@ const checked = parseRegistry(registry);
 if (!checked.ok) throw new Error(`registry.json would not parse: ${checked.error}`);
 writeFileSync(path.join(DIST, "registry.json"), `${JSON.stringify(registry, null, 2)}\n`);
 
-// The platform confirmation page, dist/reauth.html: the address concierge's authorize
-// route sends a browser to when a client asks for `max_age` (runner/src/web/authorize.rs,
-// CONFIRM_PATH). It loads the element's bundle from the registry above, its own script and
-// its own sheet; every file it names is hashed, so only the page itself is short-lived.
+// The platform pages concierge's authorize route sends a browser to
+// (runner/src/web/authorize.rs): dist/reauth.html when a client asks for `max_age`, and
+// dist/sign-in.html when there is no session to authorize with. Each loads its element's
+// bundle from the registry above, its own script and the shared page sheet; every file a
+// page names is hashed, so only the page itself is short-lived. Pages are not elements:
+// they stay out of registry.json.
 const HASHED = /^[A-Za-z0-9-]+-[A-Z0-9]{8}\.(?:js|css)$/;
+const PAGES = [
+  { page: "reauth", tag: "mfe-concierge-reauth" },
+  { page: "sign-in", tag: "mfe-concierge-sign-in" },
+];
 
 async function emitHashed(entryPoints, options = {}) {
   const result = await build({ ...common, ...options, entryPoints, entryNames: "[name]-[hash]", outdir: DIST, minify: true, legalComments: "none", metafile: true });
@@ -160,23 +166,25 @@ async function emitHashed(entryPoints, options = {}) {
   return path.basename(output);
 }
 
-{
-  const element = registry.find((entry) => entry.tag === "mfe-concierge-reauth");
-  if (!element) throw new Error("reauth.html needs the mfe-concierge-reauth bundle");
-  const pageCssIn = path.join(WORK, "reauth-page.out.css");
-  const run = spawnSync(path.join(ROOT, "node_modules/.bin/tailwindcss"), ["-i", path.join(ROOT, "styles/reauth-page.css"), "-o", pageCssIn], { cwd: ROOT, encoding: "utf8" });
-  if (run.status !== 0) throw new Error(`tailwindcss failed for reauth-page:\n${run.stderr}`);
+const pageCssIn = path.join(WORK, "platform-page.out.css");
+const pageCssRun = spawnSync(path.join(ROOT, "node_modules/.bin/tailwindcss"), ["-i", path.join(ROOT, "styles/platform-page.css"), "-o", pageCssIn], { cwd: ROOT, encoding: "utf8" });
+if (pageCssRun.status !== 0) throw new Error(`tailwindcss failed for platform-page:\n${pageCssRun.stderr}`);
+const pageCss = await emitHashed({ "platform-page": pageCssIn }, { target: CSS_TARGET });
+
+for (const { page, tag } of PAGES) {
+  const element = registry.find((entry) => entry.tag === tag);
+  if (!element) throw new Error(`${page}.html needs the ${tag} bundle`);
   const files = {
     "%ELEMENT_JS%": path.basename(element.scriptUrl),
-    "%PAGE_JS%": await emitHashed({ "reauth-page": path.join(ROOT, "src/entries/reauth-page.ts") }),
-    "%PAGE_CSS%": await emitHashed({ "reauth-page": pageCssIn }, { target: CSS_TARGET }),
+    "%PAGE_JS%": await emitHashed({ [`${page}-page`]: path.join(ROOT, `src/entries/${page}-page.ts`) }),
+    "%PAGE_CSS%": pageCss,
   };
-  let html = readFileSync(path.join(ROOT, "pages/reauth.html"), "utf8");
+  let html = readFileSync(path.join(ROOT, `pages/${page}.html`), "utf8");
   for (const [slot, file] of Object.entries(files)) {
-    if (!HASHED.test(file)) throw new Error(`reauth.html: unexpected file name ${file}`);
-    if (!html.includes(slot)) throw new Error(`reauth.html: the template has no ${slot}`);
+    if (!HASHED.test(file)) throw new Error(`${page}.html: unexpected file name ${file}`);
+    if (!html.includes(slot)) throw new Error(`${page}.html: the template has no ${slot}`);
     html = html.replaceAll(slot, file);
   }
-  writeFileSync(path.join(DIST, "reauth.html"), html);
-  console.log(`reauth.html  ${Object.values(files).join("  ")}`);
+  writeFileSync(path.join(DIST, `${page}.html`), html);
+  console.log(`${page}.html  ${Object.values(files).join("  ")}`);
 }

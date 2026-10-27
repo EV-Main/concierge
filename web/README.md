@@ -79,11 +79,42 @@ learns which kinds the account holds. With no factor that gives `min-aal`, the p
 origin enrols one in the dialog (the enrolment routes answer the platform only) and asks
 again; a scope host links to the platform's Security page and offers to ask again.
 
-## The platform confirmation page
+## The platform pages
 
-`reauth.html` is the one page in `dist/`; concierge serves it at
-`/api/auth/mfe/reauth.html` with `no-store`, `no-referrer` and a full CSP (no inline
-script; `runner/src/web/mfe.rs`). A relying party gets a fresh-sign-in proof by sending
+`dist/` holds two pages beside the bundles, `reauth.html` and `sign-in.html`. The
+authorize route sends a browser to them, and concierge serves them at
+`/api/auth/mfe/<page>.html` with `no-store`, `no-referrer` and a full CSP (no inline
+script; `runner/src/web/mfe.rs`). Pages are not elements, so they are not in
+`registry.json`.
+
+Both pages share their first steps (`src/shared/lib/authorize-page.ts`).
+
+The page accepts `return_to` only if it is a relative path that starts with
+`/api/auth/authorize?` and contains no backslash and no control character (so no scheme,
+no `//` and no `/\` at the start), if it still resolves to that path on this origin, and
+if it names exactly one `client_id` (`src/shared/lib/authorize-return.ts`). Anything else
+shows a short error and navigates nowhere: the page runs on the platform origin, and an
+open redirect there would lend the platform's address bar to a phishing link.
+
+The page names the app that asks. It takes the `client_id` from the checked `return_to`
+only, never a name from the query, and asks `GET /api/auth/clients/{client_id}`
+(same-origin, no credentials; `src/shared/api/client-name.ts`). The `display_name` is
+written as text. An empty name, a 503, a failed request or a timeout keep the generic
+line and open the dialog. A 404 means concierge would not serve the client at authorize,
+so the page says the link is not valid and does not open the dialog.
+
+The page leaves with `location.replace`, once: a second outcome from the element is
+ignored.
+
+Each page is built from `pages/<page>.html` (template), `src/entries/<page>-page.ts` (the
+script, no React) and the shared `styles/platform-page.css` (kit tokens only);
+`scripts/build.mjs` fills in the hashed names (`PAGES`). The page text is English only,
+and the pages load no font: without a host, the kit's font chain falls back to the system
+sans.
+
+### The confirmation page, `reauth.html`
+
+A relying party gets a fresh-sign-in proof by sending
 its user to `/api/auth/authorize?…&max_age=N` (D24(1)). When the session is older than
 `N`, the authorize route records a confirmation trip and answers 302 to this page with
 `return_to` set to the same authorize request, rebuilt with its `max_age`
@@ -91,31 +122,30 @@ its user to `/api/auth/authorize?…&max_age=N` (D24(1)). When the session is ol
 concierge started yields a code with `auth_time`; nothing in `return_to` marks the way
 back. The page mounts `<mfe-concierge-reauth open>` from the same build and, on
 `ev:reauthenticated` or `ev:close`, calls `location.replace(return_to)`. It does not
-judge the outcome: the authorize route answers with a code or with `access_denied`.
-
-The page accepts `return_to` only if it is a relative path that starts with
-`/api/auth/authorize?` and contains no backslash and no control character (so no scheme,
-no `//` and no `/\` at the start), if it still resolves to that path on this origin, and
-if it names exactly one `client_id` (`src/shared/lib/authorize-return.ts`). Anything else
-shows a short error and navigates nowhere: the page runs signed in on the platform
-origin, and an open redirect there would lend the platform's address bar to a phishing
-link.
-
-The page names the app that asks. It takes the `client_id` from the checked `return_to`
-only, never a name from the query, and asks `GET /api/auth/clients/{client_id}`
-(same-origin, no credentials; `src/shared/api/client-name.ts`). A `display_name` shows as
-"<name> asks you to confirm it's you", written as text. An empty name, a 503, a failed
-request or a timeout keep the generic line and open the dialog. A 404 means concierge
-would not serve the client at authorize, so the page says the link is not valid and does
-not open the dialog.
-
-The page is built from `pages/reauth.html` (template), `src/entries/reauth-page.ts` (the
-script, no React) and `styles/reauth-page.css` (kit tokens only); `scripts/build.mjs`
-fills in the hashed names. It is English only, and it loads no font: without a host, the
-kit's font chain falls back to the system sans.
+judge the outcome: the authorize route answers with a code or with `access_denied`. A
+`display_name` shows as "<name> asks you to confirm it's you".
 
 **Deploy order.** The concierge image with this page and the `max_age` handling ships
 first. Only then may invest send `max_age`: before it, a stale session lands on a 404.
+
+### The sign-in page, `sign-in.html`
+
+The authorize route sends a browser here when it has no session to authorize with: no
+session at all, `prompt=select_account`, or a session minted before the account's
+`token_version`. `return_to` is the authorize request (`runner/src/web/authorize.rs`). The
+page mounts `<mfe-concierge-sign-in open data-return-to="<return_to>">`, so an OAuth
+provider also lands back on authorize. A `display_name` shows as "Sign in to continue to
+<name>". The page text is English, but the element gets `lang` from the browser's
+languages (`negotiate` of `@evinvest/i18n`), so the dialog is localized.
+
+- `ev:signed-in`: `location.replace(return_to)`; authorize now finds the session and
+  answers with a code.
+- `ev:close` (the person dismissed the dialog): `location.replace(return_to +
+  "&auth_error=cancelled")`. authorize answers any `auth_error` with `access_denied` to
+  the client, so the browser does not come back to this page in a loop.
+
+A failed OAuth round trip also comes back to authorize with `auth_error`, so the client
+gets `access_denied` and the dialog does not show the provider's error.
 
 A new account confirms its address in the dialog through the ticket `password/signup`
 hands back (`/password/signup/confirm`, `/resend`), which needs no CSRF cookie and so
@@ -141,7 +171,9 @@ it and refuses to build without it.
 ```sh
 npm ci
 npm run typecheck && npm run lint && npm run i18n:check
-npm run build          # → dist/<name>-<hash>.js + dist/registry.json + dist/reauth.html
+npm run build          # → dist/<name>-<hash>.js + dist/registry.json
+                       #   + dist/{reauth,sign-in}.html, dist/<page>-page-<hash>.js
+                       #   + dist/platform-page-<hash>.css
 ```
 
 Build-time configuration (`scripts/config.mjs`, the only place it is read):
