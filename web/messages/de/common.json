@@ -859,6 +859,10 @@
     "en": "Account",
     "t": "Konto"
   },
+  "ui.close": {
+    "en": "Close",
+    "t": "Schließen"
+  },
   "ui.email": {
     "en": "Email",
     "t": "E-Mail"

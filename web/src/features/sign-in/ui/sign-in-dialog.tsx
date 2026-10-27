@@ -4,6 +4,7 @@ import { useId, useRef } from "react";
 
 import { useElement } from "../../../shared/element/element-context";
 import { loginHref } from "../../../shared/lib/return-to";
+import { DialogCloseButton } from "../../../shared/ui/dialog-close";
 import { confirmSignUp, passkeySignIn, passwordSignIn, passwordSignUp, requestCode, resendSignUpCode, verifyCode } from "../api/sign-in-api";
 import { errorText, oauthErrorText } from "../model/errors";
 import { firstScreen, useSignInFlow } from "../model/use-sign-in-flow";
@@ -57,7 +58,7 @@ export function SignInDialog({ open, intent, returnTo, sitekey, oauthError, onDi
   return (
     // Past sign-up the account is already signed in: closing the confirmation must still tell the host.
     <Dialog open={open} onOpenChange={(next) => !next && !busy && (signedUp ? onSignedIn() : onDismiss())}>
-      <DialogContent aria-labelledby={titleId} className="max-w-[min(25rem,calc(100%-2rem))] gap-6 rounded-2xl px-7 pt-8 pb-7 sm:max-w-100">
+      <DialogContent showCloseButton={false} aria-labelledby={titleId} className="max-w-[min(25rem,calc(100%-2rem))] gap-6 rounded-2xl px-7 pt-8 pb-7 sm:max-w-100">
         <TitleIdContext value={titleId}>
           <Logo className="mx-auto h-7 w-auto text-ink" />
           {screen.kind === "code" && (
@@ -156,6 +157,7 @@ export function SignInDialog({ open, intent, returnTo, sitekey, oauthError, onDi
             </p>
           )}
         </TitleIdContext>
+        <DialogCloseButton />
       </DialogContent>
     </Dialog>
   );

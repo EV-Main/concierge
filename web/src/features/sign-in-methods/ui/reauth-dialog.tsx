@@ -3,6 +3,7 @@ import { Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogH
 import { useId, useRef } from "react";
 
 import { useElement } from "../../../shared/element/element-context";
+import { DialogCloseButton } from "../../../shared/ui/dialog-close";
 import { ReauthBody } from "./reauth-body";
 import { reauthRefusal } from "./refusal";
 
@@ -35,7 +36,7 @@ export function ReauthDialog({ open, onConfirmed: confirmed, onDismiss: dismiss 
 
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onDismiss()}>
-      <DialogContent aria-labelledby={titleId} aria-describedby={descriptionId} className="max-w-[min(25rem,calc(100%-2rem))] gap-4 sm:max-w-100">
+      <DialogContent showCloseButton={false} aria-labelledby={titleId} aria-describedby={descriptionId} className="max-w-[min(25rem,calc(100%-2rem))] gap-4 sm:max-w-100">
         <DialogHeader>
           <DialogTitle id={titleId}>{t("auth.reauth.title", "Confirm it is you")}</DialogTitle>
           <DialogDescription id={descriptionId}>{t("auth.reauth.dialogSub", "This action needs a fresh confirmation. Confirm again to continue.")}</DialogDescription>
@@ -53,6 +54,7 @@ export function ReauthDialog({ open, onConfirmed: confirmed, onDismiss: dismiss 
             {t("auth.reauth.cancel", "Cancel")}
           </Button>
         </DialogFooter>
+        <DialogCloseButton />
       </DialogContent>
     </Dialog>
   );

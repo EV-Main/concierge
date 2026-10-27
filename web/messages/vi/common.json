@@ -859,6 +859,10 @@
     "en": "Account",
     "t": "Tài khoản"
   },
+  "ui.close": {
+    "en": "Close",
+    "t": "Đóng"
+  },
   "ui.email": {
     "en": "Email",
     "t": "Email"

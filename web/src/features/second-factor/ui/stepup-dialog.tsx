@@ -3,6 +3,7 @@ import { Button, Dialog, DialogContent, DialogFooter } from "@evinvest/uikit";
 import { useId, useRef, type ComponentType } from "react";
 
 import type { StepupProofDetail } from "../../../shared/element/events";
+import { DialogCloseButton } from "../../../shared/ui/dialog-close";
 import type { StepupRequest } from "../model/stepup-request";
 import type { ReauthSlotProps } from "./enrolment";
 import { stepupRefusal } from "./refusal";
@@ -40,7 +41,7 @@ export function StepupDialog({ open, request, reauth, onProof: proved, onDismiss
 
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onDismiss()}>
-      <DialogContent aria-labelledby={titleId} aria-describedby={descriptionId} className="max-w-[min(25rem,calc(100%-2rem))] gap-4 sm:max-w-100">
+      <DialogContent showCloseButton={false} aria-labelledby={titleId} aria-describedby={descriptionId} className="max-w-[min(25rem,calc(100%-2rem))] gap-4 sm:max-w-100">
         {request ? (
           <StepupBody request={request} titleId={titleId} descriptionId={descriptionId} reauth={reauth} onProof={onProof} />
         ) : (
@@ -56,6 +57,7 @@ export function StepupDialog({ open, request, reauth, onProof: proved, onDismiss
             {t("auth.reauth.cancel", "Cancel")}
           </Button>
         </DialogFooter>
+        <DialogCloseButton />
       </DialogContent>
     </Dialog>
   );
