@@ -223,6 +223,8 @@ async fn only_a_level_and_a_factor_answer_parse() {
 	let mut who = fx.holder("su-shape").await;
 	let hash = hex(&HASH_A);
 	for body in [
+		json!({ "intent_hash": hash, "method": "passkey" }),
+		json!({ "intent_hash": hash, "method": "email_code", "summary": "Send 5 USDT", "turnstile_token": "human" }),
 		json!({ "intent_hash": hash, "min_aal": 2, "method": "passkey" }),
 		json!({ "intent_hash": hash, "min_aal": 2, "password": "hunter2" }),
 		json!({ "intent_hash": hash }),
@@ -253,6 +255,8 @@ async fn only_a_level_and_a_factor_answer_parse() {
 	let code = app_code(&who.secret, 1);
 	for body in [
 		json!({ "ceremony_id": begun.body["ceremony_id"], "password": "hunter2" }),
+		json!({ "ceremony_id": begun.body["ceremony_id"], "code": code }),
+		json!({ "ceremony_id": begun.body["ceremony_id"], "response": { "code": code } }),
 		json!({ "ceremony_id": begun.body["ceremony_id"], "factor": who.factor, "response": { "code": code }, "code": code }),
 	] {
 		let refused = fx.page_post("/auth/stepup/verify", INVEST, body.clone(), &mut who.browser).await;

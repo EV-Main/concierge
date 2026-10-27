@@ -212,7 +212,7 @@ pub async fn password(State(st): State<WebState>, jar: CookieJar, headers: Heade
 /// during the session proves nothing about who holds it: a stolen session could add one
 /// and then "re-authenticate" with it. Registration also wants a fresh `auth_time`, but
 /// this is the half that holds when that window is open.
-pub(super) async fn eligible_passkeys(st: &Inner, jar: &CookieJar, id: UserId) -> Result<Vec<PasskeyRow>, Refusal> {
+async fn eligible_passkeys(st: &Inner, jar: &CookieJar, id: UserId) -> Result<Vec<PasskeyRow>, Refusal> {
 	let refresh = refresh_of(st, jar)
 		.await
 		.map_err(|_| internal("reauth: session store failed", "unavailable"))?

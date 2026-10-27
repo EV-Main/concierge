@@ -29,11 +29,6 @@ pub async fn surface() -> Option<Surface> {
 	surface_with(None, false).await
 }
 
-/// [`surface`] with `/auth/stepup/*` mounted for `stepup`'s origins.
-pub async fn surface_with_stepup(stepup: Option<web::stepup::StepupDeps>) -> Option<Surface> {
-	surface_with(stepup, false).await
-}
-
 /// [`surface`] with `/auth/second-factor/*` mounted under the suite's throwaway seal key,
 /// which every surface of the suite shares, as replicas do.
 pub async fn surface_with_second_factor(stepup: Option<web::stepup::StepupDeps>) -> Option<Surface> {

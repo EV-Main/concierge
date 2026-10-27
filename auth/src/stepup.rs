@@ -21,7 +21,7 @@
 //! do it for them.
 
 use jsonwebtoken::{Algorithm, Validation, decode, decode_header, get_current_timestamp};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 
 use crate::jwks::JwksCache;
 
@@ -139,20 +139,14 @@ pub fn parse_intent_hash(raw: &str) -> Option<[u8; 32]> {
 	Some(out)
 }
 
-/// The claims every flavour of proof shares, as the checks below read them.
-trait Bound: DeserializeOwned {
-	fn bound(&self) -> (&str, u64, u64, &str, &str, &str, &str);
-}
-
-impl Bound for StepupClaims {
-	fn bound(&self) -> (&str, u64, u64, &str, &str, &str, &str) {
-		(&self.typ, self.iat, self.exp, &self.jti, &self.sub, &self.intent_hash, &self.origin)
-	}
-}
-
-/// Signature (EdDSA, pinned), `iss`, `aud`, `exp`, `typ`, the lifetime, and that `sub`,
-/// `intent_hash` and `origin` are exactly these.
-fn verified<C: Bound>(token: &str, cache: &JwksCache, issuer: &str, intent_hash: &[u8; 32], sub: &str, origin: &str) -> Result<C, StepupError> {
+/// Verify a proof against the cached JWKS and the operation the verifier holds.
+///
+/// Checks the signature (EdDSA, pinned), `iss`, `aud`, `exp`, `typ`, that the proof does
+/// not live longer than [`MAX_TTL_SECS`] nor reach past `now + MAX_TTL_SECS`, then that
+/// `sub`, `intent_hash` and `origin` are exactly the expected ones and `aal` is at least
+/// `min_aal`. A proof without `aal` is refused. On success the caller still owes the replay
+/// check: spend `jti` (until `exp`) in a shared store and refuse the proof if it was spent.
+pub fn verify_stepup_proof(token: &str, cache: &JwksCache, issuer: &str, expected: &Expected<'_>) -> Result<StepupClaims, StepupError> {
 	let header = decode_header(token).map_err(|_| StepupError::Invalid)?;
 	if header.alg != Algorithm::EdDSA {
 		return Err(StepupError::Invalid);
@@ -165,99 +159,27 @@ fn verified<C: Bound>(token: &str, cache: &JwksCache, issuer: &str, intent_hash:
 	validation.set_audience(&[AUDIENCE]);
 	validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
 	validation.leeway = LEEWAY_SECS;
-	let claims = decode::<C>(token, key, &validation).map_err(|_| StepupError::Invalid)?.claims;
+	let claims = decode::<StepupClaims>(token, key, &validation).map_err(|_| StepupError::Invalid)?.claims;
 
 	// A proof dated ahead of this verifier's clock, or ending later than a proof can live,
 	// was not minted by this plane's signer however well it is signed.
 	let now = get_current_timestamp();
-	let (typ, iat, exp, jti, claimed_sub, claimed_hash, claimed_origin) = claims.bound();
-	if typ != TYP || jti.is_empty() || exp.saturating_sub(iat) > MAX_TTL_SECS || iat > now + LEEWAY_SECS || exp > now + MAX_TTL_SECS + LEEWAY_SECS {
+	if claims.typ != TYP || claims.jti.is_empty() || claims.exp.saturating_sub(claims.iat) > MAX_TTL_SECS || claims.iat > now + LEEWAY_SECS || claims.exp > now + MAX_TTL_SECS + LEEWAY_SECS {
 		return Err(StepupError::Invalid);
 	}
-	if claimed_sub != sub {
+	if claims.sub != expected.sub {
 		return Err(StepupError::Mismatch("account"));
 	}
-	if claimed_hash != hex32(intent_hash) {
+	if claims.intent_hash != hex32(expected.intent_hash) {
 		return Err(StepupError::Mismatch("operation"));
 	}
-	if claimed_origin != origin {
+	if claims.origin != expected.origin {
 		return Err(StepupError::Mismatch("origin"));
 	}
-	Ok(claims)
-}
-
-/// Verify a proof against the cached JWKS and the operation the verifier holds.
-///
-/// Checks the signature (EdDSA, pinned), `iss`, `aud`, `exp`, `typ`, that the proof does
-/// not live longer than [`MAX_TTL_SECS`] nor reach past `now + MAX_TTL_SECS`, then that
-/// `sub`, `intent_hash` and `origin` are exactly the expected ones and `aal` is at least
-/// `min_aal`. A proof without `aal` (the passkey and mailed-code flavour of 0.1) is refused.
-/// On success the caller still owes the replay check: spend `jti` (until `exp`) in a shared
-/// store and refuse the proof if it was spent.
-pub fn verify_stepup_proof(token: &str, cache: &JwksCache, issuer: &str, expected: &Expected<'_>) -> Result<StepupClaims, StepupError> {
-	let claims: StepupClaims = verified(token, cache, issuer, expected.intent_hash, expected.sub, expected.origin)?;
 	if claims.aal < expected.min_aal {
 		return Err(StepupError::Mismatch("assurance"));
 	}
 	Ok(claims)
-}
-
-/// The proof of 0.1, still minted by the passkey and mailed-code step-up for a money plane
-/// pinned to that version, and read by nothing in this version but this plane's own tests.
-/// It goes with those two methods, once no verifier asks for them.
-pub mod legacy {
-	use serde::{Deserialize, Serialize};
-
-	#[cfg(feature = "test-support")]
-	use super::{JwksCache, StepupError};
-
-	/// How the account proved the operation, in a 0.1 proof.
-	#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-	#[serde(rename_all = "snake_case")]
-	pub enum StepupMethod {
-		Passkey,
-		EmailCode,
-	}
-
-	impl StepupMethod {
-		pub fn as_str(self) -> &'static str {
-			match self {
-				Self::Passkey => "passkey",
-				Self::EmailCode => "email_code",
-			}
-		}
-	}
-
-	/// The claims of a 0.1 proof: `method` where a proof now has `aal`.
-	#[derive(Clone, Debug, Deserialize, Serialize)]
-	pub struct MethodClaims {
-		pub sub: String,
-		pub iss: String,
-		pub aud: String,
-		pub exp: u64,
-		pub iat: u64,
-		pub typ: String,
-		pub intent_hash: String,
-		pub method: StepupMethod,
-		pub origin: String,
-		pub jti: String,
-	}
-
-	impl super::Bound for MethodClaims {
-		fn bound(&self) -> (&str, u64, u64, &str, &str, &str, &str) {
-			(&self.typ, self.iat, self.exp, &self.jti, &self.sub, &self.intent_hash, &self.origin)
-		}
-	}
-
-	/// The 0.1 verifier, as the pinned money plane runs it.
-	#[cfg(feature = "test-support")]
-	pub fn verify_method_proof(token: &str, cache: &JwksCache, issuer: &str, intent_hash: &[u8; 32], sub: &str, origin: &str, methods: &[StepupMethod]) -> Result<MethodClaims, StepupError> {
-		let claims: MethodClaims = super::verified(token, cache, issuer, intent_hash, sub, origin)?;
-		if !methods.contains(&claims.method) {
-			return Err(StepupError::Mismatch("method"));
-		}
-		Ok(claims)
-	}
 }
 
 #[cfg(test)]
@@ -362,9 +284,16 @@ mod tests {
 	}
 
 	#[test]
-	fn a_method_proof_of_0_1_is_no_proof_here() {
-		let legacy = signer().mint_method_stepup(SUB, &HASH, legacy::StepupMethod::Passkey, ORIGIN, 120).unwrap().token;
-		assert_eq!(verify_stepup_proof(&legacy, &cache(), ISSUER, &expected()).unwrap_err(), StepupError::Invalid);
+	fn a_proof_without_an_assurance_level_is_refused() {
+		let now = get_current_timestamp();
+		let claims = serde_json::json!({
+			"sub": SUB, "iss": ISSUER, "aud": AUDIENCE, "exp": now + 100, "iat": now, "typ": TYP,
+			"intent_hash": hex32(&HASH), "origin": ORIGIN, "jti": "j",
+		});
+		let mut header = Header::new(Algorithm::EdDSA);
+		header.kid = Some("test-kid".into());
+		let token = encode(&header, &claims, &EncodingKey::from_ed_pem(TEST_PEM.as_bytes()).unwrap()).unwrap();
+		assert_eq!(verify_stepup_proof(&token, &cache(), ISSUER, &expected()).unwrap_err(), StepupError::Invalid);
 	}
 
 	#[test]

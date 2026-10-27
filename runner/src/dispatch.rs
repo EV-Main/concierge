@@ -280,7 +280,7 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 	if job.kind == "email_code" {
 		let payload = job.payload.as_ref()?;
 		let purpose = text_field(payload, "purpose");
-		if !matches!(purpose.as_str(), "login" | "verify" | "reauth" | "stepup") {
+		if !matches!(purpose.as_str(), "login" | "verify" | "reauth") {
 			return None;
 		}
 		let code = text_field(payload, "code");
@@ -289,16 +289,6 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 		}
 		let rendered = match purpose.as_str() {
 			"reauth" => templates::reauth_code(&code, int_field(payload, "expires_at")),
-			"stepup" => templates::stepup_code(&templates::StepupMail {
-				code: &code,
-				expires_at: int_field(payload, "expires_at"),
-				origin: &text_field(payload, "origin"),
-				summary: &text_field(payload, "summary"),
-				reference: &text_field(payload, "reference"),
-				client_ip: &text_field(payload, "client_ip"),
-				user_agent: &text_field(payload, "user_agent"),
-				requested_at: int_field(payload, "requested_at"),
-			}),
 			other => templates::email_code(other == "login", &code, int_field(payload, "expires_at")),
 		};
 		return Some(OutgoingEmail {

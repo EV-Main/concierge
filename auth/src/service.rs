@@ -25,7 +25,7 @@ use crate::{
 	management::{IssuedRefresh, RefreshInspect, RefreshStore, SessionBounds},
 	provisioner::{ProvisionedUser, Provisioner},
 	signer::{Signer, load_jwks},
-	stepup::{Aal, StepupProof, legacy},
+	stepup::{Aal, StepupProof},
 };
 
 /// The concierge plane's auth issuance service, mounted as a tonic server by the
@@ -118,12 +118,6 @@ impl AuthService {
 	pub fn mint_stepup_proof(&self, user_id: &str, intent_hash: &[u8; 32], aal: Aal, origin: &str, ttl_secs: u64) -> Result<StepupProof, AuthError> {
 		let signer = self.engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
 		signer.mint_stepup(user_id, intent_hash, aal, origin, ttl_secs)
-	}
-
-	/// The 0.1 proof, for the passkey and mailed-code step-up (`stepup::legacy`).
-	pub fn mint_method_stepup_proof(&self, user_id: &str, intent_hash: &[u8; 32], method: legacy::StepupMethod, origin: &str, ttl_secs: u64) -> Result<StepupProof, AuthError> {
-		let signer = self.engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
-		signer.mint_method_stepup(user_id, intent_hash, method, origin, ttl_secs)
 	}
 
 	/// The id of the refresh family `refresh_token` currently holds, or `None` when it is
