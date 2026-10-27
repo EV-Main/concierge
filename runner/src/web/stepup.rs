@@ -67,8 +67,8 @@ use crate::{
 /// A ceremony and the proof it yields live this long unless configured shorter. The same
 /// number is the proof's ceiling (`stepup::MAX_TTL_SECS`).
 pub const DEFAULT_TTL_SECS: u64 = stepup::MAX_TTL_SECS;
-/// How much the account may ask of these routes: a person confirms an operation once,
-/// perhaps twice with a typo.
+/// How many ceremonies the account may open (and legacy answers give): a person confirms an
+/// operation once, perhaps twice with a typo.
 const ATTEMPT_WINDOW_SECS: u64 = 300;
 const ATTEMPTS_PER_WINDOW: u32 = 10;
 /// Bounds the store whatever the rate; the oldest ceremony goes first.
@@ -451,14 +451,19 @@ pub async fn verify(State(st): State<WebState>, Extension(Asked(origin)): Extens
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
 		let sp = st.stepup.as_ref().ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "not_found"))?;
-		spend(sp, user.id())?;
 		match (body.factor, body.response, body.code) {
+			// Not charged: an answer needs a ceremony `options` was charged for, and the account's
+			// guard is what bounds the guesses — a budget spent here would end them before it does.
 			(Some(factor), Some(response), None) => verify_factor(st, sp, user.id(), &origin, &body.ceremony_id, factor, response).await,
 			(None, Some(response), None) => {
+				spend(sp, user.id())?;
 				let credential: PublicKeyCredential = serde_json::from_value(response).map_err(|_| invalid("invalid_request"))?;
 				verify_passkey(st, sp, &jar, user.id(), &origin, &body.ceremony_id, &credential).await
 			}
-			(None, None, Some(code)) => verify_code(st, sp, user.id(), &origin, &body.ceremony_id, &code).await,
+			(None, None, Some(code)) => {
+				spend(sp, user.id())?;
+				verify_code(st, sp, user.id(), &origin, &body.ceremony_id, &code).await
+			}
 			_ => Err(invalid("invalid_request")),
 		}
 	}

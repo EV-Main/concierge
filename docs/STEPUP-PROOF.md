@@ -53,7 +53,8 @@ Refusals:
   sends the person to enrol at the platform's account page.
 - `400 invalid_aal`: a level below 2.
 - `400 invalid_intent`.
-- `429 throttled`: 10 asks per account per 5 min, shared with `verify`.
+- `429 throttled`: 10 asks per account per 5 min, shared with the legacy `verify`. A factor's
+  answer is not counted here: each ceremony takes one, and the account's guard counts the wrong ones.
 
 Unknown fields are refused. A body naming both `min_aal` and `method` is `400 invalid_request`.
 
