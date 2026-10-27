@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- The platform sign-in page, built to dist/sign-in.html by scripts/build.mjs, which
+     fills the %…% names with the hashed files of the same build. Paths stay relative: the
+     page sits beside the bundles wherever concierge serves dist/. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Sign in · EV</title>
+    <link rel="stylesheet" href="./%PAGE_CSS%" />
+    <script type="module" src="./%ELEMENT_JS%"></script>
+    <script type="module" src="./%PAGE_JS%"></script>
+  </head>
+  <body>
+    <main class="platform-page">
+      <h1>Sign in</h1>
+      <p id="sign-in-lead">An app on the EV platform asks you to sign in.</p>
+      <p>When you finish, you go back to that app.</p>
+      <p id="sign-in-refusal" class="platform-refusal" role="alert" hidden>This sign-in link is not valid. Go back to the app and try again.</p>
+      <div id="sign-in-mount"></div>
+    </main>
+  </body>
+</html>

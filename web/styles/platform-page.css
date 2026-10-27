@@ -1,0 +1,35 @@
+/* The chrome of the platform pages authorize sends a browser to (pages/reauth.html,
+   pages/sign-in.html). The pages have no host app around them, so they bring the kit's
+   tokens and the page background themselves. The element each one mounts carries its own
+   sheet in `reamfe`; that layer is declared first, below the page's, as the @evinvest/mfe
+   contract asks of every host. Fonts are not loaded here: the kit's family chain falls
+   back to the system sans when no host supplies Inter. */
+@layer reamfe, theme, base, components, utilities;
+
+@import "tailwindcss/theme.css" layer(theme);
+@import "@evinvest/uikit/styles/tokens.css";
+@import "tailwindcss/utilities.css" layer(utilities) source(none);
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  @apply m-0 min-h-dvh bg-background font-sans text-ink antialiased;
+}
+
+.platform-page {
+  @apply mx-auto flex max-w-md flex-col gap-3 px-(--page-px) py-16;
+}
+
+.platform-page h1 {
+  @apply m-0 text-2xl font-semibold tracking-tight;
+}
+
+.platform-page p {
+  @apply m-0 text-sm text-ink-soft;
+}
+
+.platform-page .platform-refusal {
+  @apply text-accent-error;
+}

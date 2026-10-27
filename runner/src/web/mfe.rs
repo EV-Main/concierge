@@ -91,8 +91,8 @@ async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<Stri
 	response
 }
 
-/// What a page here may load: its own bundles and the plane's routes, Turnstile (the
-/// re-authentication code asks for a human), and the inline `<style>` the elements insert
+/// What a page here may load: its own bundles and the plane's routes, Turnstile (a mailed
+/// code and a password ask for a human), and the inline `<style>` the elements insert
 /// and the `style` attributes React writes — hence `'unsafe-inline'` for styles, never for
 /// scripts. `data:` images are the tokens' inline brand mark.
 const PAGE_CSP: &str = "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; \
@@ -108,8 +108,9 @@ fn describe(mut response: Response, name: &str) -> Response {
 		}
 	}
 	// A page here is a platform page that asks for a password, a code or a passkey (the
-	// confirmation `web::authorize` sends a browser to): never framed, never cached, and its
-	// URL — which carries a client's authorize request — never sent on as a Referer.
+	// sign-in and the confirmation `web::authorize` sends a browser to): never framed, never
+	// cached, and its URL — which carries a client's authorize request — never sent on as a
+	// Referer.
 	if matches!(extension(name), Some("html")) {
 		headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
 		headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(PAGE_CSP));
@@ -185,20 +186,23 @@ mod tests {
 
 	#[test]
 	fn a_page_is_never_framed_cached_or_referred() {
-		let page = describe(StatusCode::OK.into_response(), "reauth.html");
-		assert_eq!(page.headers()[CACHE_CONTROL], "no-store");
-		let csp = page.headers()[CONTENT_SECURITY_POLICY].to_str().unwrap();
-		for directive in [
-			"default-src 'self'",
-			"base-uri 'none'",
-			"object-src 'none'",
-			"frame-ancestors 'none'",
-			"script-src 'self' https://challenges.cloudflare.com;",
-		] {
-			assert!(csp.contains(directive), "{directive} in {csp}");
+		for name in ["reauth.html", "sign-in.html"] {
+			let page = describe(StatusCode::OK.into_response(), name);
+			assert_eq!(page.headers()[CACHE_CONTROL], "no-store", "{name}");
+			let csp = page.headers()[CONTENT_SECURITY_POLICY].to_str().unwrap();
+			for directive in [
+				"default-src 'self'",
+				"base-uri 'none'",
+				"object-src 'none'",
+				"frame-ancestors 'none'",
+				"script-src 'self' https://challenges.cloudflare.com;",
+				"frame-src https://challenges.cloudflare.com;",
+			] {
+				assert!(csp.contains(directive), "{name}: {directive} in {csp}");
+			}
+			assert!(!csp.contains("script-src 'self' 'unsafe-inline'"), "{name}: no inline script: {csp}");
+			assert_eq!(page.headers()[REFERRER_POLICY], "no-referrer", "{name}");
 		}
-		assert!(!csp.contains("script-src 'self' 'unsafe-inline'"), "no inline script: {csp}");
-		assert_eq!(page.headers()[REFERRER_POLICY], "no-referrer");
 		let bundle = describe(StatusCode::OK.into_response(), "reauth-ABCD2345.js");
 		assert_eq!(bundle.headers()[CACHE_CONTROL], IMMUTABLE);
 		assert!(bundle.headers().get(CONTENT_SECURITY_POLICY).is_none());

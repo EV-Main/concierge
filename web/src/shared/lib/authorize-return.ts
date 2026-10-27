@@ -26,12 +26,13 @@ export interface AuthorizeReturn {
 
 /**
  * The accepted `return_to`, or null. It must be a relative path to the authorize route on
- * `origin` with no scheme, no `//` or `/\` at the start, no backslash and no control
- * character anywhere, and it must name one `client_id`.
+ * `origin` with no scheme, no `//` or `/\` at the start, no backslash, fragment or control
+ * character anywhere, and it must name one `client_id`. Concierge never writes a fragment;
+ * one would ride authorize's 302 onto the client's `redirect_uri`.
  */
 export function authorizeReturnTo(raw: string | null, origin: string): AuthorizeReturn | null {
   if (!raw || !raw.startsWith(PREFIX)) return null;
-  if (raw.includes("\\") || CONTROL.test(raw)) return null;
+  if (raw.includes("\\") || raw.includes("#") || CONTROL.test(raw)) return null;
   let url: URL;
   try {
     url = new URL(raw, origin);

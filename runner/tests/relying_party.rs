@@ -791,37 +791,71 @@ async fn an_unregistered_redirect_uri_gets_a_page_never_a_redirect() {
 }
 
 #[tokio::test]
-async fn without_a_session_authorize_sends_the_browser_to_login_and_back() {
+async fn without_a_session_authorize_sends_the_browser_to_sign_in_and_back() {
 	let fx = fixture!();
 	let router = router(&fx).await;
 	let challenge = s256_challenge(&random(48));
 
 	let answer = get(&router, &authorize_uri(&fx.client.id, &fx.client.redirect_uri, &challenge), None).await;
 	assert_eq!(answer.status, StatusCode::FOUND);
-	let location = answer.location.unwrap();
-	assert!(location.starts_with("/api/auth/login?returnTo="), "{location}");
-	let return_to = &params(&location)["returnTo"];
-	assert!(
-		return_to.starts_with("/api/auth/authorize?"),
-		"returnTo must be a same-origin path the login accepts: {return_to}"
-	);
-	let back = params(return_to);
+	assert_eq!(answer.headers[header::CACHE_CONTROL], "no-store");
+	assert_eq!(answer.headers[header::REFERRER_POLICY], "no-referrer");
+	let back = params(&sign_in_return(&answer.location.unwrap()));
 	assert_eq!(back["client_id"], fx.client.id);
 	assert_eq!(back["redirect_uri"], fx.client.redirect_uri);
+	assert_eq!(back["response_type"], "code");
 	assert_eq!(back["state"], "st-123");
 	assert_eq!(back["code_challenge"], challenge);
+	assert_eq!(back["code_challenge_method"], "S256");
 
-	// Back from a failed or cancelled sign-in: the refusal goes to the client, not round
-	// the login again.
-	let answer = get(&router, &format!("{}&auth_error=denied", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &challenge)), None).await;
-	let location = answer.location.unwrap();
-	assert!(location.starts_with(&fx.client.redirect_uri));
-	assert_eq!(params(&location)["error"], "access_denied");
-	assert_eq!(params(&location)["state"], "st-123");
+	// Back from a failed or cancelled sign-in — Google's `denied`, the page's `cancelled`:
+	// the refusal goes to the client, not round the sign-in again.
+	for reason in ["denied", "cancelled"] {
+		let answer = get(
+			&router,
+			&format!("{}&auth_error={reason}", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &challenge)),
+			None,
+		)
+		.await;
+		let location = answer.location.unwrap();
+		assert!(location.starts_with(&fx.client.redirect_uri), "{reason}: {location}");
+		assert_eq!(params(&location)["error"], "access_denied", "{reason}");
+		assert_eq!(params(&location)["state"], "st-123", "{reason}");
+	}
+}
+
+/// A Google cancel during an account switch comes back with `auth_error` to a browser
+/// that still holds the OLD session. A code for it would sign the client in as the
+/// account the person was leaving.
+#[tokio::test]
+async fn a_cancelled_sign_in_is_refused_even_with_a_live_session() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let user = fx.user().await;
+	let Some(cookie) = session_cookie(&fx, user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let plain = authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48)));
+	for reason in ["denied", "cancelled", ""] {
+		let location = get(&router, &format!("{plain}&auth_error={reason}"), Some(&cookie)).await.location.unwrap();
+		assert!(location.starts_with(&fx.client.redirect_uri), "{reason:?}: {location}");
+		assert_eq!(params(&location)["error"], "access_denied", "{reason:?}");
+		assert_eq!(params(&location)["state"], "st-123", "{reason:?}");
+		assert!(!params(&location).contains_key("code"), "{reason:?}");
+	}
+	let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM rp_codes WHERE user_id = $1")
+		.bind(user.raw())
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(codes, 0);
+	// The session itself is untouched: the same request without `auth_error` authorizes.
+	assert!(params(&get(&router, &plain, Some(&cookie)).await.location.unwrap()).contains_key("code"));
 }
 
 #[tokio::test]
-async fn select_account_goes_past_a_live_session_to_the_account_chooser() {
+async fn select_account_goes_past_a_live_session_to_the_sign_in_page() {
 	let fx = fixture!();
 	let router = router(&fx).await;
 	let Some(cookie) = session_cookie(&fx, fx.user().await).await else {
@@ -832,13 +866,9 @@ async fn select_account_goes_past_a_live_session_to_the_account_chooser() {
 	let uri = format!("{}&prompt=select_account", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &challenge));
 
 	let location = get(&router, &uri, Some(&cookie)).await.location.unwrap();
-	assert!(
-		location.starts_with("/api/auth/login?returnTo="),
-		"a live session must not answer for another account: {location}"
-	);
-	let back = params(&params(&location)["returnTo"]);
+	let back = params(&sign_in_return(&location));
 	assert_eq!(back["code_challenge"], challenge);
-	assert!(!back.contains_key("prompt"), "coming back from the chooser must authorize, not choose again");
+	assert!(!back.contains_key("prompt"), "coming back from the sign-in must authorize, not choose again");
 
 	// Any other prompt is not one this server keeps.
 	for prompt in ["none", "login", "consent", "select_account login"] {
@@ -896,7 +926,8 @@ async fn authorize_issues_a_code_only_to_an_active_account() {
 /// A takeover (or a revoke-all) bumps `token_version` and leaves the squatter's refresh
 /// family in Redis until its next refresh, so the family check alone admits the session
 /// for as long as its cached access token lives. It must be refused here the way every
-/// signed-in route refuses it: 401, session closed, no code for the client.
+/// signed-in route refuses it — session closed, no code for the client — and the person
+/// sent to sign in again rather than to a dead end.
 #[tokio::test]
 async fn a_session_minted_before_a_token_version_bump_gets_no_code_and_ends() {
 	let fx = fixture!();
@@ -912,9 +943,11 @@ async fn a_session_minted_before_a_token_version_bump_gets_no_code_and_ends() {
 		"the precondition: the family is still live, so only token_version can refuse"
 	);
 
-	let answer = get(&router, &authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48))), Some(&cookie)).await;
-	assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
-	assert_eq!(answer.location, None, "no code travels to the client");
+	let challenge = s256_challenge(&random(48));
+	let answer = get(&router, &authorize_uri(&fx.client.id, &fx.client.redirect_uri, &challenge), Some(&cookie)).await;
+	assert_eq!(answer.status, StatusCode::FOUND);
+	let back = params(&sign_in_return(&answer.location.clone().unwrap()));
+	assert_eq!(back["code_challenge"], challenge, "the sign-in comes back to the same request");
 	assert!(
 		answer.headers.get_all(header::SET_COOKIE).iter().any(|c| c.to_str().unwrap().starts_with("ev_session=;")),
 		"the session cookies are cleared"
@@ -1090,10 +1123,8 @@ async fn a_cabinet_session_revoked_upstream_does_not_authorize() {
 	AuthRpc::logout(&fx.auth, logout(refresh_token, false)).await.expect("logout");
 
 	let location = get(&router, &uri, Some(&cookie)).await.location.unwrap();
-	assert!(
-		location.starts_with("/api/auth/login?"),
-		"a signed-out session must be sent to sign in, not handed a code: {location}"
-	);
+	// A signed-out session must be sent to sign in, not handed a code.
+	sign_in_return(&location);
 	let session_id = cookie.trim_start_matches("ev_session=");
 	assert!(
 		web::WebSessions::from_env().await.unwrap().csrf(session_id).await.unwrap().is_none(),
@@ -1256,9 +1287,23 @@ async fn a_client_token_carries_the_sessions_auth_time_through_exchange_and_refr
 /// The way `/auth/authorize` sends a browser to the confirmation and back: the public path
 /// of this route with the client's parameters.
 fn confirm_return(location: &str) -> String {
-	assert!(location.starts_with("/api/auth/mfe/reauth.html?return_to="), "{location}");
-	let return_to = params(location)["return_to"].clone();
+	page_return(location, "/api/auth/mfe/reauth.html")
+}
+
+/// The way `/auth/authorize` sends a browser to the sign-in page and back, as
+/// [`confirm_return`].
+fn sign_in_return(location: &str) -> String {
+	page_return(location, "/api/auth/mfe/sign-in.html")
+}
+
+fn page_return(location: &str, page: &str) -> String {
+	assert!(location.starts_with(&format!("{page}?return_to=")), "{location}");
+	let outer = params(location);
+	assert_eq!(outer.len(), 1, "the page is told where to come back and nothing else: {location}");
+	let return_to = outer["return_to"].clone();
 	assert!(return_to.starts_with("/api/auth/authorize?"), "the page only ever comes back here: {return_to}");
+	let back = params(&return_to);
+	assert!(!back.contains_key("prompt") && !back.contains_key("auth_error"), "rebuilt from the parsed request: {return_to}");
 	return_to
 }
 
@@ -1448,16 +1493,15 @@ async fn max_age_is_checked_and_a_malformed_one_goes_back_as_invalid_request() {
 }
 
 /// A new sign-in is no confirmation: a provider can complete it without the person doing
-/// anything. So `max_age=0` rides through the login, and the new session is sent to
+/// anything. So `max_age=0` rides through the sign-in, and the new session is sent to
 /// confirm on the way back.
 #[tokio::test]
-async fn without_a_session_max_age_rides_through_the_login() {
+async fn without_a_session_max_age_rides_through_the_sign_in() {
 	let fx = fixture!();
 	let router = router(&fx).await;
 	let uri = format!("{}&max_age=0", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48))));
 	let location = get(&router, &uri, None).await.location.unwrap();
-	assert!(location.starts_with("/api/auth/login?returnTo="), "{location}");
-	let back = params(&params(&location)["returnTo"]);
+	let back = params(&sign_in_return(&location));
 	assert_eq!(back["max_age"], "0");
 }
 

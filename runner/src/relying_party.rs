@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! browser → evinvest.ltd/api/auth/authorize?client_id&redirect_uri&state&code_challenge  (web::authorize)
-//!         → [no session] /api/auth/login?returnTo=<that authorize URL> → Google → back
+//!         → [no session] /api/auth/mfe/sign-in.html?return_to=<that authorize URL> → sign-in → back
 //!         → account active → 302 redirect_uri?code&state
 //! client backend → AuthService.ExchangeCode(client_id, secret, code, redirect_uri, verifier)
 //!                → access JWT (aud = client audience, ≤15 min) + refresh token

@@ -9,10 +9,16 @@
 //! client's own does an error travel back to it (`error=…&state=…`), the way OAuth
 //! clients expect to receive one.
 //!
-//! Signing in is not re-implemented: a browser with no session is sent to the ordinary
-//! `/api/auth/login` with `returnTo` pointing back here, which `safe_return_to` already
-//! admits (a same-origin path). The Google client never learns a relying party exists.
-//! `prompt=select_account` sends a signed-in browser the same way, to switch accounts.
+//! Signing in is not re-implemented: a browser with no session is sent to the platform's
+//! sign-in page ([`SIGN_IN_PATH`]), which offers every ordinary sign-in method and then
+//! sends the browser to its `return_to` — a path back here, built here. The Google client
+//! never learns a relying party exists. `prompt=select_account` sends a signed-in browser
+//! the same way, to switch accounts: every sign-in ends the browser's previous session. A
+//! session minted before the account's `token_version` is ended and sent there too, so
+//! the person signs in again instead of meeting a dead end. A sign-in that failed or was
+//! cancelled comes back with `auth_error` (any value), and that is `access_denied` to the
+//! client even when a session is still there: the session may be the account the person
+//! was trying to leave.
 //!
 //! `max_age=N` (OIDC) asks for a session whose `auth_time` is at most N seconds old;
 //! `max_age=0` always asks. An older one is not signed in again — a new sign-in would end
@@ -50,14 +56,16 @@ use crate::{
 
 /// The public path of this route — what `returnTo` must name for the login to come back.
 const PUBLIC_PATH: &str = "/api/auth/authorize";
-/// The public path of the ordinary login.
-const LOGIN_PATH: &str = "/api/auth/login";
 /// OAuth `state` is the client's opaque value; bounded so it stays a value.
 const MAX_STATE_LEN: usize = 512;
 /// The page on this origin that asks the signed-in person to confirm it is them
 /// (`mfe-concierge-reauth`) and then, confirmed or not, sends the browser to its
 /// `return_to` — always a path back to this route, built here.
 pub const CONFIRM_PATH: &str = "/api/auth/mfe/reauth.html";
+/// The page on this origin that signs a person in (`mfe-concierge-sign-in`) and then sends
+/// the browser to its `return_to` — always a path back to this route, built here — or, when
+/// the person gives up, to that path with `auth_error` added.
+pub const SIGN_IN_PATH: &str = "/api/auth/mfe/sign-in.html";
 /// How long a confirmation trip may take. A trip not back by then is forgotten, and the
 /// browser that comes back later starts a new one.
 pub const TRIP_TTL_SECS: u64 = 600;
@@ -81,7 +89,8 @@ pub struct AuthorizeQuery {
 	/// OIDC `max_age`, in seconds. A string, so a malformed one goes back to the client as
 	/// `invalid_request` instead of failing the whole request here.
 	max_age: Option<String>,
-	/// Set by the login callback when the sign-in itself failed or was cancelled.
+	/// Set by the login callback (`denied`, …) or the sign-in page (`cancelled`) when the
+	/// sign-in failed or was given up. Its value is not read.
 	auth_error: Option<String>,
 }
 
@@ -142,10 +151,17 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 	if q.prompt.is_some() && max_age.is_some() {
 		return back.error("invalid_request");
 	}
+	// Coming back from a sign-in that failed or was cancelled: the refusal goes to the
+	// client rather than round the sign-in again, which would loop. Before the session is
+	// read: a cancelled account switch leaves the old session in place, and a code for it
+	// would sign the client in as the account the person was leaving.
+	if q.auth_error.is_some() {
+		return back.error("access_denied");
+	}
 	match q.prompt.as_deref() {
 		None => {}
-		// Google's chooser is on every login; the way back drops `prompt`, so it authorizes.
-		Some("select_account") => return redirect(&asked.login_url()),
+		// The way back drops `prompt`, so it authorizes the account just signed in.
+		Some("select_account") => return redirect(&asked.sign_in_url()),
 		Some(_) => return back.error("invalid_request"),
 	}
 
@@ -161,12 +177,7 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 		None => None,
 	};
 	let Some((session_id, fresh, upstream_family)) = live else {
-		// Coming back from a sign-in that failed or was cancelled: send the refusal to the
-		// client rather than start the login again, which would loop.
-		if q.auth_error.is_some() {
-			return back.error("access_denied");
-		}
-		return redirect(&asked.login_url());
+		return redirect(&asked.sign_in_url());
 	};
 	let minted = minted_token_version(&fresh.access_token);
 	let auth_time = minted_auth_time(&fresh.access_token);
@@ -182,11 +193,12 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 		// until its next refresh, so the family check above still passes for as long as
 		// the cached access token lives. Refused as `sign_in::gate` refuses it: the
 		// session is over, and a code minted at the CURRENT version would hand the old
-		// session's holder (a squatter) the account it lost.
+		// session's holder (a squatter) the account it lost. The person is sent to sign in
+		// again; that cannot loop, a new sign-in mints at the current version.
 		Ok(Admission::Admitted { token_version }) if minted.is_none_or(|minted| minted < token_version) => {
-			tracing::info!(client_id = %client.client_id, user_id = %user, "relying party: authorize refused a session minted before the account's token_version");
+			tracing::info!(client_id = %client.client_id, user_id = %user, "relying party: authorize ended a session minted before the account's token_version");
 			let cleared = end_session(st, jar).await;
-			return (cleared, page(StatusCode::UNAUTHORIZED, "Your session has ended. Sign in again.")).into_response();
+			return (cleared, redirect(&asked.sign_in_url())).into_response();
 		}
 		Ok(Admission::Admitted { token_version }) => token_version,
 		Ok(Admission::Denied) => {
@@ -343,17 +355,20 @@ impl Asked<'_> {
 		format!("{PUBLIC_PATH}?{}", back.finish())
 	}
 
-	/// The ordinary login, coming back here with `max_age`. A new sign-in is no
+	/// The sign-in page, coming back here with `max_age`. A new sign-in is no
 	/// confirmation — a provider can complete it without the person doing anything — so
 	/// `max_age=0` still sends the new session to confirm on the way back.
-	fn login_url(&self) -> String {
-		let login = form_urlencoded::Serializer::new(String::new()).append_pair("returnTo", &self.path()).finish();
-		format!("{LOGIN_PATH}?{login}")
+	fn sign_in_url(&self) -> String {
+		self.page_url(SIGN_IN_PATH)
 	}
 
 	fn confirm_url(&self) -> String {
-		let confirm = form_urlencoded::Serializer::new(String::new()).append_pair("return_to", &self.path()).finish();
-		format!("{CONFIRM_PATH}?{confirm}")
+		self.page_url(CONFIRM_PATH)
+	}
+
+	fn page_url(&self, page: &str) -> String {
+		let query = form_urlencoded::Serializer::new(String::new()).append_pair("return_to", &self.path()).finish();
+		format!("{page}?{query}")
 	}
 }
 
@@ -456,6 +471,43 @@ mod tests {
 		for bad in ["", "-1", "+1", " 1", "1.5", "1e3", "12345678901", "0x10"] {
 			assert_eq!(parse_max_age(bad), None, "{bad:?}");
 		}
+	}
+
+	#[test]
+	fn the_sign_in_page_comes_back_to_the_parsed_request_only() {
+		let asked = Asked {
+			client_id: "sa",
+			redirect_uri: "https://rp.test/cb?x=1&y=2",
+			state: Some("s t&u"),
+			code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+			max_age: Some(0),
+		};
+		let url = asked.sign_in_url();
+		let (path, query) = url.split_once('?').unwrap();
+		assert_eq!(path, SIGN_IN_PATH);
+		let outer: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+		assert_eq!(outer.len(), 1, "{outer:?}");
+		let (key, return_to) = &outer[0];
+		assert_eq!(key, "return_to");
+		assert_eq!(return_to, &asked.path());
+		let (back_path, back_query) = return_to.split_once('?').unwrap();
+		assert_eq!(back_path, PUBLIC_PATH);
+		let back: Vec<(String, String)> = form_urlencoded::parse(back_query.as_bytes()).into_owned().collect();
+		let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+		assert_eq!(
+			back,
+			vec![
+				pair("client_id", "sa"),
+				pair("redirect_uri", "https://rp.test/cb?x=1&y=2"),
+				pair("response_type", "code"),
+				pair("state", "s t&u"),
+				pair("code_challenge", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
+				pair("code_challenge_method", "S256"),
+				pair("max_age", "0"),
+			],
+			"no prompt, no auth_error: only what was parsed"
+		);
+		assert_eq!(asked.confirm_url().split_once('?').unwrap().1, query, "both pages come back the same way");
 	}
 
 	#[test]
