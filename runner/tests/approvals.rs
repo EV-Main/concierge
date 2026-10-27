@@ -2479,7 +2479,8 @@ async fn a_kind_escalates_on_a_count() {
 }
 
 /// The person a scope admin grant names does not decide it either, when they are an owner:
-/// nobody votes on their own seat (review of #140).
+/// nobody votes on their own seat (review of #140). With three owners that leaves a roster
+/// of one, and one vote decides it: the owner's decision, not a gap in the floor (#196).
 #[tokio::test]
 async fn an_owner_named_by_a_grant_does_not_decide_it() {
 	let Some(fx) = setup().await else { return };
@@ -2487,6 +2488,7 @@ async fn an_owner_named_by_a_grant_does_not_decide_it() {
 	let scope = fx.scope().await;
 	fx.at(T0);
 	let opened = fx.grant_admin(owners[0], &scope, owners[1]).await.expect("an owner may become a scope's admin");
+	assert_eq!(opened.threshold, 1, "a roster of one is decided by its one voter");
 	let voters: Vec<String> = fx.get(owners[2], &opened.id).await.voters.into_iter().map(|v| v.auth_subject).collect();
 	assert_eq!(voters, vec![fx.auth_subject(owners[2]).await], "neither the opener nor the subject");
 	assert_eq!(code(fx.vote(owners[1], &opened.id, ApprovalVote::For).await), Some(Code::PermissionDenied));

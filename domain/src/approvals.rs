@@ -32,7 +32,12 @@ pub const PLATFORM_QUORUM_BPS: u32 = 5001;
 pub const PLATFORM_DELAY_SECS: u32 = 24 * 60 * 60;
 /// How long any proposal may stay open; the platform's lifetime and a scope's ceiling.
 pub const MAX_TTL_SECS: u32 = 72 * 60 * 60;
-/// Below this a platform proposal is refused at open: one owner would decide alone.
+/// Below this many active owners a platform proposal is refused at open: one owner would
+/// decide alone. It counts the owners BEFORE anyone is kept off the roster. After the
+/// exclusions it binds only a service's proposal with a proven initiator (D24(1)). A
+/// `concierge:*` proposal needs only one decider who is neither the opener nor the
+/// subject, so with three owners one roster of one is expected (`docs/SCOPES-AND-APPROVALS.md`
+/// §5.2, "Quorum is over the whole roster").
 pub const PLATFORM_MIN_ROSTER: usize = 2;
 /// Below this a scope proposal escalates to the platform (`sole_admin`), for the same
 /// reason.
