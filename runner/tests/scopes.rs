@@ -622,10 +622,13 @@ async fn a_missing_bundle_directory_is_not_mounted() {
 // ── a live registry ────────────────────────────────────────────────────────────────
 
 /// Closing a scope, or dropping an origin from it, stops it being let in by the next
-/// reading of the registry — no restart.
+/// reading of the registry — no restart. In a database of its own: whether a refresh
+/// rebuilds is the point, and any scope another suite writes would rebuild it.
 #[tokio::test]
 async fn a_closed_scope_or_a_removed_origin_stops_signing_in_without_a_restart() {
-	let pool = pool!();
+	let Some(url) = common::database_url() else { return };
+	let scratch = common::Scratch::create(&url).await;
+	let pool = scratch.pool.clone();
 	let (router, _, allowlist) = sign_in_surface(&pool).await;
 	let id = tag();
 	let origin = format!("https://{id}.evinvest.ltd");
@@ -671,6 +674,7 @@ async fn a_closed_scope_or_a_removed_origin_stops_signing_in_without_a_restart()
 		.unwrap();
 	allowlist.refresh().await;
 	assert!(!admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1), "removed");
+	scratch.drop_database().await;
 }
 
 /// A row that does not decode costs its own scope, never the plane's start. The CHECKs

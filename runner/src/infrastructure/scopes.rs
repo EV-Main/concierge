@@ -77,7 +77,7 @@ impl PgScopes {
 			 FROM tenants t LEFT JOIN rp_clients c ON c.tenant_id = t.id
 			 WHERE $1::TEXT IS NULL OR t.id = $1
 			 GROUP BY t.id
-			 ORDER BY t.id",
+			 ORDER BY t.id COLLATE \"C\"",
 		)
 		.bind(id)
 		.fetch_all(&self.pool)
