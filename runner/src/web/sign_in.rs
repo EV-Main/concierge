@@ -12,7 +12,7 @@
 
 use axum::{
 	Json,
-	extract::{FromRequest, Request, State},
+	extract::{FromRequest, Request, State, rejection::JsonRejection},
 	http::{HeaderMap, StatusCode},
 	response::{IntoResponse, Response},
 };
@@ -53,18 +53,20 @@ impl IntoResponse for Refusal {
 	}
 }
 
-/// A JSON request body. One that does not read is `400 invalid_request` in the shape above,
-/// never the extractor's plain-text 422.
+/// A JSON request body, refused in the shape above rather than the extractor's plain text: a
+/// missing JSON content type is 415, a body over the limit 413, anything else that does not
+/// read 400 `invalid_request`.
 pub struct Body<T>(pub T);
 
 impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for Body<T> {
 	type Rejection = Refusal;
 
 	async fn from_request(request: Request, state: &S) -> Result<Self, Refusal> {
-		Json::from_request(request, state)
-			.await
-			.map(|Json(body)| Self(body))
-			.map_err(|_| Refusal(StatusCode::BAD_REQUEST, "invalid_request"))
+		Json::from_request(request, state).await.map(|Json(body)| Self(body)).map_err(|rejection| match rejection {
+			JsonRejection::MissingJsonContentType(_) => Refusal(StatusCode::UNSUPPORTED_MEDIA_TYPE, "content_type"),
+			JsonRejection::BytesRejection(bytes) if bytes.status() == StatusCode::PAYLOAD_TOO_LARGE => Refusal(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+			_ => Refusal(StatusCode::BAD_REQUEST, "invalid_request"),
+		})
 	}
 }
 

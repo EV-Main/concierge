@@ -299,4 +299,8 @@ async fn a_body_that_does_not_read_is_refused_in_the_surface_shape() {
 		let answer = fx.post("/auth/second-factor/remove", ORIGIN, body.clone(), &mut who.browser).await;
 		assert_eq!(refusal(&answer), error(StatusCode::BAD_REQUEST, "invalid_request"), "{body}");
 	}
+	let untyped = fx.send(axum::http::Method::POST, "/auth/second-factor/remove", ORIGIN, None, &mut who.browser, true).await;
+	assert_eq!(refusal(&untyped), error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "content_type"));
+	let oversized = fx.post("/auth/second-factor/remove", ORIGIN, json!({ "factor": "f".repeat(3 << 20) }), &mut who.browser).await;
+	assert_eq!(refusal(&oversized), error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"));
 }
