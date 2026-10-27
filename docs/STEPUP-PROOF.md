@@ -53,10 +53,10 @@ Refusals:
   sends the person to enrol at the platform's account page.
 - `400 invalid_aal`: a level below 2.
 - `400 invalid_intent`.
-- `429 throttled`: 10 asks per account per 5 min, shared with the legacy `verify`. A factor's
-  answer is not counted here: each ceremony takes one, and the account's guard counts the wrong ones.
+- `429 throttled`: 10 asks per account per 5 min. A factor's answer is not counted here: each
+  ceremony takes one, and the account's guard counts the wrong ones.
 
-Unknown fields are refused. A body naming both `min_aal` and `method` is `400 invalid_request`.
+Unknown fields are refused.
 
 ### `POST /auth/stepup/verify`
 
@@ -104,7 +104,7 @@ same JWKS (`AuthService.Jwks`).
 
 ## What the bank MUST do
 
-1. Verify with `evconcierge_auth::stepup::verify_stepup_proof` (0.2) against the cached JWKS. It:
+1. Verify with `evconcierge_auth::stepup::verify_stepup_proof` (0.3) against the cached JWKS. It:
    - pins EdDSA and checks `iss`, `aud`, `exp`, `typ` and the lifetime cap;
    - checks the proof is not dated ahead of the verifier's clock (`iat <= now + 5 s`,
      `exp <= now + 120 s + 5 s`);
@@ -156,28 +156,6 @@ let claims = match verify_stepup_proof(&proof, &cache, &issuer, &expected) {
 if !intent_cas_authorized(&stored_intent).await? { return Err(Refused) }
 if !redis_set_nx(format!("stepup:jti:{}", claims.jti), claims.exp).await? { return Err(Replayed) }
 ```
-
-## The 0.1 proof, until the bank moves
-
-The bank pinned to `evconcierge_auth` 0.1 verifies a proof carrying `method`
-(`passkey | email_code`) in place of `aal`. For it, `/auth/stepup/options` still takes:
-
-```json
-{ "intent_hash": "...", "method": "passkey" | "email_code",
-  "summary": "<email_code only>", "turnstile_token": "<email_code only>" }
-```
-
-- `passkey`: an assertion of a sign-in passkey created before the session began; verified
-  with `{ceremony_id, response: <PublicKeyCredential>}`.
-- `email_code`: a mailed `stepup` code that quotes the page's summary as the page's own
-  words; verified with `{ceremony_id, code}`.
-- Both mint the `method` proof (`evconcierge_auth::stepup::legacy`). The 0.2 verifier
-  refuses that proof, and the 0.1 verifier refuses an `aal` proof, so neither flavour passes
-  for the other.
-- A password is never accepted.
-
-These two methods, the `stepup` code purpose and the `legacy` module are removed once no
-deployed bank asks for them.
 
 ## Limits worth knowing
 
