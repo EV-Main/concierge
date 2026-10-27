@@ -1,5 +1,7 @@
 import { useT } from "@evinvest/i18n/react";
+import { SIGNED_IN_EVENT } from "@evinvest/mfe";
 import { Skeleton, Tabs, TabsContent, TabsList, TabsTrigger } from "@evinvest/uikit";
+import { useEffect } from "react";
 
 import { ProfileCard } from "../../../features/account-profile";
 import { NotificationSettingsCard } from "../../../features/notification-settings";
@@ -24,6 +26,12 @@ export function AccountView({ section, onSection }: { section: AccountSection; o
   const t = useT();
   const { api, host, platform } = useElement();
   const { session, refresh } = useSession(api);
+
+  useEffect(() => {
+    const reread = () => void refresh();
+    document.addEventListener(SIGNED_IN_EVENT, reread);
+    return () => document.removeEventListener(SIGNED_IN_EVENT, reread);
+  }, [refresh]);
 
   if (session.kind === "loading") return <Skeleton className="h-64 w-full rounded-xl" />;
   if (session.kind !== "signedIn") {
