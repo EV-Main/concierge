@@ -395,6 +395,10 @@
     "en": "New codes",
     "t": "Mã mới"
   },
+  "auth.secondFactor.codes.newConfirm": {
+    "en": "Your current recovery codes stop working as soon as the new set is made.",
+    "t": "Các mã khôi phục hiện tại sẽ ngừng hoạt động ngay khi bộ mã mới được tạo."
+  },
   "auth.secondFactor.codes.row": {
     "en": "Recovery codes",
     "t": "Mã khôi phục"
@@ -550,6 +554,10 @@
   "auth.secondFactor.removeLast": {
     "en": "This is your only second factor. Without one, withdrawals are refused until you add a new one. Your recovery codes stop working too.",
     "t": "Đây là yếu tố thứ hai duy nhất của bạn. Nếu không có, các lệnh rút tiền sẽ bị từ chối cho đến khi bạn thêm yếu tố mới. Các mã khôi phục cũng sẽ ngừng hoạt động."
+  },
+  "auth.secondFactor.removeOne": {
+    "en": "Remove {label}? Its codes stop working at once.",
+    "t": "Xóa {label}? Mã của nó sẽ ngừng hoạt động ngay lập tức."
   },
   "auth.secondFactor.restart": {
     "en": "Start again",

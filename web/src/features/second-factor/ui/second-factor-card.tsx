@@ -1,25 +1,24 @@
-import { useT } from "@evinvest/i18n/react";
+import { useLocale, useT } from "@evinvest/i18n/react";
 import { dispatchSignOut } from "@evinvest/mfe";
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, ListRow, ListRows } from "@evinvest/uikit";
 import { useEffect, useState, type ComponentType } from "react";
 
 import { useElement } from "../../../shared/element/element-context";
+import { SECOND_FACTORS_CHANGED } from "../../../shared/element/events";
 import { readSecondFactors, recover, removeFactor, replaceRecoveryCodes, type Factor, type SecondFactors } from "../api/second-factor-api";
 import { useGuardedAct } from "../model/use-guarded-act";
 import { kindName } from "./answer-form";
+import { ConfirmAct } from "./confirm-act";
 import { Enrolment, type ReauthSlotProps } from "./enrolment";
 import { FactorStep } from "./factor-step";
 import { RecoverForm } from "./recover-form";
 import { RecoveryCodes } from "./recovery-codes";
 import { secondFactorRefusal } from "./refusal";
-import { RemoveLast } from "./remove-last";
 import { SessionEnded } from "./session-ended";
 
 type Loaded = { kind: "loading" } | { kind: "off" } | { kind: "failed" } | { kind: "ready"; held: SecondFactors };
 
-type Panel = null | { kind: "enrol" } | { kind: "codes"; codes: string[] } | { kind: "removeLast"; factor: string } | { kind: "recover" } | { kind: "ended" };
-
-const dateOf = (secs: number) => new Date(secs * 1000).toLocaleDateString();
+type Panel = null | { kind: "enrol" } | { kind: "codes"; codes: string[] } | { kind: "remove"; factor: Factor; last: boolean } | { kind: "newCodes" } | { kind: "recover" } | { kind: "ended" };
 
 /**
  * The account's second factor, which the money plane asks for before a withdrawal. Platform
@@ -28,6 +27,7 @@ const dateOf = (secs: number) => new Date(secs * 1000).toLocaleDateString();
  */
 export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: ComponentType<ReauthSlotProps>; onSessionEnded: () => void }) {
   const t = useT();
+  const locale = useLocale();
   const { api, host } = useElement();
   const [loaded, setLoaded] = useState<Loaded>({ kind: "loading" });
   const [revision, setRevision] = useState(0);
@@ -48,6 +48,11 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
   }, [api, revision]);
 
   const reload = () => setRevision((r) => r + 1);
+  useEffect(() => {
+    const reread = () => setRevision((r) => r + 1);
+    document.addEventListener(SECOND_FACTORS_CHANGED, reread);
+    return () => document.removeEventListener(SECOND_FACTORS_CHANGED, reread);
+  }, []);
   const open = (next: Panel) => {
     gate.clear();
     setPanel(next);
@@ -79,10 +84,7 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
       if (answer.ok) setPanel({ kind: "ended" });
       return answer;
     });
-  const askRemove = (factor: Factor, held: SecondFactors) => {
-    if (held.factors.length === 1) open({ kind: "removeLast", factor: factor.id });
-    else void remove(factor.id);
-  };
+  const dateOf = (secs: number) => new Date(secs * 1000).toLocaleDateString(locale);
 
   const addButton = (
     <Button variant="outline" size="sm" disabled={locked || panel !== null} onClick={() => open({ kind: "enrol" })}>
@@ -124,7 +126,7 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
                     factor.lastUsedAt === null ? t("auth.secondFactor.neverUsed", "never used") : t("auth.secondFactor.lastUsed", "last used {date}", { date: dateOf(factor.lastUsedAt) }),
                   ].join(" · ")}
                 >
-                  <Button variant="outline" size="sm" disabled={locked || panel !== null} onClick={() => askRemove(factor, loaded.held)}>
+                  <Button variant="outline" size="sm" disabled={locked || panel !== null} onClick={() => open({ kind: "remove", factor, last: loaded.held.factors.length === 1 })}>
                     {t("auth.passkeys.remove", "Remove")}
                   </Button>
                 </ListRow>
@@ -134,7 +136,7 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
                 label={t("auth.secondFactor.codes.row", "Recovery codes")}
                 description={t("auth.secondFactor.codes.left", "{n} left · a new set replaces the old one", { n: loaded.held.recoveryCodesLeft })}
               >
-                <Button variant="outline" size="sm" disabled={locked || panel !== null} onClick={() => void newCodes()}>
+                <Button variant="outline" size="sm" disabled={locked || panel !== null} onClick={() => open({ kind: "newCodes" })}>
                   {t("auth.secondFactor.codes.new", "New codes")}
                 </Button>
               </ListRow>
@@ -156,7 +158,28 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
             />
           )}
           {panel?.kind === "codes" && <RecoveryCodes codes={panel.codes} onSaved={() => setPanel(null)} />}
-          {panel?.kind === "removeLast" && <RemoveLast busy={locked} onRemove={() => void remove(panel.factor)} onCancel={() => setPanel(null)} />}
+          {panel?.kind === "remove" && (
+            <ConfirmAct
+              message={
+                panel.last
+                  ? t("auth.secondFactor.removeLast", "This is your only second factor. Without one, withdrawals are refused until you add a new one. Your recovery codes stop working too.")
+                  : t("auth.secondFactor.removeOne", "Remove {label}? Its codes stop working at once.", { label: panel.factor.label })
+              }
+              action={panel.last ? t("auth.secondFactor.removeAnyway", "Remove anyway") : t("auth.passkeys.remove", "Remove")}
+              busy={locked}
+              onConfirm={() => void remove(panel.factor.id)}
+              onCancel={() => setPanel(null)}
+            />
+          )}
+          {panel?.kind === "newCodes" && (
+            <ConfirmAct
+              message={t("auth.secondFactor.codes.newConfirm", "Your current recovery codes stop working as soon as the new set is made.")}
+              action={t("auth.secondFactor.codes.new", "New codes")}
+              busy={locked}
+              onConfirm={() => void newCodes()}
+              onCancel={() => setPanel(null)}
+            />
+          )}
           {panel?.kind === "recover" && <RecoverForm busy={locked} onRecover={(code) => void spendCode(code)} onCancel={() => setPanel(null)} />}
           {gate.stage === "reauth" && <Reauth sub={t("auth.secondFactor.reauthSub", "You signed in a while ago. Confirm it is you to continue.")} onConfirmed={gate.passed} onCancel={gate.cancel} />}
           {gate.stage === "factor" && <FactorStep onPassed={gate.passed} onCancel={gate.cancel} />}

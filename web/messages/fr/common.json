@@ -395,6 +395,10 @@
     "en": "New codes",
     "t": "Nouveaux codes"
   },
+  "auth.secondFactor.codes.newConfirm": {
+    "en": "Your current recovery codes stop working as soon as the new set is made.",
+    "t": "Vos codes de récupération actuels cessent de fonctionner dès que le nouveau jeu est créé."
+  },
   "auth.secondFactor.codes.row": {
     "en": "Recovery codes",
     "t": "Codes de récupération"
@@ -550,6 +554,10 @@
   "auth.secondFactor.removeLast": {
     "en": "This is your only second factor. Without one, withdrawals are refused until you add a new one. Your recovery codes stop working too.",
     "t": "C’est votre seul second facteur. Sans lui, les retraits sont refusés jusqu’à ce que vous en ajoutiez un nouveau. Vos codes de récupération cessent aussi de fonctionner."
+  },
+  "auth.secondFactor.removeOne": {
+    "en": "Remove {label}? Its codes stop working at once.",
+    "t": "Supprimer {label} ? Ses codes cessent aussitôt de fonctionner."
   },
   "auth.secondFactor.restart": {
     "en": "Start again",
