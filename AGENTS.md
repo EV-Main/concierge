@@ -782,11 +782,16 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   called by the client's backend with its secret. `/auth/authorize` settles the client and
   the redirect_uri FIRST, byte for byte against the registry (no prefix, no wildcard), and
   answers anything else with a page on this origin — never a redirect; only then do errors
-  travel back as `error=…&state=…`. With no session it sends the browser through the
-  ordinary `/api/auth/login?returnTo=` (a same-origin path), so the Google client never
-  learns a client exists. `prompt` is `select_account` — the same trip for a browser already
-  signed in, to switch accounts — or the request is refused, and never together with
-  `max_age`. `max_age=N` (OIDC; `0` is met by no session) sends a session whose `auth_time`
+  travel back as `error=…&state=…`. With no session it sends the browser to the platform's
+  sign-in page `/api/auth/mfe/sign-in.html?return_to=<this request>` (every ordinary
+  sign-in method; `return_to` is rebuilt from the parsed request, never copied), so the
+  Google client never learns a client exists. A session minted under an older
+  `token_version` is ended and sent there too, never to a dead-end page. `prompt` is
+  `select_account` — the same trip for a browser already signed in, to switch accounts —
+  or the request is refused, and never together with `max_age`. A request back with
+  `auth_error` (any value: the login callback's `denied`, …, the page's `cancelled`) answers
+  `access_denied` BEFORE the session is read: a cancelled account switch leaves the old
+  session, and a code for it would sign the client in as the account being left. `max_age=N` (OIDC; `0` is met by no session) sends a session whose `auth_time`
   is older than N seconds (or absent) to the confirmation page
   `/api/auth/mfe/reauth.html?return_to=<this request>` — the ordinary re-authentication on
   `PUBLIC_ORIGIN`, never a new sign-in, which would end the client sessions and which a

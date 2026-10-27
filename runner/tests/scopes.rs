@@ -488,6 +488,7 @@ fn bundles() -> (Router, Bundles) {
 	std::fs::write(dir.join("chunks").join("chunk-Q7ZK3M2P.js"), "export {};").unwrap();
 	std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
 	std::fs::write(dir.join("LICENSES.txt"), "MIT").unwrap();
+	std::fs::write(dir.join("sign-in.html"), "<!doctype html>").unwrap();
 	std::fs::write(outside.join("secret.txt"), "outside").unwrap();
 	std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("escape.txt")).unwrap();
 
@@ -542,6 +543,23 @@ async fn the_manifest_is_short_lived_and_hashed_bundles_are_immutable() {
 
 	let (_, headers, _) = fetch(&router, Method::GET, "/auth/mfe/LICENSES.txt", None).await;
 	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300", "an all-caps name is no content hash");
+}
+
+/// The sign-in page `/auth/authorize` sends a browser to carries the client's request in its
+/// URL and asks for a password or a code: never cached, framed or referred, and Turnstile
+/// may load.
+#[tokio::test]
+async fn the_sign_in_page_is_never_cached_framed_or_referred() {
+	let (router, _bundles) = bundles();
+	let (status, headers, _) = fetch(&router, Method::GET, "/auth/mfe/sign-in.html?return_to=%2Fapi%2Fauth%2Fauthorize%3Fclient_id%3Dsa", None).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+	assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+	assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+	let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+	assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+	assert!(csp.contains("script-src 'self' https://challenges.cloudflare.com;"), "{csp}");
+	assert!(csp.contains("frame-src https://challenges.cloudflare.com;"), "{csp}");
 }
 
 async fn fetch_with(router: &Router, path: &str, name: header::HeaderName, value: &str) -> (StatusCode, HeaderMap, Vec<u8>) {

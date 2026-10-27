@@ -188,6 +188,19 @@ for the mailed code; inline styles because the elements insert their `<style>`).
 
 ### 3.2 Relying-party sign-in: `max_age` and `auth_time`
 
+`GET /api/auth/authorize` with no live session — none, signed out elsewhere, or minted
+under an older `token_version` (that one is ended first, cookies cleared) — and with
+`prompt=select_account` answers a 302 to
+`/api/auth/mfe/sign-in.html?return_to=<this request, rebuilt from its parameters>`. The
+query carries `return_to` alone; `return_to` is `/api/auth/authorize?client_id&redirect_uri
+&response_type=code[&state]&code_challenge&code_challenge_method=S256[&max_age]` — never
+`prompt`, never `auth_error`. The page signs the person in by any ordinary method (each
+one ends the browser's previous session) and navigates to `return_to`; when the person
+gives up it navigates to `return_to` with `&auth_error=cancelled`. A request with
+`auth_error` (any value; the Google callback adds `denied`, …) answers `error=access_denied`
+to the client before the session is read, so a cancelled account switch never authorizes
+the account being left, and a failed sign-in never loops.
+
 `auth_time` reaches a client's access token (`ExchangeCode`, `RefreshClientToken`) ONLY
 from a code issued at the end of a confirmation trip this request began: it is the
 `evinvest.ltd` session's `auth_time` after the person confirmed (migration 0047 keeps it
@@ -202,7 +215,7 @@ one (security review of #193, F1).
 digits, anything else answers `error=invalid_request`; together with `prompt` it is
 `invalid_request`, because the chooser leads to a new sign-in):
 
-- no session: the ordinary login, coming back with `max_age`. A new sign-in is not a
+- no session: the sign-in page (below), coming back with `max_age`. A new sign-in is not a
   confirmation — a provider can complete it with a remembered account and no act of the
   person — so the new session is sent to confirm as below;
 - a session whose `auth_time` is at most `N` seconds old (`N > 0`): a code without the
