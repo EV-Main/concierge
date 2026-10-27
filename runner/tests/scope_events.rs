@@ -367,6 +367,8 @@ async fn a_client_sees_its_scope_and_the_scopes_that_name_it_an_observer_and_not
 async fn lifecycle_rows_are_redacted_for_a_client_and_start_after_the_join_snapshot() {
 	let Some(fx) = setup().await else { return };
 	let scope = fx.scope(&[], false).await;
+	// From before the user's first row: a page from 0 overflows on a shared database.
+	let start = fx.lifecycle_head().await;
 	let user = fx.user("redacted").await;
 	assert!(fx.sign_in(&scope, user).await);
 	fx.users.set_kyc_level(user, 2, &AdminAction::system("kyc_level_set"), 0).await.unwrap();
@@ -374,7 +376,7 @@ async fn lifecycle_rows_are_redacted_for_a_client_and_start_after_the_join_snaps
 
 	let as_client_page = fx
 		.bridge
-		.pull_user_lifecycle(as_client(PullUserLifecycleRequest { after_position: 0, limit: 500 }, &scope))
+		.pull_user_lifecycle(as_client(PullUserLifecycleRequest { after_position: start, limit: 500 }, &scope))
 		.await
 		.unwrap()
 		.into_inner();
@@ -389,18 +391,9 @@ async fn lifecycle_rows_are_redacted_for_a_client_and_start_after_the_join_snaps
 	}
 	assert_eq!(mine[0].kyc_level, 2, "KYC level is carried (D5)");
 
-	// From just before the user's first row: a page from 0 overflows on a shared database.
-	let created = sqlx::query_scalar::<_, i64>("SELECT min(position) FROM user_outbox WHERE user_id = $1")
-		.bind(user.raw())
-		.fetch_one(&fx.pool)
-		.await
-		.unwrap();
 	let bank = fx
 		.bridge
-		.pull_user_lifecycle(as_bridge(PullUserLifecycleRequest {
-			after_position: created - 1,
-			limit: 500,
-		}))
+		.pull_user_lifecycle(as_bridge(PullUserLifecycleRequest { after_position: start, limit: 500 }))
 		.await
 		.unwrap()
 		.into_inner();
