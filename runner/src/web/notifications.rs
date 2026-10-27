@@ -31,7 +31,7 @@ use crate::{
 		WebState,
 		logout::escape,
 		routes::ClientIp,
-		sign_in::{Refusal, guard, internal},
+		sign_in::{Body, Refusal, guard, internal},
 	},
 };
 
@@ -151,7 +151,7 @@ pub struct SubscribeRequest {
 /// this origin or a scope's host. Double opt-in: the address gets one throttled
 /// confirmation mail and nothing else until its link is pressed. Answers `{accepted: true}`
 /// for a new address, a confirmed one and a throttled one alike.
-pub async fn subscribe(State(st): State<WebState>, headers: HeaderMap, ip: ClientIp, Json(body): Json<SubscribeRequest>) -> Result<Json<Value>, Refusal> {
+pub async fn subscribe(State(st): State<WebState>, headers: HeaderMap, ip: ClientIp, Body(body): Body<SubscribeRequest>) -> Result<Json<Value>, Refusal> {
 	let st = &st.inner;
 	guard(st, &headers, &ip, Some(&body.turnstile_token)).await?;
 	let accepted = subscribe_accountless(st.notifications.as_ref(), &st.subscribe_limiter, &body.email, &body.topic, &ip.0)

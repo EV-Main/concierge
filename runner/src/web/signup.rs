@@ -23,7 +23,7 @@ use crate::{
 	web::{
 		WebState, now_secs, random_token,
 		routes::ClientIp,
-		sign_in::{Refusal, code_refusal, guard, internal, sent, signed_in_as},
+		sign_in::{Body, Refusal, code_refusal, guard, internal, sent, signed_in_as},
 	},
 };
 
@@ -56,7 +56,7 @@ pub struct SignUpConfirm {
 /// exactly as a wrong code does, so the ticket cannot be probed apart from the code. No
 /// Turnstile: the code proves the mailbox, as on `/auth/code/verify`, and its attempts
 /// are counted.
-pub async fn confirm(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Json(body): Json<SignUpConfirm>) -> Result<(CookieJar, Json<Value>), Refusal> {
+pub async fn confirm(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Body(body): Body<SignUpConfirm>) -> Result<(CookieJar, Json<Value>), Refusal> {
 	let st = &st.inner;
 	guard(st, &headers, &ip, None).await?;
 	match st.credentials.confirm_signup(&digest(&body.ticket), &body.code, now_secs()).await {
@@ -82,7 +82,7 @@ pub struct SignUpResend {
 /// Turnstile and the per-address throttle apply as on `/auth/code/request`. A ticket that
 /// speaks for nobody answers `{ok:true}` and mails nothing — the same as a live one — so
 /// a ticket cannot be probed here apart from the code; only a live ticket can be throttled.
-pub async fn resend(State(st): State<WebState>, headers: HeaderMap, ip: ClientIp, Json(body): Json<SignUpResend>) -> Result<Json<Value>, Refusal> {
+pub async fn resend(State(st): State<WebState>, headers: HeaderMap, ip: ClientIp, Body(body): Body<SignUpResend>) -> Result<Json<Value>, Refusal> {
 	let st = &st.inner;
 	guard(st, &headers, &ip, Some(&body.turnstile_token)).await?;
 	match st.credentials.resend_signup_code(&digest(&body.ticket), now_secs()).await {

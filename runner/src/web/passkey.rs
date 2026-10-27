@@ -26,7 +26,7 @@ use crate::{
 	web::{
 		WebState, now_secs, random_token,
 		routes::ClientIp,
-		sign_in::{Answered, Refusal, Signed, guard, internal, require_fresh, signed_in, signed_in_as, signed_in_live},
+		sign_in::{Answered, Body, Refusal, Signed, guard, internal, require_fresh, signed_in, signed_in_as, signed_in_live},
 	},
 };
 
@@ -155,7 +155,7 @@ pub struct RegisterVerify {
 }
 
 /// `POST /auth/passkey/register/verify` — finish registering, and keep the passkey.
-pub async fn register_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<RegisterVerify>) -> Answered {
+pub async fn register_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<RegisterVerify>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed_in_live(st, &jar, &headers).await?;
 	let id = caller.id;
@@ -216,7 +216,7 @@ pub struct SigninVerify {
 
 /// `POST /auth/passkey/signin/verify` — the authenticator named the account (its user handle
 /// is the account id); check the assertion against that account's passkey and sign in.
-pub async fn signin_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Json(body): Json<SigninVerify>) -> Result<(CookieJar, Json<Value>), Refusal> {
+pub async fn signin_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Body(body): Body<SigninVerify>) -> Result<(CookieJar, Json<Value>), Refusal> {
 	let st = &st.inner;
 	guard(st, &headers, &ip, None).await?;
 	let (state, webauthn) = st.passkey_sign_ins.take(&body.ceremony).await.ok_or_else(expired)?;
@@ -251,7 +251,7 @@ pub struct Remove {
 }
 
 /// `POST /auth/passkey/remove` — forget one of the signed-in account's passkeys.
-pub async fn remove(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<Remove>) -> Answered {
+pub async fn remove(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<Remove>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, .. } = signed_in(st, &jar, &headers).await?;
 	let id = caller.id;

@@ -31,7 +31,6 @@ use std::{
 
 use axum::{
 	Extension, Json,
-	body::Bytes,
 	extract::{Request, State},
 	http::{HeaderMap, HeaderValue, Method, StatusCode, header},
 	middleware::Next,
@@ -61,7 +60,7 @@ use crate::{
 		reauth::{eligible_passkeys, verified_address},
 		routes::ClientIp,
 		second_factor,
-		sign_in::{Answered, Halt, Refusal, Signed, code_refusal, human, internal, require_live, sent, signed_in_read},
+		sign_in::{Answered, Body, Halt, Refusal, Signed, code_refusal, human, internal, require_live, sent, signed_in_read},
 	},
 };
 
@@ -283,12 +282,6 @@ pub(super) async fn guard(State(st): State<WebState>, mut request: Request, next
 	response
 }
 
-/// The body, or `400 invalid_request` in this surface's own error shape — the extractor's
-/// plain-text 422 would be the one answer here a page cannot read as an error code.
-fn parse<T: serde::de::DeserializeOwned>(bytes: &Bytes) -> Result<T, Refusal> {
-	serde_json::from_slice(bytes).map_err(|_| invalid("invalid_request"))
-}
-
 fn spend(sp: &Stepup, user: UserId) -> Result<(), Refusal> {
 	match sp.attempts.check(&user.to_string()) {
 		true => Ok(()),
@@ -331,9 +324,8 @@ pub struct OptionsBody {
 }
 
 /// `POST /auth/stepup/options` — open a ceremony for one operation.
-pub async fn options(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, bytes: Bytes) -> Answered {
+pub async fn options(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Body(body): Body<OptionsBody>) -> Answered {
 	let st = &st.inner;
-	let body: OptionsBody = parse(&bytes)?;
 	let Signed { caller, user } = session(st, &jar).await?;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
@@ -453,9 +445,8 @@ pub struct VerifyBody {
 }
 
 /// `POST /auth/stepup/verify` — close the ceremony and answer the proof for its operation.
-pub async fn verify(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, bytes: Bytes) -> Answered {
+pub async fn verify(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, Body(body): Body<VerifyBody>) -> Answered {
 	let st = &st.inner;
-	let body: VerifyBody = parse(&bytes)?;
 	let Signed { caller, user } = session(st, &jar).await?;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
