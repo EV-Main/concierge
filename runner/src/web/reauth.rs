@@ -36,7 +36,7 @@ use crate::{
 		Inner, WebState, now_secs,
 		passkey::{base64url, expired, rejected},
 		routes::{ClientIp, live_family_of, refresh_of},
-		sign_in::{Answered, DECOY, Halt, Refusal, Signed, code_refusal, end_session, human, internal, matches, sent, signed_in_live},
+		sign_in::{Answered, Body, DECOY, Halt, Refusal, Signed, code_refusal, end_session, human, internal, matches, sent, signed_in_live},
 	},
 };
 
@@ -122,7 +122,7 @@ pub struct CodeRequest {
 /// `POST /auth/reauth/code/request` — mail the signed-in account a re-authentication code
 /// (its own purpose: a sign-in code, which anyone can ask for, never stands in for it). A mail
 /// costs us, so a person must be behind it, as on `/auth/code/request`.
-pub async fn code_request(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Json(body): Json<CodeRequest>) -> Answered {
+pub async fn code_request(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Body(body): Body<CodeRequest>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
@@ -149,7 +149,7 @@ pub struct CodeVerify {
 /// `POST /auth/reauth/code/verify` — spend the mailed code. It is bound to this account
 /// and to its VERIFIED address (`users_verified_email_idx`), and spends the account's own
 /// daily budget of codes and wrong guesses.
-pub async fn code_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<CodeVerify>) -> Answered {
+pub async fn code_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<CodeVerify>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
@@ -171,7 +171,7 @@ pub struct PasswordBody {
 /// `POST /auth/reauth/password` — the account's password. Shares the sign-in lockout
 /// (`record_password_attempt`): ten failures lock the password for everyone, this route
 /// included, and never the code or passkey paths.
-pub async fn password(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<PasswordBody>) -> Answered {
+pub async fn password(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<PasswordBody>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
@@ -266,7 +266,7 @@ pub struct PasskeyVerify {
 
 /// `POST /auth/reauth/passkey/verify` — check the assertion against the passkey that was
 /// offered, for the account that began the ceremony.
-pub async fn passkey_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<PasskeyVerify>) -> Answered {
+pub async fn passkey_verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<PasskeyVerify>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);

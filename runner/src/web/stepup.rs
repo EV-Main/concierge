@@ -31,7 +31,6 @@ use std::{
 
 use axum::{
 	Extension, Json,
-	body::Bytes,
 	extract::{Request, State},
 	http::{HeaderMap, HeaderValue, Method, StatusCode, header},
 	middleware::Next,
@@ -61,15 +60,15 @@ use crate::{
 		reauth::{eligible_passkeys, verified_address},
 		routes::ClientIp,
 		second_factor,
-		sign_in::{Answered, Halt, Refusal, Signed, code_refusal, human, internal, require_live, sent, signed_in_read},
+		sign_in::{Answered, Body, Halt, Refusal, Signed, code_refusal, human, internal, require_live, sent, signed_in_read},
 	},
 };
 
 /// A ceremony and the proof it yields live this long unless configured shorter. The same
 /// number is the proof's ceiling (`stepup::MAX_TTL_SECS`).
 pub const DEFAULT_TTL_SECS: u64 = stepup::MAX_TTL_SECS;
-/// How much the account may ask of these routes: a person confirms an operation once,
-/// perhaps twice with a typo.
+/// How many ceremonies the account may open (and legacy answers give): a person confirms an
+/// operation once, perhaps twice with a typo.
 const ATTEMPT_WINDOW_SECS: u64 = 300;
 const ATTEMPTS_PER_WINDOW: u32 = 10;
 /// Bounds the store whatever the rate; the oldest ceremony goes first.
@@ -283,12 +282,6 @@ pub(super) async fn guard(State(st): State<WebState>, mut request: Request, next
 	response
 }
 
-/// The body, or `400 invalid_request` in this surface's own error shape — the extractor's
-/// plain-text 422 would be the one answer here a page cannot read as an error code.
-fn parse<T: serde::de::DeserializeOwned>(bytes: &Bytes) -> Result<T, Refusal> {
-	serde_json::from_slice(bytes).map_err(|_| invalid("invalid_request"))
-}
-
 fn spend(sp: &Stepup, user: UserId) -> Result<(), Refusal> {
 	match sp.attempts.check(&user.to_string()) {
 		true => Ok(()),
@@ -331,9 +324,8 @@ pub struct OptionsBody {
 }
 
 /// `POST /auth/stepup/options` — open a ceremony for one operation.
-pub async fn options(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, bytes: Bytes) -> Answered {
+pub async fn options(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Body(body): Body<OptionsBody>) -> Answered {
 	let st = &st.inner;
-	let body: OptionsBody = parse(&bytes)?;
 	let Signed { caller, user } = session(st, &jar).await?;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
@@ -453,21 +445,25 @@ pub struct VerifyBody {
 }
 
 /// `POST /auth/stepup/verify` — close the ceremony and answer the proof for its operation.
-pub async fn verify(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, bytes: Bytes) -> Answered {
+pub async fn verify(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, Body(body): Body<VerifyBody>) -> Answered {
 	let st = &st.inner;
-	let body: VerifyBody = parse(&bytes)?;
 	let Signed { caller, user } = session(st, &jar).await?;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
 		let sp = st.stepup.as_ref().ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "not_found"))?;
-		spend(sp, user.id())?;
 		match (body.factor, body.response, body.code) {
+			// Not charged: an answer needs a ceremony `options` was charged for, and the account's
+			// guard is what bounds the guesses — a budget spent here would end them before it does.
 			(Some(factor), Some(response), None) => verify_factor(st, sp, user.id(), &origin, &body.ceremony_id, factor, response).await,
 			(None, Some(response), None) => {
+				spend(sp, user.id())?;
 				let credential: PublicKeyCredential = serde_json::from_value(response).map_err(|_| invalid("invalid_request"))?;
 				verify_passkey(st, sp, &jar, user.id(), &origin, &body.ceremony_id, &credential).await
 			}
-			(None, None, Some(code)) => verify_code(st, sp, user.id(), &origin, &body.ceremony_id, &code).await,
+			(None, None, Some(code)) => {
+				spend(sp, user.id())?;
+				verify_code(st, sp, user.id(), &origin, &body.ceremony_id, &code).await
+			}
 			_ => Err(invalid("invalid_request")),
 		}
 	}

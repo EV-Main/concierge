@@ -1,4 +1,4 @@
-import { useT } from "@evinvest/i18n/react";
+import { useLocale, useT } from "@evinvest/i18n/react";
 import { Button, ListRow } from "@evinvest/uikit";
 
 import { useElement } from "../../../shared/element/element-context";
@@ -13,11 +13,12 @@ import { refusal } from "./refusal";
 
 export function Passkeys({ methods, onChanged }: { methods: SignInMethods; onChanged: () => void }) {
   const t = useT();
+  const locale = useLocale();
   const { api } = useElement();
   const gate = useReauthGate(onChanged);
   const locked = gate.busy || gate.stage !== "idle";
 
-  const name = () => `${t("auth.passkeys.default", "Passkey")} · ${new Date().toLocaleDateString()}`;
+  const name = () => `${t("auth.passkeys.default", "Passkey")} · ${new Date().toLocaleDateString(locale)}`;
   const confirmWith = reauthMethods({ emailVerified: methods.emailVerified, password: methods.password, passkeys: methods.passkeys.length }, passkeysSupported());
   return (
     <>

@@ -12,7 +12,7 @@
 
 use axum::{
 	Json,
-	extract::State,
+	extract::{FromRequest, Request, State, rejection::JsonRejection},
 	http::{HeaderMap, StatusCode},
 	response::{IntoResponse, Response},
 };
@@ -22,7 +22,7 @@ use domain::{
 	error::DomainError,
 	users::{Email, User, UserStatus, Username},
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::{
@@ -50,6 +50,23 @@ impl Refusal {
 impl IntoResponse for Refusal {
 	fn into_response(self) -> Response {
 		(self.0, Json(json!({ "error": self.1 }))).into_response()
+	}
+}
+
+/// A JSON request body, refused in the shape above rather than the extractor's plain text: a
+/// missing JSON content type is 415, a body over the limit 413, anything else that does not
+/// read 400 `invalid_request`.
+pub struct Body<T>(pub T);
+
+impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for Body<T> {
+	type Rejection = Refusal;
+
+	async fn from_request(request: Request, state: &S) -> Result<Self, Refusal> {
+		Json::from_request(request, state).await.map(|Json(body)| Self(body)).map_err(|rejection| match rejection {
+			JsonRejection::MissingJsonContentType(_) => Refusal(StatusCode::UNSUPPORTED_MEDIA_TYPE, "content_type"),
+			JsonRejection::BytesRejection(bytes) if bytes.status() == StatusCode::PAYLOAD_TOO_LARGE => Refusal(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+			_ => Refusal(StatusCode::BAD_REQUEST, "invalid_request"),
+		})
 	}
 }
 
@@ -265,7 +282,7 @@ pub struct CodeRequest {
 
 /// `POST /auth/code/request` — mail a sign-in code. Answers the same for an address no
 /// account holds: whether one does is decided only once the code proves the mailbox.
-pub async fn request_code(State(st): State<WebState>, headers: HeaderMap, ip: ClientIp, Json(body): Json<CodeRequest>) -> Result<Json<Value>, Refusal> {
+pub async fn request_code(State(st): State<WebState>, headers: HeaderMap, ip: ClientIp, Body(body): Body<CodeRequest>) -> Result<Json<Value>, Refusal> {
 	let st = &st.inner;
 	guard(st, &headers, &ip, Some(&body.turnstile_token)).await?;
 	let email = email(&body.email)?;
@@ -285,7 +302,7 @@ pub struct CodeVerify {
 
 /// `POST /auth/code/verify` — spend the code and sign in to the account the mailbox opens
 /// (`UserDirectoryRepository::resolve`), creating it when there is none.
-pub async fn verify_code(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Json(body): Json<CodeVerify>) -> Result<(CookieJar, Json<Value>), Refusal> {
+pub async fn verify_code(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Body(body): Body<CodeVerify>) -> Result<(CookieJar, Json<Value>), Refusal> {
 	let st = &st.inner;
 	guard(st, &headers, &ip, None).await?;
 	let email = email(&body.email)?;
@@ -328,7 +345,7 @@ pub struct VerificationRequest {
 /// `POST /auth/email/verify/request` — mail the signed-in account a code for its own
 /// address. A mail costs us, so a person must be behind it, as on `/auth/code/request`: a
 /// stolen session must not be a way to fill the owner's mailbox.
-pub async fn request_verification(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Json(body): Json<VerificationRequest>) -> Answered {
+pub async fn request_verification(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Body(body): Body<VerificationRequest>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, .. } = signed_in(st, &jar, &headers).await?;
 	let id = caller.id;
@@ -349,7 +366,7 @@ pub struct CodeOnly {
 }
 
 /// `POST /auth/email/verify/confirm` — spend it: the account's address is verified.
-pub async fn confirm_verification(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<CodeOnly>) -> Answered {
+pub async fn confirm_verification(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<CodeOnly>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, .. } = signed_in(st, &jar, &headers).await?;
 	let id = caller.id;
@@ -422,7 +439,7 @@ pub struct SignUpRequest {
 /// at once and working unverified. Refused `email_taken` when the address already backs a
 /// password or is verified on an account: that person signs in, with a code if they forgot.
 /// Saying so tells the caller an account exists, which a sign-up by email cannot avoid.
-pub async fn sign_up(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Json(body): Json<SignUpRequest>) -> Result<(CookieJar, Json<Value>), Refusal> {
+pub async fn sign_up(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Body(body): Body<SignUpRequest>) -> Result<(CookieJar, Json<Value>), Refusal> {
 	let st = &st.inner;
 	guard(st, &headers, &ip, Some(&body.turnstile_token)).await?;
 	let email = email(&body.email)?;
@@ -482,7 +499,7 @@ pub struct SignInRequest {
 /// `POST /auth/password/signin`. One refusal, `invalid_credentials`, for every handle and
 /// password that do not match — except a locked password, which says so: the dialog then
 /// offers a code, which the lock never blocks.
-pub async fn sign_in(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Json(body): Json<SignInRequest>) -> Result<(CookieJar, Json<Value>), Refusal> {
+pub async fn sign_in(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Body(body): Body<SignInRequest>) -> Result<(CookieJar, Json<Value>), Refusal> {
 	let st = &st.inner;
 	guard(st, &headers, &ip, Some(&body.turnstile_token)).await?;
 	let invalid = Refusal(StatusCode::UNAUTHORIZED, "invalid_credentials");
@@ -513,7 +530,7 @@ pub struct SetPassword {
 
 /// `POST /auth/password/set` — set or replace the password with a verification code
 /// mailed by `/auth/email/verify/request`. "Forgot password" is a code sign-in, then this.
-pub async fn set_password(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<SetPassword>) -> Answered {
+pub async fn set_password(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<SetPassword>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, .. } = signed_in_live(st, &jar, &headers).await?;
 	let id = caller.id;
@@ -537,7 +554,7 @@ pub struct SetUsername {
 }
 
 /// `POST /auth/username` — the signed-in account's chosen handle.
-pub async fn set_username(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<SetUsername>) -> Answered {
+pub async fn set_username(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<SetUsername>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, .. } = signed_in(st, &jar, &headers).await?;
 	let id = caller.id;

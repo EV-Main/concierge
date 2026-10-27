@@ -11,6 +11,12 @@ export const REAUTHENTICATED_EVENT = "ev:reauthenticated";
 /** The proof for the host's backend, opaque to the host; `expiresAt` in unix seconds. */
 export const STEPUP_PROOF_EVENT = "ev:stepup-proof";
 
+/**
+ * Between this plane's own elements on one page, never for the host: dispatched on
+ * `document` once the account's second factors changed, so another element showing them re-reads.
+ */
+export const SECOND_FACTORS_CHANGED = "concierge:second-factors-changed";
+
 export interface StepupProofDetail {
   proof: string;
   expiresAt: number;

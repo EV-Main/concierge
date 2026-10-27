@@ -35,7 +35,7 @@ use crate::{
 	web::{
 		WebState,
 		routes::{Caller, session_user},
-		sign_in::{Answered, Denied, Refusal, Signed, end_session, gate, internal, signed_in},
+		sign_in::{Answered, Body, Denied, Refusal, Signed, end_session, gate, internal, signed_in},
 	},
 };
 
@@ -155,7 +155,7 @@ pub struct ChannelChange {
 /// `POST /auth/notifications/settings/channel` — answers the whole snapshot. Both channels
 /// off is allowed: "stop contacting me" is a supported state. Not from a scope's host: a
 /// switch there would silence every other inbox too.
-pub async fn set_channel(State(st): State<WebState>, Query(query): Query<ViewQuery>, jar: CookieJar, headers: HeaderMap, Json(body): Json<ChannelChange>) -> Answered {
+pub async fn set_channel(State(st): State<WebState>, Query(query): Query<ViewQuery>, jar: CookieJar, headers: HeaderMap, Body(body): Body<ChannelChange>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed_in(st, &jar, &headers).await?;
 	let answer = async {
@@ -197,7 +197,7 @@ pub struct TopicChange {
 /// `POST /auth/notifications/settings/topic` — a topic the request's inbox offers; answers
 /// that inbox's whole snapshot. A topic of another inbox is as unknown as a made-up one;
 /// switching a required topic (or its mail copy) off is `409 required_topic`.
-pub async fn set_topic(State(st): State<WebState>, Query(query): Query<ViewQuery>, jar: CookieJar, headers: HeaderMap, Json(body): Json<TopicChange>) -> Answered {
+pub async fn set_topic(State(st): State<WebState>, Query(query): Query<ViewQuery>, jar: CookieJar, headers: HeaderMap, Body(body): Body<TopicChange>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed_in(st, &jar, &headers).await?;
 	let answer = async {

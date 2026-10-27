@@ -109,8 +109,10 @@ function tailwind(element, modules) {
 }
 
 function catalogueFor(modules) {
-  const files = new Set(modules);
-  const keys = new Set(extraction.entries.filter((entry) => files.has(path.resolve(ROOT, "src", entry.where.replace(/:\d+$/, "")))).map((entry) => entry.key));
+  // Looked up in every kept module's text, not by `entry.where`: `collect` keeps one call site
+  // per key, and a key rendered here may be filed under a module this bundle does not include.
+  const sources = modules.filter((file) => file.startsWith(path.join(ROOT, "src"))).map((file) => readFileSync(file, "utf8"));
+  const keys = new Set(extraction.entries.map((entry) => entry.key).filter((key) => sources.some((source) => source.includes(JSON.stringify(key)))));
   return Object.fromEntries(LOCALES.map((locale) => [locale, Object.fromEntries(Object.entries(translated[locale]).filter(([key]) => keys.has(key)))]));
 }
 

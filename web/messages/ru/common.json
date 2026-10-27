@@ -395,6 +395,10 @@
     "en": "New codes",
     "t": "Новые коды"
   },
+  "auth.secondFactor.codes.newConfirm": {
+    "en": "Your current recovery codes stop working as soon as the new set is made.",
+    "t": "Текущие коды восстановления перестанут работать, как только будет создан новый набор."
+  },
   "auth.secondFactor.codes.row": {
     "en": "Recovery codes",
     "t": "Коды восстановления"
@@ -550,6 +554,10 @@
   "auth.secondFactor.removeLast": {
     "en": "This is your only second factor. Without one, withdrawals are refused until you add a new one. Your recovery codes stop working too.",
     "t": "Это ваш единственный второй фактор. Без него вывод средств будет отклоняться, пока вы не добавите новый. Коды восстановления тоже перестанут работать."
+  },
+  "auth.secondFactor.removeOne": {
+    "en": "Remove {label}? Its codes stop working at once.",
+    "t": "Удалить {label}? Его коды сразу перестанут работать."
   },
   "auth.secondFactor.restart": {
     "en": "Start again",
@@ -850,6 +858,10 @@
   "ui.account": {
     "en": "Account",
     "t": "Аккаунт"
+  },
+  "ui.close": {
+    "en": "Close",
+    "t": "Закрыть"
   },
   "ui.email": {
     "en": "Email",

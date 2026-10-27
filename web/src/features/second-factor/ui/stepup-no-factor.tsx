@@ -5,6 +5,7 @@ import { useState, type ComponentType } from "react";
 
 import { platformAccountUrl } from "../../../shared/config/origin";
 import { useElement } from "../../../shared/element/element-context";
+import { SECOND_FACTORS_CHANGED } from "../../../shared/element/events";
 import { Enrolment, type ReauthSlotProps } from "./enrolment";
 
 /**
@@ -19,7 +20,14 @@ export function StepupNoFactor({ reauth, onReady }: { reauth: ComponentType<Reau
   if (enrolling) {
     return (
       <ul className="m-0 flex list-none flex-col p-0">
-        <Enrolment reauth={reauth} onEnrolled={onReady} onCancel={() => setEnrolling(false)} />
+        <Enrolment
+          reauth={reauth}
+          onEnrolled={() => {
+            document.dispatchEvent(new Event(SECOND_FACTORS_CHANGED));
+            onReady();
+          }}
+          onCancel={() => setEnrolling(false)}
+        />
       </ul>
     );
   }

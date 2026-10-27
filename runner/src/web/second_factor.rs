@@ -44,7 +44,7 @@ use crate::{
 	web::{
 		Inner, WebState, now_secs,
 		reauth::{signed, verified_address},
-		sign_in::{Answered, Refusal, Signed, end_session, internal, require_fresh},
+		sign_in::{Answered, Body, Refusal, Signed, end_session, internal, require_fresh},
 	},
 };
 
@@ -221,7 +221,7 @@ pub struct EnrolStart {
 
 /// `POST /auth/second-factor/enrol/start` — begin an enrolment: the offer (for an
 /// authenticator app, its `otpauth://` URI and secret) is shown once, here.
-pub async fn enrol_start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<EnrolStart>) -> Answered {
+pub async fn enrol_start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<EnrolStart>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let fresh_sign_in = require_fresh(&caller);
@@ -267,7 +267,7 @@ pub struct EnrolConfirm {
 
 /// `POST /auth/second-factor/enrol/confirm` — prove the new factor with its first answer.
 /// The account's first factor comes with its recovery codes, shown once, here.
-pub async fn enrol_confirm(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<EnrolConfirm>) -> Answered {
+pub async fn enrol_confirm(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<EnrolConfirm>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
@@ -372,7 +372,7 @@ pub struct VerifyBody {
 
 /// `POST /auth/second-factor/verify` — answer one factor of the ceremony. The session may
 /// then change the account's factors for [`FACTOR_FRESH_SECS`].
-pub async fn verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<VerifyBody>) -> Answered {
+pub async fn verify(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<VerifyBody>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
@@ -403,7 +403,7 @@ pub struct RemoveBody {
 
 /// `POST /auth/second-factor/remove` — the last factor takes the recovery codes with it,
 /// and the money plane then refuses what it asks a factor for until a new one is enrolled.
-pub async fn remove(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<RemoveBody>) -> Answered {
+pub async fn remove(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<RemoveBody>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let jar = caller.refreshed(st, jar);
@@ -457,7 +457,7 @@ pub struct RecoverBody {
 
 /// `POST /auth/second-factor/recover` — spend a recovery code: every factor and code goes,
 /// and every session of the account ends, this one included.
-pub async fn recover(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Json(body): Json<RecoverBody>) -> Answered {
+pub async fn recover(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Body(body): Body<RecoverBody>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = signed(st, &jar, &headers).await?;
 	let fresh_sign_in = require_fresh(&caller);

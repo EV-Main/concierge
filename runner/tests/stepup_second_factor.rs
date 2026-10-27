@@ -188,6 +188,23 @@ async fn wrong_answers_here_lock_the_account_everywhere() {
 	assert_eq!(refusal(&fx.prove(&mut who, &right).await), error(StatusCode::TOO_MANY_REQUESTS, "factor_locked"));
 }
 
+/// The account's guard is what bounds guessing; the page's request budget sits above it, so
+/// a reader who keeps trying is told the lock, not to slow down.
+#[tokio::test]
+async fn the_guard_locks_before_the_request_budget_runs_out() {
+	let fx = fixture!();
+	let mut who = fx.holder("su-budget").await;
+	let bad = wrong(&who.secret);
+	for _ in 0..5 {
+		assert_eq!(refusal(&fx.step_up(&mut who, INVEST, &HASH_A, &bad).await), error(StatusCode::BAD_REQUEST, "invalid_answer"));
+	}
+	let right = app_code(&who.secret, 1);
+	assert_eq!(
+		refusal(&fx.step_up(&mut who, INVEST, &HASH_A, &right).await),
+		error(StatusCode::TOO_MANY_REQUESTS, "factor_locked")
+	);
+}
+
 #[tokio::test]
 async fn a_ceremony_is_its_page_and_its_account_and_one_answer() {
 	let fx = fixture!();
