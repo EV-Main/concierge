@@ -436,6 +436,27 @@ async fn an_owner_removal_demotes_the_target_who_neither_votes_nor_vetoes() {
 	assert_eq!(remaining, 3);
 }
 
+/// The case the platform floor skips `concierge:*` proposals for (#196): at three owners
+/// the peer set of a removal is exactly one, so two honest owners can remove a bad third.
+/// A floor of two after the exclusions would make that owner unremovable.
+#[tokio::test]
+async fn a_fund_of_three_removes_its_bad_actor_with_one_voter() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	let target = owners[2];
+	fx.at(T0);
+
+	let opened = fx.open(owners[0], Decision::Remove, target).await.expect("three owners may spare one");
+	assert_eq!((opened.voters.len(), opened.threshold), (1, 1), "owners \\ {{opener, target}} is exactly one");
+
+	fx.carry(&owners[1..2], &opened.id).await;
+	fx.execute_at(T0 + 24 * HOUR).await;
+	assert_eq!(fx.row(target).await.0, Role::Investor);
+	assert_eq!(state(&fx.get(owners[0], &opened.id).await), ApprovalState::Executed);
+	let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE role = 'owner'").fetch_one(&fx.pool).await.unwrap();
+	assert_eq!(remaining, 2, "and the fund lands on two");
+}
+
 #[tokio::test]
 async fn any_other_owner_vetoes_a_removal() {
 	let Some(fx) = setup().await else { return };

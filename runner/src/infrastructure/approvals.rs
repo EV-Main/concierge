@@ -840,6 +840,9 @@ impl ApprovalRepository for PgApprovals {
 		// one owner must not decide another's money alone. The code word lets the proposer
 		// tell this refusal from the others: retrying without the token would put the
 		// initiator back on the roster, which is the one thing this refusal exists to stop.
+		// This plane's own `concierge:*` kinds are exempt: their opener and subject are proven
+		// and kept off by D23, and a floor of two here would leave a bad owner in a group of
+		// three unremovable — the one peer left is the whole roster (§5.2).
 		if roster.len() < before && new.proposer != approvals::OWN_NAMESPACE && deciders < PLATFORM_MIN_ROSTER {
 			return Err(DomainError::Precondition(format!(
 				"not_enough_owners_besides_initiator: not enough active owners besides the initiator — {PLATFORM_MIN_ROSTER} others must decide it; \

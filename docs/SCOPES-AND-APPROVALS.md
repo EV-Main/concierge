@@ -397,7 +397,8 @@ containment is never slower than the grant).
   with fewer than two owners, or when nobody besides the one who asked and the one it would
   seat is left to decide. ⚠️ For the owner's attention, kept as decided: with three owners,
   one opening a grant for another leaves a roster of one, so that grant is decided by a
-  single owner.
+  single owner. The same roster of one lets three owners remove a bad owner, and that is
+  why the floor of two after the exclusions binds only a service's proposal.
 - **A proven initiator of a money decision does not decide it** (D24(1)): a proposer may
   present, in metadata `x-ev-user-token`, an access token that `requested_by` holds. Which
   token depends on who proposes:
