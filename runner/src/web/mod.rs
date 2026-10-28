@@ -140,7 +140,7 @@ impl WebState {
 		kyc: KycDeps,
 		relying_parties: Option<Arc<RelyingParties>>,
 	) -> color_eyre::Result<Self> {
-		let stepup = sign_in.stepup.map(|deps| stepup::Stepup::new(deps, &public_origin)).transpose()?;
+		let stepup = sign_in.stepup.map(stepup::Stepup::new);
 		let second_factor = sign_in.second_factor.map(second_factor::SecondFactor::new);
 		Ok(Self {
 			inner: Arc::new(Inner {

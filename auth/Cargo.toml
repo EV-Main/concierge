@@ -1,6 +1,6 @@
 [package]
 name = "evconcierge_auth"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "The concierge plane's auth: the user/session AuthService skeleton plus the shared, server-only stateless verification flow imported by every downstream service repo for local JWKS verification. Wasm-unsafe by design (crypto backend + tonic)."
 license = "BlueOak-1.0.0"

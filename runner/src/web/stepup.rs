@@ -6,15 +6,15 @@
 //! it is `PUBLIC_ORIGIN`-only, and what it yields is a fresher session, which proves
 //! nothing about WHICH operation the person agreed to. Here a ceremony is opened for an
 //! `intent_hash` the bank computed, kept on THIS side with the account and the asking page,
-//! and a passkey assertion or a mailed code that closes it yields a proof for exactly that
-//! hash (`evconcierge_auth::stepup`). The session is not touched: `auth_time` stays, and no
-//! session cookie is set but the rotation a plain session read owes the browser.
+//! and an answer of one of the account's second factors that closes it yields a proof for
+//! exactly that hash (`evconcierge_auth::stepup`). The session is not touched: `auth_time`
+//! stays, and no session cookie is set but the rotation a plain session read owes the browser.
 //!
 //! The surface is closed three ways. Not mounted at all unless `STEPUP_PROOF_ORIGINS` names
 //! an origin. Answers only to those exact origins (`Origin`, never a pattern), from a
 //! request the browser itself marks `Sec-Fetch-Site: same-origin|same-site`, carrying JSON
 //! (which forces a preflight, the CORS layer's `Max-Age` 60). And it takes no password:
-//! the methods are a passkey and a mailed code, and nothing else parses.
+//! a second factor's answer is the only thing that parses.
 //!
 //! There is no CSRF token here, by necessity: the double-submit cookie is `__Host-` bound
 //! to `PUBLIC_ORIGIN`, which a script on another host can neither read nor set. The
@@ -39,36 +39,28 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 use color_eyre::eyre::{Context, bail, ensure};
 use domain::users::UserId;
-use evconcierge_auth::stepup::{self, Aal, legacy::StepupMethod, parse_intent_hash};
+use evconcierge_auth::stepup::{self, Aal, parse_intent_hash};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
-use webauthn_rs::{
-	Webauthn,
-	prelude::{Passkey, PasskeyAuthentication, PublicKeyCredential, Url},
-};
+use webauthn_rs::prelude::Url;
 
 use crate::{
-	infrastructure::email::templates::breaks_or_hides,
 	notification::RateLimiter,
 	ports::Attempt,
 	web::{
-		Inner, WebState, now_secs,
-		passkey::{base64url, expired, rejected},
-		reauth::{eligible_passkeys, verified_address},
-		routes::ClientIp,
-		second_factor,
-		sign_in::{Answered, Body, Halt, Refusal, Signed, code_refusal, human, internal, require_live, sent, signed_in_read},
+		Inner, WebState, now_secs, second_factor,
+		sign_in::{Answered, Body, Halt, Refusal, Signed, internal, require_live, signed_in_read},
 	},
 };
 
 /// A ceremony and the proof it yields live this long unless configured shorter. The same
 /// number is the proof's ceiling (`stepup::MAX_TTL_SECS`).
 pub const DEFAULT_TTL_SECS: u64 = stepup::MAX_TTL_SECS;
-/// How many ceremonies the account may open (and legacy answers give): a person confirms an
-/// operation once, perhaps twice with a typo.
+/// How many ceremonies the account may open: a person confirms an operation once, perhaps
+/// twice with a typo.
 const ATTEMPT_WINDOW_SECS: u64 = 300;
 const ATTEMPTS_PER_WINDOW: u32 = 10;
 /// Bounds the store whatever the rate; the oldest ceremony goes first.
@@ -76,8 +68,6 @@ const MAX_CEREMONIES: usize = 10_000;
 /// How many ceremonies one account may hold open. A page that opens them in a loop evicts
 /// its own oldest, never anyone else's.
 const MAX_OPEN_PER_USER: usize = 3;
-const MAX_SUMMARY_CHARS: usize = 240;
-const MAX_AGENT_CHARS: usize = 200;
 /// How long a browser may reuse a preflight. Short: a listing withdrawn from the flag
 /// should not outlive a deploy by a cached approval.
 const PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(60);
@@ -92,9 +82,8 @@ pub struct StepupDeps {
 
 /// Read and check `STEPUP_PROOF_ORIGINS`. Every entry is a bare origin, written the way a
 /// browser sends it, never a pattern. In production each must also be `https` and either
-/// `PUBLIC_ORIGIN` or a host under it — the passkey's relying party is `PUBLIC_ORIGIN`'s
-/// host, so an origin outside could not run a ceremony anyway, and listing one would only
-/// widen who may ask for a mail.
+/// `PUBLIC_ORIGIN` or a host under it — a page outside the site is `cross-site` to this
+/// one and fails `Sec-Fetch-Site` anyway, so listing one could only be a mistake.
 pub fn parse_origins(raw: &[String], public_origin: &str, production: bool) -> color_eyre::Result<Vec<String>> {
 	let public = Url::parse(public_origin).context("PUBLIC_ORIGIN is not a URL")?;
 	let public_host = public.host_str().ok_or_else(|| color_eyre::eyre::eyre!("PUBLIC_ORIGIN has no host"))?.to_owned();
@@ -128,43 +117,32 @@ pub fn parse_origins(raw: &[String], public_origin: &str, production: bool) -> c
 	Ok(origins)
 }
 
-enum Kind {
-	/// The account's second factors, each with what its kind holds until the answer.
-	Factor(Vec<second_factor::Pending>),
-	Passkey(Box<PasskeyAuthentication>),
-	Email,
-}
-
 struct Ceremony {
 	user: UserId,
 	intent_hash: [u8; 32],
 	/// The page that asked, from its `Origin` header. The second half must come from it.
 	origin: String,
 	born: Instant,
-	kind: Kind,
+	/// The account's second factors, each with what its kind holds until the answer.
+	pending: Vec<second_factor::Pending>,
 }
 
 /// The state behind the routes. Present only where the flag lists an origin.
 pub(super) struct Stepup {
 	origins: Vec<String>,
-	/// Relying party `PUBLIC_ORIGIN`'s host; the origins accepted are `PUBLIC_ORIGIN` and
-	/// the listed ones, exactly — not the scope registry, which is wider and moves.
-	webauthn: Webauthn,
 	ttl: Duration,
 	open: Mutex<HashMap<String, Ceremony>>,
 	attempts: RateLimiter,
 }
 
 impl Stepup {
-	pub(super) fn new(deps: StepupDeps, public_origin: &str) -> color_eyre::Result<Self> {
-		let webauthn = super::passkey::verifier(public_origin, deps.origins.iter().map(String::as_str))?;
-		Ok(Self {
+	pub(super) fn new(deps: StepupDeps) -> Self {
+		Self {
 			ttl: Duration::from_secs(deps.ttl_secs.clamp(1, stepup::MAX_TTL_SECS)),
 			origins: deps.origins,
-			webauthn,
 			open: Mutex::new(HashMap::new()),
 			attempts: RateLimiter::new(Duration::from_secs(ATTEMPT_WINDOW_SECS), ATTEMPTS_PER_WINDOW),
-		})
+		}
 	}
 
 	pub(super) fn cors(&self) -> CorsLayer {
@@ -181,17 +159,12 @@ impl Stepup {
 		self.ttl.as_secs()
 	}
 
-	/// Keep a new ceremony and name it. An account has one email ceremony at a time: the
-	/// code it mails supersedes the previous one, so an older ceremony would otherwise
-	/// accept a code that was mailed for a different operation.
+	/// Keep a new ceremony and name it.
 	async fn begin(&self, ceremony: Ceremony) -> (String, i64) {
 		let id = super::random_token(24);
 		let expires_at = now_secs() + self.ttl_secs() as i64;
 		let mut open = self.open.lock().await;
 		open.retain(|_, c| c.born.elapsed() <= self.ttl);
-		if matches!(ceremony.kind, Kind::Email) {
-			open.retain(|_, c| !(c.user == ceremony.user && matches!(c.kind, Kind::Email)));
-		}
 		let mut mine: Vec<(String, Instant)> = open.iter().filter(|(_, c)| c.user == ceremony.user).map(|(k, c)| (k.clone(), c.born)).collect();
 		if mine.len() >= MAX_OPEN_PER_USER {
 			mine.sort_by_key(|(_, born)| *born);
@@ -213,23 +186,6 @@ impl Stepup {
 	async fn take(&self, id: &str) -> Option<Ceremony> {
 		let ceremony = self.open.lock().await.remove(id)?;
 		(ceremony.born.elapsed() <= self.ttl).then_some(ceremony)
-	}
-
-	/// An email ceremony, left in place: a mistyped code is not the end of it (the code's own
-	/// five guesses are).
-	async fn email(&self, id: &str) -> Option<(UserId, [u8; 32], String)> {
-		let mut open = self.open.lock().await;
-		let alive = open.get(id).is_some_and(|c| c.born.elapsed() <= self.ttl);
-		if !alive {
-			open.remove(id);
-			return None;
-		}
-		let ceremony = open.get(id)?;
-		matches!(ceremony.kind, Kind::Email).then(|| (ceremony.user, ceremony.intent_hash, ceremony.origin.clone()))
-	}
-
-	async fn discard(&self, id: &str) {
-		self.open.lock().await.remove(id);
 	}
 }
 
@@ -308,279 +264,77 @@ pub struct OptionsBody {
 	/// 64 lowercase hex characters: the bank's hash of the operation it stored.
 	intent_hash: String,
 	/// The least assurance the operation asks for: the account's second factors that give
-	/// at least this much are offered. Never together with `method`.
-	#[serde(default)]
-	min_aal: Option<u8>,
-	/// The 0.1 step-up: `passkey` or `email_code`. Read as text so that any other word, a
-	/// password included, is told `invalid_method` rather than a parser's prose.
-	#[serde(default)]
-	method: Option<String>,
-	/// For `email_code` only: what the page says the operation is, quoted in the mail as the
-	/// page's own words.
-	#[serde(default)]
-	summary: Option<String>,
-	#[serde(default)]
-	turnstile_token: String,
+	/// at least this much are offered.
+	min_aal: u8,
 }
 
 /// `POST /auth/stepup/options` — open a ceremony for one operation.
-pub async fn options(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, headers: HeaderMap, ip: ClientIp, Body(body): Body<OptionsBody>) -> Answered {
+pub async fn options(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, Body(body): Body<OptionsBody>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = session(st, &jar).await?;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
 		let sp = st.stepup.as_ref().ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "not_found"))?;
 		let intent_hash = parse_intent_hash(&body.intent_hash).ok_or_else(|| invalid("invalid_intent"))?;
-		let method = match (body.min_aal, body.method.as_deref()) {
-			(Some(level), None) if body.summary.is_none() && body.turnstile_token.is_empty() => {
-				let min_aal = Aal::named(level).ok_or_else(|| invalid("invalid_aal"))?;
-				spend(sp, user.id())?;
-				return begin_factor(st, sp, user.id(), intent_hash, origin, min_aal).await;
-			}
-			(None, Some("passkey")) => StepupMethod::Passkey,
-			(None, Some("email_code")) => StepupMethod::EmailCode,
-			(None, Some(_)) => return Err(invalid("invalid_method")),
-			_ => return Err(invalid("invalid_request")),
-		};
+		let min_aal = Aal::named(body.min_aal).ok_or_else(|| invalid("invalid_aal"))?;
 		spend(sp, user.id())?;
-		match method {
-			StepupMethod::Passkey => begin_passkey(st, sp, &jar, user.id(), intent_hash, origin).await,
-			StepupMethod::EmailCode => {
-				verified_address(&user)?;
-				let summary = clean_summary(body.summary.as_deref())?;
-				human(st, &ip, &body.turnstile_token).await?;
-				let now = now_secs();
-				let context = json!({
-					"origin": origin,
-					"summary": summary,
-					"reference": &body.intent_hash[..8],
-					"client_ip": ip.0,
-					"user_agent": headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or_default().chars().take(MAX_AGENT_CHARS).collect::<String>(),
-					"requested_at": now,
-				});
-				let issue = st
-					.credentials
-					.issue_stepup_code(user.id(), intent_hash, context, sp.ttl_secs() as i64, now)
-					.await
-					.map_err(|e| internal("stepup: code not issued", e))?;
-				// Answers Ok only for a code that was queued; every other issue is a refusal.
-				sent(st, issue).await.map(|_| ())?;
-				let (ceremony_id, expires_at) = sp
-					.begin(Ceremony {
-						user: user.id(),
-						intent_hash,
-						origin,
-						born: Instant::now(),
-						kind: Kind::Email,
-					})
-					.await;
-				Ok(Json(json!({ "ceremony_id": ceremony_id, "method": "email_code", "expires_at": expires_at })))
-			}
-		}
+		let second_factor::Challenges { offered, pending } = second_factor::challenge(st, user.id(), min_aal).await?;
+		let (ceremony_id, expires_at) = sp
+			.begin(Ceremony {
+				user: user.id(),
+				intent_hash,
+				origin,
+				born: Instant::now(),
+				pending,
+			})
+			.await;
+		Ok(Json(json!({ "ceremony_id": ceremony_id, "factors": offered, "expires_at": expires_at })))
 	}
 	.await;
 	Ok((jar, answer))
-}
-
-/// What the page says the operation is, kept to one short line of printable text: it is
-/// quoted in a mail, and the mail's own lines must not be forgeable through it.
-fn clean_summary(raw: Option<&str>) -> Result<String, Refusal> {
-	let summary = raw.map(str::trim).unwrap_or_default();
-	if summary.is_empty() || summary.chars().count() > MAX_SUMMARY_CHARS || summary.chars().any(breaks_or_hides) {
-		return Err(invalid("invalid_summary"));
-	}
-	Ok(summary.to_owned())
-}
-
-async fn begin_factor(st: &Inner, sp: &Stepup, user: UserId, intent_hash: [u8; 32], origin: String, min_aal: Aal) -> Result<Json<Value>, Refusal> {
-	let second_factor::Challenges { offered, pending } = second_factor::challenge(st, user, min_aal).await?;
-	let (ceremony_id, expires_at) = sp
-		.begin(Ceremony {
-			user,
-			intent_hash,
-			origin,
-			born: Instant::now(),
-			kind: Kind::Factor(pending),
-		})
-		.await;
-	Ok(Json(json!({ "ceremony_id": ceremony_id, "factors": offered, "expires_at": expires_at })))
-}
-
-async fn begin_passkey(st: &Inner, sp: &Stepup, jar: &CookieJar, user: UserId, intent_hash: [u8; 32], origin: String) -> Result<Json<Value>, Refusal> {
-	let rows = eligible_passkeys(st, jar, user).await?;
-	let passkeys = rows
-		.into_iter()
-		.map(|row| serde_json::from_value::<Passkey>(row.passkey))
-		.collect::<Result<Vec<_>, _>>()
-		.map_err(|e| internal("stepup: a stored passkey does not parse", e))?;
-	if passkeys.is_empty() {
-		return Err(invalid("no_passkey"));
-	}
-	let (options, state) = sp.webauthn.start_passkey_authentication(&passkeys).map_err(|e| internal("stepup: assertion not begun", e))?;
-	let (ceremony_id, expires_at) = sp
-		.begin(Ceremony {
-			user,
-			intent_hash,
-			origin,
-			born: Instant::now(),
-			kind: Kind::Passkey(Box::new(state)),
-		})
-		.await;
-	Ok(Json(json!({ "ceremony_id": ceremony_id, "method": "passkey", "options": options, "expires_at": expires_at })))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifyBody {
 	ceremony_id: String,
-	/// The factor answered, for a second-factor ceremony.
-	#[serde(default)]
-	factor: Option<Uuid>,
-	/// The factor's answer, or the authenticator's assertion for a passkey ceremony.
-	#[serde(default)]
-	response: Option<Value>,
-	/// The mailed code, for an email ceremony.
-	#[serde(default)]
-	code: Option<String>,
+	/// The factor answered.
+	factor: Uuid,
+	/// The factor's answer, in its kind's shape.
+	response: Value,
 }
 
 /// `POST /auth/stepup/verify` — close the ceremony and answer the proof for its operation.
+/// Not charged: an answer needs a ceremony `options` was charged for, and the account's guard
+/// is what bounds the guesses — a budget spent here would end them before it does.
 pub async fn verify(State(st): State<WebState>, Extension(Asked(origin)): Extension<Asked>, jar: CookieJar, Body(body): Body<VerifyBody>) -> Answered {
 	let st = &st.inner;
 	let Signed { caller, user } = session(st, &jar).await?;
 	let jar = caller.refreshed(st, jar);
 	let answer = async {
 		let sp = st.stepup.as_ref().ok_or_else(|| Refusal::new(StatusCode::NOT_FOUND, "not_found"))?;
-		match (body.factor, body.response, body.code) {
-			// Not charged: an answer needs a ceremony `options` was charged for, and the account's
-			// guard is what bounds the guesses — a budget spent here would end them before it does.
-			(Some(factor), Some(response), None) => verify_factor(st, sp, user.id(), &origin, &body.ceremony_id, factor, response).await,
-			(None, Some(response), None) => {
-				spend(sp, user.id())?;
-				let credential: PublicKeyCredential = serde_json::from_value(response).map_err(|_| invalid("invalid_request"))?;
-				verify_passkey(st, sp, &jar, user.id(), &origin, &body.ceremony_id, &credential).await
+		let user = user.id();
+		let lapsed = || invalid("ceremony_expired");
+		let ceremony = sp.take(&body.ceremony_id).await.ok_or_else(lapsed)?;
+		if ceremony.user != user || ceremony.origin != origin {
+			return Err(lapsed());
+		}
+		let (_, kind, pending) = ceremony.pending.into_iter().find(|(id, ..)| *id == body.factor).ok_or_else(lapsed)?;
+		match second_factor::answer(st, user, body.factor, pending, body.response).await? {
+			Attempt::Accepted(()) => {
+				let aal = kind.aal();
+				let minted = st
+					.auth
+					.mint_stepup_proof(&user.to_string(), &ceremony.intent_hash, aal, &ceremony.origin, sp.ttl_secs())
+					.map_err(|e| internal("stepup: proof not minted", e))?;
+				tracing::info!(%user, origin = ceremony.origin, aal = aal.level(), jti = %minted.jti, "step-up proof issued");
+				Ok(Json(json!({ "proof": minted.token, "aal": aal.level(), "expires_at": minted.exp })))
 			}
-			(None, None, Some(code)) => {
-				spend(sp, user.id())?;
-				verify_code(st, sp, user.id(), &origin, &body.ceremony_id, &code).await
-			}
-			_ => Err(invalid("invalid_request")),
+			other => Err(second_factor::refused(&other)),
 		}
 	}
 	.await;
 	Ok((jar, answer))
-}
-
-async fn verify_factor(st: &Inner, sp: &Stepup, user: UserId, origin: &str, ceremony_id: &str, factor: Uuid, response: Value) -> Result<Json<Value>, Refusal> {
-	let lapsed = || invalid("ceremony_expired");
-	let ceremony = sp.take(ceremony_id).await.ok_or_else(lapsed)?;
-	let Kind::Factor(pending) = ceremony.kind else {
-		return Err(lapsed());
-	};
-	if ceremony.user != user || ceremony.origin != origin {
-		return Err(lapsed());
-	}
-	let (_, kind, pending) = pending.into_iter().find(|(id, ..)| *id == factor).ok_or_else(lapsed)?;
-	match second_factor::answer(st, user, factor, pending, response).await? {
-		Attempt::Accepted(()) => {
-			let aal = kind.aal();
-			let minted = st
-				.auth
-				.mint_stepup_proof(&user.to_string(), &ceremony.intent_hash, aal, &ceremony.origin, sp.ttl_secs())
-				.map_err(|e| internal("stepup: proof not minted", e))?;
-			tracing::info!(%user, origin = ceremony.origin, aal = aal.level(), jti = %minted.jti, "step-up proof issued");
-			Ok(Json(json!({ "proof": minted.token, "aal": aal.level(), "expires_at": minted.exp })))
-		}
-		other => Err(second_factor::refused(&other)),
-	}
-}
-
-async fn verify_passkey(st: &Inner, sp: &Stepup, jar: &CookieJar, user: UserId, origin: &str, ceremony_id: &str, credential: &PublicKeyCredential) -> Result<Json<Value>, Refusal> {
-	let ceremony = sp.take(ceremony_id).await.ok_or_else(expired)?;
-	let Kind::Passkey(state) = ceremony.kind else {
-		return Err(expired());
-	};
-	// The ceremony is the account's and the page's that began it; neither a sibling page nor
-	// another account of the same browser can finish it.
-	if ceremony.user != user || ceremony.origin != origin {
-		return Err(expired());
-	}
-	assert_made_on(credential, &ceremony.origin)?;
-	let result = sp.webauthn.finish_passkey_authentication(credential, &state).map_err(|e| {
-		tracing::info!(error = %e, "stepup: assertion refused");
-		rejected()
-	})?;
-	let credential_id = base64url(result.cred_id());
-	// Checked again here, not only when the ceremony began: a key planted between the two
-	// must not count (the rule `reauth` keeps).
-	let row = eligible_passkeys(st, jar, user)
-		.await?
-		.into_iter()
-		.find(|row| row.credential_id == credential_id)
-		.ok_or_else(rejected)?;
-	let mut passkey: Passkey = serde_json::from_value(row.passkey).map_err(|e| internal("stepup: a stored passkey does not parse", e))?;
-	passkey.update_credential(&result);
-	let updated = serde_json::to_value(&passkey).map_err(|e| internal("stepup: passkey not serialized", e))?;
-	st.credentials
-		.passkey_used(&credential_id, updated, now_secs())
-		.await
-		.map_err(|e| internal("stepup: passkey use not recorded", e))?;
-	proof(st, sp, user, &ceremony.intent_hash, &ceremony.origin, StepupMethod::Passkey)
-}
-
-/// The assertion's own `clientDataJSON` names the page it was made on. The verifier accepts
-/// any listed origin, so without this a page could finish a ceremony with an assertion made
-/// on another listed page; and an assertion made inside a cross-origin frame is refused.
-fn assert_made_on(credential: &PublicKeyCredential, origin: &str) -> Result<(), Refusal> {
-	let client_data: Value = serde_json::from_slice(credential.response.client_data_json.as_ref()).map_err(|_| rejected())?;
-	// Compared as origins, as the verifier does: the software authenticator the tests drive
-	// writes the URL with a trailing slash that no browser does.
-	let same_page = client_data
-		.get("origin")
-		.and_then(Value::as_str)
-		.and_then(|claimed| Url::parse(claimed).ok())
-		.is_some_and(|claimed| claimed.origin().ascii_serialization() == origin);
-	let assertion = client_data.get("type").and_then(Value::as_str) == Some("webauthn.get");
-	let framed = client_data.get("crossOrigin").and_then(Value::as_bool).unwrap_or(false);
-	match same_page && assertion && !framed {
-		true => Ok(()),
-		false => Err(rejected()),
-	}
-}
-
-async fn verify_code(st: &Inner, sp: &Stepup, user: UserId, origin: &str, ceremony_id: &str, code: &str) -> Result<Json<Value>, Refusal> {
-	let (owner, intent_hash, asked_from) = sp.email(ceremony_id).await.ok_or_else(expired)?;
-	if owner != user || asked_from != origin {
-		return Err(expired());
-	}
-	match st
-		.credentials
-		.redeem_stepup_code(user, intent_hash, code, now_secs())
-		.await
-		.map_err(|e| internal("stepup: code not redeemed", e))?
-	{
-		Ok(()) => {
-			sp.discard(ceremony_id).await;
-			proof(st, sp, user, &intent_hash, &asked_from, StepupMethod::EmailCode)
-		}
-		Err(refusal) => {
-			use crate::ports::CodeRefusal;
-			// A burned or lapsed code leaves nothing for the ceremony to wait for.
-			if matches!(refusal, CodeRefusal::Exhausted | CodeRefusal::Expired | CodeRefusal::Missing) {
-				sp.discard(ceremony_id).await;
-			}
-			Err(code_refusal(refusal))
-		}
-	}
-}
-
-fn proof(st: &Inner, sp: &Stepup, user: UserId, intent_hash: &[u8; 32], origin: &str, method: StepupMethod) -> Result<Json<Value>, Refusal> {
-	let minted = st
-		.auth
-		.mint_method_stepup_proof(&user.to_string(), intent_hash, method, origin, sp.ttl_secs())
-		.map_err(|e| internal("stepup: proof not minted", e))?;
-	tracing::info!(%user, origin, method = method.as_str(), jti = %minted.jti, "step-up proof issued");
-	Ok(Json(json!({ "proof": minted.token, "method": method.as_str(), "expires_at": minted.exp })))
 }
 
 #[cfg(test)]
@@ -632,14 +386,6 @@ mod tests {
 			"https://evinvest.ltd.evil.example",
 		] {
 			assert!(parse(&[bad], false).is_err(), "{bad:?}");
-		}
-	}
-
-	#[test]
-	fn a_summary_is_one_short_printable_line() {
-		assert!(clean_summary(Some("Send 5 USDT to TXyz")).is_ok());
-		for bad in [None, Some(""), Some("   "), Some("a\nb"), Some("a\u{202e}b"), Some(&"x".repeat(MAX_SUMMARY_CHARS + 1))] {
-			assert!(clean_summary(bad).is_err(), "{bad:?}");
 		}
 	}
 

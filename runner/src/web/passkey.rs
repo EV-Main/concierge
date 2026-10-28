@@ -299,14 +299,4 @@ mod tests {
 		assert!(!asserts_from(&webauthn, "https://rogue.evinvest.ltd"), "an unregistered subdomain runs no ceremony");
 		assert!(!asserts_from(&webauthn, "https://elsewhere.example"), "an origin outside the relying party is never added");
 	}
-
-	#[test]
-	fn the_step_up_verifier_takes_the_listed_hosts_and_no_sibling() {
-		// Built as `web::stepup` builds it: the public origin and the flag's origins.
-		let webauthn = verifier("https://evinvest.ltd", ["https://sa.evinvest.ltd", "https://invest.evinvest.ltd"].into_iter()).unwrap();
-		assert!(asserts_from(&webauthn, "https://sa.evinvest.ltd"));
-		assert!(asserts_from(&webauthn, "https://invest.evinvest.ltd"));
-		assert!(!asserts_from(&webauthn, "https://rogue.evinvest.ltd"));
-		assert!(!asserts_from(&webauthn, "https://evinvest.ltd.evil.example"));
-	}
 }
