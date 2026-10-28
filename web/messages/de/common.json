@@ -415,14 +415,6 @@
     "en": "Your recovery codes",
     "t": "Ihre Wiederherstellungscodes"
   },
-  "auth.secondFactor.confirm": {
-    "en": "Turn on",
-    "t": "Aktivieren"
-  },
-  "auth.secondFactor.continue": {
-    "en": "Continue",
-    "t": "Weiter"
-  },
   "auth.secondFactor.copied": {
     "en": "Copied",
     "t": "Kopiert"
@@ -438,6 +430,38 @@
   "auth.secondFactor.ended": {
     "en": "Your second factors were removed and every session of your account was signed out, this one included. Sign in again, then add a new authenticator.",
     "t": "Ihre zweiten Faktoren wurden entfernt und alle Sitzungen Ihres Kontos abgemeldet, auch diese. Melden Sie sich erneut an und fügen Sie dann einen neuen Authenticator hinzu."
+  },
+  "auth.secondFactor.enrol.cantScan": {
+    "en": "Can't scan it? Enter a setup key instead",
+    "t": "Scannen klappt nicht? Geben Sie stattdessen einen Einrichtungsschlüssel ein"
+  },
+  "auth.secondFactor.enrol.code": {
+    "en": "The app now shows a 6-digit code for EV Investment. It changes every 30 seconds.",
+    "t": "Die App zeigt jetzt einen 6-stelligen Code für EV Investment. Er ändert sich alle 30 Sekunden."
+  },
+  "auth.secondFactor.enrol.codeTitle": {
+    "en": "Enter the code from the app",
+    "t": "Code aus der App eingeben"
+  },
+  "auth.secondFactor.enrol.keyHint": {
+    "en": "In the app, choose to enter a key, and type or paste this one. It is time-based.",
+    "t": "Wählen Sie in der App die Eingabe eines Schlüssels und tippen oder fügen Sie diesen ein. Er ist zeitbasiert."
+  },
+  "auth.secondFactor.enrol.openApp": {
+    "en": "Open in authenticator app",
+    "t": "In der Authenticator-App öffnen"
+  },
+  "auth.secondFactor.enrol.scan": {
+    "en": "Open an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password, Authy or any other) and scan this code.",
+    "t": "Öffnen Sie eine Authenticator-App (Google Authenticator, Microsoft Authenticator, 1Password, Authy oder eine andere) und scannen Sie diesen Code."
+  },
+  "auth.secondFactor.enrol.scanTitle": {
+    "en": "Scan the QR code",
+    "t": "QR-Code scannen"
+  },
+  "auth.secondFactor.enrol.title": {
+    "en": "Set up an authenticator app",
+    "t": "Authenticator-App einrichten"
   },
   "auth.secondFactor.err.ceremonyExpired": {
     "en": "That took too long. Enter a new code.",
@@ -495,17 +519,9 @@
     "en": "That authenticator is no longer on your account. Reload the page.",
     "t": "Dieser Authenticator ist nicht mehr in Ihrem Konto. Laden Sie die Seite neu."
   },
-  "auth.secondFactor.key": {
-    "en": "Setup key",
-    "t": "Einrichtungsschlüssel"
-  },
   "auth.secondFactor.kind.totp": {
     "en": "Authenticator app",
     "t": "Authenticator-App"
-  },
-  "auth.secondFactor.labelField": {
-    "en": "Name, to tell it apart later",
-    "t": "Name, um ihn später zu unterscheiden"
   },
   "auth.secondFactor.lastUsed": {
     "en": "last used {date}",
@@ -562,10 +578,6 @@
   "auth.secondFactor.restart": {
     "en": "Start again",
     "t": "Neu beginnen"
-  },
-  "auth.secondFactor.scan": {
-    "en": "Scan this code with your authenticator app, or type the key into it. Then enter the 6-digit code it shows.",
-    "t": "Scannen Sie diesen Code mit Ihrer Authenticator-App oder geben Sie den Schlüssel dort ein. Geben Sie dann den 6-stelligen Code ein, den sie anzeigt."
   },
   "auth.secondFactor.signInAgain": {
     "en": "Sign in again",
