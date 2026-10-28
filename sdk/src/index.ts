@@ -23,6 +23,9 @@ export {
 } from './elements';
 export type { ConciergeElement, ConciergeRegistryOptions } from './elements';
 
+export { ACCOUNT_SECTIONS, SECTION_EVENT } from './account';
+export type { AccountSection } from './account';
+
 export { fetchSession, parseSession, SESSION_URL } from './session';
 export type { Session, SessionUser } from './session';
 
