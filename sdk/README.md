@@ -181,7 +181,13 @@ fires per opening. `StepupDialog` calls `onProof` before `onOpenChange(false)`.
 `account` and `chip` are entries taken the same way (`'account'`, `'accountChip'`).
 
 ```tsx
-<AccountPage scriptUrl={account.scriptUrl} onNavigate={href => (router.push(href), true)} onSignOut={signOut} />
+<AccountPage
+  scriptUrl={account.scriptUrl}
+  section={sectionFromUrl} // `?section=` — concierge's own links to /admin/account use it
+  onSection={s => router.replace(`/account?section=${s}`)}
+  onNavigate={href => (router.push(href), true)}
+  onSignOut={signOut}
+/>
 
 <AccountChip
   scriptUrl={chip.scriptUrl}

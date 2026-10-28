@@ -326,3 +326,36 @@ describe('AccountPage events', () => {
     expect(assign).not.toHaveBeenCalled();
   });
 });
+
+describe('AccountPage section', () => {
+  function switchTab(target: Element | null, detail: unknown): void {
+    target?.dispatchEvent(new CustomEvent('ev:section', { bubbles: true, composed: true, detail }));
+  }
+
+  it('should_show_the_section_the_host_gives', async () => {
+    await render(<AccountPage scriptUrl="/auth/mfe/account.js" section="security" />);
+
+    expect(container.querySelector(PAGE)?.getAttribute('data-section')).toBe('security');
+  });
+
+  it('should_hand_a_switched_tab_to_onSection', async () => {
+    const onSection = vi.fn();
+    await render(<AccountPage scriptUrl="/auth/mfe/account.js" onSection={onSection} />);
+
+    switchTab(container.querySelector(PAGE), { section: 'notifications' });
+
+    expect(onSection).toHaveBeenCalledWith('notifications');
+  });
+
+  it.each([
+    ['unknown', { section: 'billing' }],
+    ['missing', null],
+  ])('should_not_call_onSection_for_an_%s_section', async (_label, detail) => {
+    const onSection = vi.fn();
+    await render(<AccountPage scriptUrl="/auth/mfe/account.js" onSection={onSection} />);
+
+    switchTab(container.querySelector(PAGE), detail);
+
+    expect(onSection).not.toHaveBeenCalled();
+  });
+});

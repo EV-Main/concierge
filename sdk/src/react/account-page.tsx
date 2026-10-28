@@ -2,12 +2,16 @@ import { API_VERSION, NAVIGATE_EVENT, SIGNOUT_EVENT } from '@evinvest/mfe';
 import { navigateListener, RemoteElement, type NavigateHandler } from '@evinvest/mfe/react';
 import type { ReactNode } from 'react';
 
-import { ACCOUNT_TAG } from '../index';
+import { ACCOUNT_SECTIONS, ACCOUNT_TAG, SECTION_EVENT, type AccountSection } from '../index';
 import { signOutListener, type SignOutHandler } from './sign-out-listener';
 
 export interface AccountPageProps {
   /** Bundle URL from the concierge registry (`conciergeEntry(entries, 'account')`). */
   scriptUrl: string;
+  /** The tab shown; absent, the first. Give it from the host's URL so a link opens that tab. */
+  section?: AccountSection;
+  /** The reader switched tabs; write it back to the host's URL. */
+  onSection?: (section: AccountSection) => void;
   onNavigate?: NavigateHandler;
   /** Sign out was picked; end the host's own session. Awaited when it returns a promise. */
   onSignOut?: SignOutHandler;
@@ -27,10 +31,12 @@ export interface AccountPageProps {
 /**
  * The concierge account page — profile, security, notifications — for the
  * host's `/account` route. The element reads and writes everything itself on
- * evinvest.ltd; the host only routes its links and hears sign-out.
+ * evinvest.ltd; the host only routes its links, keeps the tab and hears sign-out.
  */
 export function AccountPage({
   scriptUrl,
+  section,
+  onSection,
   onNavigate,
   onSignOut,
   platformSignOut = true,
@@ -44,7 +50,12 @@ export function AccountPage({
       scriptUrl={scriptUrl}
       minApiVersion={minApiVersion}
       {...(className === undefined ? {} : { className })}
+      attributes={{ 'data-section': section }}
       events={{
+        [SECTION_EVENT]: event => {
+          const next = ACCOUNT_SECTIONS.find(s => s === (event.detail as { section?: unknown } | null)?.section);
+          if (next) onSection?.(next); // a detail from a bundle the host does not build: an unknown tab is dropped, as navigateListener drops a bad href
+        },
         [NAVIGATE_EVENT]: navigateListener(onNavigate),
         [SIGNOUT_EVENT]: signOutListener(onSignOut, platformSignOut),
       }}
