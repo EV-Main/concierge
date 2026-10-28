@@ -415,14 +415,6 @@
     "en": "Your recovery codes",
     "t": "Mã khôi phục của bạn"
   },
-  "auth.secondFactor.confirm": {
-    "en": "Turn on",
-    "t": "Bật"
-  },
-  "auth.secondFactor.continue": {
-    "en": "Continue",
-    "t": "Tiếp tục"
-  },
   "auth.secondFactor.copied": {
     "en": "Copied",
     "t": "Đã sao chép"
@@ -438,6 +430,38 @@
   "auth.secondFactor.ended": {
     "en": "Your second factors were removed and every session of your account was signed out, this one included. Sign in again, then add a new authenticator.",
     "t": "Các yếu tố thứ hai của bạn đã bị xóa và mọi phiên của tài khoản đã được đăng xuất, kể cả phiên này. Hãy đăng nhập lại, rồi thêm ứng dụng xác thực mới."
+  },
+  "auth.secondFactor.enrol.cantScan": {
+    "en": "Can't scan it? Enter a setup key instead",
+    "t": "Không quét được? Hãy nhập khóa thiết lập"
+  },
+  "auth.secondFactor.enrol.code": {
+    "en": "The app now shows a 6-digit code for EV Investment. It changes every 30 seconds.",
+    "t": "Ứng dụng sẽ hiển thị mã 6 chữ số cho EV Investment. Mã thay đổi sau mỗi 30 giây."
+  },
+  "auth.secondFactor.enrol.codeTitle": {
+    "en": "Enter the code from the app",
+    "t": "Nhập mã từ ứng dụng"
+  },
+  "auth.secondFactor.enrol.keyHint": {
+    "en": "In the app, choose to enter a key, and type or paste this one. It is time-based.",
+    "t": "Trong ứng dụng, chọn nhập khóa rồi gõ hoặc dán khóa này. Khóa dựa trên thời gian."
+  },
+  "auth.secondFactor.enrol.openApp": {
+    "en": "Open in authenticator app",
+    "t": "Mở trong ứng dụng xác thực"
+  },
+  "auth.secondFactor.enrol.scan": {
+    "en": "Open an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password, Authy or any other) and scan this code.",
+    "t": "Mở một ứng dụng xác thực (Google Authenticator, Microsoft Authenticator, 1Password, Authy hoặc ứng dụng khác) và quét mã này."
+  },
+  "auth.secondFactor.enrol.scanTitle": {
+    "en": "Scan the QR code",
+    "t": "Quét mã QR"
+  },
+  "auth.secondFactor.enrol.title": {
+    "en": "Set up an authenticator app",
+    "t": "Thiết lập ứng dụng xác thực"
   },
   "auth.secondFactor.err.ceremonyExpired": {
     "en": "That took too long. Enter a new code.",
@@ -495,17 +519,9 @@
     "en": "That authenticator is no longer on your account. Reload the page.",
     "t": "Ứng dụng xác thực này không còn trong tài khoản của bạn. Hãy tải lại trang."
   },
-  "auth.secondFactor.key": {
-    "en": "Setup key",
-    "t": "Khóa thiết lập"
-  },
   "auth.secondFactor.kind.totp": {
     "en": "Authenticator app",
     "t": "Ứng dụng xác thực"
-  },
-  "auth.secondFactor.labelField": {
-    "en": "Name, to tell it apart later",
-    "t": "Tên, để phân biệt về sau"
   },
   "auth.secondFactor.lastUsed": {
     "en": "last used {date}",
@@ -562,10 +578,6 @@
   "auth.secondFactor.restart": {
     "en": "Start again",
     "t": "Bắt đầu lại"
-  },
-  "auth.secondFactor.scan": {
-    "en": "Scan this code with your authenticator app, or type the key into it. Then enter the 6-digit code it shows.",
-    "t": "Quét mã này bằng ứng dụng xác thực, hoặc nhập khóa vào ứng dụng. Sau đó nhập mã 6 chữ số mà ứng dụng hiển thị."
   },
   "auth.secondFactor.signInAgain": {
     "en": "Sign in again",

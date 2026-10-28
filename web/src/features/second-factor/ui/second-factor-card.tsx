@@ -1,7 +1,7 @@
 import { useLocale, useT } from "@evinvest/i18n/react";
 import { dispatchSignOut } from "@evinvest/mfe";
-import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, ListRow, ListRows } from "@evinvest/uikit";
-import { useEffect, useState, type ComponentType } from "react";
+import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Dialog, DialogContent, DialogHeader, DialogTitle, ListRow, ListRows } from "@evinvest/uikit";
+import { useEffect, useId, useState, type ComponentType } from "react";
 
 import { useElement } from "../../../shared/element/element-context";
 import { SECOND_FACTORS_CHANGED } from "../../../shared/element/events";
@@ -33,6 +33,7 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
   const [revision, setRevision] = useState(0);
   const [panel, setPanel] = useState<Panel>(null);
   const gate = useGuardedAct();
+  const enrolTitle = useId();
   const locked = gate.busy || gate.stage !== "idle";
 
   useEffect(() => {
@@ -121,7 +122,7 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
                   key={factor.id}
                   label={factor.label}
                   description={[
-                    kindName(t, factor.kind),
+                    ...(factor.label === kindName(t, factor.kind) ? [] : [kindName(t, factor.kind)]),
                     t("auth.secondFactor.added", "added {date}", { date: dateOf(factor.createdAt) }),
                     factor.lastUsedAt === null ? t("auth.secondFactor.neverUsed", "never used") : t("auth.secondFactor.lastUsed", "last used {date}", { date: dateOf(factor.lastUsedAt) }),
                   ].join(" · ")}
@@ -147,17 +148,11 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
               </ListRow>
             </>
           )}
-          {panel?.kind === "enrol" && (
-            <Enrolment
-              reauth={Reauth}
-              onEnrolled={() => {
-                setPanel(null);
-                reload();
-              }}
-              onCancel={() => setPanel(null)}
-            />
+          {panel?.kind === "codes" && (
+            <li className="mb-3 list-none rounded-md border border-ink/10 p-3">
+              <RecoveryCodes codes={panel.codes} onSaved={() => setPanel(null)} />
+            </li>
           )}
-          {panel?.kind === "codes" && <RecoveryCodes codes={panel.codes} onSaved={() => setPanel(null)} />}
           {panel?.kind === "remove" && (
             <ConfirmAct
               message={
@@ -190,6 +185,24 @@ export function SecondFactorCard({ reauth: Reauth, onSessionEnded }: { reauth: C
           )}
         </ListRows>
       </CardContent>
+      {/* Closed by its own buttons only: a stray click outside must not throw away a scanned secret or unsaved recovery codes. */}
+      <Dialog open={panel?.kind === "enrol"}>
+        <DialogContent showCloseButton={false} aria-labelledby={enrolTitle} aria-describedby={undefined} className="max-w-[min(28rem,calc(100%-2rem))] gap-4 sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle id={enrolTitle}>{t("auth.secondFactor.enrol.title", "Set up an authenticator app")}</DialogTitle>
+          </DialogHeader>
+          {panel?.kind === "enrol" && (
+            <Enrolment
+              reauth={Reauth}
+              onEnrolled={() => {
+                setPanel(null);
+                reload();
+              }}
+              onCancel={() => setPanel(null)}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }

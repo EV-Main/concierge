@@ -19,16 +19,14 @@ export function StepupNoFactor({ reauth, onReady }: { reauth: ComponentType<Reau
 
   if (enrolling) {
     return (
-      <ul className="m-0 flex list-none flex-col p-0">
-        <Enrolment
-          reauth={reauth}
-          onEnrolled={() => {
-            document.dispatchEvent(new Event(SECOND_FACTORS_CHANGED));
-            onReady();
-          }}
-          onCancel={() => setEnrolling(false)}
-        />
-      </ul>
+      <Enrolment
+        reauth={reauth}
+        onEnrolled={() => {
+          document.dispatchEvent(new Event(SECOND_FACTORS_CHANGED));
+          onReady();
+        }}
+        onCancel={() => setEnrolling(false)}
+      />
     );
   }
   return (
