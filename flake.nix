@@ -209,6 +209,8 @@
           # The site-level auth HTTP surface (runner/src/web); the conductor
           # rewrites /api/auth/* + /api/callback/auth/* here.
           CONCIERGE_WEB_PORT = "55671";
+          # banking's wallet host; its pages ask this plane for step-up proofs.
+          CABINET_FRONTEND_PORT = "50061";
         };
         # DEFAULTS, not overrides: anything already set in the environment (or a
         # sourced `.env`) wins — machines with non-standard ports stay working.
@@ -264,6 +266,13 @@
             export PUBLIC_ORIGIN="''${PUBLIC_ORIGIN:-http://localhost:58843}"
             # Cloudflare's always-pass test secret: the check still runs, against Cloudflare.
             export TURNSTILE_SECRET="''${TURNSTILE_SECRET:-1x0000000000000000000000000000000AA}"
+            export STEPUP_PROOF_ORIGINS="''${STEPUP_PROOF_ORIGINS:-$PUBLIC_ORIGIN,http://localhost:$CABINET_FRONTEND_PORT}"
+            state="''${XDG_STATE_HOME:-$HOME/.local/state}/ev_invest"
+            if [ -z "''${SECOND_FACTOR_SEAL_KEY_FILE:-}" ]; then
+              export SECOND_FACTOR_SEAL_KEY_FILE="$state/concierge-seal.key"
+              # Never rotated: a new key orphans every sealed factor.
+              [ -s "$SECOND_FACTOR_SEAL_KEY_FILE" ] || (umask 077 && head -c32 /dev/urandom | base64 > "$SECOND_FACTOR_SEAL_KEY_FILE")
+            fi
             export RUST_LOG="''${RUST_LOG:-info,concierge=debug,evconcierge_auth=debug}"
             exec cargo run -p concierge
           '';
