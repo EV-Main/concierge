@@ -573,7 +573,7 @@ async fn the_bundles_revalidate_and_serve_ranges() {
 	let (router, _bundles) = bundles();
 	let (_, headers, _) = fetch(&router, Method::GET, "/auth/mfe/registry.json", None).await;
 	let etag = headers[header::ETAG].to_str().unwrap().to_owned();
-	assert!(headers.contains_key(header::LAST_MODIFIED));
+	assert!(!headers.contains_key(header::LAST_MODIFIED), "the store mtime is no validator of a manifest");
 
 	let (status, headers, body) = fetch_with(&router, "/auth/mfe/registry.json", header::IF_NONE_MATCH, &etag).await;
 	assert_eq!(status, StatusCode::NOT_MODIFIED);
@@ -584,6 +584,30 @@ async fn the_bundles_revalidate_and_serve_ranges() {
 	assert_eq!(status, StatusCode::PARTIAL_CONTENT);
 	assert_eq!(body, b"export");
 	assert_eq!(headers[header::CONTENT_TYPE], "text/javascript; charset=utf-8");
+}
+
+/// A release rewrites the manifest from the nix store, where every file's mtime is 1: a new
+/// manifest the same size as the old one must not revalidate as the old one.
+#[tokio::test]
+async fn a_manifest_rewritten_under_the_same_size_and_mtime_is_not_revalidated_as_unchanged() {
+	let (router, bundles) = bundles();
+	let manifest = bundles.dir.join("dist").join("registry.json");
+	let store_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+	let write = |body: &str| {
+		std::fs::write(&manifest, body).unwrap();
+		std::fs::File::options().write(true).open(&manifest).unwrap().set_modified(store_mtime).unwrap();
+	};
+	write(r#"{"account":"account-JUWOCNHT.js"}"#);
+	let (_, headers, _) = fetch(&router, Method::GET, "/auth/mfe/registry.json", None).await;
+	let etag = headers[header::ETAG].to_str().unwrap().to_owned();
+
+	write(r#"{"account":"account-V5EIPT5F.js"}"#);
+	let (status, _, body) = fetch_with(&router, "/auth/mfe/registry.json", header::IF_NONE_MATCH, &etag).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(body, br#"{"account":"account-V5EIPT5F.js"}"#);
+	let (status, _, body) = fetch_with(&router, "/auth/mfe/registry.json", header::IF_MODIFIED_SINCE, "Thu, 01 Jan 1970 00:00:01 GMT").await;
+	assert_eq!(status, StatusCode::OK, "a store mtime says nothing about the bytes");
+	assert_eq!(body, br#"{"account":"account-V5EIPT5F.js"}"#);
 }
 
 #[tokio::test]

@@ -4,7 +4,8 @@
 //! manifest, [`MANIFEST`].
 //!
 //! The serving itself — conditional requests (ETag, Last-Modified, 304), ranges, the
-//! content type — is tower-http's `ServeDir`. What is decided here is what it may be
+//! content type — is tower-http's `ServeDir`, except the validator of a file whose name
+//! carries no content hash ([`content_tag`]). What is decided here is what it may be
 //! asked for: files only, no index, no listing, nothing outside the directory. A path
 //! segment that could climb out of it (`..`, `.`, a dotfile, a backslash) or a symlink
 //! that resolves outside it answers 404, the same as a file that is not there — checked
@@ -22,12 +23,17 @@ use axum::{
 	extract::{Path as UrlPath, Request, State},
 	http::{
 		HeaderValue, StatusCode, Uri,
-		header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ORIGIN, REFERRER_POLICY, VARY, X_CONTENT_TYPE_OPTIONS},
+		header::{
+			ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE,
+			LAST_MODIFIED, ORIGIN, REFERRER_POLICY, VARY, X_CONTENT_TYPE_OPTIONS,
+		},
 	},
 	response::{IntoResponse, Response},
 	routing::get,
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use color_eyre::eyre::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use tower_http::services::ServeDir;
 
@@ -63,8 +69,34 @@ pub fn mount(router: Router, assets: MfeAssets) -> Router {
 
 async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<String>, mut request: Request) -> Response {
 	let origin = request.headers().get(ORIGIN).cloned();
-	let mut response = match serveable(&assets.root, &path).await {
-		Some(name) => {
+	let response = match serveable(&assets.root, &path).await {
+		Some((name, resolved)) => {
+			let tag = if is_hashed(&name) {
+				None
+			} else {
+				match content_tag(&resolved).await {
+					Some(tag) => Some(tag),
+					None => return StatusCode::NOT_FOUND.into_response(), // removed since `serveable` saw it
+				}
+			};
+			if let Some(tag) = &tag
+				&& request
+					.headers()
+					.get_all(IF_NONE_MATCH)
+					.iter()
+					.filter_map(|v| v.to_str().ok())
+					.flat_map(|v| v.split(','))
+					.any(|t| t.trim() == tag || t.trim() == "*")
+			{
+				let mut response = StatusCode::NOT_MODIFIED.into_response();
+				response.headers_mut().insert(ETAG, HeaderValue::from_str(tag).expect("quoted base64url"));
+				return finish(describe(response, &name), origin, &assets);
+			}
+			if tag.is_some() {
+				for conditional in [IF_NONE_MATCH, IF_MODIFIED_SINCE, IF_MATCH, IF_UNMODIFIED_SINCE, IF_RANGE] {
+					request.headers_mut().remove(conditional);
+				}
+			}
 			// `ServeDir` sees the path below the mount, still percent-encoded: it decodes
 			// it itself, to the same file just checked.
 			let rest = request.uri().path().strip_prefix(PREFIX).unwrap_or("/").to_owned();
@@ -72,14 +104,23 @@ async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<Stri
 				Ok(uri) => *request.uri_mut() = uri,
 				Err(_) => return StatusCode::NOT_FOUND.into_response(),
 			}
-			let response = match assets.files.clone().oneshot(request).await {
+			let mut response = match assets.files.clone().oneshot(request).await {
 				Ok(response) => response.into_response(),
 				Err(never) => match never {},
 			};
+			if let Some(tag) = &tag {
+				let headers = response.headers_mut();
+				headers.remove(LAST_MODIFIED);
+				headers.insert(ETAG, HeaderValue::from_str(tag).expect("quoted base64url"));
+			}
 			describe(response, &name)
 		}
 		None => StatusCode::NOT_FOUND.into_response(),
 	};
+	finish(response, origin, &assets)
+}
+
+fn finish(mut response: Response, origin: Option<HeaderValue>, assets: &MfeAssets) -> Response {
 	let headers = response.headers_mut();
 	headers.append(VARY, HeaderValue::from_static("Origin"));
 	if let Some(origin) = origin
@@ -120,7 +161,15 @@ fn describe(mut response: Response, name: &str) -> Response {
 	response
 }
 
-async fn serveable(root: &Path, path: &str) -> Option<String> {
+/// A strong ETag from the bytes. `ServeDir`'s is mtime and size, and every file in the nix
+/// store has mtime 1: a manifest that kept its size across a release would revalidate as
+/// the old one for ever, naming bundles that are gone.
+async fn content_tag(path: &Path) -> Option<String> {
+	let bytes = tokio::fs::read(path).await.ok()?;
+	Some(format!("\"{}\"", URL_SAFE_NO_PAD.encode(Sha256::digest(&bytes))))
+}
+
+async fn serveable(root: &Path, path: &str) -> Option<(String, PathBuf)> {
 	let segments: Vec<&str> = path.split('/').collect();
 	if !segments.iter().all(|s| is_plain_segment(s)) {
 		return None;
@@ -131,7 +180,7 @@ async fn serveable(root: &Path, path: &str) -> Option<String> {
 	if !resolved.starts_with(root) || !tokio::fs::metadata(&resolved).await.ok()?.is_file() {
 		return None;
 	}
-	segments.last().map(|s| (*s).to_owned())
+	segments.last().map(|s| ((*s).to_owned(), resolved))
 }
 
 fn is_plain_segment(segment: &str) -> bool {
