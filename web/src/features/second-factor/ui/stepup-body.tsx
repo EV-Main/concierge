@@ -54,7 +54,7 @@ export function StepupBody({ request, titleId, descriptionId, reauth, onProof }:
       ) : step.ceremony === null ? (
         <Skeleton className="h-16 w-full" />
       ) : (
-        <FactorPicker factors={factors} action={t("auth.reauth.confirm", "Confirm")} busy={step.busy} refusedBy={step.refused ? errorId : undefined} generation={step.generation} onAnswer={(factor, response) => void step.answer(factor, response)} />
+        <FactorPicker factors={factors} busy={step.busy} refusedBy={step.refused ? errorId : undefined} generation={step.generation} onAnswer={(factor, response) => void step.answer(factor, response)} />
       )}
       {step.refused && !step.unopened && (
         <p id={errorId} role="alert" className="m-0 text-xs text-accent-error">

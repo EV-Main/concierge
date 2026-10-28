@@ -1,46 +1,53 @@
 import type { Translate } from "@evinvest/i18n";
 import { useT } from "@evinvest/i18n/react";
-import { Button, Input } from "@evinvest/uikit";
-import { useState, type FormEvent, type ReactNode } from "react";
+import { InputOTP, InputOTPGroup, InputOTPSlot } from "@evinvest/uikit";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 /** What a kind's form gets: the challenge it was sent (if its kind has one) and where its answer goes. */
 interface AnswerFormProps {
   challenge: unknown;
-  action: string;
   busy: boolean;
   /** The id of the refusal shown under the form, when the last answer was refused. */
   refusedBy: string | undefined;
   onAnswer: (response: unknown) => void;
 }
 
-const TOTP_CODE = /^\d{6}$/;
+const TOTP_DIGITS = 6;
 
-function TotpForm({ action, busy, refusedBy, onAnswer }: AnswerFormProps) {
+/** Six digits, submitted as the last one lands, as the sign-in code is. */
+function TotpForm({ busy, refusedBy, onAnswer }: AnswerFormProps) {
   const t = useT();
   const [code, setCode] = useState("");
+  const input = useRef<HTMLInputElement>(null);
 
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    onAnswer({ code: code.trim() });
+  // Not `autoFocus`: a form remounted after a refusal mounts disabled while the next ceremony opens.
+  useEffect(() => {
+    if (!busy) input.current?.focus();
+  }, [busy]);
+
+  function change(raw: string) {
+    const digits = raw.replace(/\D/g, "").slice(0, TOTP_DIGITS);
+    setCode(digits);
+    if (digits.length === TOTP_DIGITS && !busy) onAnswer({ code: digits });
   }
 
   return (
-    <form className="flex flex-col gap-2" onSubmit={submit}>
-      <Input
-        inputMode="numeric"
-        autoComplete="one-time-code"
-        maxLength={6}
-        aria-label={t("auth.secondFactor.totp.code", "6-digit code from your authenticator app")}
-        placeholder={t("auth.code.label", "Code")}
-        aria-invalid={refusedBy ? true : undefined}
-        aria-describedby={refusedBy}
-        value={code}
-        onChange={(e) => setCode(e.target.value)}
-      />
-      <Button type="submit" size="sm" className="self-start" disabled={busy || !TOTP_CODE.test(code.trim())}>
-        {action}
-      </Button>
-    </form>
+    <InputOTP
+      maxLength={TOTP_DIGITS}
+      value={code}
+      onChange={change}
+      ref={input}
+      disabled={busy}
+      aria-label={t("auth.secondFactor.totp.code", "6-digit code from your authenticator app")}
+      aria-invalid={refusedBy ? true : undefined}
+      aria-describedby={refusedBy}
+    >
+      <InputOTPGroup>
+        {Array.from({ length: TOTP_DIGITS }, (_, i) => (
+          <InputOTPSlot key={i} index={i} className="h-12 w-11 text-base" />
+        ))}
+      </InputOTPGroup>
+    </InputOTP>
   );
 }
 

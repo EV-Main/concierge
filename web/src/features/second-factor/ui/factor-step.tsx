@@ -34,7 +34,7 @@ export function FactorStep({ onPassed, onCancel }: { onPassed: () => void; onCan
         </div>
         {step.ceremony === null && step.opening && <Skeleton className="h-16 w-full" />}
         {step.ceremony !== null && (
-          <FactorPicker factors={step.ceremony.factors} action={t("auth.reauth.confirm", "Confirm")} busy={step.busy} refusedBy={error ? errorId : undefined} generation={step.generation} onAnswer={(factor, response) => void step.answer(factor, response)} />
+          <FactorPicker factors={step.ceremony.factors} busy={step.busy} refusedBy={error ? errorId : undefined} generation={step.generation} onAnswer={(factor, response) => void step.answer(factor, response)} />
         )}
         {error && (
           <p id={errorId} role="alert" className="m-0 text-xs text-accent-error">

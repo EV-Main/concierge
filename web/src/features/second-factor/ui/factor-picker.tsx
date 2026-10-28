@@ -8,14 +8,12 @@ import { AnswerForm, kindName } from "./answer-form";
 /** One tab per offered factor when there are several, each with its kind's answer form. */
 export function FactorPicker({
   factors,
-  action,
   busy,
   refusedBy,
   generation,
   onAnswer,
 }: {
   factors: FactorChallenge[];
-  action: string;
   busy: boolean;
   refusedBy: string | undefined;
   /** Bumped with each new ceremony, which clears the forms for the next answer. */
@@ -39,7 +37,7 @@ export function FactorPicker({
       )}
       {factors.map((f) => (
         <TabsContent key={f.id} value={f.id} className={factors.length > 1 ? "pt-3" : undefined}>
-          <AnswerForm key={generation} kind={f.kind} challenge={f.challenge} action={action} busy={busy} refusedBy={refusedBy} onAnswer={(response) => onAnswer(f.id, response)} />
+          <AnswerForm key={generation} kind={f.kind} challenge={f.challenge} busy={busy} refusedBy={refusedBy} onAnswer={(response) => onAnswer(f.id, response)} />
         </TabsContent>
       ))}
     </Tabs>
