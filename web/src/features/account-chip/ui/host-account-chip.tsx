@@ -15,11 +15,11 @@ export type HostAccountChipProps = HostProps & {
 
 /**
  * The chip on a host with its own session (`data-mode="host"`): who is signed in and the
- * host's own entries come from the element's attributes; the profile row is always the
- * platform's account page, so `data-profile-href` and `data-manage-href` are not read. No
- * session read and no logout request — the host holds both. Neither name nor email yet is the host still loading: the skeleton, in the final box.
+ * host's own entries come from the element's attributes. No session read and no logout
+ * request — the host holds both. Neither name nor email yet is the host still loading: the
+ * skeleton, in the final box.
  */
-export function HostAccountChip({ name, email, switchHref, groups, onSignOut }: HostAccountChipProps) {
+export function HostAccountChip({ name, email, profileHref, switchHref, groups, onSignOut }: HostAccountChipProps) {
   const t = useT();
   const identity: MenuIdentity | null =
     name || email
@@ -32,6 +32,7 @@ export function HostAccountChip({ name, email, switchHref, groups, onSignOut }: 
   return (
     <AccountMenu
       identity={identity}
+      profileHref={profileHref}
       switchAccount={switchHref}
       groups={groups}
       onSignOut={onSignOut}

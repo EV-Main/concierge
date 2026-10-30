@@ -191,7 +191,7 @@ fires per opening. `StepupDialog` calls `onProof` before `onOpenChange(false)`.
 
 <AccountChip
   scriptUrl={chip.scriptUrl}
-  host={{ name, email, groups }} // host mode; omit for default mode
+  host={{ name, email, groups, profileHref: '/account' }} // host mode; omit for default mode
   onNavigate={href => isMyRoute(href) && (router.push(href), true)}
   onSignOut={signOut}
   fallback={<ChipPlaceholder />}
@@ -230,6 +230,9 @@ evinvest.ltd session alive.
 validated root-relative path and returns whether the host took it. In default
 mode the chip takes the same `intent` (`signin` | `signup`) and an absolute
 `returnTo` as the dialog, with the same default: this page's origin and path.
+The profile row goes to `profileHref` (`host.profileHref` in host mode): the
+host's own route that mounts `AccountPage`. Without one it leaves the host for
+the platform's account page.
 The chip keeps `apiVersion` 2, `ev:navigate` and `signout`;
 host-mode attributes come from `hostAttributes` in `@evinvest/mfe`.
 

@@ -27,6 +27,8 @@ username, notification settings, platform sign-out — is a link to
 That page is concierge's own: `pages/account.html`, served at `/account` (the apex routes
 the path here) with the account element and the chip, which is its sign-in when nobody is.
 `src/shared/config/origin.ts` (`isPlatformPage`) is that switch.
+A host that embeds the account element on its own route sets `data-profile-href` on the
+chip (either mode) and the profile row goes there instead of leaving for that page.
 
 Notification settings are per inbox: the plane picks it by the request's `Origin`. From
 the platform the account page shows the platform's inbox (the two delivery channels, the
@@ -162,7 +164,8 @@ Each bundle inlines its own stylesheet, inserted once as `<style data-mfe="<tag>
 (hosts' CSP needs `style-src 'unsafe-inline'` or a hash, as for the old chip). Utilities
 are compiled `!important` and scoped to the element inside the `reamfe` layer, so the
 host's preflight cannot strip the forms and our utilities cannot reach the host's
-elements — `scripts/scope-css.mjs` has the reasoning. Hosts declare
+elements — `scripts/scope-css.mjs` has the reasoning. The bundles ship no preflight; the host brings it,
+and on the platform pages `styles/platform-page.css` does. Hosts declare
 `@layer reamfe, …` first, as the `@evinvest/mfe` README asks. Overlays (the sign-in
 dialog) portal into the element, so mount it outside any transformed ancestor.
 

@@ -35,6 +35,8 @@ export type MenuPanelProps = {
   panelRef: Ref<HTMLDivElement>;
   phase: DisclosurePhase;
   identity: MenuIdentity;
+  /** The host's own account route; absent, the platform's account page. */
+  profileHref: string | null;
   switchAccount: string | null;
   groups: readonly MenuGroup[];
   onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => void;
@@ -44,7 +46,7 @@ export type MenuPanelProps = {
   onSignOut: () => void;
 };
 
-export function MenuPanel({ id, panelRef, phase, identity, switchAccount, groups, onKeyDown, onPick, onSwitchAccount, onSignOut }: MenuPanelProps) {
+export function MenuPanel({ id, panelRef, phase, identity, profileHref, switchAccount, groups, onKeyDown, onPick, onSwitchAccount, onSignOut }: MenuPanelProps) {
   const t = useT();
   const { api, host } = useElement();
   const shown = phase === "open";
@@ -63,7 +65,7 @@ export function MenuPanel({ id, panelRef, phase, identity, switchAccount, groups
       // while closed. A host's own `.flex` no longer reaches the panel: ours are scoped.
       className={cn(PANEL, phase === "closed" ? "hidden" : "flex")}
     >
-      <a href={platformAccountUrl(api.origin)} onClick={onPick} className={ENTRY}>
+      <a href={profileHref ?? platformAccountUrl(api.origin)} onClick={onPick} className={ENTRY}>
         <span className="flex min-w-0 flex-1 flex-col">
           <span className="truncate font-semibold">{identity.label}</span>
           {identity.email && <span className="truncate text-ink-soft">{identity.email}</span>}

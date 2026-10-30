@@ -12,6 +12,7 @@ export type AccountMenuProps = {
   className?: string;
   /** Null is the first-visit skeleton: same box, same width, nothing to open. */
   identity: MenuIdentity | null;
+  profileHref: string | null;
   /**
    * An identity painted before the session confirmed it (the last visit's cache): shown, but
    * nothing opens — on a shared machine the panel would be the previous person's account.
@@ -30,8 +31,8 @@ export type AccountMenuProps = {
 const ENTRIES = "a[href], button:not(:disabled)";
 
 /**
- * Avatar + name + chevron, and the panel it discloses: identity (the way to the platform
- * account page), the service groups, Switch account, Sign out. Presentational — it fetches nothing and knows
+ * Avatar + name + chevron, and the panel it discloses: identity (the way to the account
+ * page), the service groups, Switch account, Sign out. Presentational — it fetches nothing and knows
  * no session; both wrappers (`AccountChip`, `HostAccountChip`) feed it.
  *
  * The skeleton is this same component with no identity, so its box is the final chip's box
@@ -42,7 +43,7 @@ const ENTRIES = "a[href], button:not(:disabled)";
  * Home and End are a shortcut on top of Tab, not a replacement for it; Escape, Tab out and
  * a click elsewhere close it.
  */
-export function AccountMenu({ className, identity, locked = false, switchAccount, groups, error = null, onSwitchAccount, onSignOut }: AccountMenuProps) {
+export function AccountMenu({ className, identity, profileHref, locked = false, switchAccount, groups, error = null, onSwitchAccount, onSignOut }: AccountMenuProps) {
   const t = useT();
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -168,6 +169,7 @@ export function AccountMenu({ className, identity, locked = false, switchAccount
           panelRef={panel}
           phase={phase}
           identity={identity}
+          profileHref={profileHref}
           switchAccount={switchAccount}
           groups={groups}
           onKeyDown={onPanelKey}
