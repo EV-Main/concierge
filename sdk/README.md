@@ -183,7 +183,7 @@ fires per opening. `StepupDialog` calls `onProof` before `onOpenChange(false)`.
 ```tsx
 <AccountPage
   scriptUrl={account.scriptUrl}
-  section={sectionFromUrl} // `?section=` — concierge's own links to /admin/account use it
+  section={sectionFromUrl} // `?section=` — concierge's own links to /account use it
   onSection={s => router.replace(`/account?section=${s}`)}
   onNavigate={href => (router.push(href), true)}
   onSignOut={signOut}

@@ -35,10 +35,6 @@
     "en": "This could not be loaded. Try again in a moment.",
     "t": "Не удалось загрузить. Попробуйте чуть позже."
   },
-  "auth.cabinet": {
-    "en": "Cabinet",
-    "t": "Кабинет"
-  },
   "auth.code.back": {
     "en": "Use a different email",
     "t": "Другой адрес"
@@ -226,10 +222,6 @@
   "auth.field.password": {
     "en": "Password",
     "t": "Пароль"
-  },
-  "auth.manageAccount": {
-    "en": "Manage account",
-    "t": "Управление аккаунтом"
   },
   "auth.method.code": {
     "en": "Email code",

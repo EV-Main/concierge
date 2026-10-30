@@ -37,13 +37,3 @@ export const CHIP_PRESS = cn(
 );
 
 export type MenuIdentity = { label: string; email: string | null; initials: string };
-
-export type MenuLinks = {
-  /**
-   * The name/email row of the panel and what it is labelled: `cabinet` on hosts (their own
-   * account area), `profile` for the platform's account page. Null renders the row as plain text.
-   */
-  profile: { href: string; kind: "cabinet" | "profile" } | null;
-  manage: string | null;
-  switchAccount: string | null;
-};

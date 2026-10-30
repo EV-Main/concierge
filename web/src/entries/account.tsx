@@ -3,7 +3,7 @@
 //
 // On the platform origin it reads and changes everything itself. On a scope host it shows
 // who is signed in (the session is the one read allowed cross-origin) and links every
-// action on the session to the platform's /admin/account (ORG-RESTRUCTURE-PLAN §3.9 F).
+// action on the session to the platform's /account (ORG-RESTRUCTURE-PLAN §3.9 F).
 // Attributes: `data-section` (`profile` | `security` | `notifications`; the element writes
 // it back when the reader switches tabs), `data-origin` (dev and stand builds only).
 // Events (bubbling, composed): `ev:section` (`{ section }`) when the reader switches tabs;

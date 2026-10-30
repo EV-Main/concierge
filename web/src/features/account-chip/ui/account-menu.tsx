@@ -4,7 +4,7 @@ import { cn } from "@evinvest/uikit";
 import { ChevronDown } from "lucide-react";
 import { useEffect, useId, useRef, type KeyboardEvent, type MouseEvent } from "react";
 
-import { CHIP_FOCUS, CHIP_PRESS, type MenuIdentity, type MenuLinks } from "../lib/chip-parts";
+import { CHIP_FOCUS, CHIP_PRESS, type MenuIdentity } from "../lib/chip-parts";
 import { MenuPanel } from "./menu-panel";
 import { useDisclosure } from "./use-disclosure";
 
@@ -19,7 +19,7 @@ export type AccountMenuProps = {
    * different trees), so an open phase never survives into a lock or out of one.
    */
   locked?: boolean;
-  links: MenuLinks;
+  switchAccount: string | null;
   groups: readonly MenuGroup[];
   /** An action from the panel failed after it closed (sign out); shown under the chip. */
   error?: string | null;
@@ -30,8 +30,8 @@ export type AccountMenuProps = {
 const ENTRIES = "a[href], button:not(:disabled)";
 
 /**
- * Avatar + name + chevron, and the panel it discloses: identity, Manage account, the
- * service groups, Switch account, Sign out. Presentational — it fetches nothing and knows
+ * Avatar + name + chevron, and the panel it discloses: identity (the way to the platform
+ * account page), the service groups, Switch account, Sign out. Presentational — it fetches nothing and knows
  * no session; both wrappers (`AccountChip`, `HostAccountChip`) feed it.
  *
  * The skeleton is this same component with no identity, so its box is the final chip's box
@@ -42,7 +42,7 @@ const ENTRIES = "a[href], button:not(:disabled)";
  * Home and End are a shortcut on top of Tab, not a replacement for it; Escape, Tab out and
  * a click elsewhere close it.
  */
-export function AccountMenu({ className, identity, locked = false, links, groups, error = null, onSwitchAccount, onSignOut }: AccountMenuProps) {
+export function AccountMenu({ className, identity, locked = false, switchAccount, groups, error = null, onSwitchAccount, onSignOut }: AccountMenuProps) {
   const t = useT();
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -168,7 +168,7 @@ export function AccountMenu({ className, identity, locked = false, links, groups
           panelRef={panel}
           phase={phase}
           identity={identity}
-          links={links}
+          switchAccount={switchAccount}
           groups={groups}
           onKeyDown={onPanelKey}
           onPick={close}
