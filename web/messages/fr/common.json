@@ -35,10 +35,6 @@
     "en": "This could not be loaded. Try again in a moment.",
     "t": "Chargement impossible. Réessayez dans un instant."
   },
-  "auth.cabinet": {
-    "en": "Cabinet",
-    "t": "Mon espace"
-  },
   "auth.code.back": {
     "en": "Use a different email",
     "t": "Utiliser une autre adresse"
@@ -226,10 +222,6 @@
   "auth.field.password": {
     "en": "Password",
     "t": "Mot de passe"
-  },
-  "auth.manageAccount": {
-    "en": "Manage account",
-    "t": "Gérer le compte"
   },
   "auth.method.code": {
     "en": "Email code",

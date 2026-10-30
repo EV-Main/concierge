@@ -8,7 +8,7 @@ import { platformAccountUrl } from "../../../shared/config/origin";
 import { useElement } from "../../../shared/element/element-context";
 import { displayName, initialsOfName, truncateName } from "../../../shared/lib/identity";
 import { useSession } from "../../../shared/model/use-session";
-import type { MenuIdentity, MenuLinks } from "../lib/chip-parts";
+import type { MenuIdentity } from "../lib/chip-parts";
 import { signOut } from "../model/sign-out";
 import { AccountMenu } from "./account-menu";
 import { MAX_LABEL } from "./host-account-chip";
@@ -23,7 +23,7 @@ import { SignInCta } from "./sign-in-cta";
 export function AccountChip({ intent, returnTo }: { intent: string | null; returnTo: string | null }) {
   const { api } = useElement();
   const { session, refresh } = useSession(api);
-  if (session.kind === "loading") return <AccountMenu identity={null} links={{ profile: null, manage: null, switchAccount: null }} groups={[]} onSignOut={() => undefined} />;
+  if (session.kind === "loading") return <AccountMenu identity={null} switchAccount={null} groups={[]} onSignOut={() => undefined} />;
   if (session.kind !== "signedIn") return <SignInCta intent={intent} returnTo={returnTo} onSignedIn={() => void refresh()} />;
   return <SignedInChip user={session.user} />;
 }
@@ -49,23 +49,14 @@ function SignedInChip({ user }: { user: SessionUser }) {
   return (
     <AccountMenu
       identity={identity}
-      links={platformLinks(api.origin, platform)}
+      // Google's chooser is on every sign-in, and the new session closes this one. A platform
+      // route; a scope host switches accounts through its own RP login instead.
+      switchAccount={platform ? `${api.origin}/api/auth/login?returnTo=${encodeURIComponent(location.pathname + location.search)}` : null}
       groups={serviceGroups(t("ui.services", "Services"))}
       error={failed ? t("auth.err.signOut", "We couldn't sign you out. Please try again.") : null}
       onSignOut={() => void onSignOut()}
     />
   );
-}
-
-function platformLinks(origin: string, platform: boolean): MenuLinks {
-  const here = location.pathname + location.search;
-  return {
-    profile: { href: platformAccountUrl(origin), kind: "profile" },
-    manage: platformAccountUrl(origin, "security"),
-    // Google's chooser is on every sign-in, and the new session closes this one. A platform
-    // route; a scope host switches accounts through its own RP login instead.
-    switchAccount: platform ? `${origin}/api/auth/login?returnTo=${encodeURIComponent(here)}` : null,
-  };
 }
 
 /** The Services group; Service-Arb is `current` when this page is the panel's own origin. */

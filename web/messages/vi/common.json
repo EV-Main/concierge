@@ -35,10 +35,6 @@
     "en": "This could not be loaded. Try again in a moment.",
     "t": "Không thể tải. Vui lòng thử lại sau giây lát."
   },
-  "auth.cabinet": {
-    "en": "Cabinet",
-    "t": "Cabinet"
-  },
   "auth.code.back": {
     "en": "Use a different email",
     "t": "Dùng email khác"
@@ -226,10 +222,6 @@
   "auth.field.password": {
     "en": "Password",
     "t": "Mật khẩu"
-  },
-  "auth.manageAccount": {
-    "en": "Manage account",
-    "t": "Quản lý tài khoản"
   },
   "auth.method.code": {
     "en": "Email code",

@@ -39,7 +39,7 @@ export type AccountSection = "profile" | "security" | "notifications";
 
 /** The platform's own account page, where a scope host sends every account action. */
 export function platformAccountUrl(origin: string, section?: AccountSection): string {
-  return `${origin}/admin/account${section ? `?section=${section}` : ""}`;
+  return `${origin}/account${section ? `?section=${section}` : ""}`;
 }
 
 /**

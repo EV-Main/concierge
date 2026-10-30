@@ -4,9 +4,10 @@ import { cn } from "@evinvest/uikit";
 import { ChevronRight } from "lucide-react";
 import { Fragment, type KeyboardEvent, type Ref } from "react";
 
+import { platformAccountUrl } from "../../../shared/config/origin";
 import { offerLinkToHost } from "../../../shared/element/offer-link";
 import { useElement } from "../../../shared/element/element-context";
-import { CHIP_FOCUS, CHIP_PRESS, type MenuIdentity, type MenuLinks } from "../lib/chip-parts";
+import { CHIP_FOCUS, CHIP_PRESS, type MenuIdentity } from "../lib/chip-parts";
 import type { DisclosurePhase } from "./use-disclosure";
 
 // Spelled out to the reset: the host page's base styles are not this bundle's to rely on.
@@ -34,7 +35,7 @@ export type MenuPanelProps = {
   panelRef: Ref<HTMLDivElement>;
   phase: DisclosurePhase;
   identity: MenuIdentity;
-  links: MenuLinks;
+  switchAccount: string | null;
   groups: readonly MenuGroup[];
   onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => void;
   /** Any entry activated: the panel closes behind the navigation or the action. */
@@ -43,9 +44,9 @@ export type MenuPanelProps = {
   onSignOut: () => void;
 };
 
-export function MenuPanel({ id, panelRef, phase, identity, links, groups, onKeyDown, onPick, onSwitchAccount, onSignOut }: MenuPanelProps) {
+export function MenuPanel({ id, panelRef, phase, identity, switchAccount, groups, onKeyDown, onPick, onSwitchAccount, onSignOut }: MenuPanelProps) {
   const t = useT();
-  const { host } = useElement();
+  const { api, host } = useElement();
   const shown = phase === "open";
   return (
     <div
@@ -62,12 +63,16 @@ export function MenuPanel({ id, panelRef, phase, identity, links, groups, onKeyD
       // while closed. A host's own `.flex` no longer reaches the panel: ours are scoped.
       className={cn(PANEL, phase === "closed" ? "hidden" : "flex")}
     >
-      <ProfileRow identity={identity} links={links} onPick={onPick} />
-      {links.manage && (
-        <a href={links.manage} onClick={onPick} className={ENTRY}>
-          {t("auth.manageAccount", "Manage account")}
-        </a>
-      )}
+      <a href={platformAccountUrl(api.origin)} onClick={onPick} className={ENTRY}>
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="truncate font-semibold">{identity.label}</span>
+          {identity.email && <span className="truncate text-ink-soft">{identity.email}</span>}
+        </span>
+        <span className="flex shrink-0 items-center gap-0.5 text-xs text-ink-soft">
+          {t("ui.profile", "Profile")}
+          <ChevronRight className="size-4" aria-hidden />
+        </span>
+      </a>
       {groups.map((group, i) => {
         const labelId = `${id}-group-${i}`;
         return (
@@ -97,9 +102,9 @@ export function MenuPanel({ id, panelRef, phase, identity, links, groups, onKeyD
         );
       })}
       <hr role="separator" className={RULE} />
-      {links.switchAccount && (
+      {switchAccount && (
         <a
-          href={links.switchAccount}
+          href={switchAccount}
           onClick={() => {
             onSwitchAccount?.();
             onPick();
@@ -120,30 +125,5 @@ export function MenuPanel({ id, panelRef, phase, identity, links, groups, onKeyD
         {t("auth.signOut", "Sign out")}
       </button>
     </div>
-  );
-}
-
-/**
- * Name and email, as an explicit way in: "Cabinet" (or "Profile" inside the cabinet) and a
- * chevron on the right, so it reads as a row you can press and not as a caption. With no
- * destination it is plain text — no label, no chevron, nothing that promises a link.
- */
-function ProfileRow({ identity, links, onPick }: Pick<MenuPanelProps, "identity" | "links" | "onPick">) {
-  const t = useT();
-  const who = (
-    <span className="flex min-w-0 flex-1 flex-col">
-      <span className="truncate font-semibold">{identity.label}</span>
-      {identity.email && <span className="truncate text-ink-soft">{identity.email}</span>}
-    </span>
-  );
-  if (!links.profile) return <div className="flex min-h-11 flex-col justify-center px-2! py-1.5! text-sm text-ink">{who}</div>;
-  return (
-    <a href={links.profile.href} onClick={onPick} className={ENTRY}>
-      {who}
-      <span className="flex shrink-0 items-center gap-0.5 text-xs text-ink-soft">
-        {links.profile.kind === "profile" ? t("ui.profile", "Profile") : t("auth.cabinet", "Cabinet")}
-        <ChevronRight className="size-4" aria-hidden />
-      </span>
-    </a>
   );
 }

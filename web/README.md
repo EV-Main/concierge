@@ -23,7 +23,7 @@ the registered scope origins (ORG-RESTRUCTURE-PLAN §3.9 F). So on a scope host
 (`invest.evinvest.ltd`, `sa.evinvest.ltd`) the elements sign people in and show who is
 signed in, and every action on an open session — password, passkeys, sessions,
 username, notification settings, platform sign-out — is a link to
-`https://evinvest.ltd/admin/account`. On the platform origin they do it in place.
+`https://evinvest.ltd/account`. On the platform origin they do it in place.
 `src/shared/config/origin.ts` (`isPlatformPage`) is that switch.
 
 Notification settings are per inbox: the plane picks it by the request's `Origin`. From
