@@ -12,6 +12,10 @@
 //! here because `ServeDir` follows symlinks wherever they point. GET and HEAD only.
 //! Read-only and public, so CORS answers a scope's origin without credentials: a host
 //! fetches the manifest and the bundles anonymously.
+//!
+//! One page is also served outside the prefix: `account.html` at `/account`, the platform's
+//! account page. It acts on the session, which this plane accepts only from
+//! `PUBLIC_ORIGIN`, so it is the identity plane's own page and not a host's.
 
 use std::{
 	path::{Path, PathBuf},
@@ -44,6 +48,7 @@ use crate::web::allowlist::SignInAllowlist;
 pub const MANIFEST: &str = "registry.json";
 
 const PREFIX: &str = "/auth/mfe";
+const ACCOUNT_PAGE: &str = "account.html";
 const SHORT_CACHE: &str = "public, max-age=300";
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
@@ -64,7 +69,12 @@ impl MfeAssets {
 }
 
 pub fn mount(router: Router, assets: MfeAssets) -> Router {
-	router.merge(Router::new().route("/auth/mfe/{*path}", get(serve)).with_state(Arc::new(assets)))
+	router.merge(Router::new().route("/auth/mfe/{*path}", get(serve)).route("/account", get(account)).with_state(Arc::new(assets)))
+}
+
+async fn account(assets: State<Arc<MfeAssets>>, mut request: Request) -> Response {
+	*request.uri_mut() = Uri::from_static("/auth/mfe/account.html");
+	serve(assets, UrlPath(ACCOUNT_PAGE.to_owned()), request).await
 }
 
 async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<String>, mut request: Request) -> Response {
@@ -235,7 +245,7 @@ mod tests {
 
 	#[test]
 	fn a_page_is_never_framed_cached_or_referred() {
-		for name in ["reauth.html", "sign-in.html"] {
+		for name in ["reauth.html", "sign-in.html", ACCOUNT_PAGE] {
 			let page = describe(StatusCode::OK.into_response(), name);
 			assert_eq!(page.headers()[CACHE_CONTROL], "no-store", "{name}");
 			let csp = page.headers()[CONTENT_SECURITY_POLICY].to_str().unwrap();

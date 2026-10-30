@@ -24,6 +24,8 @@ the registered scope origins (ORG-RESTRUCTURE-PLAN §3.9 F). So on a scope host
 signed in, and every action on an open session — password, passkeys, sessions,
 username, notification settings, platform sign-out — is a link to
 `https://evinvest.ltd/account`. On the platform origin they do it in place.
+That page is concierge's own: `pages/account.html`, served at `/account` (the apex routes
+the path here) with the account element and the chip, which is its sign-in when nobody is.
 `src/shared/config/origin.ts` (`isPlatformPage`) is that switch.
 
 Notification settings are per inbox: the plane picks it by the request's `Origin`. From

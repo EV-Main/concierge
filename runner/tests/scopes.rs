@@ -489,6 +489,7 @@ fn bundles() -> (Router, Bundles) {
 	std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
 	std::fs::write(dir.join("LICENSES.txt"), "MIT").unwrap();
 	std::fs::write(dir.join("sign-in.html"), "<!doctype html>").unwrap();
+	std::fs::write(dir.join("account.html"), "<!doctype html><title>Account</title>").unwrap();
 	std::fs::write(outside.join("secret.txt"), "outside").unwrap();
 	std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("escape.txt")).unwrap();
 
@@ -560,6 +561,20 @@ async fn the_sign_in_page_is_never_cached_framed_or_referred() {
 	assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
 	assert!(csp.contains("script-src 'self' https://challenges.cloudflare.com;"), "{csp}");
 	assert!(csp.contains("frame-src https://challenges.cloudflare.com;"), "{csp}");
+}
+
+/// The platform's account page lives at `/account`, not under the bundles' prefix, and is a
+/// page like the others: never cached, framed or referred.
+#[tokio::test]
+async fn the_account_page_is_served_at_account() {
+	let (router, _bundles) = bundles();
+	let (status, headers, body) = fetch(&router, Method::GET, "/account?section=security", None).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(body, b"<!doctype html><title>Account</title>");
+	assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+	assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+	assert!(headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("frame-ancestors 'none'"));
+	assert_eq!(fetch(&router, Method::GET, "/account/anything", None).await.0, StatusCode::NOT_FOUND);
 }
 
 async fn fetch_with(router: &Router, path: &str, name: header::HeaderName, value: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
