@@ -9,10 +9,11 @@
 //     service groups (`hostAttributes`); the chip fetches nothing and turns Sign out into a
 //     `signout` event — then, off the platform origin, navigates to the platform's sign-out
 //     confirmation (shared/element/host-sign-out.ts).
+// Either mode: `data-profile-href` is the host's own account route for the profile row.
 // Events (bubbling, composed): `signout` (host mode), `ev:navigate` (cancelable, `{ href }`,
 // a plain same-origin menu-link click offered to the host's router). `[data-ready]` is set
 // once the chip has painted; `data-layout="menu"` keeps the name below `sm`.
-import { HOST_ATTRIBUTE_NAMES, HOST_ATTRS, isHostMode, readHostProps } from "@evinvest/mfe";
+import { HOST_ATTRIBUTE_NAMES, HOST_ATTRS, isHostMode, readHostProps, safeHref } from "@evinvest/mfe";
 import css from "virtual:mfe/css";
 
 import { AccountChip, HostAccountChip } from "../features/account-chip";
@@ -29,7 +30,7 @@ defineElement({
     return isHostMode(read) ? (
       <HostAccountChip {...readHostProps(read)} onSignOut={() => signOutOnHost(host, apiOriginOf(host))} />
     ) : (
-      <AccountChip intent={read(HOST_ATTRS.intent)} returnTo={read(HOST_ATTRS.returnTo)} />
+      <AccountChip intent={read(HOST_ATTRS.intent)} returnTo={read(HOST_ATTRS.returnTo)} profileHref={safeHref(read(HOST_ATTRS.profileHref))} />
     );
   },
 });

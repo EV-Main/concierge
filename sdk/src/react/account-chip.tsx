@@ -22,6 +22,11 @@ export interface AccountChipProps {
    * (`hostReturnTo`; http only to loopback).
    */
   returnTo?: string;
+  /**
+   * Default mode: this host's own account route (root-relative, or absolute https), which
+   * the profile row goes to; absent, the platform's account page. Host mode: `host.profileHref`.
+   */
+  profileHref?: string;
   onNavigate?: NavigateHandler;
   /** Host mode: sign out was picked; end the host's own session. Awaited when it returns a promise. */
   onSignOut?: SignOutHandler;
@@ -53,6 +58,7 @@ export function AccountChip({
   host,
   intent,
   returnTo,
+  profileHref,
   onNavigate,
   onSignOut,
   platformSignOut = true,
@@ -65,6 +71,7 @@ export function AccountChip({
     : {
         [HOST_ATTRS.intent]: intent,
         [HOST_ATTRS.returnTo]: defaultModeReturnTo(returnTo),
+        [HOST_ATTRS.profileHref]: profileHref,
       };
   return (
     <RemoteElement

@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@evinvest/i18n": "^0.11.0",
-    "@evinvest/mfe": "^0.2.0",
+    "@evinvest/mfe": "^0.3.0",
     "@evinvest/uikit": "^0.29.1",
     "lucide-react": "^0.453.0",
     "react": "^19.2.1",

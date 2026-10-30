@@ -115,6 +115,12 @@ describe('AccountChip attributes', () => {
     expect(container.querySelector(CHIP)?.getAttribute('data-intent')).toBe('signup');
   });
 
+  it('should_point_the_profile_row_at_the_host_route_in_default_mode', async () => {
+    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" profileHref="/admin/account" />);
+
+    expect(container.querySelector(CHIP)?.getAttribute('data-profile-href')).toBe('/admin/account');
+  });
+
   it('should_drop_a_root_relative_return_to', async () => {
     await render(<AccountChip scriptUrl="/auth/mfe/chip.js" returnTo="/funds" />);
 

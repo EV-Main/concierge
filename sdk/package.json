@@ -1,6 +1,6 @@
 {
   "name": "@evinvest/concierge",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Host wrappers for the concierge microfrontends: the sign-in dialog, the account page, the account chip, the re-authentication dialog and the step-up dialog, the sign-in-required, reauth-required and step-up hooks, and the session shape. A thin layer over @evinvest/mfe.",
   "license": "BlueOak-1.0.0",
   "publishConfig": {
@@ -38,7 +38,7 @@
     "prepare": "tsup && tsup --config tsup.react.config.ts"
   },
   "peerDependencies": {
-    "@evinvest/mfe": ">=0.1.0 <1",
+    "@evinvest/mfe": ">=0.3.0 <1",
     "react": "^18 || ^19"
   },
   "peerDependenciesMeta": {
@@ -47,7 +47,7 @@
     }
   },
   "devDependencies": {
-    "@evinvest/mfe": "^0.1.0",
+    "@evinvest/mfe": "^0.3.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "jsdom": "^25.0.1",

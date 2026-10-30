@@ -20,15 +20,15 @@ import { SignInCta } from "./sign-in-cta";
 //   • signed out, or the plane down   → the sign-in CTA
 //   • signed in                       → the chip; username, else a name from the email
 // It never redirects on a dropped session: an anonymous visitor must not be bounced.
-export function AccountChip({ intent, returnTo }: { intent: string | null; returnTo: string | null }) {
+export function AccountChip({ intent, returnTo, profileHref }: { intent: string | null; returnTo: string | null; profileHref: string | null }) {
   const { api } = useElement();
   const { session, refresh } = useSession(api);
-  if (session.kind === "loading") return <AccountMenu identity={null} switchAccount={null} groups={[]} onSignOut={() => undefined} />;
+  if (session.kind === "loading") return <AccountMenu identity={null} profileHref={null} switchAccount={null} groups={[]} onSignOut={() => undefined} />;
   if (session.kind !== "signedIn") return <SignInCta intent={intent} returnTo={returnTo} onSignedIn={() => void refresh()} />;
-  return <SignedInChip user={session.user} />;
+  return <SignedInChip user={session.user} profileHref={profileHref} />;
 }
 
-function SignedInChip({ user }: { user: SessionUser }) {
+function SignedInChip({ user, profileHref }: { user: SessionUser; profileHref: string | null }) {
   const t = useT();
   const { api, platform } = useElement();
   const [failed, setFailed] = useState(false);
@@ -49,6 +49,7 @@ function SignedInChip({ user }: { user: SessionUser }) {
   return (
     <AccountMenu
       identity={identity}
+      profileHref={profileHref}
       // Google's chooser is on every sign-in, and the new session closes this one. A platform
       // route; a scope host switches accounts through its own RP login instead.
       switchAccount={platform ? `${api.origin}/api/auth/login?returnTo=${encodeURIComponent(location.pathname + location.search)}` : null}
