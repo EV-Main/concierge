@@ -1,0 +1,26 @@
+<!doctype html>
+<!-- The platform account page, built to dist/account.html by scripts/build.mjs and served
+     at /account (runner/src/web/mfe.rs). Paths are absolute (%BASE%): the page's URL is not
+     beside the bundles. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Account · EV</title>
+    <link rel="stylesheet" href="%BASE%%PAGE_CSS%" />
+    <script type="module" src="%BASE%%ELEMENT_JS%"></script>
+    <script type="module" src="%BASE%%CHIP_JS%"></script>
+    <script type="module" src="%BASE%%PAGE_JS%"></script>
+  </head>
+  <body>
+    <header class="platform-bar">
+      <a href="/" class="platform-brand">EV</a>
+      <mfe-concierge-account-chip></mfe-concierge-account-chip>
+    </header>
+    <main class="platform-page platform-page-wide">
+      <mfe-concierge-account></mfe-concierge-account>
+    </main>
+  </body>
+</html>

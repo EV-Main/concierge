@@ -33,3 +33,15 @@ body {
 .platform-page .platform-refusal {
   @apply text-accent-error;
 }
+
+.platform-page-wide {
+  @apply max-w-4xl py-8;
+}
+
+.platform-bar {
+  @apply mx-auto flex max-w-4xl items-center justify-between px-(--page-px) pt-6;
+}
+
+.platform-brand {
+  @apply text-lg font-semibold tracking-tight text-ink no-underline;
+}

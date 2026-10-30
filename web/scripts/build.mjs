@@ -149,16 +149,16 @@ const checked = parseRegistry(registry);
 if (!checked.ok) throw new Error(`registry.json would not parse: ${checked.error}`);
 writeFileSync(path.join(DIST, "registry.json"), `${JSON.stringify(registry, null, 2)}\n`);
 
-// The platform pages concierge's authorize route sends a browser to
-// (runner/src/web/authorize.rs): dist/reauth.html when a client asks for `max_age`, and
-// dist/sign-in.html when there is no session to authorize with. Each loads its element's
-// bundle from the registry above, its own script and the shared page sheet; every file a
-// page names is hashed, so only the page itself is short-lived. Pages are not elements:
-// they stay out of registry.json.
+// The platform pages: dist/reauth.html and dist/sign-in.html, where concierge's authorize
+// route sends a browser (runner/src/web/authorize.rs), and dist/account.html, served at
+// `/account`. Each loads its elements' bundles from the registry above, its own script and
+// the shared page sheet; every file a page names is hashed, so only the page itself is
+// short-lived. Pages are not elements: they stay out of registry.json.
 const HASHED = /^[A-Za-z0-9-]+-[A-Z0-9]{8}\.(?:js|css)$/;
 const PAGES = [
-  { page: "reauth", tag: "mfe-concierge-reauth" },
-  { page: "sign-in", tag: "mfe-concierge-sign-in" },
+  { page: "reauth", elements: { "%ELEMENT_JS%": "mfe-concierge-reauth" } },
+  { page: "sign-in", elements: { "%ELEMENT_JS%": "mfe-concierge-sign-in" } },
+  { page: "account", elements: { "%ELEMENT_JS%": "mfe-concierge-account", "%CHIP_JS%": "mfe-concierge-account-chip" } },
 ];
 
 async function emitHashed(entryPoints, options = {}) {
@@ -173,15 +173,17 @@ const pageCssRun = spawnSync(path.join(ROOT, "node_modules/.bin/tailwindcss"), [
 if (pageCssRun.status !== 0) throw new Error(`tailwindcss failed for platform-page:\n${pageCssRun.stderr}`);
 const pageCss = await emitHashed({ "platform-page": pageCssIn }, { target: CSS_TARGET });
 
-for (const { page, tag } of PAGES) {
-  const element = registry.find((entry) => entry.tag === tag);
-  if (!element) throw new Error(`${page}.html needs the ${tag} bundle`);
+for (const { page, elements } of PAGES) {
   const files = {
-    "%ELEMENT_JS%": path.basename(element.scriptUrl),
     "%PAGE_JS%": await emitHashed({ [`${page}-page`]: path.join(ROOT, `src/entries/${page}-page.ts`) }),
     "%PAGE_CSS%": pageCss,
   };
-  let html = readFileSync(path.join(ROOT, `pages/${page}.html`), "utf8");
+  for (const [slot, tag] of Object.entries(elements)) {
+    const element = registry.find((entry) => entry.tag === tag);
+    if (!element) throw new Error(`${page}.html needs the ${tag} bundle`);
+    files[slot] = path.basename(element.scriptUrl);
+  }
+  let html = readFileSync(path.join(ROOT, `pages/${page}.html`), "utf8").replaceAll("%BASE%", config.basePath);
   for (const [slot, file] of Object.entries(files)) {
     if (!HASHED.test(file)) throw new Error(`${page}.html: unexpected file name ${file}`);
     if (!html.includes(slot)) throw new Error(`${page}.html: the template has no ${slot}`);
