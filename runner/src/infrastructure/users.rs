@@ -142,14 +142,19 @@ pub struct AdminAction {
 	pub action: &'static str,
 	/// The actor's stated cause. Empty where the surface does not ask for one.
 	pub reason: String,
-	/// The proposal that authorized this, when one did.
-	pub proposal_id: Option<Uuid>,
-	/// The approval (`approvals`) that authorized this, when one did: the legacy proposal
-	/// above is a `user_proposal`, and a decision of the generalised consilium is not.
+	/// The approval (`approvals`) that authorized this, when one did.
 	pub approval_id: Option<Uuid>,
 	/// What the action did, in the vocabulary of the action itself.
 	pub detail: Option<serde_json::Value>,
-	/// Where the request came from. Same provenance the consilium records.
+	/// Where the request came from.
+	pub client_ip: String,
+	pub user_agent: String,
+}
+
+/// Where a command came from, recorded against its audit row: a decision whose provenance
+/// was never captured cannot be audited afterwards.
+#[derive(Clone, Default)]
+pub struct Audit {
 	pub client_ip: String,
 	pub user_agent: String,
 }
@@ -161,7 +166,7 @@ impl AdminAction {
 	}
 
 	/// An action by a signed-in operator, with the request's provenance attached.
-	pub fn by(actor: UserId, action: &'static str, audit: &super::governance::Audit) -> Self {
+	pub fn by(actor: UserId, action: &'static str, audit: &Audit) -> Self {
 		Self {
 			actor: Some(actor),
 			action,
@@ -183,11 +188,6 @@ impl AdminAction {
 
 	pub fn with_detail(mut self, detail: serde_json::Value) -> Self {
 		self.detail = Some(detail);
-		self
-	}
-
-	pub fn with_proposal(mut self, proposal_id: Uuid) -> Self {
-		self.proposal_id = Some(proposal_id);
 		self
 	}
 }
@@ -419,8 +419,7 @@ impl UserDirectoryRepository for PgUsers {
 		// The plane's lazy-expiry convention: a proposal past its deadline is not open,
 		// whether or not a write path has got round to stamping it so.
 		let ratification_pending: bool = sqlx::query_scalar(
-			"SELECT EXISTS (SELECT 1 FROM user_proposal WHERE subject_user_id = $1 AND kind = 'suspension' AND state = 'open' AND expires_at > $2) \
-			 OR EXISTS (SELECT 1 FROM approvals WHERE kind = 'concierge:user_suspension' AND scope = 'main' AND subject_ref = 'user:' || $1::text \
+			"SELECT EXISTS (SELECT 1 FROM approvals WHERE kind = 'concierge:user_suspension' AND scope = 'main' AND subject_ref = 'user:' || $1::text \
 			            AND ((state = 'open' AND expires_at > $2) OR (state = 'passed' AND executable_at + $3 > $2)))",
 		)
 		.bind(id.raw())
@@ -494,7 +493,7 @@ impl UserDirectoryRepository for PgUsers {
 	/// strand the rest, and return who was released.
 	///
 	/// This one thing does NOT follow the plane's lazy-expiry convention, and the reason
-	/// is the bridge. A governance proposal going stale has no effect outside this
+	/// is the bridge. A proposal going stale has no effect outside this
 	/// database, so projecting it as expired at read time is enough. A hold's whole
 	/// purpose is the FROZEN flag the money plane mirrors, and the money plane learns
 	/// about it only from a `user_outbox` row — so a lapse that is merely projected would
@@ -914,9 +913,9 @@ async fn link(conn: &mut PgConnection, provider: Provider, subject: &str, user: 
 	Ok(())
 }
 
-/// Read one user `FOR UPDATE` on an open transaction. Shared with the governance
-/// adapter, which must take a seat and append the resulting `ROLE_CHANGED` in the same
-/// transaction as the consilium's verdict — one identity writer, not two.
+/// Read one user `FOR UPDATE` on an open transaction. Shared with the seat writers
+/// (`governance`, `people`), which must move a seat and append the resulting `ROLE_CHANGED`
+/// in the same transaction as the decision — one identity writer, not two.
 pub(crate) async fn load_for_update(conn: &mut PgConnection, id: UserId) -> Result<User, DomainError> {
 	sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE id = $1 FOR UPDATE"))
 		.bind(id.raw())
@@ -1013,13 +1012,12 @@ fn detail_with(base: Option<serde_json::Value>, keys: serde_json::Value) -> serd
 /// the mutation it describes commit together or not at all.
 pub(crate) async fn record_action(conn: &mut PgConnection, subject: UserId, action: &AdminAction, now: i64) -> Result<(), DomainError> {
 	sqlx::query(
-		"INSERT INTO admin_action (subject_user_id, actor_user_id, action, proposal_id, reason, detail, occurred_at, client_ip, user_agent, approval_id) \
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+		"INSERT INTO admin_action (subject_user_id, actor_user_id, action, reason, detail, occurred_at, client_ip, user_agent, approval_id) \
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
 	)
 	.bind(subject.raw())
 	.bind(action.actor.map(|a| a.raw()))
 	.bind(action.action)
-	.bind(action.proposal_id)
 	.bind(&action.reason)
 	.bind(action.detail.as_ref())
 	.bind(now)

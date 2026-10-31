@@ -9,9 +9,8 @@
 //! - [`kyc`] — identity verification: the vendor adapter (and its no-network twin) plus
 //!   the `kyc_cases` store a webhook resolves an identity through. The level itself is
 //!   written by [`users`], exactly the way an operator's decision is.
-//! - [`governance`] — the ownership consilium: proposals, the snapshotted peer set,
-//!   the target's emailed token, and the seat change itself (written through the
-//!   `users` helpers, in the same transaction as the verdict).
+//! - [`governance`] — the owner roster outside `approvals`: genesis, a resignation, and
+//!   the mail queue that bypasses notification preferences.
 //! - [`grants`] — grants over tenant namespaces and the tenants' published catalogs,
 //!   decided and audited inside the transaction that writes them.
 //! - [`relying_parties`] — the registry of first-party clients on other origins, their
@@ -24,7 +23,7 @@
 //! - [`approvals`] — proposals of every scope, their frozen rosters and history, each
 //!   transition and its history row in one transaction.
 //! - [`people`] — the decisions about people inside `approvals`: what may be asked at open
-//!   and what an executed one writes, through the same `users` helpers the legacy consilia use.
+//!   and what an executed one writes, through the same `users` helpers every identity write uses.
 //! - [`credentials`] — what this plane checks itself: emailed one-time codes and
 //!   passwords.
 //! - [`email`] — the SMTP transport seam and the rendered messages that cross it.

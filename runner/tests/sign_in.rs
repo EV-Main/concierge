@@ -54,7 +54,7 @@ async fn setup() -> Option<Fx> {
 			users: users.clone(),
 			cases: Arc::new(PgKycCases::new(pool.clone())),
 			notifications: Arc::new(PgNotifications::new(pool.clone())),
-			governance: Arc::new(PgGovernance::new(pool.clone(), format!("{ORIGIN}/governance"))),
+			governance: Arc::new(PgGovernance::new(pool.clone())),
 			provider: None,
 			support_email: "support@evinvest.test".into(),
 			case_ttl_secs: 86_400,

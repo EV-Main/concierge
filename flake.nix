@@ -154,7 +154,7 @@
               # deploy/config.nix is kept for reference.
               BIND = "0.0.0.0:55670";
               WEB_BIND = "0.0.0.0:55671";
-              # The bridge seams (UserEvents + MailRelayService) over TLS, on a SECOND
+              # The service seams (UserEvents + the scope seams) over TLS, on a SECOND
               # port (EV-invest/banking#199, phase 2). Not TLS on 55670: that port has
               # three cleartext callers — the in-process JWKS verifier above, the cabinet
               # BFF (banking CONCIERGE_GRPC_ADDR) and gRPC-Web — that would all have to

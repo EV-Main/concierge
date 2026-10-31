@@ -265,7 +265,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 			users: users.clone(),
 			cases: cases.clone(),
 			notifications: notifications.clone(),
-			governance: Arc::new(PgGovernance::new(pool.clone(), "https://evinvest.test/governance".to_string())),
+			governance: Arc::new(PgGovernance::new(pool.clone())),
 			provider,
 			support_email: SUPPORT.to_string(),
 			case_ttl_secs: CASE_TTL_SECS,

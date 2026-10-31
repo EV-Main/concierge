@@ -55,7 +55,7 @@ async fn setup() -> Option<Fixture> {
 		.expect("clear the roster");
 
 	Some(Fixture {
-		seeder: Arc::new(PgGovernance::new(pool.clone(), "https://example.test/governance/removal".into())),
+		seeder: Arc::new(PgGovernance::new(pool.clone())),
 		users: Arc::new(PgUsers::new(pool.clone())),
 		pool,
 		_roster_lock: roster_lock,

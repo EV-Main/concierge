@@ -171,7 +171,7 @@ pub const HOLD_TTL_SECS: i64 = 24 * 60 * 60;
 /// off, forever, with no consilium ever asked. So a second hold inside this window is
 /// refused unless a suspension proposal about the account is OPEN, in which case the
 /// owners are already deciding and keeping the account frozen until they do is the
-/// point. A week is longer than a proposal lives ([`crate::governance::REMOVAL_TTL_SECS`],
+/// point. A week is longer than a proposal lives ([`crate::approvals::MAX_TTL_SECS`],
 /// 72h), so "the owners never got round to it" cannot be bridged by re-holding, and
 /// short enough that a threat which genuinely returns after the owners declined can be
 /// braked again without a change of policy.

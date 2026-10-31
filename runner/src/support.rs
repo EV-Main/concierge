@@ -24,10 +24,9 @@ pub fn domain_to_status(err: DomainError) -> Status {
 
 /// Authenticate a SERVICE-to-service caller against a shared bearer token.
 ///
-/// The two seams that cross a plane boundary without a user behind them — the
-/// lifecycle bridge the money plane pulls, and the mail relay it pushes to — both
-/// authenticate this way rather than through the user `grpc_auth_layer`, and both are
-/// mounted outside it. The comparison is constant time, so verifying leaks nothing
+/// The lifecycle bridge the money plane pulls crosses a plane boundary without a user
+/// behind it, so it authenticates this way rather than through the user
+/// `grpc_auth_layer`, and is mounted outside it. The comparison is constant time, so verifying leaks nothing
 /// through timing; an unconfigured token fails CLOSED, because a seam that quietly
 /// stops checking is worse than one that stops working.
 ///

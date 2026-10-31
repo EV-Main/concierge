@@ -2,8 +2,7 @@
 //!
 //! An emitter names a cabinet-RELATIVE path, never a host. A notice about a scope's
 //! business links to that scope's own cabinet, so the emitter may also name the scope
-//! (`EmitRequest.link_scope`, `FeePolicyNoticeMail.link_scope`), and this plane looks its
-//! base up in `NOTICE_LINK_BASES`.
+//! (`EmitRequest.link_scope`), and this plane looks its base up in `NOTICE_LINK_BASES`.
 //! The emit stores the finished absolute link, because the inbox row is read by the
 //! frontends as it is stored and no column holds the scope. Without a base the link stays
 //! relative and the mail joins it onto `CABINET_URL`, as before.
@@ -97,7 +96,7 @@ impl NoticeLinkBases {
 		}
 	}
 
-	pub fn base(&self, scope: &str) -> Option<&str> {
+	fn base(&self, scope: &str) -> Option<&str> {
 		self.bases.iter().find(|(s, _)| s == scope).map(|(_, base)| base.as_str())
 	}
 
@@ -197,7 +196,7 @@ enum Stored {
 /// writes origin + link turns into another host. ASCII, because the mail's text part
 /// prints the link bare on its own line: an invisible character (U+200B, U+202E) folds
 /// to a space there and starts a second, foreign link on that line. The empty path means
-/// the cabinet's front page. The money plane's fee notice link is held to the same rule.
+/// the cabinet's front page.
 pub fn cabinet_path(raw: &str) -> Result<String, Status> {
 	if raw.is_empty() {
 		return Ok(String::new());
@@ -215,8 +214,8 @@ pub fn cabinet_path(raw: &str) -> Result<String, Status> {
 	Ok(raw.to_owned())
 }
 
-/// `link` is `base` or below it. The boundary is checked explicitly, as
-/// `MailRelay::check_origin` does: a bare `starts_with` would also accept
+/// `link` is `base` or below it. The boundary is checked explicitly: a bare `starts_with`
+/// would also accept
 /// `https://invest.evinvest.ltd.attacker.example`.
 fn is_under(base: &str, link: &str) -> bool {
 	if !link.bytes().all(|b| b.is_ascii_graphic()) {

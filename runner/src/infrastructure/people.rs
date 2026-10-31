@@ -3,14 +3,13 @@
 //! `user_reinstatement`, `admin_admission`, `second_factor_reset`;
 //! `docs/SCOPES-AND-APPROVALS.md` §5.3).
 //!
-//! The effects are the legacy consilia's, written through the SAME identity helpers
-//! (`users::load_for_update`, `update_row`, `drain_outbox`), so there is one identity writer
-//! and one outbox convention. `Role::Owner` is written here by an executed
-//! `concierge:owner_admission` and by genesis, and nowhere else (`UserDirectory.SetRole`
-//! refuses it) — besides the legacy `GovernanceService`, which stays until the contract step.
+//! The effects are written through the SAME identity helpers (`users::load_for_update`,
+//! `update_row`, `drain_outbox`), so there is one identity writer and one outbox convention.
+//! `Role::Owner` is written here by an executed `concierge:owner_admission` and by genesis,
+//! and nowhere else (`UserDirectory.SetRole` refuses it).
 //!
 //! LOCKS. An execution takes, in this order: the governance revision (so it serialises with
-//! the legacy writers, which take it first), the `users` rows of every owner and of the two
+//! genesis and a resignation, which take it first), the `users` rows of every owner and of the two
 //! accounts named, in id order, and only then the proposal row. A change of the owners
 //! takes its `users` row and then the `approvals` rows its trigger voids; taken the other
 //! way round the executor and a role change could each hold what the other waits for.

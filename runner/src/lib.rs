@@ -11,11 +11,8 @@
 //! Hexagonal layout over the shared `domain`:
 //!   directory       — the user/profile gRPC service + the auth→directory provisioner loop
 //!   bridge          — the cross-plane (identity→money) producer over the user_outbox
-//!   bridge_tls      — the TLS listener that serves the bridge seams to the money plane
+//!   bridge_tls      — the TLS listener that serves the service seams to the money plane
 //!   platform        — the platform/cabinet config service (maintenance · announcement · flags)
-//!   governance      — the consilia: the owner roster, owner admission/removal proposals,
-//!                     the user proposals over suspension/reinstatement/`admin`, the
-//!                     target's emailed approval surface, and the money plane's mail relay
 //!   authz           — the shared RBAC gate (persisted role + status/revocation enforcement),
 //!                     plus the emergency access that retires itself at the first owner
 //!   genesis         — the boot-time seeding of the fund's first owner registry
@@ -50,7 +47,6 @@ pub mod config;
 pub mod directory;
 pub mod dispatch;
 pub mod genesis;
-pub mod governance;
 pub mod infrastructure;
 pub mod log;
 pub mod notice_link;

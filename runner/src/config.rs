@@ -35,8 +35,8 @@ ev::settings! {
 		/// Shared bearer token for the cross-plane bridge (`UserEvents.PullUserLifecycle`).
 		#[secret]
 		bridge_service_token: String,
-		/// A SECOND gRPC listener that serves ONLY the two seams the money plane dials —
-		/// `UserEvents` and `MailRelayService` — over TLS (EV-invest/banking#199, phase 2).
+		/// A SECOND gRPC listener that serves ONLY the service seams — `UserEvents` and the
+		/// scope seams — over TLS (EV-invest/banking#199, phase 2).
 		///
 		/// A second port rather than TLS on `bind`, because 55670 has three cleartext
 		/// callers that would all have to move at once: the in-process JWKS verifier
@@ -95,8 +95,7 @@ ev::settings! {
 		/// Origin the cabinet is served from; builds the links inside emails. A notice whose
 		/// `link_scope` has no entry in `notice_link_bases` links here too.
 		cabinet_url: String = "https://evinvest.ltd/cabinet",
-		/// Each scope's own cabinet, for the notices an emitter (or the money plane's fee
-		/// notice) sends with `link_scope`
+		/// Each scope's own cabinet, for the notices an emitter sends with `link_scope`
 		/// (comma-separated `scope=base`, e.g. `invest=https://invest.evinvest.ltd/cabinet`;
 		/// banking#580). Empty ⇒ every notice links under `cabinet_url`. A malformed entry
 		/// refuses the boot (`notice_link::NoticeLinkBases::parse`). Removing an entry later
@@ -138,33 +137,11 @@ ev::settings! {
 		/// Account-less subscribe attempts allowed per client IP per window.
 		subscribe_rate_limit: u32 = "5",
 		subscribe_rate_window_secs: u64 = "3600",
-		/// Governance mails the relay accepts per RECIPIENT per window. The money plane is
-		/// the one caller and is trusted enough to be there at all; this bounds how much
-		/// branded security mail a compromised one can aim at a single person before an
-		/// operator notices. Spent only on a NEW mail actually queued — a retry the dedupe
-		/// key turns into a no-op costs nothing — so a recipient's handful per consilium
-		/// fits with room to spare, and the durable ceiling stays the daily send budget.
-		governance_mail_rate_limit: u32 = "30",
-		governance_mail_rate_window_secs: u64 = "3600",
 		/// GrantPermission + RevokePermission calls one delegate may make per window,
 		/// refusals included — the ceiling on probing addresses through their delegation.
 		/// Granting seats are not counted. Mirrors `directory::GRANT_WRITE_RATE_LIMIT`.
 		grant_write_rate_limit: u32 = "20",
 		grant_write_rate_window_secs: u64 = "3600",
-		/// Base URL of the owner-removal approval page; the emailed token is appended as
-		/// the final path segment, so a message carries `<this>/<token>`.
-		///
-		/// It is a CABINET route (`/{locale}/cabinet/owner-removal/{token}`) served
-		/// publicly — the person opening it is the one being removed and may well not be
-		/// signed in, but there is no `/governance/*` surface on the site and a link into
-		/// one would 404 every removal invitation ever sent.
-		governance_approval_url: String = "https://evinvest.ltd/cabinet/owner-removal",
-		/// Close new openings of the legacy `GovernanceService` consilia (owner admission and
-		/// removal, user suspension, reinstatement, admin admission): they are refused and name
-		/// the `ApprovalService` RPC that replaces them. Off by default. Votes on what is
-		/// already open, cancellation, resignation and `DrainLegacyProposals` keep working, so
-		/// the window can be emptied before the old service goes.
-		governance_new_votes_closed: bool = "false",
 		/// Didit (identity verification) credentials. The feature is ON only when all three
 		/// are present; with any of them missing `/kyc/start` and `/kyc/callback/didit` answer
 		/// 503 and no case can be opened.
@@ -297,22 +274,6 @@ mod tests {
 
 		let vars: Vec<&str> = error.errors.iter().map(|e| e.var.as_str()).collect();
 		assert_eq!(vars, vec!["SENTRY_DSN", "SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD"]);
-	}
-
-	/// The emailed link must point at a page that exists. It is a CABINET route served
-	/// publicly, NOT a `/governance/*` path — there is no such surface on the site, and
-	/// an invitation linking into one would 404 for every owner who ever received it.
-	///
-	/// The token is appended as the final segment, so the base must carry no trailing
-	/// slash and no query string.
-	#[test]
-	fn the_approval_link_points_into_the_cabinet() {
-		let config = AppConfig::from_source(minimal_env).expect("boot");
-		let base = &config.governance_approval_url;
-		let path = base.strip_prefix("https://evinvest.ltd").expect("the public site: {base}");
-		assert_eq!(path, "/cabinet/owner-removal", "the cabinet serves /{{locale}}/cabinet/owner-removal/{{token}}");
-		assert!(!base.ends_with('/'), "the token is appended as `<base>/<token>`");
-		assert!(!base.contains('?'), "a query string would swallow the token segment");
 	}
 
 	/// The KYC return keeps today's page until it is moved on purpose. Moving

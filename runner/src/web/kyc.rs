@@ -900,8 +900,7 @@ async fn alert_owners_if_contradicted(st: &super::Inner, case: &KycCase, redeliv
 
 	for owner in owners {
 		// The address comes from the IDENTITY RECORD — the roster read above IS that
-		// record — and must be VERIFIED, the same rule the mail relay applies to every
-		// governance kind: an address nobody has proved belongs to the person is not
+		// record — and must be VERIFIED: an address nobody has proved belongs to the person is not
 		// where an operational alert about somebody else's account should land. Read off
 		// the roster rather than by a lookup per owner, because this handler answers a
 		// webhook with a 5-second vendor budget and a round trip each is the shape that
@@ -990,7 +989,7 @@ mod tests {
 			status: KycStatus::KycExpired,
 		};
 		let payload = verdict_alert_payload("subject@example.com", &case, 1, 1_785_143_640);
-		let mail = crate::dispatch::governance_mail("kyc_verdict_alert", &payload, &crate::notice_link::NoticeLinkBases::cabinet_only("https://cabinet.example/")).expect("renderable");
+		let mail = crate::dispatch::governance_mail("kyc_verdict_alert", &payload).expect("renderable");
 
 		// The address is how an operator finds the person: this mail carries no link and
 		// no code on purpose, so losing it makes the alert unactionable rather than ugly.
@@ -1001,14 +1000,11 @@ mod tests {
 
 		// Nobody unsubscribes from an operational alert about somebody else's account.
 		assert!(!mail.html.contains("Unsubscribe"), "governance mail carries no unsubscribe target");
-		// No link and no code: lowering a level from a mailbox is not a thing anyone does.
-		assert!(!mail.html.contains("https://cabinet.example"), "this alert deliberately links nowhere: {}", mail.html);
 
 		// A key the producer stopped writing must not render as a plausible mail.
 		let mut renamed = payload.clone();
 		renamed["subject"] = renamed["subject_email"].take();
-		let drifted =
-			crate::dispatch::governance_mail("kyc_verdict_alert", &renamed, &crate::notice_link::NoticeLinkBases::cabinet_only("https://cabinet.example/")).expect("still renderable");
+		let drifted = crate::dispatch::governance_mail("kyc_verdict_alert", &renamed).expect("still renderable");
 		assert!(
 			!drifted.text.contains("subject@example.com"),
 			"a renamed key silently empties the field — which is why the assertions above exist"

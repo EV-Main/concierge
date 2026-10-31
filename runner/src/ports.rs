@@ -32,7 +32,6 @@ use domain::{
 	auth::ProvenIdentity,
 	authz::Role,
 	error::DomainError,
-	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
 	iam::{Catalog, Target},
 	scope_catalog::{ApprovalKind, ApprovalLevel, NotificationTopic, ScopeCatalog, TopicDelivery},
 	users::{Email, ProfileFields, User, UserId, Username},
@@ -42,7 +41,7 @@ use uuid::Uuid;
 use crate::{
 	genesis::{GenesisOutcome, GenesisSubject},
 	infrastructure::{
-		governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision, UserProposalRecord},
+		governance::OwnerRow,
 		notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
 		platform::{FeatureFlagRow, PlatformConfigRow},
 		users::{AdminAction, AdminUserRow, AuthzRecord, Reinstatement},
@@ -1554,97 +1553,12 @@ pub trait NotificationDispatchRepository: Send + Sync {
 	async fn scope_topics(&self) -> Result<Vec<NotificationTopic>, DomainError>;
 }
 
-/// Persistence + read port for the ownership consilium (the `OwnerRemoval` aggregate
-/// and the roster it is decided against).
-///
-/// `now` is passed in rather than read here so the domain layer stays clock-free and
-/// every decision is reproducible from its inputs.
-/// Which legacy table a drained proposal lives in.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LegacyKind {
-	Removal,
-	Admission,
-	UserProposal,
-}
-
-/// What a drain did to one proposal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Drained {
-	Voided,
-	/// Already decided, expired or withdrawn: nothing changed.
-	NotOpen,
-	NotFound,
-}
-
+/// The owner roster and the mail queue that bypasses notification preferences, for the
+/// callers outside `approvals` (the KYC verdict alert).
 #[async_trait]
 pub trait GovernanceRepository: Send + Sync {
 	/// The current owner roster, oldest seat first.
 	async fn owners(&self) -> Result<Vec<OwnerRow>, DomainError>;
-
-	/// Snapshot the peer set, mint the target's token, and queue their invitation —
-	/// one transaction, so `target_notified` can never claim a message nobody queued.
-	async fn open_removal(&self, target: UserId, initiator: UserId, reason: &str, now: i64) -> Result<RemovalRecord, DomainError>;
-
-	async fn find_removal(&self, id: RemovalId, now: i64) -> Result<Option<RemovalRecord>, DomainError>;
-
-	/// Every proposal, newest first. Nothing is filtered out: a rejected, expired or
-	/// void one stays readable.
-	async fn list_removals(&self, limit: i64, now: i64) -> Result<Vec<RemovalRecord>, DomainError>;
-
-	/// Record one peer's answer and carry the verdict if it passed.
-	async fn peer_vote(&self, id: RemovalId, voter: UserId, vote: Vote, now: i64, audit: &Audit) -> Result<RemovalRecord, DomainError>;
-
-	async fn cancel_removal(&self, id: RemovalId, by: UserId, now: i64) -> Result<RemovalRecord, DomainError>;
-
-	/// Snapshot the voter set and open a proposal to GRANT a seat. No token and no mail:
-	/// every voter is a signed-in owner, and the candidate has no say.
-	async fn open_admission(&self, candidate: UserId, initiator: UserId, reason: &str, now: i64) -> Result<AdmissionRecord, DomainError>;
-
-	async fn find_admission(&self, id: AdmissionId, now: i64) -> Result<Option<AdmissionRecord>, DomainError>;
-
-	/// Every admission, newest first. Nothing is filtered out.
-	async fn list_admissions(&self, limit: i64, now: i64) -> Result<Vec<AdmissionRecord>, DomainError>;
-
-	/// Record one owner's answer and grant the seat if the vote was unanimous.
-	async fn admission_vote(&self, id: AdmissionId, voter: UserId, vote: AdmissionVote, now: i64, audit: &Audit) -> Result<AdmissionRecord, DomainError>;
-
-	async fn cancel_admission(&self, id: AdmissionId, by: UserId, now: i64) -> Result<AdmissionRecord, DomainError>;
-
-	/// Snapshot the voter set and open a proposal over one PERSON's standing — a permanent
-	/// suspension, a reinstatement from one, or the `admin` seat. No token and no mail:
-	/// every voter is a signed-in owner, and the subject has no say.
-	async fn open_user_proposal(&self, kind: UserProposalKind, subject: UserId, initiator: UserId, reason: &str, now: i64) -> Result<UserProposalRecord, DomainError>;
-
-	async fn find_user_proposal(&self, id: UserProposalId, now: i64) -> Result<Option<UserProposalRecord>, DomainError>;
-
-	/// Every proposal, newest first, optionally narrowed to one kind. Nothing is filtered
-	/// out: a rejected, expired or void one stays readable.
-	async fn list_user_proposals(&self, kind: Option<UserProposalKind>, limit: i64, now: i64) -> Result<Vec<UserProposalRecord>, DomainError>;
-
-	/// Record one owner's answer and, if the threshold is met, APPLY the verdict — the
-	/// status or role write, its cross-plane event and the audit row, all in this
-	/// transaction.
-	async fn user_proposal_vote(&self, id: UserProposalId, voter: UserId, vote: ProposalVote, now: i64, audit: &Audit) -> Result<UserProposalRecord, DomainError>;
-
-	async fn cancel_user_proposal(&self, id: UserProposalId, by: UserId, now: i64) -> Result<UserProposalRecord, DomainError>;
-
-	/// The redacted invitation behind an emailed token. STRICTLY read-only.
-	async fn invitation(&self, token: &str, now: i64) -> Result<Option<InvitationRecord>, DomainError>;
-
-	/// The target answering from their mailbox: attempt-counted, constant-time and
-	/// one-shot.
-	async fn self_decision(&self, token: &str, code: &str, vote: Vote, now: i64, audit: &Audit) -> Result<SelfDecision, DomainError>;
-
-	/// Give up a seat voluntarily. Subject to the same floor as a removal.
-	async fn resign(&self, who: UserId, now: i64) -> Result<(), DomainError>;
-
-	/// The live feed's clock, read straight from Postgres.
-	async fn revision(&self) -> Result<u64, DomainError>;
-
-	/// Void the OPEN legacy proposals named, in one transaction, and say what became of
-	/// each: the window's drain, so this service's part of the consilia can be emptied
-	/// before the people's decisions live in `approvals` alone.
-	async fn drain(&self, items: &[(LegacyKind, Uuid)], reason: &str, by: UserId, now: i64) -> Result<Vec<Drained>, DomainError>;
 
 	/// Queue one governance mail to a resolved recipient, bypassing notification
 	/// preferences. What happened to `dedupe_key` is the answer — see

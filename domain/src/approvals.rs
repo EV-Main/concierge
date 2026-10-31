@@ -1,12 +1,12 @@
 //! `approvals` — the consilium generalised to every scope (`docs/SCOPES-AND-APPROVALS.md`
 //! §5, `approvals.proto`).
 //!
-//! Pure and wasm-safe like [`crate::governance`]: ids, the clock, the roster and the
+//! Pure and wasm-safe like [`crate::users`]: ids, the clock, the roster and the
 //! amounts already counted in a scope's trailing window are supplied by the application
 //! layer, so every rule here — who decides, when a proposal passes, what a veto may still
 //! stop — is testable without a database and identical for every caller.
 //!
-//! What differs from the owner consilia, and why:
+//! What differs from the owners' consilium it generalises (banking's `docs/CONSILIUM.md`), and why:
 //!
 //! * the quorum is MORE THAN HALF of a roster frozen at open and NOBODY is excluded from
 //!   it: a service cannot prove which person asked it, so the person it names
@@ -26,7 +26,7 @@ use crate::{
 	users::UserId,
 };
 
-/// The platform roster's bar: more than half of the owners, as the user consilia.
+/// The platform roster's bar: more than half of the owners.
 pub const PLATFORM_QUORUM_BPS: u32 = 5001;
 /// The owners' veto window, the consilium's.
 pub const PLATFORM_DELAY_SECS: u32 = 24 * 60 * 60;
@@ -74,8 +74,7 @@ pub const OWN_NAMESPACE: &str = "concierge";
 pub const SCOPE_ADMIN_GRANT: &str = "concierge:scope_admin_grant";
 pub const SCOPE_POLICY_CHANGE: &str = "concierge:scope_policy_change";
 pub const PLATFORM_POLICY: &str = "concierge:platform_policy";
-/// The decisions about people, moved here from the legacy governance consilia. Each is the
-/// platform's, in scope `main`.
+/// The decisions about people. Each is the platform's, in scope `main`.
 pub const OWNER_ADMISSION: &str = "concierge:owner_admission";
 pub const OWNER_REMOVAL: &str = "concierge:owner_removal";
 pub const USER_SUSPENSION: &str = "concierge:user_suspension";
@@ -91,8 +90,8 @@ pub const UNANIMOUS_QUORUM_BPS: u32 = 10_000;
 
 /// The bar a platform proposal of `kind` is measured by: every owner on the roster for a
 /// change of the seats — nobody may grow or shrink the roster that decides everything else
-/// by a majority (the reason the legacy consilia were unanimous) — and more than half for
-/// the rest, as the user consilia were.
+/// by a majority: a minority able to add or remove owners grows itself into a majority — and
+/// more than half for the rest.
 pub fn platform_quorum_bps(kind: &str) -> u32 {
 	match kind {
 		OWNER_ADMISSION | OWNER_REMOVAL => UNANIMOUS_QUORUM_BPS,
