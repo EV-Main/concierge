@@ -426,9 +426,8 @@ pub(super) async fn refresh_of(st: &super::Inner, jar: &CookieJar) -> Result<Opt
 ///
 /// Both comparisons are constant time. Neither is a plausible oracle on its own — a
 /// `memcmp` would have to be timed across the network and the whole token guessed anyway
-/// — but this plane compares the bridge token (`support::authenticate_service`), the
-/// webhook signature (`infrastructure::kyc::didit`) and the consilium code
-/// (`infrastructure::governance`) that way, and a token check that quietly does not is
+/// — but this plane compares the bridge token (`support::authenticate_service`) and the
+/// webhook signature (`infrastructure::kyc::didit`) that way, and a token check that quietly does not is
 /// the kind of exception a reader takes for the rule.
 ///
 /// The order matters more than the timing does and is deliberate: the header is matched

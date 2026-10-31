@@ -290,7 +290,7 @@ async fn sign_in_surface(pool: &PgPool) -> (Router, String, Arc<SignInAllowlist>
 			users,
 			cases: Arc::new(PgKycCases::new(pool.clone())),
 			notifications: Arc::new(PgNotifications::new(pool.clone())),
-			governance: Arc::new(PgGovernance::new(pool.clone(), format!("{PUBLIC}/governance"))),
+			governance: Arc::new(PgGovernance::new(pool.clone())),
 			provider: None,
 			support_email: "support@evinvest.test".into(),
 			case_ttl_secs: 86_400,

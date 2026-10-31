@@ -1156,8 +1156,8 @@ impl ApprovalRepository for PgApprovals {
 		};
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		if about_people {
-			// First, as every legacy governance write takes it: the one row that orders them
-			// all, and what moves the legacy live feed when the owners change.
+			// First, as genesis and a resignation take it: the one row that orders every
+			// write of a seat.
 			governance::lock_governance(&mut tx).await?;
 		}
 		if about_people {
@@ -1259,11 +1259,7 @@ impl ApprovalRepository for PgApprovals {
 	}
 
 	async fn resign(&self, who: UserId) -> Result<(), DomainError> {
-		let now = {
-			let mut conn = self.pool.acquire().await.map_err(repo_err)?;
-			self.instant(&mut conn).await?
-		};
-		governance::resign_seat(&self.pool, who, now).await
+		governance::resign_seat(&self.pool, who).await
 	}
 
 	async fn revision(&self) -> Result<u64, DomainError> {

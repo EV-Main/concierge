@@ -13,8 +13,9 @@
 //! all have to move in one release — the in-process JWKS verifier
 //! (`AUTH_JWKS_GRPC_ENDPOINT`), the cabinet BFF (`CONCIERGE_GRPC_ADDR`, a tonic client
 //! with no TLS) and the gRPC-Web browser path (`accept_http1`). This listener serves
-//! ONLY the two seams banking reaches through `CONCIERGE_BRIDGE_ADDR` — `UserEvents`
-//! and `MailRelayService` — so the two planes can move one seam at a time.
+//! ONLY the service seams — `UserEvents`, which banking reaches through
+//! `CONCIERGE_BRIDGE_ADDR`, and the scope seams (`docs/SCOPES-AND-APPROVALS.md` §1) — so
+//! the planes can move one seam at a time.
 //!
 //! The rule is all-or-nothing and fails CLOSED: a bind with no key material, key
 //! material with no bind, a client CA with no listener, or a path that does not read

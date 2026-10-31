@@ -649,7 +649,7 @@ async fn router(fx: &Fx) -> Router {
 			users: fx.users.clone(),
 			cases: Arc::new(PgKycCases::new(fx.pool.clone())),
 			notifications: Arc::new(PgNotifications::new(fx.pool.clone())),
-			governance: Arc::new(PgGovernance::new(fx.pool.clone(), "https://evinvest.test/governance".to_string())),
+			governance: Arc::new(PgGovernance::new(fx.pool.clone())),
 			provider: None,
 			support_email: "support@evinvest.test".into(),
 			case_ttl_secs: 86_400,

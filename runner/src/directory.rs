@@ -29,7 +29,7 @@
 //! OWNERSHIP IS NOT A ROLE EDIT. `SetRole` refuses to grant or strip `Role::Owner` —
 //! unconditionally, including on a fund with no owners at all — and it refuses from
 //! INSIDE the write transaction, so no consilium can commit between the check and the
-//! write. Both directions go through the consilium in [`crate::governance`], and the
+//! write. Both directions go through the people decisions in [`crate::approvals`], and the
 //! very first seats through the genesis seed ([`crate::genesis`]); those two are the
 //! only writers of `owner` there are. Without that refusal every control there is
 //! decorative: one owner could mint four sock puppets and then carry a payout quorum
@@ -63,12 +63,19 @@ use uuid::Uuid;
 
 use crate::{
 	authz::{BreakGlass, EffectiveRole, Elevation},
-	governance::audit_of,
-	infrastructure::users::{AdminAction, AdminUserRow, Reinstatement},
+	infrastructure::users::{AdminAction, AdminUserRow, Audit, Reinstatement},
 	notification::{RateLimiter, now_secs},
 	ports::{GrantActor, GrantAuthority, GrantOutcome, GrantRecord, GrantRepository, GrantSubject, RevokeOutcome, RoleChange, UngrantableAddress, UserDirectoryRepository},
 	support::domain_to_status,
 };
+
+/// The transport facts a command arrived with, for its audit row.
+fn audit_of<T>(request: &Request<T>) -> Audit {
+	Audit {
+		client_ip: request.remote_addr().map(|addr| addr.ip().to_string()).unwrap_or_default(),
+		user_agent: request.metadata().get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned(),
+	}
+}
 
 /// Grant writes (`GrantPermission` + `RevokePermission`, one budget) a delegate may make
 /// per [`GRANT_WRITE_RATE_WINDOW`]. The defaults of
@@ -375,8 +382,8 @@ impl UserDirectory for Directory {
 		let caller = crate::authz::caller_gate(self.users.as_ref(), &request).await?;
 		let actor = caller.id.ok_or_else(|| Status::unauthenticated("subject is not a user id"))?;
 		// The actor's role is NOT taken from `caller` here: the repository reads the
-		// PERSISTED one — never the elevated one, the same choice the mail relay makes,
-		// since emergency access authorizes an operator but does not seat them — inside
+		// PERSISTED one — never the elevated one, since emergency access authorizes an
+		// operator but does not seat them — inside
 		// the transaction that holds the target, so a demotion committed between this
 		// gate and that lock is seen rather than sailed past.
 		let audit = audit_of(&request);

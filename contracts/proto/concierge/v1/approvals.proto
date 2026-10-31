@@ -2,8 +2,7 @@ syntax = "proto3";
 
 package concierge.v1;
 
-// Approvals — the consilium, generalised from the owners' votes in governance.proto into
-// one service every scope uses. The policy and the reasoning behind each rule are in
+// Approvals — the consilium, one service every scope uses. The policy and the reasoning behind each rule are in
 // docs/SCOPES-AND-APPROVALS.md; what follows is the wire.
 //
 // A KIND belongs to the namespace that published it (`bank:payment`,
@@ -115,15 +114,14 @@ service ApprovalService {
   // 0..=1209600 (14 days; INVALID_ARGUMENT otherwise). One change is live at a time.
   rpc ProposePlatformPolicyChange(ProposePlatformPolicyChangeRequest) returns (Approval);
 
-  // The decisions about PEOPLE, moved here from GovernanceService (docs §5.3). All five are
+  // The decisions about PEOPLE (docs §5.3). All six are
   // PLATFORM level in scope `main`, opened by a persisted, active owner (PERMISSION_DENIED
   // otherwise) who is kept off the roster, as is the account the decision is about: nobody
   // votes on their own seat, and the subject has no veto on it either. The account is named
   // by `user_id` or by `account` (an email or username); `reason` is required, one line, at
   // most 200 bytes, no link. One decision about an account per kind is live at a time
   // (ALREADY_EXISTS / FAILED_PRECONDITION on a second). Each is carried out by this plane's
-  // executor once passed, with the same effect the legacy GovernanceService path had; a
-  // decision that no longer applies when it is executed is VOID.
+  // executor once passed; a decision that no longer applies when it is executed is VOID.
   //
   // ProposeOwnerAdmission  — grant `Role::Owner` to an ACTIVE account with a VERIFIED address
   //                          that holds no seat. UNANIMITY of the other owners.
@@ -149,7 +147,7 @@ service ApprovalService {
   rpc ProposeSecondFactorReset(ProposePersonDecisionRequest) returns (Approval);
 
   // The owner roster (the seat holders, suspended ones included), for a caller holding the
-  // permission to grant roles — the same gate as GovernanceService.ListOwners.
+  // permission to grant roles.
   rpc ListOwners(ListPlatformOwnersRequest) returns (PlatformOwnerList);
 
   // Give up your own seat, typed-confirmed with your own address. Subject to the same floor
@@ -158,8 +156,8 @@ service ApprovalService {
   rpc ResignOwnership(ResignPlatformOwnershipRequest) returns (PlatformOwnerList);
 
   // A number that moves whenever an approval or the owner roster does, for a console that
-  // polls it and refetches when it changes (the replacement of WatchGovernance's stream:
-  // a revision, never a tally). Platform owners and scope admins.
+  // polls it and refetches when it changes (a revision, never a tally). Platform owners and
+  // scope admins.
   rpc GetApprovalsRevision(GetApprovalsRevisionRequest) returns (ApprovalsRevision);
 }
 

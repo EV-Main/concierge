@@ -129,9 +129,8 @@ pub struct DeliveryJob {
 }
 
 /// The payload fields that arm a decision: the approval link and the code typed into
-/// it. Every kind that carries a secret carries it under these two names (the relay in
-/// `governance.rs` builds each payload), so a parked row is redacted by key rather
-/// than by kind — a new kind that reuses the names is covered without a second list.
+/// it. Every kind that ever carried a secret carried it under these two names, so a parked
+/// row is redacted by key rather than by kind.
 pub const SECRET_PAYLOAD_KEYS: &[&str] = &["approval_url", "code"];
 
 fn repo_err(err: sqlx::Error) -> DomainError {
@@ -747,11 +746,10 @@ pub(crate) async fn upsert_subscriber(conn: &mut PgConnection, user_id: Uuid, em
 /// `NotificationService.Emit` is opt-out on both channels and gated on a followed
 /// topic. A security mail a subscriber can silently switch off is not a security mail:
 /// an attacker who reaches the settings surface would otherwise be able to mute the
-/// warning that their own expulsion — or a payout — is being approved. So this writes
-/// straight to the queue and never consults `notification_subscriptions`.
+/// warning that a decision about them is being taken. So this writes straight to the
+/// queue and never consults `notification_subscriptions`.
 ///
-/// Idempotent by `dedupe_key`, which is what makes the money plane's at-least-once relay
-/// safe to retry — and a key already present is told apart as the same mail (same
+/// Idempotent by `dedupe_key`, so an at-least-once producer is safe to retry — and a key already present is told apart as the same mail (same
 /// subscriber, same kind) or a foreign one; see [`GovernanceMailQueued`]. The conflicting
 /// row is read after the insert yields to it: under READ COMMITTED an `ON CONFLICT DO
 /// NOTHING` has waited for the other writer to commit, and queue rows are never deleted,

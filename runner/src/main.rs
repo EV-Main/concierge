@@ -4,7 +4,7 @@
 //! plane). One runner binary mounts its internal modules — `auth` (token issuance,
 //! served by [`evconcierge_auth::AuthService`]), `directory` (user profile/admin),
 //! `bridge` (the cross-plane producer), `platform` (platform/cabinet config),
-//! `governance` (the ownership consilium), `notification`, and `log` — on a single
+//! `approvals` (the consilium), `notification`, and `log` — on a single
 //! tonic server. It opens the Postgres control plane and applies its migrations on
 //! boot (the identity records + the cross-plane bridge outbox). Logs are a DEFERRED
 //! stub. There is no money plane here: the consilium mounted here decides OWNERSHIP,
@@ -17,7 +17,7 @@ use color_eyre::{
 	eyre::{Context, ensure, eyre},
 };
 use concierge::{
-	bridge, bridge_tls, config, directory, governance,
+	bridge, bridge_tls, config, directory,
 	infrastructure::{
 		self,
 		email::transport::{EmailTransport, NoopTransport, SmtpTransport},
@@ -33,12 +33,9 @@ use evconcierge_contracts::concierge::v1::{
 	approval_execution_service_server::ApprovalExecutionServiceServer,
 	approval_service_server::ApprovalServiceServer,
 	auth_service_server::AuthServiceServer,
-	governance_service_server::GovernanceServiceServer,
 	health_service_server::{HealthService, HealthServiceServer},
 	log_service_server::LogServiceServer,
-	mail_relay_service_server::MailRelayServiceServer,
 	notification_service_server::NotificationServiceServer,
-	owner_removal_approval_service_server::OwnerRemovalApprovalServiceServer,
 	platform_service_server::PlatformServiceServer,
 	scope_catalog_service_server::ScopeCatalogServiceServer,
 	scope_events_server::ScopeEventsServer,
@@ -175,9 +172,9 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.context("failed to connect to the database")?;
 	infrastructure::db::migrate(&pool).await.context("failed to apply database migrations")?;
 
-	// The ownership consilium's adapter, built here rather than beside the other services
-	// because genesis runs off it — before anything is served.
-	let pg_governance = Arc::new(infrastructure::governance::PgGovernance::new(pool.clone(), config.governance_approval_url.clone()));
+	// The owner roster's adapter, built here rather than beside the other services because
+	// genesis runs off it — before anything is served.
+	let pg_governance = Arc::new(infrastructure::governance::PgGovernance::new(pool.clone()));
 
 	// Genesis: the fund's first owner registry, written before the surface is up. A no-op
 	// on every boot after the first one — see `concierge::genesis` for why that is a
@@ -366,12 +363,6 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// A direction's own inbox, read by its backend with its client credential (D21).
 	let scope_inbox = concierge::scope_inbox::ScopeInbox::new(service_callers, notification_repo.clone(), users.clone(), client_tokens, notice_links.clone());
 
-	// The ownership consilium. The broadcast channel is only an immediacy optimisation
-	// for the live feed — each stream ALSO re-reads the revision from Postgres on an
-	// interval, so a second replica that never sees these sends still converges.
-	let governance_repo: Arc<dyn concierge::ports::GovernanceRepository> = pg_governance;
-	let (governance_revisions, _) = tokio::sync::broadcast::channel(64);
-
 	// Real SMTP when configured, else a logging no-op — the same "unconfigured ⇒
 	// silent no-op" contract the analytics/Sentry seams use. The whole emit → queue →
 	// render path still runs locally and in CI; only the final hop is suppressed.
@@ -413,10 +404,6 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		std::time::Duration::from_secs(config.subscribe_rate_window_secs),
 		config.subscribe_rate_limit,
 	));
-	let governance_mail_limiter = Arc::new(notification::RateLimiter::new(
-		std::time::Duration::from_secs(config.governance_mail_rate_window_secs),
-		config.governance_mail_rate_limit,
-	));
 	let grant_write_limiter = Arc::new(notification::RateLimiter::new(
 		std::time::Duration::from_secs(config.grant_write_rate_window_secs),
 		config.grant_write_rate_limit,
@@ -454,7 +441,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			users: users.clone(),
 			cases: kyc_cases,
 			notifications: notification_repo.clone(),
-			governance: governance_repo.clone(),
+			governance: pg_governance,
 			provider: kyc_provider,
 			support_email: config.support_email.clone(),
 			case_ttl_secs: config.kyc_case_ttl_secs,
@@ -478,30 +465,13 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.context("concierge auth web server error")
 	};
 
-	// The money plane's mail push. ONE adapter mounted on both listeners: the rate
-	// limiter and the dedupe are per-process state, and a second instance would let the
-	// cleartext and TLS ports each spend the whole budget.
-	let mail_relay = governance::MailRelay::new(
-		users.clone(),
-		governance_repo.clone(),
-		notification_repo.clone(),
-		governance_mail_limiter,
-		// The SAME secret the bridge uses. One trust relationship between the two
-		// planes, one secret to rotate — and banking presents this token on both
-		// seams, so a second variable could only ever drift out of step with it.
-		Some(config.bridge_service_token.clone()),
-		config.public_origin.clone(),
-		notice_links.clone(),
-	);
-
-	// The TLS listener serves ONLY the service seams: the lifecycle pull and the mail push
-	// banking dials through `CONCIERGE_BRIDGE_ADDR`, and the scope stream, catalog and inbox
+	// The TLS listener serves ONLY the service seams: the lifecycle pull banking dials
+	// through `CONCIERGE_BRIDGE_ADDR`, and the scope stream, catalog and inbox
 	// (`docs/SCOPES-AND-APPROVALS.md` §1). No gRPC-Web, no `accept_http1` — nothing a
 	// browser reaches — and the credential checks stay inside the handlers, so TLS
 	// is added proof, not a replacement. Unconfigured ⇒ resolves at once and lets the
 	// `try_join!` below wait on the other two.
 	let tls_bridge = bridge.clone();
-	let tls_mail_relay = mail_relay.clone();
 	let tls_scope_events = scope_events.clone();
 	let tls_scope_catalogs = scope_catalogs.clone();
 	let tls_approval_execution = approval_execution.clone();
@@ -520,7 +490,6 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.context("failed to build the bridge TLS acceptor")?
 			.layer(TraceLayer::new_for_grpc())
 			.add_service(UserEventsServer::new(tls_bridge))
-			.add_service(MailRelayServiceServer::new(tls_mail_relay))
 			.add_service(ScopeEventsServer::new(tls_scope_events))
 			.add_service(ScopeCatalogServiceServer::new(tls_scope_catalogs))
 			.add_service(ApprovalExecutionServiceServer::new(tls_approval_execution))
@@ -541,22 +510,16 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(ScopeCatalogServiceServer::new(scope_catalogs))
 			.add_service(ApprovalExecutionServiceServer::new(approval_execution))
 			.add_service(ScopeInboxServiceServer::new(scope_inbox))
-			// Both governance seams are mounted OUTSIDE the user auth layer, for the two
-			// different reasons the layer exists to distinguish: the approval surface is
-			// reached by a person holding an emailed token who may not be signed in, and
-			// the mail relay is a service-to-service push authenticated by the shared
-			// banking↔concierge secret, exactly like the lifecycle bridge above.
-			.add_service(OwnerRemovalApprovalServiceServer::new(governance::RemovalApproval::new(
-				governance_repo.clone(),
-				governance_revisions.clone(),
+			.add_service(auth.layer(UserDirectoryServer::new(
+				directory::Directory::new(users.clone(), grants, break_glass.clone()).with_grant_write_limiter(grant_write_limiter),
 			)))
-			.add_service(MailRelayServiceServer::new(mail_relay))
-			.add_service(auth.layer(GovernanceServiceServer::new(
-				governance::Governance::new(users.clone(), break_glass.clone(), governance_repo, governance_revisions).with_openings_closed(config.governance_new_votes_closed),
-			)))
-			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), grants, break_glass.clone()).with_grant_write_limiter(grant_write_limiter))))
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass.clone(), platform_repo))))
-			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users.clone(), subscribe_limiter, notice_links))))
+			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(
+				notification_repo,
+				users.clone(),
+				subscribe_limiter,
+				notice_links,
+			))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 			.add_service(auth.layer(ScopeRegistryServer::new(concierge::scopes::ScopeRegistry::new(scope_repo))))
 			.add_service(auth.layer(ApprovalServiceServer::new(concierge::approvals::Approvals::new(users, break_glass, approval_repo, catalog_repo))))

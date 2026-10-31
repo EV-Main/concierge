@@ -16,8 +16,7 @@ use std::sync::{
 use concierge::{
 	approvals::Approvals,
 	authz::BreakGlass,
-	governance::Governance,
-	infrastructure::{approvals::PgApprovals, db, governance::PgGovernance, scope_catalogs::PgScopeCatalogs, users::PgUsers},
+	infrastructure::{approvals::PgApprovals, db, scope_catalogs::PgScopeCatalogs, users::PgUsers},
 	ports::UserDirectoryRepository,
 };
 use domain::{
@@ -26,9 +25,8 @@ use domain::{
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
-	Approval, ApprovalState, ApprovalVote, DrainLegacyProposalsRequest, GetApprovalRequest, GetApprovalsRevisionRequest, LegacyProposalKind, LegacyProposalRef, ListPlatformOwnersRequest,
-	OpenOwnerAdmissionRequest, ProposePersonDecisionRequest, ResignPlatformOwnershipRequest, VetoApprovalRequest, VoteApprovalRequest, approval_service_server::ApprovalService,
-	governance_service_server::GovernanceService, propose_person_decision_request::Subject,
+	Approval, ApprovalState, ApprovalVote, GetApprovalRequest, GetApprovalsRevisionRequest, ListPlatformOwnersRequest, ProposePersonDecisionRequest, ResignPlatformOwnershipRequest,
+	VetoApprovalRequest, VoteApprovalRequest, approval_service_server::ApprovalService, propose_person_decision_request::Subject,
 };
 use sqlx::{Connection, PgConnection, PgPool};
 use tonic::{Code, Request};
@@ -46,7 +44,6 @@ struct Fx {
 	users: Arc<PgUsers>,
 	people: Approvals,
 	repo: Arc<PgApprovals>,
-	governance_repo: Arc<PgGovernance>,
 	clock: Arc<AtomicI64>,
 }
 
@@ -60,7 +57,6 @@ async fn setup() -> Option<Fx> {
 	let repo = Arc::new(PgApprovals::with_fixed_time(pool.clone(), clock.clone()));
 	Some(Fx {
 		people: Approvals::new(users.clone(), Arc::new(BreakGlass::new(Vec::new())), repo.clone(), catalogs),
-		governance_repo: Arc::new(PgGovernance::new(pool.clone(), "https://example.test/owner-removal".into())),
 		repo,
 		users,
 		pool,
@@ -598,11 +594,7 @@ async fn the_floor_keeps_two_owners_at_open_by_resignation_and_when_the_roster_m
 		}
 	};
 	let refused = resign(owners[0], &email(owners[0]).await).await.unwrap_err();
-	assert_eq!(
-		refused.code(),
-		Code::AlreadyExists,
-		"resigning is held to the removal's floor, refused as the legacy path refuses it"
-	);
+	assert_eq!(refused.code(), Code::AlreadyExists, "resigning is held to the removal's floor");
 	assert_eq!(fx.role(owners[0]).await, Role::Owner);
 
 	// Three owners: one may leave, typed-confirmed; then the floor holds again.
@@ -744,7 +736,7 @@ async fn an_owner_s_suspension_by_the_owners_changes_the_roster() {
 }
 
 #[tokio::test]
-async fn an_approval_suspension_open_lets_the_hold_extend_as_a_legacy_proposal_did() {
+async fn an_approval_suspension_open_lets_the_hold_extend() {
 	let Some(fx) = setup().await else { return };
 	let (_lock, owners) = fx.owners(3).await;
 	let subject = fx.user("subject").await;
@@ -796,12 +788,56 @@ async fn the_roster_the_revision_and_the_only_writers_of_the_owner_seat() {
 	assert_eq!(revision(outsider).await.unwrap_err().code(), Code::PermissionDenied);
 }
 
+/// Emergency access never becomes a seat. On a populated fund an `OWNER_SUBJECTS`-listed
+/// operator is not on the roster, cannot open a decision and is not drawn as a voter — which
+/// would otherwise hand them a vote in every decision about people.
+#[tokio::test]
+async fn a_break_glass_operator_holds_no_seat_in_any_decision() {
+	let Some(fx) = setup().await else { return };
+	let (_lock, owners) = fx.owners(3).await;
+	fx.at(T0);
+	let operator = fx.user("break-glass").await;
+	let people = Approvals::new(
+		fx.users.clone(),
+		Arc::new(BreakGlass::new(vec![operator.to_string()])),
+		fx.repo.clone(),
+		Arc::new(PgScopeCatalogs::new(fx.pool.clone())),
+	);
+
+	let roster = people
+		.list_owners(as_user(owners[0], ListPlatformOwnersRequest {}))
+		.await
+		.expect("an owner reads the roster")
+		.into_inner();
+	assert_eq!(roster.items.len(), 3, "the roster counts persisted seats only");
+	assert!(!roster.items.iter().any(|o| o.user_id == operator.to_string()), "the env-listed operator is not on it");
+
+	let subject = fx.user("subject").await;
+	let propose = ProposePersonDecisionRequest {
+		subject: Some(Subject::UserId(subject.to_string())),
+		reason: "The owners agreed it on a call".into(),
+	};
+	assert_eq!(people.propose_admin_admission(as_user(operator, propose)).await.unwrap_err().code(), Code::PermissionDenied);
+
+	let opened = fx.open(owners[0], Decision::Admin, subject).await.expect("an owner opens");
+	assert_eq!(opened.voters.len(), 2, "the roster is the owners besides the opener: {:?}", opened.voters);
+	let vote = VoteApprovalRequest {
+		approval_id: opened.id,
+		vote: ApprovalVote::For as i32,
+	};
+	assert_eq!(
+		people.vote_approval(as_user(operator, vote)).await.unwrap_err().code(),
+		Code::NotFound,
+		"not a voter, so not even a reader of it"
+	);
+}
+
 /// Who may write the owner seat. Every call site of the aggregate's `set_role`, every raw
 /// `SET role` and every insert into `users` in the binary's source is named here: a new
 /// writer is a second path to the seat and must be routed through an approval — or argued
 /// for in this list. (A database trigger refusing `role = 'owner'` outside the two writers
 /// was considered and left out: `update_row` rewrites `role` on every account mutation, genesis
-/// and the legacy consilium write it too, and older binaries write beside this one during a
+/// and a resignation write it too, and older binaries write beside this one during a
 /// rollout, so a trigger would fail closed on paths nobody changed.)
 #[test]
 fn nothing_else_writes_the_owner_seat() {
@@ -828,8 +864,8 @@ fn nothing_else_writes_the_owner_seat() {
 		files.sort();
 	}
 	let get = |label: &str| found.get(label).cloned().unwrap_or_default();
-	// The executor of an approval, the legacy consilium (until it goes) and the one
-	// request-driven writer, which refuses `owner` and the granting of `admin`.
+	// The executor of an approval, genesis and a resignation, and the one request-driven
+	// writer, which refuses `owner` and the granting of `admin`.
 	assert_eq!(
 		get("set_role"),
 		["infrastructure/governance.rs", "infrastructure/people.rs", "infrastructure/users.rs"],
@@ -850,7 +886,7 @@ fn the_raw_role_writer_exists_only_for_tests() {
 }
 
 // ---------------------------------------------------------------------------------
-// Review: holds, drain, the tally, the floor over standing seats, locks, caps, decoding.
+// Review: holds, the tally, the floor over standing seats, locks, caps, decoding.
 // ---------------------------------------------------------------------------------
 
 fn admin_action(actor: UserId, reason: &str) -> concierge::infrastructure::users::AdminAction {
@@ -914,50 +950,6 @@ async fn nobody_holds_the_owners_while_they_decide_on_them_and_the_target_does_n
 	);
 	let seen_by_peer = fx.get(owners[2], &opened.id).await;
 	assert!(seen_by_peer.voters.iter().any(|v| v.vote == ApprovalVote::For as i32), "a decider still sees the tally");
-}
-
-#[tokio::test]
-async fn the_drain_is_refused_over_a_proposal_about_the_caller_and_holds_its_reason_to_the_text_rules() {
-	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
-	let service = Governance::new(
-		fx.users.clone(),
-		Arc::new(BreakGlass::new(Vec::new())),
-		fx.governance_repo.clone(),
-		tokio::sync::broadcast::channel(8).0,
-	);
-	let removal = service
-		.open_owner_removal(as_user(
-			owners[0],
-			evconcierge_contracts::concierge::v1::OpenOwnerRemovalRequest {
-				target_user_id: owners[3].to_string(),
-				reason: "legacy".into(),
-			},
-		))
-		.await
-		.expect("the legacy path opens")
-		.into_inner();
-	let by = LegacyProposalRef {
-		kind: LegacyProposalKind::OwnerRemoval as i32,
-		id: removal.id.clone(),
-	};
-	let drain = |who: UserId, reason: &str| {
-		let request = as_user(
-			who,
-			DrainLegacyProposalsRequest {
-				items: vec![by.clone()],
-				reason: reason.to_owned(),
-			},
-		);
-		let service = service.clone();
-		async move { service.drain_legacy_proposals(request).await }
-	};
-	assert_eq!(drain(owners[3], "stopping my own removal").await.unwrap_err().code(), Code::PermissionDenied);
-	assert_eq!(drain(owners[1], "see https://evil.example").await.unwrap_err().code(), Code::InvalidArgument, "no link");
-	assert_eq!(drain(owners[1], "tricky\u{202e}text").await.unwrap_err().code(), Code::InvalidArgument, "no direction override");
-	assert_eq!(drain(owners[1], "   ").await.unwrap_err().code(), Code::InvalidArgument);
-	let drained = drain(owners[1], "moving to approvals").await.expect("another owner drains it").into_inner();
-	assert_eq!(drained.items[0].result, "voided");
 }
 
 #[tokio::test]
@@ -1107,135 +1099,4 @@ async fn text_and_standing_are_checked_for_an_admin_too_and_the_audit_names_who_
 		.await
 		.unwrap();
 	assert_eq!(detail["opened_by"], owners[0].to_string());
-}
-
-#[tokio::test]
-async fn a_legacy_decision_is_void_once_an_owner_it_never_asked_is_seated() {
-	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
-	let candidate = fx.user("candidate").await;
-	let newcomer = fx.user("newcomer").await;
-	let service = Governance::new(
-		fx.users.clone(),
-		Arc::new(BreakGlass::new(Vec::new())),
-		fx.governance_repo.clone(),
-		tokio::sync::broadcast::channel(8).0,
-	);
-	let admission = service
-		.open_owner_admission(as_user(
-			owners[0],
-			OpenOwnerAdmissionRequest {
-				candidate_user_id: candidate.to_string(),
-				reason: "legacy".into(),
-			},
-		))
-		.await
-		.unwrap()
-		.into_inner();
-	let vote = |who: UserId| {
-		let request = as_user(
-			who,
-			evconcierge_contracts::concierge::v1::SubmitAdmissionVoteRequest {
-				admission_id: admission.id.clone(),
-				vote: evconcierge_contracts::concierge::v1::AdmissionVote::Admit as i32,
-			},
-		);
-		let service = service.clone();
-		async move { service.submit_admission_vote(request).await }
-	};
-	vote(owners[1]).await.unwrap();
-	// Beside the legacy path, an owner is seated by another door while it is open.
-	fx.users.set_role(newcomer, Role::Owner).await.unwrap();
-	vote(owners[2]).await.unwrap();
-	let state: String = sqlx::query_scalar("SELECT state FROM owner_admission WHERE id = $1::uuid")
-		.bind(&admission.id)
-		.fetch_one(&fx.pool)
-		.await
-		.unwrap();
-	assert_eq!(state, "void", "unanimity of the snapshot must not seat someone the newcomer never agreed to");
-	assert_eq!(fx.role(candidate).await, Role::Investor);
-}
-
-// ---------------------------------------------------------------------------------
-// The window: the freeze and the drain on the legacy service.
-// ---------------------------------------------------------------------------------
-
-#[tokio::test]
-async fn closed_openings_refuse_the_legacy_service_and_the_drain_empties_what_is_open() {
-	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
-	let candidate = fx.user("candidate").await;
-	let open_service = Governance::new(
-		fx.users.clone(),
-		Arc::new(BreakGlass::new(Vec::new())),
-		fx.governance_repo.clone(),
-		tokio::sync::broadcast::channel(8).0,
-	);
-	let closed_service = Governance::new(
-		fx.users.clone(),
-		Arc::new(BreakGlass::new(Vec::new())),
-		fx.governance_repo.clone(),
-		tokio::sync::broadcast::channel(8).0,
-	)
-	.with_openings_closed(true);
-	let open = |service: &Governance| {
-		let request = as_user(
-			owners[0],
-			OpenOwnerAdmissionRequest {
-				candidate_user_id: candidate.to_string(),
-				reason: "legacy".into(),
-			},
-		);
-		let service = service.clone();
-		async move { service.open_owner_admission(request).await }
-	};
-
-	let legacy = open(&open_service).await.expect("the legacy path still opens while the freeze is off").into_inner();
-	let refused = open(&closed_service).await.unwrap_err();
-	assert_eq!(refused.code(), Code::FailedPrecondition);
-	assert!(refused.message().contains("ProposeOwnerAdmission"), "{refused}");
-
-	let drain = |items: Vec<LegacyProposalRef>| {
-		let request = as_user(
-			owners[0],
-			DrainLegacyProposalsRequest {
-				items,
-				reason: "moving to approvals".into(),
-			},
-		);
-		let service = closed_service.clone();
-		async move { service.drain_legacy_proposals(request).await.map(tonic::Response::into_inner) }
-	};
-	let by = |kind: LegacyProposalKind, id: &str| LegacyProposalRef {
-		kind: kind as i32,
-		id: id.to_owned(),
-	};
-	let drained = drain(vec![
-		by(LegacyProposalKind::OwnerAdmission, &legacy.id),
-		by(LegacyProposalKind::OwnerRemoval, &Uuid::new_v4().to_string()),
-	])
-	.await
-	.expect("the drain works while openings are closed");
-	assert_eq!(drained.items[0].result, "voided");
-	assert_eq!(drained.items[1].result, "not_found");
-	let again = drain(vec![by(LegacyProposalKind::OwnerAdmission, &legacy.id)]).await.unwrap();
-	assert_eq!(again.items[0].result, "not_open", "an already closed proposal is reported, not changed");
-	let state: String = sqlx::query_scalar("SELECT state FROM owner_admission WHERE id = $1::uuid")
-		.bind(&legacy.id)
-		.fetch_one(&fx.pool)
-		.await
-		.unwrap();
-	assert_eq!(state, "void");
-
-	let empty = as_user(owners[0], DrainLegacyProposalsRequest { items: vec![], reason: "x".into() });
-	assert_eq!(closed_service.drain_legacy_proposals(empty).await.unwrap_err().code(), Code::InvalidArgument);
-	let outsider = fx.user("outsider").await;
-	let not_owner = as_user(
-		outsider,
-		DrainLegacyProposalsRequest {
-			items: vec![by(LegacyProposalKind::OwnerAdmission, &legacy.id)],
-			reason: "x".into(),
-		},
-	);
-	assert_eq!(closed_service.drain_legacy_proposals(not_owner).await.unwrap_err().code(), Code::PermissionDenied);
 }
