@@ -41,10 +41,10 @@ restricted verifier is not widened.
 
 ### What did not change, and why
 
-`auth.proto`, `directory.proto` and `governance.proto` are byte-identical to `7c71775`.
-Banking vendors those three through its pin and `concierge-pin-check` compares their
-bytes against `origin/main`, so an edit there turns banking's drift check red until it
-bumps. More importantly, compatibility here is a property of Rust **source**, not only
+`auth.proto` and `directory.proto` are byte-identical to `7c71775` (`governance.proto` was
+too, until the contract step removed it, §5.3). Banking vendors those two through its pin
+and `concierge-pin-check` compares their bytes against `origin/main`, so an edit there
+turns banking's drift check red until it bumps. More importantly, compatibility here is a property of Rust **source**, not only
 of the wire: consumers build some messages with struct literals and implement some
 server traits in their fakes, and either breaks at the next pin bump when the contract
 grows a field or an RPC. As of banking `origin/main`:
@@ -52,7 +52,7 @@ grows a field or an RPC. As of banking `origin/main`:
 | Banking does | With |
 | ------------ | ---- |
 | implements the server trait (test fakes) | `UserDirectory`, `AuthService`, `UserEvents` |
-| builds with a struct literal | `PullUserLifecycleRequest`, `UserLifecycleEvent`, `SendGovernanceMailRequest` and its mail payloads, `UserProfile`, `PermissionGrant`, `GrantHolder`, `ListGrantsResponse`, the `UserDirectory` request/response messages |
+| builds with a struct literal | `PullUserLifecycleRequest`, `UserLifecycleEvent`, `UserProfile`, `PermissionGrant`, `GrantHolder`, `ListGrantsResponse`, the `UserDirectory` request/response messages |
 
 So nothing was added to those messages or services. A catalog of approval kinds is
 therefore **not** a new field on `PublishCatalogRequest`: it is
@@ -81,8 +81,8 @@ Both are compared in constant time (a digest for the client secret, as
 secret are the same `UNAUTHENTICATED`. Credentials never ride in a request body on
 these services, so a logged request carries none.
 
-Cost to weigh: the bridge token already opens `UserEvents` and `MailRelayService`; it
-now also opens approval execution for `bank`. One secret, one trust relationship, as
+Cost to weigh: the bridge token already opens `UserEvents`; it now also opens approval
+execution for `bank`. One secret, one trust relationship, as
 before — and a bigger blast radius if it leaks. Graduating to `typ=service` tokens
 (`AuthService.MintServiceToken`, reserved) replaces both forms without a wire change on
 the request messages.
@@ -348,11 +348,9 @@ emitters.
 
 ## 5. Approvals
 
-The owners' consilium (`governance.proto`, banking's `docs/CONSILIUM.md`) generalised to
-every scope. `GovernanceService` and `MailRelayService` stay as they are until the
-contract step of the reorganisation (the people's decisions have a second home in the
-`concierge:*` kinds below); the new kinds replace banking's consilium
-tables, whose foreign keys become `subject_ref`s on banking's side.
+The owners' consilium (banking's `docs/CONSILIUM.md`) generalised to every scope. The
+people's decisions are the `concierge:*` kinds below; the new kinds replace banking's
+consilium tables, whose foreign keys become `subject_ref`s on banking's side.
 
 ### 5.1 One owner per kind: proposer = executor
 
@@ -590,9 +588,7 @@ executor loop once passed (D23).
 | `concierge:platform_policy` | PLATFORM | a persisted owner | cooldown_secs (COUNT) | the platform's next policy `version` |
 | `concierge:scope_policy_change` | PLATFORM | such a seat, or an admin of the scope | quorum_bps, delay_secs, ttl_secs, thresholds (COUNT), and one `threshold` TEXT field per override, `<kind>/<parameter>=<value>` — the values are in `payload_hash`; the whole policy is also `Approval.proposed_policy` | the scope's next policy `version`, checked again against the catalogs then in force; VOID if it no longer fits |
 
-The decisions about **people**, moved here from `GovernanceService` (expand step; the old
-service keeps working beside them until the contract step), and the one about a person's
-second factors, which never had a legacy form. All six are `PLATFORM`, in
+The decisions about **people**, and the one about a person's second factors. All six are `PLATFORM`, in
 scope `main`, with `account (USER)` and `reason (TEXT)` fields, opened over `ApprovalService`
 by an active persisted owner, who is kept off the roster, as is the account they are about
 (`Action::People`; subject_ref `user:<uuid>`, one live decision per kind and account).
@@ -606,35 +602,33 @@ by an active persisted owner, who is kept off the roster, as is the account they
 | `concierge:admin_admission` | as suspension | `Role::Admin`; VOID over an owner or an admin |
 | `concierge:second_factor_reset` | as suspension | every second factor and recovery code removed, `token_version` bumped (`SESSIONS_REVOKED`), a `security_notice` mailed; VOID if the account holds no factor |
 
-Unanimity is the quorum at 10000 bps over the frozen roster (`platform_quorum_bps`): the
-reason the legacy consilia were unanimous holds — a minority able to add or remove owners by
-majority grows itself into a majority. The target of a removal is not asked, as the legacy
-peer set did not ask them, and the emailed self-accept is gone: the target has no vote and
-no veto over a decision about their own standing (nobody judges their own seat); any other
+Unanimity is the quorum at 10000 bps over the frozen roster (`platform_quorum_bps`): a
+minority able to add or remove owners by majority grows itself into a majority. The target
+of a removal is not asked: the target has no vote and no veto over a decision about their own standing (nobody judges their own seat); any other
 owner vetoes inside the delay, as on every platform decision. A FOR counts only while its
 voter holds the seat, so a held owner cannot carry a unanimous decision, and execution
 counts the seated FORs again against the threshold (a decision whose voters left is VOID).
 The floor, the 48 h pause (D24(2)) and the voiding of live platform decisions on a change
 of the owners apply as to every platform decision. `Role::Owner` is written by genesis and
-by the executor of an executed `owner_admission`, and (until the contract step) by the
-legacy service. An execution takes the governance revision, every owner's `users` row and
+by the executor of an executed `owner_admission`. An execution takes the governance revision, every owner's `users` row and
 the two accounts, and only then the proposal; it records its outcome BEFORE writing the
 seat, so the trigger that voids live platform decisions finds this one already executed.
 
-`ApprovalService.ListOwners` and `ResignOwnership` (same gate, same typed confirmation, same
-floor) replace the legacy pair, and `GetApprovalsRevision` replaces `WatchGovernance`: a
-number that moves whenever an approval or the owner roster does, which a console polls and
-refetches on a change — no stream. `GOVERNANCE_NEW_VOTES_CLOSED=true` closes the legacy
-openings (they answer `FAILED_PRECONDITION` naming the RPC above) and
-`GovernanceService.DrainLegacyProposals` voids the open legacy proposals by list, so the
-window can be emptied.
+`ApprovalService.ListOwners`, `ResignOwnership` (typed confirmation, the removal's floor) and
+`GetApprovalsRevision`: a number that moves whenever an approval or the owner roster does,
+which a console polls and refetches on a change — no stream.
+
+The legacy `GovernanceService` (and its emailed self-accept, `OwnerRemovalApprovalService`)
+is gone, and so is `MailRelayService`. Migration 0051 drops their tables and refuses to while
+any of them holds a row, decided or open; `governance_revision` stays, as the lock every write
+of a seat takes first.
 
 Review hardening of these kinds:
 
 - **The floor counts seats that can still decide.** `MIN_OWNERS` is measured over owners that
   are active or only on a temporary hold (`admin_hold` lapses); an owner suspended by the
   owners' verdict keeps the role and has no say, so it is not counted — by an owner removal,
-  at open and at execution, and by `ResignOwnership` (the legacy resignation shares the code).
+  at open and at execution, and by `ResignOwnership`.
   Two suspensions and a resignation cannot leave one voice.
 - **A person is not told the tally of a decision about them** (`Reader::Subject`: they read
   that it exists and its state, not who voted what, nor the deciders' addresses), cannot veto
@@ -648,24 +642,19 @@ Review hardening of these kinds:
   insert into `approval_voters`, a foreign key to `users`) is not queued behind it.
 - **A stored `action` this binary cannot decode reads as none**: the proposal lists, votes and
   vetoes, and the executor voids it. That protects reads in a rollback, not execution.
-- **Legacy decisions are void when an owner they never asked is seated** meanwhile (admission,
-  removal and the user proposals compare the roster at settlement with their snapshot).
 - `UserDirectory`'s raw `set_role` exists only under the `test-support` feature; a test scans
   the source for every call site of the aggregate's `set_role`, raw `SET role` and user
   inserts. A database trigger on `role = 'owner'` was weighed and left out: `update_row`
-  rewrites `role` on every account mutation, genesis and the legacy consilium write it, and
+  rewrites `role` on every account mutation, genesis and a resignation write it, and
   older binaries run beside this one during a rollout.
 - **To do later:** `Propose*`, `ResignOwnership` and voting should require a fresh `auth_time`
   (re-authentication, #168); they do not yet.
 
-**Rollout order (the window).** (1) deploy with `GOVERNANCE_NEW_VOTES_CLOSED=true`; (2)
-`DrainLegacyProposals` every open legacy proposal (list them with the `List*` RPCs of
-`GovernanceService`); (3) only then admit owners through `approvals` — a legacy decision still
-open when an owner is seated that way is void, but the window is cleanest empty. To roll the
-binary back, close the openings, withdraw or veto the live `concierge:owner_*`,
+**Rolling the binary back.** Withdraw or veto the live `concierge:owner_*`,
 `user_suspension`, `user_reinstatement`, `admin_admission` and `second_factor_reset` decisions, and
-`UPDATE approvals SET action = NULL WHERE kind IN (...)` for any left, before starting the old
-binary: it cannot decode the `people` action.
+`UPDATE approvals SET action = NULL WHERE kind IN (...)` for any left, before starting an older
+binary: it cannot decode the `people` action. One from before 0051 also needs that migration's
+down step run first.
 
 Assigning an operator in a scope is still a delegated `GrantPermission` by a
 `<scope>:admin`, with no approval.
@@ -847,10 +836,10 @@ in `domain::approvals`.
 - **The pause is the store's too**: a `BEFORE INSERT` trigger on `approvals`
   (`approvals_platform_pause`, migration 0038) refuses a `PLATFORM` row created inside the
   pause, with the same lock and arithmetic as the code — a binary that predates the rule,
-  or a check that raced a change, cannot open one. `platform_roster` is seeded from the
+  or a check that raced a change, cannot open one. `platform_roster` was seeded from the
   last executed owner admission, removal, or suspension / reinstatement of a current owner
-  in `governance_event`; a resignation and the genesis seed leave no event and are not
-  dated.
+  in the legacy `governance_event`; a resignation and the genesis seed leave no event and
+  are not dated.
 - **The executor locks accounts before the proposal**: a grant takes the two `users` rows
   it names first, then the proposal row — the order a change of the owners takes them
   (its `users` row, then the trigger's `approvals` rows) — so the two cannot deadlock.
@@ -962,18 +951,6 @@ the offer when a later catalog withdraws them.
   read (`ListNotifications`, `ListScopeNotifications`) return the notice with an empty
   link. The emit path is
   the same on both RPCs (`EmitScopeNotification`, `NotificationService.Emit`).
-- **The money plane's fee notice links the same way** (decided 2026-10-22).
-  `MailRelayService.SendGovernanceMail` with `FEE_POLICY_NOTICE` carries
-  `FeePolicyNoticeMail.link_scope` beside its `link`, on the kind's own message as every
-  governance mail carries its link. Only the bridge sends governance mail, so it may name any
-  scope; the name rule and its `INVALID_ARGUMENT` are the emit's. The relay stores the
-  finished link (`base + link`, or the path when the scope has no base), and the dispatcher
-  checks it again when it sends, so a base removed in between sends the mail to
-  `CABINET_URL` itself. banking sends `link_scope = "invest"` once its own `/invest/<service>`
-  page is gone (banking#584). `governance.proto` is vendored by banking
-  (`contracts/concierge-protos.txt`, `nix run .#concierge-pin-check`): at its next pin bump
-  banking copies it again and fills the new field in its `FeePolicyNoticeMail` struct
-  literal (or adds `..Default::default()`), or its build breaks.
 - **`default_subscribed` applies.** Switching a topic off writes a row to
   `notification_topic_optouts` (migration 0041) beside deleting the subscription, so "never
   touched" and "switched off" read differently. A default topic is followed — with its mail

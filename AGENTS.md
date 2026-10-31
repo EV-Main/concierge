@@ -16,70 +16,26 @@ logs. Its sibling `banking` is the **MONEY** plane (TigerBeetle ledger,
 money-operation authorization). The two run **independent auth flows** and share
 no database.
 
-They are coupled by **two seams, both initiated by `banking`** — `concierge` still
-never calls `banking`:
+They are coupled by seams **initiated by `banking`** — `concierge` never calls
+`banking`. The **cross-plane bridge**: `concierge` emits user-lifecycle events
+(`events.proto` — `UserLifecycleEvent`) to its `user_outbox`, and `banking` **pulls**
+them over `UserEvents.PullUserLifecycle` (`bridge` module) to gate/freeze money ops. The
+scope seams (approvals, the scope stream, catalog and inbox) are
+`docs/SCOPES-AND-APPROVALS.md` §1.
 
-1. The **cross-plane bridge**: `concierge` emits user-lifecycle events
-   (`events.proto` — `UserLifecycleEvent`) to its `user_outbox`, and `banking`
-   **pulls** them over `UserEvents.PullUserLifecycle` (`bridge` module) to
-   gate/freeze money ops.
-2. The **mail relay**: `banking` **pushes** typed governance mail over
-   `MailRelayService.SendGovernanceMail` (`governance` module), because this plane
-   owns the only mailer and standing up a second one would duplicate the queue,
-   the backoff and the daily budget. The payload is TYPED, never rendered markup;
-   the recipient's address is resolved HERE from the identity record, never from
-   the request; and every emailed link is pinned to `PUBLIC_ORIGIN` — a
-   compromised money plane must not become a phishing cannon aimed at owners.
-   WHO may receive one is decided per KIND, and the default is the strict one:
-   the consilium kinds — the three payout kinds and `PAYMENT_APPROVAL`, the
-   owners' question about a payment of fund-owned money — are addressed to the
-   consilium, so they go to a seated owner and to nobody else. `PAYMENT_CONSENT`
-   cannot use that rule — consenting to a transfer of your own money has nothing
-   to do with holding a seat — so it gets its own, narrower in the dimension that
-   matters: the recipient must BE the payment's subject, named in the typed
-   payload and matched against the resolved identity record. The surface widens
-   by exactly one person per message rather than to everyone. Every kind, under
-   either rule, is refused unless the resolved address is VERIFIED
-   (`users.email_verified`): each of these mails carries a link and the code that
-   arms it, and an address nobody has proved belongs to the person hands that
-   decision to whoever holds the mailbox (#64 closed the payout kinds' exemption).
-   A consent also leaves an in-app trace in the subject's inbox
-   — written regardless of what they follow, because nobody subscribes to being
-   asked about their own money and none of this plane's topics is followed by default — so the
-   request is findable in the cabinet when the mail is late or lost; the link and
-   the code stay in the mail. The fee policy pair follows the same split:
-   `FEE_POLICY_APPROVAL` is a consilium kind (a seated owner, verified address,
-   link + code), `FEE_POLICY_NOTICE` is addressed by identity to the one investor
-   whose fund is repriced, traced in their inbox, and carries no code — its only
-   link is a cabinet-relative path hung off `CABINET_URL`, or off the cabinet of the
-   scope its `link_scope` names (`NOTICE_LINK_BASES`), so the money plane names no
-   host at all. Fee terms cross the wire as basis points and
-   closed vocabularies; the percentages are rendered here. `PAYMENT_OUTCOME` is the
-   one two-armed rule: a payment that died waiting for consent (the link BURNED on
-   five wrong codes, or was INVALIDATED under the subject) is told to the subject the
-   payload names OR to staff (`admin`/`owner`, persisted role — whoever opened the
-   order is usually an admin with no seat), verified address either way. It carries no
-   link and no code; why the consent died is a closed word this plane phrases itself,
-   the amount must read as money, and only the subject's copy leaves an inbox trace. The
-   relay stores which reader it was (`audience`) and the renderer writes a different
-   mail for each. A `dedupe_key` names ONE mail (one kind, one recipient): reusing it for
-   another is refused `ALREADY_EXISTS`, so each copy of a kind needs its own key.
-
-Both seams are authenticated by the SAME shared bridge service token
-(`BRIDGE_SERVICE_TOKEN`), compared in constant time and mounted OUTSIDE the user
-auth layer. One trust relationship between the planes means one secret to rotate;
-graduate to mTLS/SPIFFE at platform scale.
+The bridge is authenticated by the shared bridge service token
+(`BRIDGE_SERVICE_TOKEN`), compared in constant time and mounted OUTSIDE the user auth
+layer; graduate to mTLS/SPIFFE at platform scale.
 
 **Ownership** (`Role::Owner`) is governed, not administered: it is granted only by
 an executed admission consilium (`concierge:owner_admission` in `approvals`, unanimity of the
-other owners; the legacy `governance` consilium until it goes) and taken only by an executed removal, so
-`UserDirectory.SetRole` refuses both directions (`governance` module; the policy is
+other owners) and taken only by an executed removal or a resignation, so
+`UserDirectory.SetRole` refuses both directions (`approvals` module; the policy is
 `banking`'s `docs/CONSILIUM.md`).
 
 **So is `Role::Admin`, and so is a permanent suspension** — see the Hard rule below.
 `SetRole` refuses to GRANT `admin` (never to take it away), and `DisableUser` is
-retired in favour of `HoldUser` plus `ApprovalService.ProposeUserSuspension` (the owners' decision;
-`GovernanceService.OpenUserSuspension` stays beside it until the contract step).
+retired in favour of `HoldUser` plus `ApprovalService.ProposeUserSuspension` (the owners' decision).
 
 ---
 
@@ -89,7 +45,7 @@ retired in favour of `HoldUser` plus `ApprovalService.ProposeUserSuspension` (th
 | ----- | ------ |
 | Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
-| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **approvals** (the consilium generalised to every scope), **log**. `directory` + `bridge` + `governance` + `platform` + `notification` + `approvals` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
+| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **approvals** (the consilium generalised to every scope, the decisions about people included), **log**. `directory` + `bridge` + `platform` + `notification` + `approvals` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
 | `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Redis-backed refresh rotation with reuse detection · `Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party `ExchangeCode`/`RefreshClientToken` over the runner's `ClientGrants` port, plus `open_session` for the web surface's sign-ins) reading accounts from the directory over an in-process `Provisioner` channel, the closed `oauth::OAuthProvider` set (Google, GitHub — code + PKCE), **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-prost-build` (protoc from `PROTOC`, else the vendored one). `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
 | Scopes, approvals (the consilium generalised to every scope), scope catalogs and the relying-party event streams; also which consumer-built messages and services must never grow. Implemented so far: the registry (`tenants`, migration 0031; `ScopeRegistry`, `scopes` module), sign-in from a scope's hosts (`web::origins`, `web::cors`, the live allowlist `web::allowlist`), the MFE bundles under `/auth/mfe/*` (`web::mfe`, `WEB_MFE_DIR`), the sign-up ticket that confirms an address from a scope's host (`web::signup`, migration 0032), the relying-party streams (`ScopeEvents`, `UserEvents` by client credential; `scope_events`, `service_caller`, migration 0034) the stored scope catalog (`ScopeCatalogService`, `scope_catalog`) each direction's own inbox (`notification::InboxView`; `ScopeInboxService`, `scope_inbox`, §6) and approvals of the published kinds (`ApprovalService`, `ApprovalExecutionService`; `approvals`, migrations 0036–0039, §5.7; the approval mail, §5.5) | [`docs/SCOPES-AND-APPROVALS.md`](./docs/SCOPES-AND-APPROVALS.md) |
@@ -538,7 +494,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   mismatch, so without the guard a wrong-length candidate is distinguishable from a
   wrong one of the right length). That is the bridge service token
   (`support::authenticate_service`), the Didit webhook HMAC (`infrastructure::kyc::didit`),
-  the consilium self-decision code (`infrastructure::governance`), the refresh-token secret
+  the refresh-token secret
   (`evconcierge_auth::management`), a relying party's client secret and refresh secret
   (`relying_party` and, for the service seams, `service_caller`; compared as fixed-width digests), an emailed sign-in or verification
   code (`infrastructure::credentials`), an authenticator code (`second_factor::totp`) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
@@ -556,8 +512,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `DisableUser` is retired (it refuses, naming both replacements) and splits into
   `HoldUser` — one operator, `Users::Suspend`, `users.suspended_by =
   'admin_hold'` with `hold_expires_at = now + HOLD_TTL_SECS` (24h) — and
-  `ApprovalService.ProposeUserSuspension`, the owners' decision (`concierge:user_suspension`; the legacy
-  `GovernanceService.OpenUserSuspension` does the same until it goes), which writes
+  `ApprovalService.ProposeUserSuspension`, the owners' decision (`concierge:user_suspension`), which writes
   `suspended_by = 'governance'` and carries no deadline. One actor may stop money
   temporarily and never permanently — and "temporarily" is enforced, not assumed: a
   hold is refused while one is live and for `HOLD_COOLDOWN_SECS` (7 days, longer than
@@ -848,8 +803,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   origin for a registered scope's sign-in and refuses to boot in production. Sign-ins are recorded by
   `rp_codes`/`rp_sessions` and `tracing`, not `admin_action` (nobody acted on anyone); a
   replay or a reused refresh token is `error!` → Sentry.
-- **The USER consilia pass on a MAJORITY, the OWNER consilia on unanimity**, and the
-  asymmetry is argued in `domain::governance::majority`. Unanimity guards the owner
+- **The decisions about USERS pass on a MAJORITY, the ones about OWNER seats on unanimity**,
+  and the asymmetry is set in `domain::approvals::platform_quorum_bps`. Unanimity guards the owner
   roster because a minority able to add owners by majority grows itself into a majority;
   neither an `admin` seat (which cannot vote and cannot be granted `owner`) nor a
   suspension (defensive, reversible by the same body) can amplify itself that way.
@@ -857,13 +812,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   under unanimity one unreachable owner does not delay the verdict — they decide it, by
   releasing a compromised account at the deadline. What is preserved is the property that
   matters: the initiator is excluded from the voter set and the threshold is at least
-  one, so no single actor ever acts alone. All three kinds share ONE aggregate
-  (`UserProposal`), one table and one `Lifecycle`, for the reason `0009_governance.sql`
-  already gives for its two: near-identical copies drift the first time one is edited.
-- **Two audit logs, answering two questions.** `governance_event` is "what happened to
-  this PROPOSAL" — keyed by the three proposal ids under a CHECK that exactly one is set,
-  and the reason it is one log is that "who has held a seat, and by whose decision" is a
-  single ordering. `admin_action` is "what has been done TO this person, by whom" —
+  one, so no single actor ever acts alone.
+- **Two audit logs, answering two questions.** `approval_events` is "what happened to
+  this PROPOSAL" — one row per transition, keyed by the approval. `admin_action` is "what has been done TO this person, by whom" —
   keyed by the subject, and the home of the rows suspension, reinstatement, `SetRole`,
   `SetKycLevel` and `RevokeTokens` never wrote at all. Every one of them is appended in
   the SAME transaction as the change it describes: a log that can be missing the entry
