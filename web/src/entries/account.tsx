@@ -5,7 +5,8 @@
 // who is signed in (the session is the one read allowed cross-origin) and links every
 // action on the session to the platform's /account (ORG-RESTRUCTURE-PLAN §3.9 F).
 // Attributes: `data-section` (`profile` | `security` | `notifications`; the element writes
-// it back when the reader switches tabs), `data-origin` (dev and stand builds only).
+// it back when the reader switches tabs), `data-nav` (`host`: the host draws the sections'
+// navigation, so the element draws no tabs), `data-origin` (dev and stand builds only).
 // Events (bubbling, composed): `ev:section` (`{ section }`) when the reader switches tabs;
 // `ev:navigate` (cancelable, `{ href }`) for a plain same-origin
 // link click; `signout` when the reader signs out — on the platform after the platform
@@ -18,15 +19,17 @@ import { dispatchSection } from "../shared/element/events";
 import { AccountView, sectionOf } from "../views/account";
 
 const SECTION_ATTR = "data-section";
+const NAV_ATTR = "data-nav";
 
 defineElement({
   tag: "mfe-concierge-account",
   css,
-  observed: [SECTION_ATTR],
+  observed: [SECTION_ATTR, NAV_ATTR],
   render(host) {
     return (
       <AccountView
         section={sectionOf(host.getAttribute(SECTION_ATTR))}
+        tabs={host.getAttribute(NAV_ATTR) !== "host"}
         onSection={(next) => {
           host.setAttribute(SECTION_ATTR, next);
           dispatchSection(host, next);

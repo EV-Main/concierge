@@ -29,6 +29,8 @@ the path here) with the account element and the chip, which is its sign-in when 
 `src/shared/config/origin.ts` (`isPlatformPage`) is that switch.
 A host that embeds the account element on its own route sets `data-profile-href` on the
 chip (either mode) and the profile row goes there instead of leaving for that page.
+One that draws the sections' navigation itself (a settings sidebar) sets `data-nav="host"` on
+the account element, which then draws no tabs and follows `data-section` alone.
 
 Notification settings are per inbox: the plane picks it by the request's `Origin`. From
 the platform the account page shows the platform's inbox (the two delivery channels, the

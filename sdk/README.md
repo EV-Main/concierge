@@ -187,6 +187,7 @@ fires per opening. `StepupDialog` calls `onProof` before `onOpenChange(false)`.
   onSection={s => router.replace(`/account?section=${s}`)}
   onNavigate={href => (router.push(href), true)}
   onSignOut={signOut}
+  nav="host" // optional: the host's own sidebar picks `section`; the element draws no tabs
 />
 
 <AccountChip

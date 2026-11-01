@@ -12,6 +12,8 @@ export interface AccountPageProps {
   section?: AccountSection;
   /** The reader switched tabs; write it back to the host's URL. */
   onSection?: (section: AccountSection) => void;
+  /** `host`: the host draws the sections' navigation (e.g. a sidebar setting `section`), and the element no tabs. */
+  nav?: 'element' | 'host';
   onNavigate?: NavigateHandler;
   /** Sign out was picked; end the host's own session. Awaited when it returns a promise. */
   onSignOut?: SignOutHandler;
@@ -37,6 +39,7 @@ export function AccountPage({
   scriptUrl,
   section,
   onSection,
+  nav = 'element',
   onNavigate,
   onSignOut,
   platformSignOut = true,
@@ -50,7 +53,7 @@ export function AccountPage({
       scriptUrl={scriptUrl}
       minApiVersion={minApiVersion}
       {...(className === undefined ? {} : { className })}
-      attributes={{ 'data-section': section }}
+      attributes={{ 'data-section': section, 'data-nav': nav === 'host' ? 'host' : undefined }}
       events={{
         [SECTION_EVENT]: event => {
           const next = ACCOUNT_SECTIONS.find(s => s === (event.detail as { section?: unknown } | null)?.section);

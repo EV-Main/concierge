@@ -22,7 +22,7 @@ export function sectionOf(raw: string | null): AccountSection {
  * The account page a host mounts on its own `/account`: profile, security, notifications.
  * It never redirects: signed out, it says so and leaves sign-in to the host.
  */
-export function AccountView({ section, onSection }: { section: AccountSection; onSection: (next: AccountSection) => void }) {
+export function AccountView({ section, tabs, onSection }: { section: AccountSection; tabs: boolean; onSection: (next: AccountSection) => void }) {
   const t = useT();
   const { api, host, platform } = useElement();
   const { session, refresh } = useSession(api);
@@ -43,13 +43,15 @@ export function AccountView({ section, onSection }: { section: AccountSection; o
   return (
     <div className="flex w-full min-w-0 flex-col gap-4" onClick={(e) => offerLinkToHost(e, host)}>
       <Tabs value={section} onValueChange={(v) => onSection(sectionOf(v))}>
-        <TabsList>
-          {SECTIONS.map((s) => (
-            <TabsTrigger key={s} value={s}>
-              {labels[s]}
-            </TabsTrigger>
-          ))}
-        </TabsList>
+        {tabs && (
+          <TabsList>
+            {SECTIONS.map((s) => (
+              <TabsTrigger key={s} value={s}>
+                {labels[s]}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        )}
         <TabsContent value="profile">
           <ProfileCard user={session.user} />
         </TabsContent>
