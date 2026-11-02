@@ -77,6 +77,7 @@
           buildInputs = [ pkgs.openssl ];
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           doCheck = false;
+          meta.description = "the concierge binary";
         };
         # ── the platform's micro-frontends (web/ → /auth/mfe/*) ──────────────
         # Built only when web/ exists: it lands with EV-Main/concierge#128, and main must
@@ -112,6 +113,7 @@
                 cp -r dist $out/share/concierge/web
                 runHook postInstall
               '';
+              meta.description = "the platform's micro-frontends, web/ built";
             };
         # Where the bundles sit inside the image; WEB_MFE_DIR below points here.
         webMfeDir = "/share/concierge/web";
@@ -347,44 +349,15 @@
             echo "postgres ready on 127.0.0.1:$POSTGRES_PORT (databases ensured: $dbs)"
           '';
         };
-        # ── bump latest remote vX.Y.Z tag and push: `.#publish major|minor|patch` ──
-        runPublish = pkgs.writeShellApplication {
-          name = "publish";
-          runtimeInputs = with pkgs; [ git ];
-          text = ''
-                        part="''${1:-}"
-                        case "$part" in major|minor|patch) ;; *) echo "usage: nix run .#publish -- major|minor|patch" >&2; exit 1 ;; esac
-                        [ -z "$(git status --porcelain)" ] || { echo "uncommitted changes — commit or stash first" >&2; exit 1; }
-
-                        git fetch --tags --force origin >/dev/null 2>&1
-                        last="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
-                        ver="''${last#v}"; [ -n "$ver" ] || ver="0.0.0"
-                        IFS=. read -r ma mi pa <<EOF
-            $ver
-            EOF
-                        case "$part" in
-                          major) ma=$((ma+1)); mi=0; pa=0 ;;
-                          minor) mi=$((mi+1)); pa=0 ;;
-                          patch) pa=$((pa+1)) ;;
-                        esac
-                        next="v$ma.$mi.$pa"
-                        echo "$last → $next"
-                        git tag "$next"
-                        git push origin "$next"
-          '';
-        };
       in
       {
-        # `nix run` (default = .#concierge) → the runner binary (auth/directory/notification/log modules in-process; applies DB migrations on boot; ensures shared postgres + redis first)
-        # `nix run .#db`        → ensure the SHARED ev_invest Postgres is up (+ this repo's `concierge` database)
-        # `nix run .#redis`     → ensure the SHARED ev_invest Redis is up
-        # `nix run .#publish`   → bump latest remote vX.Y.Z tag (major|minor|patch) + push
         apps = {
-          default = { type = "app"; program = "${runConcierge}/bin/run-concierge"; };
-          concierge = { type = "app"; program = "${runConcierge}/bin/run-concierge"; };
-          db = { type = "app"; program = "${runPostgres}/bin/run-postgres"; };
-          redis = { type = "app"; program = "${runRedis}/bin/run-redis"; };
-          publish = { type = "app"; program = "${runPublish}/bin/publish"; };
+          default = { type = "app"; program = "${runConcierge}/bin/run-concierge"; meta.description = "the runner: auth, directory, notification and log modules in-process; migrates on boot; ensures the shared postgres and redis first"; };
+          concierge = { type = "app"; program = "${runConcierge}/bin/run-concierge"; meta.description = "same as the default"; };
+          db = { type = "app"; program = "${runPostgres}/bin/run-postgres"; meta.description = "ensure the shared ev_invest Postgres is up, with this repo's `concierge` database"; };
+          redis = { type = "app"; program = "${runRedis}/bin/run-redis"; meta.description = "ensure the shared ev_invest Redis is up"; };
+          publish = v_flakes.utils.publish pkgs;
+          help = v_flakes.utils.help { inherit pkgs self system; };
         };
 
         packages = {
