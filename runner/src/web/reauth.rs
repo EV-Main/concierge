@@ -227,7 +227,7 @@ async fn eligible_passkeys(st: &Inner, jar: &CookieJar, id: UserId) -> Result<Ve
 		.map(|s| s.created_at)
 		.ok_or_else(|| Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated"))?;
 	let rows = st.credentials.passkeys(id).await.map_err(|e| internal("reauth: passkeys not read", e))?;
-	Ok(rows.into_iter().filter(|row| row.created_at <= started).collect())
+	Ok(rows.into_iter().filter(|row| row.created_at < started).collect()) // whole seconds: one from the session's own second may be planted
 }
 
 /// `POST /auth/reauth/passkey/options` — begin an assertion against the signed-in

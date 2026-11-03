@@ -373,6 +373,19 @@ mod passkeys {
 	}
 
 	#[tokio::test]
+	async fn a_passkey_planted_in_the_second_the_session_began_does_not_re_authenticate() {
+		let fx = fixture!();
+		let mut browser = Browser::default();
+		fx.sign_in_with_code(&address("reauth-same-second"), &mut browser).await;
+		register(&fx, &mut browser).await;
+		let began = access_claims(&browser)["auth_time"].as_i64().expect("signed in now: auth_time is the session's start");
+		sqlx::query("UPDATE passkey_credentials SET created_at = $1").bind(began).execute(&fx.db.pool).await.unwrap();
+
+		let none = fx.post("/auth/reauth/passkey/options", ORIGIN, json!({}), &mut browser).await;
+		assert_eq!((none.status, none.body), (StatusCode::BAD_REQUEST, json!({ "error": "no_passkey" })));
+	}
+
+	#[tokio::test]
 	async fn another_accounts_ceremony_is_not_taken() {
 		let fx = fixture!();
 		let mut owner = Browser::default();
