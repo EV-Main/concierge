@@ -4,12 +4,6 @@
 //! These hit a **real** Postgres (no mocks, per the project rules). They run when
 //! `DATABASE_URL` is set and skip cleanly otherwise, so a DB-less `cargo test` still
 //! passes.
-//!
-//! ⚠️ THIS SUITE OWNS THE OWNER ROSTER. The rules are decided against `users.role =
-//! 'owner'` globally, so a test cannot scope itself to its own fixtures the way
-//! `user_directory.rs` does. Each test therefore takes a session-level advisory lock
-//! (serializing against concurrent runs and other processes) and demotes every existing
-//! owner before minting its own. Point `DATABASE_URL` at a development database.
 
 use std::sync::Arc;
 
@@ -18,56 +12,31 @@ mod common;
 use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
-	infrastructure::{db, governance::PgGovernance, grants::PgGrants, notifications::PgNotifications, users::PgUsers},
+	infrastructure::{governance::PgGovernance, grants::PgGrants, notifications::PgNotifications, users::PgUsers},
 	ports::{GovernanceMailQueued, GovernanceRepository, NotificationDispatchRepository, NotificationRepository, UserDirectoryRepository},
 };
 use domain::{authz::Role, users::UserId};
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{SetRoleRequest, user_directory_server::UserDirectory};
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::{Connection, PgConnection};
 use tonic::{Code, Request};
 use uuid::Uuid;
 
-/// Arbitrary, stable key for the session lock this suite serializes on.
-const ROSTER_LOCK: i64 = 0x676f_765f_6974; // "gov_it"
 /// A fixed instant, so every assertion about time is exact rather than racy.
 const T0: i64 = 1_800_000_000;
 
 struct Fixture {
 	governance: Arc<PgGovernance>,
 	users: Arc<PgUsers>,
-	pool: PgPool,
-	/// Holding this connection open holds the advisory lock; dropping it releases.
-	_roster_lock: PgConnection,
+	db: common::Db,
 }
 
 async fn setup() -> Option<Fixture> {
-	let url = common::database_url()?;
-	// This suite clears the owner registry — a state no API can restore. Never on a
-	// database nobody has declared disposable.
-	common::assert_disposable_database();
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-
-	let mut roster_lock = PgConnection::connect(&url).await.expect("a dedicated connection for the roster lock");
-	sqlx::query("SELECT pg_advisory_lock($1)")
-		.bind(ROSTER_LOCK)
-		.execute(&mut roster_lock)
-		.await
-		.expect("take the roster lock");
-
-	// A clean roster is a precondition, not a courtesy: the floor and the peer set are
-	// both counted from every owner in the database.
-	sqlx::query("UPDATE users SET role = 'investor' WHERE role = 'owner'")
-		.execute(&pool)
-		.await
-		.expect("clear the roster");
-
+	let db = common::Db::migrated().await?;
 	Some(Fixture {
-		governance: Arc::new(PgGovernance::new(pool.clone())),
-		users: Arc::new(PgUsers::new(pool.clone())),
-		pool,
-		_roster_lock: roster_lock,
+		governance: Arc::new(PgGovernance::new(db.pool.clone())),
+		users: Arc::new(PgUsers::new(db.pool.clone())),
+		db,
 	})
 }
 
@@ -109,14 +78,14 @@ impl Fixture {
 
 	/// The directory service over the same adapter, with no emergency allowlist.
 	fn directory(&self) -> Directory {
-		Directory::new(self.users.clone(), Arc::new(PgGrants::new(self.pool.clone())), Arc::new(BreakGlass::new(Vec::new())))
+		Directory::new(self.users.clone(), Arc::new(PgGrants::new(self.db.pool.clone())), Arc::new(BreakGlass::new(Vec::new())))
 	}
 
 	/// The directory service as an `OWNER_SUBJECTS`-listed operator sees it.
 	fn directory_with_break_glass(&self, subject: UserId) -> Directory {
 		Directory::new(
 			self.users.clone(),
-			Arc::new(PgGrants::new(self.pool.clone())),
+			Arc::new(PgGrants::new(self.db.pool.clone())),
 			Arc::new(BreakGlass::new(vec![subject.to_string()])),
 		)
 	}
@@ -170,7 +139,7 @@ async fn governance_mail_is_deduped_and_ignores_notification_preferences() {
 	// The subscriber follows nothing and has email switched off; the mail queues anyway.
 	sqlx::query("UPDATE notification_subscribers SET email_enabled = FALSE, in_app_enabled = FALSE WHERE user_id = $1")
 		.bind(owner.raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.expect("switch every channel off");
 	let second_key = format!("kyc-verdict:{}", Uuid::new_v4());
@@ -210,7 +179,7 @@ async fn governance_mail_is_deduped_and_ignores_notification_preferences() {
 		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notification_deliveries WHERE dedupe_key IN ($1, $2)")
 			.bind(&key)
 			.bind(&second_key)
-			.fetch_one(&fx.pool)
+			.fetch_one(&fx.db.pool)
 			.await
 			.unwrap(),
 		2
@@ -238,7 +207,7 @@ async fn a_governance_mail_does_not_verify_the_subscriber_by_itself() {
 	);
 	let (subscriber_id, verified): (Uuid, bool) = sqlx::query_as("SELECT id, email_verified FROM notification_subscribers WHERE user_id = $1")
 		.bind(owner.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.expect("the subscriber row the mail refreshed");
 	assert!(
@@ -249,7 +218,7 @@ async fn a_governance_mail_does_not_verify_the_subscriber_by_itself() {
 	// The consequence the flag guards: an ordinary notification on a followed topic
 	// reaches the inbox and NOT the mail queue. The row is followed as the mail left
 	// it — re-resolving the subscriber here would overwrite the very flag under test.
-	let notifications = PgNotifications::new(fx.pool.clone());
+	let notifications = PgNotifications::new(fx.db.pool.clone());
 	notifications.set_topic_subscription(subscriber_id, "platform:announcements", true, true).await.expect("follow");
 	let outcome = notifications
 		.emit(
@@ -293,16 +262,16 @@ async fn a_parked_delivery_is_redacted_but_a_retried_one_is_not() {
 	);
 	let delivery_id: i64 = sqlx::query_scalar("SELECT id FROM notification_deliveries WHERE dedupe_key = $1")
 		.bind(&key)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.expect("the queued row");
-	let dispatch = PgNotifications::new(fx.pool.clone());
+	let dispatch = PgNotifications::new(fx.db.pool.clone());
 
 	// Attempts left ⇒ rescheduled, and the payload is what the next attempt sends.
 	dispatch.mark_failed(delivery_id, "smtp down", 60, 6).await.expect("reschedule");
 	let (status, payload_after): (String, serde_json::Value) = sqlx::query_as("SELECT status, payload FROM notification_deliveries WHERE id = $1")
 		.bind(delivery_id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.expect("the row");
 	assert_eq!(status, "pending");
@@ -312,7 +281,7 @@ async fn a_parked_delivery_is_redacted_but_a_retried_one_is_not() {
 	dispatch.mark_failed(delivery_id, "smtp down", 60, 0).await.expect("park");
 	let (status, payload_after): (String, serde_json::Value) = sqlx::query_as("SELECT status, payload FROM notification_deliveries WHERE id = $1")
 		.bind(delivery_id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.expect("the row");
 	assert_eq!(status, "failed");
@@ -494,8 +463,7 @@ async fn set_role_cannot_strip_a_seat_granted_while_it_was_deciding() {
 
 	// Stand in for an admission carrying its verdict: the seat is written and the
 	// candidate's row held, exactly as `grant_seat` leaves it mid-transaction.
-	let url = std::env::var("DATABASE_URL").expect("setup already required it");
-	let mut seating = PgConnection::connect(&url).await.expect("a connection for the seating transaction");
+	let mut seating = PgConnection::connect(&fx.db.url).await.expect("a connection for the seating transaction");
 	sqlx::query("BEGIN").execute(&mut seating).await.expect("begin");
 	sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1")
 		.bind(candidate.raw())

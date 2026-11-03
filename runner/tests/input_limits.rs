@@ -12,7 +12,6 @@ use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
 	infrastructure::{
-		db,
 		grants::PgGrants,
 		platform::PgPlatform,
 		users::{AdminAction, PgUsers},
@@ -35,18 +34,8 @@ use uuid::Uuid;
 
 mod common;
 
-/// The suite's preconditions, or `None` when there is no database to assert against.
-///
-/// The gate is not cosmetic. Every test here returns early when `DATABASE_URL` is missing,
-/// and a skipped run prints exactly the same "N passed" a real one does — so "8 passed" is
-/// evidence of nothing on its own, including for the refusal in `#47` this suite is the
-/// only pin for. [`common::database_url`] answers that twice over: it panics under CI, and
-/// it prints a SKIPPED line a local `--nocapture` run shows.
-async fn setup() -> Option<(Arc<dyn UserDirectoryRepository>, Arc<dyn PlatformConfigRepository>, PgPool)> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-	Some((Arc::new(PgUsers::new(pool.clone())), Arc::new(PgPlatform::new(pool.clone())), pool))
+fn setup(db: &common::Db) -> (Arc<dyn UserDirectoryRepository>, Arc<dyn PlatformConfigRepository>, PgPool) {
+	(Arc::new(PgUsers::new(db.pool.clone())), Arc::new(PgPlatform::new(db.pool.clone())), db.pool.clone())
 }
 
 /// Rows `admin_action` holds about this person, and `KYC_CHANGED` rows on the outbox the
@@ -117,9 +106,8 @@ fn profile(phone: &str, base_currency: &str) -> UpdateProfileRequest {
 
 #[tokio::test]
 async fn update_profile_rejects_junk_with_invalid_argument() {
-	let Some((users, _, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (users, _, pool) = setup(&db);
 	let (sub, break_glass) = admin(&users).await;
 	let directory = Directory::new(users, Arc::new(PgGrants::new(pool.clone())), break_glass);
 
@@ -142,9 +130,8 @@ async fn update_profile_rejects_junk_with_invalid_argument() {
 
 #[tokio::test]
 async fn set_kyc_level_is_bounded() {
-	let Some((users, _, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (users, _, pool) = setup(&db);
 	let (sub, break_glass) = admin(&users).await;
 	let target = subject_of(&users, "kyc-target").await;
 	let directory = Directory::new(users, Arc::new(PgGrants::new(pool.clone())), break_glass);
@@ -195,9 +182,8 @@ async fn set_kyc_level_is_bounded() {
 /// tripped by picking a legal number.
 #[tokio::test]
 async fn an_operator_cannot_set_their_own_kyc_level() {
-	let Some((users, _, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (users, _, pool) = setup(&db);
 	let (sub, break_glass) = admin(&users).await;
 	let actor = sub.parse::<Uuid>().map(UserId::from_raw).unwrap();
 	// The operator starts at 1, through the front door they are still allowed. A run that
@@ -255,9 +241,8 @@ async fn an_operator_cannot_set_their_own_kyc_level() {
 /// handler.
 #[tokio::test]
 async fn a_self_targeted_kyc_write_is_refused_beneath_the_handler() {
-	let Some((users, _, _)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (users, _, _) = setup(&db);
 	let user = users.resolve(common::google("kyc-self", true), 0).await.unwrap();
 	let other = subject_of(&users, "kyc-writer").await.parse::<Uuid>().map(UserId::from_raw).unwrap();
 
@@ -278,9 +263,8 @@ async fn a_self_targeted_kyc_write_is_refused_beneath_the_handler() {
 /// still refuse, mapping to `INVALID_ARGUMENT` because the level came from outside.
 #[tokio::test]
 async fn kyc_level_is_bounded_beneath_the_handler() {
-	let Some((users, _, _)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (users, _, _) = setup(&db);
 	let user = users.resolve(common::google("kyc-bound", true), 0).await.unwrap();
 
 	for level in [MAX_KYC_LEVEL + 1, 999, u32::MAX] {
@@ -298,11 +282,8 @@ async fn kyc_level_is_bounded_beneath_the_handler() {
 /// `user_outbox`, which is the copy the banking money plane actually mirrors.
 #[tokio::test]
 async fn kyc_level_out_of_range_is_refused_by_the_store() {
-	let Some(url) = common::database_url() else {
-		return;
-	};
-	let pool = db::connect_sized(&url, 2).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let Some(db) = common::Db::migrated().await else { return };
+	let pool = db.pool.clone();
 	let users: Arc<dyn UserDirectoryRepository> = Arc::new(PgUsers::new(pool.clone()));
 
 	let user = users.resolve(common::google("kyc-store", true), 0).await.unwrap();
@@ -332,9 +313,8 @@ async fn kyc_level_out_of_range_is_refused_by_the_store() {
 
 #[tokio::test]
 async fn list_users_validates_filters_and_truncates_query() {
-	let Some((users, _, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (users, _, pool) = setup(&db);
 	let (sub, break_glass) = admin(&users).await;
 	let directory = Directory::new(users, Arc::new(PgGrants::new(pool.clone())), break_glass);
 	let list = |query: &str, role: &str, status: &str| ListUsersRequest {
@@ -357,9 +337,8 @@ async fn list_users_validates_filters_and_truncates_query() {
 
 #[tokio::test]
 async fn announcement_and_flag_writes_enforce_caps() {
-	let Some((users, config, _)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (users, config, _) = setup(&db);
 	let (sub, break_glass) = admin(&users).await;
 	let platform = Platform::new(users, break_glass, config);
 

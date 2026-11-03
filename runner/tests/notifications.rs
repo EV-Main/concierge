@@ -5,35 +5,28 @@
 //! `ON CONFLICT` inference against a *partial* unique index, `make_interval(secs =>)`
 //! with a float bind, a `FOR UPDATE SKIP LOCKED` CTE feeding an `UPDATE … RETURNING`,
 //! and the `(created_at, id) < (SELECT …)` keyset cursor.
-//!
-//! Every test generates its own subscriber, so the suites can run concurrently against
-//! the shared dev database without a clean-slate requirement — matching the convention
-//! in `platform.rs` and `user_directory.rs`.
+
+mod common;
 
 use std::sync::Arc;
 
 use concierge::{
-	infrastructure::{db, notifications::PgNotifications},
+	infrastructure::notifications::PgNotifications,
 	ports::{InboxTopics, NotificationDispatchRepository, NotificationRepository},
 };
 use domain::scope_catalog::TopicDelivery;
 use uuid::Uuid;
 
-async fn setup() -> Option<Arc<PgNotifications>> {
-	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-	Some(Arc::new(PgNotifications::new(pool)))
+fn setup(db: &common::Db) -> Arc<PgNotifications> {
+	Arc::new(PgNotifications::new(db.pool.clone()))
 }
 
 const TOPIC: &str = "platform:announcements";
 
 #[tokio::test]
 async fn subscriber_is_idempotent_and_tracks_the_address() {
-	let Some(repo) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let repo = setup(&db);
 	let user = Uuid::new_v4();
 
 	// The upsert infers a PARTIAL unique index (`WHERE user_id IS NOT NULL`), which is
@@ -51,10 +44,8 @@ async fn subscriber_is_idempotent_and_tracks_the_address() {
 
 #[tokio::test]
 async fn emit_requires_a_subscription_and_dedupes() {
-	let Some(repo) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let repo = setup(&db);
 	let user = Uuid::new_v4();
 	let sub = repo.subscriber_for_user(user, "emit@example.com", true).await.expect("subscriber");
 
@@ -90,10 +81,8 @@ async fn emit_requires_a_subscription_and_dedupes() {
 
 #[tokio::test]
 async fn channels_gate_delivery_independently_and_may_both_be_off() {
-	let Some(repo) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let repo = setup(&db);
 	let user = Uuid::new_v4();
 	let sub = repo.subscriber_for_user(user, "gate@example.com", true).await.expect("subscriber");
 	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
@@ -121,10 +110,8 @@ async fn channels_gate_delivery_independently_and_may_both_be_off() {
 
 #[tokio::test]
 async fn inbox_paginates_by_keyset_and_marks_read() {
-	let Some(repo) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let repo = setup(&db);
 	let user = Uuid::new_v4();
 	let sub = repo.subscriber_for_user(user, "page@example.com", true).await.expect("subscriber");
 	repo.set_topic_subscription(sub.id, TOPIC, true, false).await.expect("follow");
@@ -176,10 +163,8 @@ async fn inbox_paginates_by_keyset_and_marks_read() {
 
 #[tokio::test]
 async fn anonymous_subscribe_is_throttled_and_confirmable() {
-	let Some(repo) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let repo = setup(&db);
 	let email = format!("anon-{}@example.com", Uuid::new_v4());
 
 	let first = repo.subscribe_anonymous(&email, TOPIC, 3600).await.expect("first subscribe");
@@ -201,10 +186,8 @@ async fn anonymous_subscribe_is_throttled_and_confirmable() {
 
 #[tokio::test]
 async fn unsubscribe_stops_email_without_touching_the_inbox() {
-	let Some(repo) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let repo = setup(&db);
 	let user = Uuid::new_v4();
 	let sub = repo.subscriber_for_user(user, "unsub@example.com", true).await.expect("subscriber");
 	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
@@ -228,18 +211,11 @@ async fn unsubscribe_stops_email_without_touching_the_inbox() {
 
 #[tokio::test]
 async fn delivery_queue_claims_leases_and_backs_off() {
-	let Some(repo) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let repo = setup(&db);
 	let user = Uuid::new_v4();
 	let sub = repo.subscriber_for_user(user, "queue@example.com", true).await.expect("subscriber");
 	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
-	// Quiet whatever a shared development database already has queued. `claim_due` takes
-	// the OLDEST due rows first, so a backlog left by another suite would fill the batch
-	// and hide the row seeded below — a failure with nothing to do with the queue. The
-	// long lease keeps the drained rows out of the way for the rest of this test.
-	while !repo.claim_due(500, 3600).await.expect("drain the queue").is_empty() {}
 
 	repo.emit(user, TOPIC, "nav", "Queued", "body", "/x", "q1", 100, TopicDelivery::OptIn).await.expect("emit");
 
@@ -266,10 +242,8 @@ async fn delivery_queue_claims_leases_and_backs_off() {
 
 #[tokio::test]
 async fn switching_a_topic_off_is_remembered_and_following_it_again_clears_that() {
-	let Some(repo) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let repo = setup(&db);
 	let user = Uuid::new_v4();
 	let sub = repo.subscriber_for_user(user, "optout@example.com", true).await.expect("subscriber");
 	let stance = |rows: Vec<concierge::infrastructure::notifications::SubscriptionRow>| rows.into_iter().map(|r| (r.topic, r.subscribed)).collect::<Vec<_>>();

@@ -1,8 +1,8 @@
 //! `ScopeInboxService` against a real Postgres: a direction's backend reads its users'
 //! inbox with its client credential, and only its own namespace, only for its members.
 //!
-//! Every test makes its own scopes (tenant, client, secret, catalog) and its own users, so
-//! the suite runs beside the others on a shared database. A write needs the user's own
+//! Every test makes its own scopes (tenant, client, secret, catalog) and its own users. A
+//! write needs the user's own
 //! access token for the calling client, minted here through the real code exchange and
 //! verified by the real relying-party verifier against this suite's JWKS server.
 
@@ -13,7 +13,6 @@ mod common;
 use concierge::{
 	dispatch::{DispatcherConfig, drain_once},
 	infrastructure::{
-		db,
 		email::transport::{EmailTransport, OutgoingEmail},
 		grants::PgGrants,
 		notifications::PgNotifications,
@@ -42,7 +41,6 @@ use evconcierge_contracts::concierge::v1::{
 	scope_inbox_service_server::ScopeInboxService,
 };
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use tonic::{
 	Code, Request,
 	metadata::MetadataValue,
@@ -58,7 +56,7 @@ const ISSUER: &str = "https://auth.concierge.test";
 const CABINET: &str = "https://evinvest.ltd/cabinet";
 
 struct Fx {
-	pool: PgPool,
+	db: common::Db,
 	callers: ServiceCallers,
 	notifications: Arc<PgNotifications>,
 	users: Arc<PgUsers>,
@@ -97,9 +95,8 @@ fn auth_config() -> AuthConfig {
 }
 
 async fn setup() -> Option<Fx> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let db = common::Db::migrated().await?;
+	let pool = db.pool.clone();
 	let callers = ServiceCallers::new(Some(BRIDGE_TOKEN.into()), Arc::new(PgRelyingParties::new(pool.clone())));
 	let notifications = Arc::new(PgNotifications::new(pool.clone()));
 	let users = Arc::new(PgUsers::new(pool.clone()));
@@ -126,7 +123,7 @@ async fn setup() -> Option<Fx> {
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
 	Some(Fx {
-		pool,
+		db,
 		callers,
 		notifications,
 		users,
@@ -222,7 +219,7 @@ impl Fx {
 			approval_kinds: Vec::new(),
 			notification_topics: vec![news(&scope.topic, false, required)],
 		};
-		PgScopeCatalogs::new(self.pool.clone())
+		PgScopeCatalogs::new(self.db.pool.clone())
 			.publish(&scope.id, &scope.client, &catalog, now())
 			.await
 			.expect("publish the catalog");
@@ -241,17 +238,17 @@ impl Fx {
 		sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, observers) VALUES ($1, $1, FALSE, 0, $2)")
 			.bind(&scope.id)
 			.bind(&observers)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("register the scope");
 		sqlx::query("INSERT INTO rp_clients (client_id, audience, redirect_uris, created_at, tenant_id) VALUES ($1, $1, $2, 0, $3)")
 			.bind(&scope.client)
 			.bind(vec![scope.redirect.clone()])
 			.bind(&scope.id)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("register the client");
-		PgRelyingParties::new(self.pool.clone())
+		PgRelyingParties::new(self.db.pool.clone())
 			.set_secret_hash(&scope.client, Some(Sha256::digest(scope.secret.as_bytes()).as_slice()), 0)
 			.await
 			.expect("set the secret");
@@ -260,7 +257,7 @@ impl Fx {
 			approval_kinds: Vec::new(),
 			notification_topics: vec![news(&scope.topic, default_subscribed, required)],
 		};
-		PgScopeCatalogs::new(self.pool.clone())
+		PgScopeCatalogs::new(self.db.pool.clone())
 			.publish(&scope.id, &scope.client, &catalog, now())
 			.await
 			.expect("publish the catalog");
@@ -278,7 +275,7 @@ impl Fx {
 		)
 		.bind(&scope.id)
 		.bind(user)
-		.execute(&self.pool)
+		.execute(&self.db.pool)
 		.await
 		.expect("make the user a member");
 	}
@@ -290,7 +287,7 @@ impl Fx {
 		sqlx::query_scalar("SELECT n.id FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.dedupe_key = $2")
 			.bind(user)
 			.bind(&dedupe)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -298,7 +295,7 @@ impl Fx {
 	async fn unread_rows(&self, user: Uuid) -> i64 {
 		sqlx::query_scalar("SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.read_at IS NULL")
 			.bind(user)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -434,7 +431,11 @@ async fn a_non_member_reads_nothing() {
 
 	let disabled = fx.user("disabled").await.0;
 	fx.join(&scope, disabled).await;
-	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(disabled).execute(&fx.pool).await.unwrap();
+	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
+		.bind(disabled)
+		.execute(&fx.db.pool)
+		.await
+		.unwrap();
 
 	for id in [user, disabled, Uuid::new_v4()] {
 		let page = inbox.list_scope_notifications(as_client(list(id), &scope)).await.unwrap().into_inner();
@@ -515,7 +516,7 @@ async fn a_write_needs_the_user_s_token_for_this_client() {
 	assert_eq!(inbox.mark_scope_notifications_read(on_behalf(mark_all(&me), &mine, &token)).await.unwrap().into_inner().marked, 1);
 
 	// A token that still verifies, for an account suspended since: not a member any more.
-	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(user).execute(&fx.pool).await.unwrap();
+	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(user).execute(&fx.db.pool).await.unwrap();
 	let held = inbox.set_scope_topic_subscription(on_behalf(follow(&me, &mine.topic), &mine, &token)).await.unwrap_err();
 	assert_eq!(held.code(), Code::FailedPrecondition);
 }
@@ -542,14 +543,18 @@ async fn only_the_scope_s_own_client_opens_it() {
 
 	sqlx::query("UPDATE rp_clients SET disabled_at = 0 WHERE client_id = $1")
 		.bind(&scope.client)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let disabled = inbox.list_scope_notifications(as_client(list(user), &scope)).await.unwrap_err();
 	assert_eq!(disabled.code(), Code::Unauthenticated);
 
 	fx.join(&closed, user).await;
-	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1").bind(&closed.id).execute(&fx.pool).await.unwrap();
+	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1")
+		.bind(&closed.id)
+		.execute(&fx.db.pool)
+		.await
+		.unwrap();
 	let refused = inbox.list_scope_notifications(as_client(list(user), &closed)).await.unwrap_err();
 	assert_eq!(refused.code(), Code::FailedPrecondition);
 }
@@ -632,35 +637,23 @@ impl Fx {
 		sqlx::query_scalar("SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.topic = $2")
 			.bind(user)
 			.bind(topic)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
 
-	/// `topics` added to the bank's catalog in force, keeping what it already publishes: the
-	/// namespace is shared by every suite on the database.
+	/// `topics` added to the bank's catalog in force, keeping what it already publishes.
 	async fn publish_bank(&self, topics: &[NotificationTopic]) {
-		let catalogs = PgScopeCatalogs::new(self.pool.clone());
-		loop {
-			if let Some(current) = catalogs.current("bank").await.unwrap()
-				&& topics.iter().all(|t| current.notification_topics.contains(t))
-			{
-				return;
-			}
-			let mut catalog = catalogs.current("bank").await.unwrap().unwrap_or(ScopeCatalog {
-				version: 0,
-				approval_kinds: Vec::new(),
-				notification_topics: Vec::new(),
-			});
-			catalog.notification_topics.retain(|t| topics.iter().all(|mine| mine.topic != t.topic));
-			catalog.notification_topics.extend(topics.iter().cloned());
-			catalog.version = catalog.version.max(now() as u64) + 1;
-			catalogs.publish("bank", "bridge", &catalog, now()).await.unwrap();
-			let current = catalogs.current("bank").await.unwrap().unwrap();
-			if topics.iter().all(|t| current.notification_topics.contains(t)) {
-				return;
-			}
-		}
+		let catalogs = PgScopeCatalogs::new(self.db.pool.clone());
+		let mut catalog = catalogs.current("bank").await.unwrap().unwrap_or(ScopeCatalog {
+			version: 0,
+			approval_kinds: Vec::new(),
+			notification_topics: Vec::new(),
+		});
+		catalog.notification_topics.retain(|t| topics.iter().all(|mine| mine.topic != t.topic));
+		catalog.notification_topics.extend(topics.iter().cloned());
+		catalog.version = catalog.version.max(now() as u64) + 1;
+		catalogs.publish("bank", "bridge", &catalog, now()).await.unwrap();
 	}
 }
 
@@ -708,7 +701,11 @@ async fn a_service_emits_only_its_own_namespace_s_published_topics_to_members() 
 		.await
 		.unwrap_err();
 	assert_eq!(wrong.code(), Code::Unauthenticated);
-	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1").bind(&mine.id).execute(&fx.pool).await.unwrap();
+	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1")
+		.bind(&mine.id)
+		.execute(&fx.db.pool)
+		.await
+		.unwrap();
 	let closed = inbox.emit_scope_notification(as_client(emit(member, &mine.topic), &mine)).await.unwrap_err();
 	assert_eq!(closed.code(), Code::FailedPrecondition);
 	assert_eq!(fx.rows_on(member, &mine.topic).await, 1, "no refused emit wrote anything");
@@ -796,8 +793,6 @@ async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
 	let bases = Arc::new(NoticeLinkBases::parse(&["invest=https://invest.evinvest.ltd/cabinet".to_owned()], CABINET, "https://evinvest.ltd", true).unwrap());
 	let scope = fx.scope(&[]).await;
 	let inbox = fx.inbox_with(&[&scope], bases.clone());
-	// The topic of the bridge test beside it: each new `bank` topic bumps the shared
-	// catalog's version past the clock, which `scoped_inbox`'s publication must beat.
 	let topic = "bank:emit_test".to_owned();
 	fx.publish_bank(&[NotificationTopic {
 		topic: topic.clone(),
@@ -825,7 +820,7 @@ async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
 		sqlx::query_as("SELECT n.title, n.link FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.topic = $2 ORDER BY n.title")
 			.bind(user)
 			.bind(&topic)
-			.fetch_all(&fx.pool)
+			.fetch_all(&fx.db.pool)
 			.await
 			.unwrap();
 	assert_eq!(
@@ -853,7 +848,7 @@ async fn a_notice_for_a_scope_links_to_that_scope_s_cabinet() {
 		daily_budget: i64::MAX,
 		interval: Duration::from_secs(60),
 	};
-	while drain_once(&PgNotifications::new(fx.pool.clone()), &outbox, &cfg).await > 0 {}
+	while drain_once(&PgNotifications::new(fx.db.pool.clone()), &outbox, &cfg).await > 0 {}
 	let mails: Vec<OutgoingEmail> = outbox.0.lock().unwrap().iter().filter(|m| m.to == email).cloned().collect();
 	let target = |title: &str| {
 		let mail = mails.iter().find(|m| m.subject.ends_with(title)).unwrap_or_else(|| panic!("the {title:?} mail was sent"));
@@ -906,7 +901,7 @@ async fn an_inbox_read_drops_a_stored_link_under_no_configured_cabinet() {
 		sqlx::query("UPDATE notifications SET link = $2 WHERE id = $1")
 			.bind(id)
 			.bind(link)
-			.execute(&fx.pool)
+			.execute(&fx.db.pool)
 			.await
 			.unwrap();
 	}
@@ -955,7 +950,7 @@ async fn a_default_topic_reaches_members_who_never_touched_it_until_they_switch_
 	)
 	.bind(user)
 	.bind(&scope.topic)
-	.fetch_one(&fx.pool)
+	.fetch_one(&fx.db.pool)
 	.await
 	.unwrap();
 	assert_eq!((rows, optouts), (0, 1), "switched off is a row of its own, not a missing one");
@@ -990,7 +985,7 @@ async fn a_required_topic_reaches_every_member_whatever_they_chose() {
 		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notification_topic_optouts o JOIN notification_subscribers s ON s.id = o.subscriber_id WHERE s.user_id = $1 AND o.topic = $2")
 			.bind(member)
 			.bind(&scope.topic)
-			.fetch_one(&fx.pool)
+			.fetch_one(&fx.db.pool)
 			.await
 			.unwrap()
 	};
@@ -1035,7 +1030,7 @@ async fn a_required_topic_reaches_every_member_whatever_they_chose() {
 	assert_eq!(unread.unread_count, 2);
 	let mails: i64 = sqlx::query_scalar("SELECT count(*) FROM notification_deliveries WHERE subscriber_id = $1 AND kind = 'notification'")
 		.bind(sub.id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(mails, 2, "both required notices queued a mail");
@@ -1076,7 +1071,7 @@ async fn an_ordinary_topic_beside_a_required_one_keeps_the_member_s_choice() {
 		approval_kinds: Vec::new(),
 		notification_topics: vec![news(&scope.topic, false, false), news(&notice, false, true)],
 	};
-	PgScopeCatalogs::new(fx.pool.clone()).publish(&scope.id, &scope.client, &catalog, now()).await.unwrap();
+	PgScopeCatalogs::new(fx.db.pool.clone()).publish(&scope.id, &scope.client, &catalog, now()).await.unwrap();
 	let inbox = fx.inbox(&[&scope]);
 	let (member, email) = fx.user("ordinary-member").await;
 	fx.join(&scope, member).await;

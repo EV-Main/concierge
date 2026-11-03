@@ -18,13 +18,12 @@ use axum::{
 	routing::{get, post},
 };
 use concierge::{
-	infrastructure::{db, governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
+	infrastructure::{governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
 	ports::UserDirectoryRepository,
 	web::{self, KycDeps, allowlist::SignInAllowlist},
 };
 use evconcierge_auth::{OAuthClientConfig, oauth::OAuthProvider};
 use serde_json::{Value, json};
-use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -56,15 +55,14 @@ async fn emails(State(gh): State<Github>, headers: axum::http::HeaderMap) -> Jso
 
 struct Fx {
 	router: Router,
-	pool: PgPool,
+	db: common::Db,
 	users: Arc<PgUsers>,
 	github: Github,
 }
 
 async fn setup() -> Option<Fx> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let db = common::Db::migrated().await?;
+	let pool = db.pool.clone();
 	let users = Arc::new(PgUsers::new(pool.clone()));
 
 	let github = Github::default();
@@ -105,7 +103,7 @@ async fn setup() -> Option<Fx> {
 	.expect("build the web state");
 	Some(Fx {
 		router: web::router(state),
-		pool,
+		db,
 		users,
 		github,
 	})
@@ -179,7 +177,7 @@ impl Fx {
 	async fn github_account(&self, id: u64) -> Option<Uuid> {
 		sqlx::query_scalar("SELECT user_id FROM user_identities WHERE provider = 'github' AND subject = $1")
 			.bind(id.to_string())
-			.fetch_optional(&self.pool)
+			.fetch_optional(&self.db.pool)
 			.await
 			.unwrap()
 	}

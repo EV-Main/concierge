@@ -95,7 +95,7 @@ async fn five_wrong_answers_lock_every_answer_of_the_account() {
 	assert_eq!(refusal(&locked), error(StatusCode::TOO_MANY_REQUESTS, "factor_locked"));
 	let left: i64 = sqlx::query_scalar("SELECT count(*) FROM second_factor_recovery_codes WHERE user_id = $1 AND used_at IS NULL")
 		.bind(who.user)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(left, 10, "a locked account spends no code");
@@ -105,7 +105,7 @@ async fn five_wrong_answers_lock_every_answer_of_the_account() {
 async fn the_count_is_kept_in_the_database_for_every_replica() {
 	let fx = fixture!();
 	let mut who = fx.holder("sf-replicas").await;
-	let other = surface_with_second_factor(None).await.unwrap();
+	let other = fx.replica().await;
 	let bad = wrong(&who.secret);
 	for _ in 0..5 {
 		fx.prove(&mut who, &bad).await;
@@ -198,7 +198,7 @@ async fn a_recovery_code_removes_every_factor_and_ends_every_session() {
 	fx.sign_in_with_code(&who.email, &mut elsewhere).await;
 	let version: i64 = sqlx::query_scalar("SELECT token_version FROM users WHERE id = $1")
 		.bind(who.user)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 
@@ -208,19 +208,19 @@ async fn a_recovery_code_removes_every_factor_and_ends_every_session() {
 
 	let after: i64 = sqlx::query_scalar("SELECT token_version FROM users WHERE id = $1")
 		.bind(who.user)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(after, version + 1);
 	let revoked: i64 = sqlx::query_scalar("SELECT count(*) FROM user_outbox WHERE user_id = $1 AND kind = 'SESSIONS_REVOKED'")
 		.bind(who.user)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(revoked, 1, "the money plane learns every session ended");
 	let left: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM second_factors WHERE user_id = $1) + (SELECT count(*) FROM second_factor_recovery_codes WHERE user_id = $1)")
 		.bind(who.user)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(left, 0);
@@ -236,7 +236,7 @@ async fn sealed_material_opens_only_on_its_own_row() {
 	let mut b = fx.holder("sf-seal-b").await;
 	let material: Vec<u8> = sqlx::query_scalar("SELECT material FROM second_factors WHERE user_id = $1")
 		.bind(a.user)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	let secret = data_encoding::BASE32_NOPAD.decode(a.secret.as_bytes()).unwrap();
@@ -244,7 +244,7 @@ async fn sealed_material_opens_only_on_its_own_row() {
 	sqlx::query("UPDATE second_factors SET material = $2 WHERE user_id = $1")
 		.bind(b.user)
 		.bind(&material)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let crossed = fx.post("/auth/second-factor/verify/options", ORIGIN, json!({}), &mut b.browser).await;

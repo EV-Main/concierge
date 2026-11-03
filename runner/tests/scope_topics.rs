@@ -1,16 +1,13 @@
 //! A scope's notification topics on `NotificationService` (`docs/SCOPES-AND-APPROVALS.md`
 //! §6): the account-less subscribe takes a published one, and the keys that moved to a
 //! scope are no longer aliased.
-//!
-//! Every test registers its own scope and catalog, so the suite runs beside the others on a
-//! shared database.
 
 use std::{sync::Arc, time::Duration};
 
 mod common;
 
 use concierge::{
-	infrastructure::{db, notifications::PgNotifications, scope_catalogs::PgScopeCatalogs, users::PgUsers},
+	infrastructure::{notifications::PgNotifications, scope_catalogs::PgScopeCatalogs, users::PgUsers},
 	notification::{Notifications, RateLimiter, TOPICS},
 	ports::{NotificationRepository, ScopeCatalogRepository, UserDirectoryRepository},
 };
@@ -19,21 +16,19 @@ use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
 	EmitRequest, GetNotificationSettingsRequest, ListNotificationsRequest, SetTopicSubscriptionRequest, SubscribeAnonymousRequest, notification_service_server::NotificationService,
 };
-use sqlx::PgPool;
 use tonic::{Code, Request};
 use uuid::Uuid;
 
 struct Fx {
-	pool: PgPool,
+	db: common::Db,
 	service: Notifications,
 	notifications: Arc<PgNotifications>,
 	users: Arc<PgUsers>,
 }
 
 async fn setup() -> Option<Fx> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let db = common::Db::migrated().await?;
+	let pool = db.pool.clone();
 	let notifications = Arc::new(PgNotifications::new(pool.clone()));
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let service = Notifications::new(
@@ -42,12 +37,7 @@ async fn setup() -> Option<Fx> {
 		Arc::new(RateLimiter::new(Duration::from_secs(60), 1000)),
 		std::sync::Arc::new(concierge::notice_link::NoticeLinkBases::cabinet_only("https://evinvest.ltd/cabinet")),
 	);
-	Some(Fx {
-		pool,
-		service,
-		notifications,
-		users,
-	})
+	Some(Fx { db, service, notifications, users })
 }
 
 fn now() -> i64 {
@@ -103,7 +93,7 @@ impl Fx {
 		let id = format!("t_{}", &Uuid::new_v4().simple().to_string()[..12]);
 		sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, FALSE, 0)")
 			.bind(&id)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("register the scope");
 		let topic = format!("{id}:news");
@@ -119,7 +109,7 @@ impl Fx {
 				required_reason: String::new(),
 			}],
 		};
-		PgScopeCatalogs::new(self.pool.clone()).publish(&id, "test", &catalog, now()).await.expect("publish");
+		PgScopeCatalogs::new(self.db.pool.clone()).publish(&id, "test", &catalog, now()).await.expect("publish");
 		topic
 	}
 
@@ -132,7 +122,7 @@ impl Fx {
 	async fn inbox_topics(&self, user: Uuid) -> Vec<String> {
 		sqlx::query_scalar("SELECT n.topic FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 ORDER BY n.created_at")
 			.bind(user)
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -141,7 +131,7 @@ impl Fx {
 	async fn follows(&self, user: Uuid) -> Vec<String> {
 		sqlx::query_scalar("SELECT t.topic FROM notification_subscriptions t JOIN notification_subscribers s ON s.id = t.subscriber_id WHERE s.user_id = $1 ORDER BY t.topic")
 			.bind(user)
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -153,7 +143,7 @@ impl Fx {
 			 WHERE s.user_id IS NULL AND lower(s.email) = lower($1) ORDER BY t.topic",
 		)
 		.bind(email)
-		.fetch_all(&self.pool)
+		.fetch_all(&self.db.pool)
 		.await
 		.unwrap()
 	}
@@ -261,7 +251,7 @@ async fn the_move_carries_subscriptions_and_history_across() {
 			.bind(subscriber)
 			.bind(topic)
 			.bind(email_enabled)
-			.execute(&fx.pool)
+			.execute(&fx.db.pool)
 			.await
 			.unwrap();
 	}
@@ -271,12 +261,12 @@ async fn the_move_carries_subscriptions_and_history_across() {
 			.bind(topic)
 			.bind(kind)
 			.bind(Uuid::new_v4().to_string())
-			.execute(&fx.pool)
+			.execute(&fx.db.pool)
 			.await
 			.unwrap();
 	}
 
-	let mut tx = fx.pool.begin().await.unwrap();
+	let mut tx = fx.db.pool.begin().await.unwrap();
 	sqlx::raw_sql(include_str!("../migrations/0042_move_scope_topics.up.sql")).execute(&mut *tx).await.unwrap();
 	tx.commit().await.unwrap();
 

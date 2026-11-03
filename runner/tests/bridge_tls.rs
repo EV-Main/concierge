@@ -18,7 +18,6 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use concierge::{
 	bridge::Bridge,
 	bridge_tls::{self, Files, Listener},
-	infrastructure::db,
 };
 use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, user_events_client::UserEventsClient, user_events_server::UserEventsServer};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -52,13 +51,6 @@ fn files(client_ca: Option<&str>) -> Files {
 /// first, so no connection is ever opened. `connect_lazy` makes that explicit.
 fn detached_pool() -> PgPool {
 	PgPoolOptions::new().connect_lazy("postgres://127.0.0.1:1/never-connected").expect("a lazy pool needs no server")
-}
-
-async fn real_pool() -> Option<PgPool> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-	Some(pool)
 }
 
 /// Serve the bridge over the listener's TLS config on an ephemeral loopback port —
@@ -96,7 +88,7 @@ fn pinned(ca: &str) -> ClientTlsConfig {
 }
 
 fn authed_pull() -> Request<PullUserLifecycleRequest> {
-	// `after_position` past anything a shared database holds: the pull must be REAL
+	// `after_position` past anything the database holds: the pull must be REAL
 	// (it runs the query) and still return an empty page.
 	let mut request = Request::new(PullUserLifecycleRequest {
 		after_position: i64::MAX - 1,
@@ -108,9 +100,8 @@ fn authed_pull() -> Request<PullUserLifecycleRequest> {
 
 #[tokio::test]
 async fn a_client_pinning_the_ca_completes_a_pull_over_tls() {
-	let Some(pool) = real_pool().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let pool = db.pool.clone();
 	let listener = files(None).load().expect("load fixtures");
 	let (addr, server) = serve(&listener, pool);
 
@@ -185,9 +176,8 @@ async fn under_mtls_a_certificate_from_another_ca_is_refused() {
 
 #[tokio::test]
 async fn under_mtls_a_certificate_from_the_client_ca_completes_a_pull() {
-	let Some(pool) = real_pool().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let pool = db.pool.clone();
 	let listener = files(Some("ca.pem")).load().expect("load fixtures");
 	let (addr, server) = serve(&listener, pool);
 
@@ -203,9 +193,8 @@ async fn under_mtls_a_certificate_from_the_client_ca_completes_a_pull() {
 /// must not be mistaken for authentication of the pull itself.
 #[tokio::test]
 async fn tls_does_not_replace_the_bridge_token() {
-	let Some(pool) = real_pool().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let pool = db.pool.clone();
 	let listener = files(None).load().expect("load fixtures");
 	let (addr, server) = serve(&listener, pool);
 

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use concierge::{
 	authz::BreakGlass,
-	infrastructure::{db, platform::PgPlatform, users::PgUsers},
+	infrastructure::{platform::PgPlatform, users::PgUsers},
 	platform::Platform,
 	ports::{PlatformConfigRepository, UserDirectoryRepository},
 };
@@ -23,11 +23,8 @@ use evconcierge_contracts::concierge::v1::{GetPlatformConfigRequest, SetAnnounce
 use tonic::{Code, Request};
 use uuid::Uuid;
 
-async fn setup() -> Option<(Arc<dyn UserDirectoryRepository>, Arc<dyn PlatformConfigRepository>)> {
-	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-	Some((Arc::new(PgUsers::new(pool.clone())), Arc::new(PgPlatform::new(pool))))
+fn setup(db: &common::Db) -> (Arc<dyn UserDirectoryRepository>, Arc<dyn PlatformConfigRepository>) {
+	(Arc::new(PgUsers::new(db.pool.clone())), Arc::new(PgPlatform::new(db.pool.clone())))
 }
 
 fn access_claims(sub: &str) -> Claims {
@@ -52,10 +49,8 @@ fn request_with<T>(claims: Claims, inner: T) -> Request<T> {
 
 #[tokio::test]
 async fn any_authenticated_principal_reads_config_but_cannot_write() {
-	let Some((users, config)) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (users, config) = setup(&db);
 	// A freshly provisioned user is an Investor — no console permission at all.
 	let user = users.resolve(common::google("platform", true), 0).await.unwrap();
 	let sub = user.id().to_string();
@@ -84,10 +79,8 @@ async fn any_authenticated_principal_reads_config_but_cannot_write() {
 /// One test so the two writes to the SINGLETON `platform_config` row stay sequential.
 #[tokio::test]
 async fn operator_config_writes_validate_and_round_trip() {
-	let Some((users, config)) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (users, config) = setup(&db);
 	let user = users.resolve(common::google("platform-op", true), 0).await.unwrap();
 	let sub = user.id().to_string();
 	// A PERSISTED admin, so these assertions are about the validation past the gate and
@@ -111,8 +104,7 @@ async fn operator_config_writes_validate_and_round_trip() {
 
 	// `rollout` is a u32 on the wire: the `> 100` guard has to reject everything above it,
 	// including values that would wrap negative through the `as i32` narrowing and clamp
-	// silently to 0 in the adapter. Unique keys — the table is shared dev/CI state, so a
-	// rejected write must be proven absent by a key only this run could have written.
+	// silently to 0 in the adapter.
 	let guard_key = format!("rollout-guard-{}", Uuid::new_v4());
 	for rollout in [101, i32::MAX as u32 + 1, u32::MAX] {
 		let rejected = platform.set_feature_flag(request_with(access_claims(&sub), flag(&guard_key, rollout))).await.unwrap_err();

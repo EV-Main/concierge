@@ -83,7 +83,7 @@ impl Surface {
 		let recovery = confirmed.body["recoveryCodes"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_owned()).collect();
 		let methods = self.get("/auth/methods", &mut browser).await;
 		let factor = methods.body["secondFactor"]["factors"][0]["id"].as_str().unwrap().to_owned();
-		let user = sqlx::query_scalar("SELECT id FROM users WHERE email = $1").bind(&email).fetch_one(&self.pool).await.unwrap();
+		let user = sqlx::query_scalar("SELECT id FROM users WHERE email = $1").bind(&email).fetch_one(&self.db.pool).await.unwrap();
 		Holder {
 			browser,
 			email,
@@ -110,7 +110,7 @@ impl Surface {
 	pub async fn notices(&self, email: &str) -> Vec<String> {
 		sqlx::query_scalar("SELECT payload->>'event' FROM notification_deliveries WHERE kind = 'security_notice' AND recipient = $1 ORDER BY id")
 			.bind(email)
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.unwrap()
 	}

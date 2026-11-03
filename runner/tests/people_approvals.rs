@@ -3,10 +3,6 @@
 //! `second_factor_reset`) against a
 //! REAL Postgres: each kind end to end, and the invariants that make them safe to hand the
 //! seats to (`docs/SCOPES-AND-APPROVALS.md` §5.3).
-//!
-//! ⚠️ THIS SUITE OWNS THE OWNER ROSTER, like `approvals.rs` and `governance.rs`: it takes
-//! the same session advisory lock, and clears the roster of a database the
-//! `CONCIERGE_TEST_DB` marker calls disposable.
 
 use std::sync::{
 	Arc,
@@ -16,7 +12,7 @@ use std::sync::{
 use concierge::{
 	approvals::Approvals,
 	authz::BreakGlass,
-	infrastructure::{approvals::PgApprovals, db, scope_catalogs::PgScopeCatalogs, users::PgUsers},
+	infrastructure::{approvals::PgApprovals, scope_catalogs::PgScopeCatalogs, users::PgUsers},
 	ports::UserDirectoryRepository,
 };
 use domain::{
@@ -28,19 +24,16 @@ use evconcierge_contracts::concierge::v1::{
 	Approval, ApprovalState, ApprovalVote, GetApprovalRequest, GetApprovalsRevisionRequest, ListPlatformOwnersRequest, ProposePersonDecisionRequest, ResignPlatformOwnershipRequest,
 	VetoApprovalRequest, VoteApprovalRequest, approval_service_server::ApprovalService, propose_person_decision_request::Subject,
 };
-use sqlx::{Connection, PgConnection, PgPool};
 use tonic::{Code, Request};
 use uuid::Uuid;
 
 mod common;
 
-const ROSTER_LOCK: i64 = 0x676f_765f_6974; // "gov_it"
 const T0: i64 = 1_900_000_000;
 const HOUR: i64 = 60 * 60;
 
 struct Fx {
-	pool: PgPool,
-	url: String,
+	db: common::Db,
 	users: Arc<PgUsers>,
 	people: Approvals,
 	repo: Arc<PgApprovals>,
@@ -48,9 +41,8 @@ struct Fx {
 }
 
 async fn setup() -> Option<Fx> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 10).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let db = common::Db::migrated().await?;
+	let pool = db.pool.clone();
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let catalogs = Arc::new(PgScopeCatalogs::new(pool.clone()));
 	let clock = Arc::new(AtomicI64::new(T0));
@@ -59,8 +51,7 @@ async fn setup() -> Option<Fx> {
 		people: Approvals::new(users.clone(), Arc::new(BreakGlass::new(Vec::new())), repo.clone(), catalogs),
 		repo,
 		users,
-		pool,
-		url,
+		db,
 		clock,
 	})
 }
@@ -116,7 +107,7 @@ impl Fx {
 
 	async fn db_now(&self) -> i64 {
 		sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::BIGINT")
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -125,17 +116,10 @@ impl Fx {
 		self.users.resolve(common::google(tag, true), 0).await.expect("provision").id()
 	}
 
-	/// Exactly `n` owners, held until the returned connection drops.
-	async fn owners(&self, n: usize) -> (PgConnection, Vec<UserId>) {
-		common::assert_disposable_database();
-		let mut lock = PgConnection::connect(&self.url).await.expect("a connection for the roster lock");
-		sqlx::query("SELECT pg_advisory_lock($1)")
-			.bind(ROSTER_LOCK)
-			.execute(&mut lock)
-			.await
-			.expect("take the roster lock");
+	/// Exactly `n` owners: whoever held a seat before holds none.
+	async fn owners(&self, n: usize) -> Vec<UserId> {
 		sqlx::query("UPDATE users SET role = 'investor' WHERE role = 'owner'")
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("clear the roster");
 		let mut owners = Vec::with_capacity(n);
@@ -144,7 +128,7 @@ impl Fx {
 			self.users.set_role(id, Role::Owner).await.expect("seat the owner");
 			owners.push(id);
 		}
-		(lock, owners)
+		owners
 	}
 
 	async fn open(&self, who: UserId, decision: Decision, subject: UserId) -> Result<Approval, tonic::Status> {
@@ -226,17 +210,17 @@ impl Fx {
 	}
 
 	async fn count(&self, sql: &str, id: Uuid) -> i64 {
-		sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned())).bind(id).fetch_one(&self.pool).await.unwrap()
+		sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned())).bind(id).fetch_one(&self.db.pool).await.unwrap()
 	}
 
 	async fn roster_changed_at(&self) -> i64 {
-		sqlx::query_scalar("SELECT changed_at FROM platform_roster").fetch_one(&self.pool).await.unwrap()
+		sqlx::query_scalar("SELECT changed_at FROM platform_roster").fetch_one(&self.db.pool).await.unwrap()
 	}
 
 	async fn proposal_state(&self, id: &str) -> String {
 		sqlx::query_scalar("SELECT state FROM approvals WHERE id = $1::uuid")
 			.bind(id)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -270,7 +254,7 @@ impl Fx {
 #[tokio::test]
 async fn a_second_factor_reset_passes_on_a_majority_and_leaves_no_factor_no_code_and_no_session() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	let subject = fx.user("lost-phone").await;
 	let bare = fx.user("no-factor").await;
 	fx.at(T0);
@@ -279,14 +263,14 @@ async fn a_second_factor_reset_passes_on_a_majority_and_leaves_no_factor_no_code
 		.bind(Uuid::new_v4())
 		.bind(subject.raw())
 		.bind(T0)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	sqlx::query("INSERT INTO second_factor_recovery_codes (user_id, digest, created_at) VALUES ($1, $2, $3)")
 		.bind(subject.raw())
 		.bind(vec![7u8; 32])
 		.bind(T0)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -326,7 +310,7 @@ async fn a_second_factor_reset_passes_on_a_majority_and_leaves_no_factor_no_code
 	let told: Vec<String> =
 		sqlx::query_scalar("SELECT payload->>'event' FROM notification_deliveries d JOIN users u ON u.email = d.recipient WHERE u.id = $1 AND d.kind = 'security_notice'")
 			.bind(subject.raw())
-			.fetch_all(&fx.pool)
+			.fetch_all(&fx.db.pool)
 			.await
 			.unwrap();
 	assert_eq!(told, ["reset"]);
@@ -335,7 +319,7 @@ async fn a_second_factor_reset_passes_on_a_majority_and_leaves_no_factor_no_code
 #[tokio::test]
 async fn an_owner_admission_needs_every_other_owner_and_seats_the_candidate_once() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	let candidate = fx.user("candidate").await;
 	fx.at(T0);
 
@@ -377,7 +361,7 @@ async fn an_owner_admission_needs_every_other_owner_and_seats_the_candidate_once
 	);
 	let outbox: i64 = sqlx::query_scalar("SELECT count(*) FROM user_outbox WHERE user_id = $1 AND kind = 'ROLE_CHANGED' AND role = 'owner'")
 		.bind(candidate.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(outbox, 1, "the money plane is told, in the same transaction");
@@ -391,7 +375,7 @@ async fn an_owner_admission_needs_every_other_owner_and_seats_the_candidate_once
 #[tokio::test]
 async fn one_against_ends_an_owner_admission_and_a_majority_is_not_enough() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	let candidate = fx.user("candidate").await;
 	fx.at(T0);
 	let opened = fx.open(owners[0], Decision::Admit, candidate).await.unwrap();
@@ -406,7 +390,7 @@ async fn one_against_ends_an_owner_admission_and_a_majority_is_not_enough() {
 #[tokio::test]
 async fn an_owner_removal_demotes_the_target_who_neither_votes_nor_vetoes() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	let target = owners[3];
 	fx.at(T0);
 
@@ -428,7 +412,7 @@ async fn an_owner_removal_demotes_the_target_who_neither_votes_nor_vetoes() {
 	fx.execute_at(T0 + 24 * HOUR).await;
 	assert_eq!(fx.row(target).await.0, Role::Investor, "all the way down, as an expulsion always was");
 	assert_eq!(state(&fx.get(owners[0], &opened.id).await), ApprovalState::Executed);
-	let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE role = 'owner'").fetch_one(&fx.pool).await.unwrap();
+	let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE role = 'owner'").fetch_one(&fx.db.pool).await.unwrap();
 	assert_eq!(remaining, 3);
 }
 
@@ -438,7 +422,7 @@ async fn an_owner_removal_demotes_the_target_who_neither_votes_nor_vetoes() {
 #[tokio::test]
 async fn a_fund_of_three_removes_its_bad_actor_with_one_voter() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let target = owners[2];
 	fx.at(T0);
 
@@ -449,14 +433,14 @@ async fn a_fund_of_three_removes_its_bad_actor_with_one_voter() {
 	fx.execute_at(T0 + 24 * HOUR).await;
 	assert_eq!(fx.row(target).await.0, Role::Investor);
 	assert_eq!(state(&fx.get(owners[0], &opened.id).await), ApprovalState::Executed);
-	let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE role = 'owner'").fetch_one(&fx.pool).await.unwrap();
+	let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE role = 'owner'").fetch_one(&fx.db.pool).await.unwrap();
 	assert_eq!(remaining, 2, "and the fund lands on two");
 }
 
 #[tokio::test]
 async fn any_other_owner_vetoes_a_removal() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	fx.at(T0);
 	let opened = fx.open(owners[0], Decision::Remove, owners[3]).await.unwrap();
 	fx.carry(&owners[1..3], &opened.id).await;
@@ -469,7 +453,7 @@ async fn any_other_owner_vetoes_a_removal() {
 #[tokio::test]
 async fn a_suspension_passes_on_a_majority_is_the_owners_verdict_and_a_reinstatement_lifts_it() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	let subject = fx.user("subject").await;
 	fx.at(T0);
 
@@ -482,7 +466,7 @@ async fn a_suspension_passes_on_a_majority_is_the_owners_verdict_and_a_reinstate
 	assert_eq!((status, by.as_deref()), (UserStatus::Disabled, Some("governance")));
 	let verbs: Vec<String> = sqlx::query_scalar("SELECT action FROM admin_action WHERE subject_user_id = $1 AND approval_id IS NOT NULL")
 		.bind(subject.raw())
-		.fetch_all(&fx.pool)
+		.fetch_all(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(verbs, ["suspended_by_approval"]);
@@ -498,7 +482,7 @@ async fn a_suspension_passes_on_a_majority_is_the_owners_verdict_and_a_reinstate
 #[tokio::test]
 async fn a_reinstatement_lifts_only_what_the_owners_imposed() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let held = fx.user("held").await;
 	let free = fx.user("free").await;
 	fx.at(T0);
@@ -518,7 +502,7 @@ async fn a_reinstatement_lifts_only_what_the_owners_imposed() {
 #[tokio::test]
 async fn an_admin_admission_grants_the_admin_role_and_never_over_an_owner() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let subject = fx.user("subject").await;
 	fx.at(T0);
 	let opened = fx.open(owners[0], Decision::Admin, subject).await.unwrap();
@@ -541,7 +525,7 @@ async fn an_admin_admission_grants_the_admin_role_and_never_over_an_owner() {
 #[tokio::test]
 async fn only_an_active_owner_opens_and_nobody_opens_one_about_themselves() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let outsider = fx.user("outsider").await;
 	let subject = fx.user("subject").await;
 	for decision in [
@@ -573,7 +557,7 @@ async fn only_an_active_owner_opens_and_nobody_opens_one_about_themselves() {
 #[tokio::test]
 async fn the_floor_keeps_two_owners_at_open_by_resignation_and_when_the_roster_moves_under_a_decision() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(2).await;
+	let owners = fx.owners(2).await;
 	fx.at(T0);
 	let refused = fx.open(owners[0], Decision::Remove, owners[1]).await.unwrap_err();
 	assert_eq!(refused.code(), Code::FailedPrecondition, "two owners may not become one: {}", refused.message());
@@ -584,7 +568,7 @@ async fn the_floor_keeps_two_owners_at_open_by_resignation_and_when_the_roster_m
 		async move { people.resign_ownership(as_user(who, ResignPlatformOwnershipRequest { confirm_email: confirm })).await }
 	};
 	let email = |who: UserId| {
-		let pool = fx.pool.clone();
+		let pool = fx.db.pool.clone();
 		async move {
 			sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
 				.bind(who.raw())
@@ -610,15 +594,12 @@ async fn the_floor_keeps_two_owners_at_open_by_resignation_and_when_the_roster_m
 	assert_eq!(refused.code(), Code::AlreadyExists);
 
 	// Under a PASSED removal the roster moves: the store voids it instead of carrying it out.
-	let (_lock2, owners) = {
-		drop(_lock);
-		fx.owners(4).await
-	};
+	let owners = fx.owners(4).await;
 	let opened = fx.open(owners[0], Decision::Remove, owners[3]).await.unwrap();
 	fx.carry(&owners[1..3], &opened.id).await;
 	sqlx::query("UPDATE users SET role = 'investor' WHERE id = $1")
 		.bind(owners[2].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -633,14 +614,14 @@ async fn the_floor_keeps_two_owners_at_open_by_resignation_and_when_the_roster_m
 #[tokio::test]
 async fn a_seat_decision_is_void_when_the_candidate_stops_qualifying_before_it_is_carried_out() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let candidate = fx.user("candidate").await;
 	fx.at(T0);
 	let opened = fx.open(owners[0], Decision::Admit, candidate).await.unwrap();
 	fx.carry(&owners[1..3], &opened.id).await;
 	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
 		.bind(candidate.raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	fx.execute_at(T0 + 24 * HOUR).await;
@@ -652,7 +633,7 @@ async fn a_seat_decision_is_void_when_the_candidate_stops_qualifying_before_it_i
 #[tokio::test]
 async fn a_vote_is_the_seat_s_a_held_voter_cannot_carry_a_unanimous_decision() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	let candidate = fx.user("candidate").await;
 	fx.at(T0);
 	let opened = fx.open(owners[0], Decision::Admit, candidate).await.unwrap();
@@ -681,7 +662,7 @@ async fn a_vote_is_the_seat_s_a_held_voter_cannot_carry_a_unanimous_decision() {
 #[tokio::test]
 async fn the_same_decision_cannot_be_opened_twice_while_live_and_the_pause_follows_a_change() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	let candidate = fx.user("candidate").await;
 	let other = fx.user("other").await;
 	fx.at(T0);
@@ -701,8 +682,7 @@ async fn the_same_decision_cannot_be_opened_twice_while_live_and_the_pause_follo
 	fx.execute_at(T0 + 24 * HOUR).await;
 	assert_eq!(fx.role(candidate).await, Role::Owner);
 
-	// D24(2): the change of the owners pauses platform decisions for the cool-down in force
-	// (another suite of this database may have installed its own).
+	// D24(2): the change of the owners pauses platform decisions for the cool-down in force.
 	let policy = fx
 		.people
 		.get_platform_approval_policy(as_user(owners[0], evconcierge_contracts::concierge::v1::GetPlatformApprovalPolicyRequest {}))
@@ -722,7 +702,7 @@ async fn the_same_decision_cannot_be_opened_twice_while_live_and_the_pause_follo
 #[tokio::test]
 async fn an_owner_s_suspension_by_the_owners_changes_the_roster() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	fx.at(T0);
 	let opened = fx.open(owners[0], Decision::Suspend, owners[3]).await.unwrap();
 	assert_eq!(opened.voters.len(), 2, "the subject is not asked about their own suspension");
@@ -738,7 +718,7 @@ async fn an_owner_s_suspension_by_the_owners_changes_the_roster() {
 #[tokio::test]
 async fn an_approval_suspension_open_lets_the_hold_extend() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let subject = fx.user("subject").await;
 	fx.at(T0);
 	let now = fx.db_now().await;
@@ -761,7 +741,7 @@ async fn an_approval_suspension_open_lets_the_hold_extend() {
 #[tokio::test]
 async fn the_roster_the_revision_and_the_only_writers_of_the_owner_seat() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	fx.at(T0);
 
 	let roster = fx
@@ -794,14 +774,14 @@ async fn the_roster_the_revision_and_the_only_writers_of_the_owner_seat() {
 #[tokio::test]
 async fn a_break_glass_operator_holds_no_seat_in_any_decision() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	fx.at(T0);
 	let operator = fx.user("break-glass").await;
 	let people = Approvals::new(
 		fx.users.clone(),
 		Arc::new(BreakGlass::new(vec![operator.to_string()])),
 		fx.repo.clone(),
-		Arc::new(PgScopeCatalogs::new(fx.pool.clone())),
+		Arc::new(PgScopeCatalogs::new(fx.db.pool.clone())),
 	);
 
 	let roster = people
@@ -901,7 +881,7 @@ fn admin_action(actor: UserId, reason: &str) -> concierge::infrastructure::users
 #[tokio::test]
 async fn an_expired_decision_does_not_extend_a_hold() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let subject = fx.user("subject").await;
 	fx.at(T0);
 	let now = fx.db_now().await;
@@ -915,7 +895,7 @@ async fn an_expired_decision_does_not_extend_a_hold() {
 	sqlx::query("UPDATE approvals SET created_at = $2 - 300000, expires_at = $2 - 100000 WHERE id = $1::uuid")
 		.bind(&opened.id)
 		.bind(now)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let refused = fx.users.hold_user(subject, &admin_action(owners[1], "forever"), owners[1], now).await.unwrap_err();
@@ -928,7 +908,7 @@ async fn an_expired_decision_does_not_extend_a_hold() {
 #[tokio::test]
 async fn nobody_holds_the_owners_while_they_decide_on_them_and_the_target_does_not_see_the_tally() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	let bystander = fx.user("bystander").await;
 	fx.at(T0);
 	let target = owners[3];
@@ -955,17 +935,17 @@ async fn nobody_holds_the_owners_while_they_decide_on_them_and_the_target_does_n
 #[tokio::test]
 async fn the_floor_counts_the_seats_that_can_still_decide() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	fx.at(T0);
 	// The owners' verdict on C: the seat is kept and has no say.
 	sqlx::query("UPDATE users SET status = 'disabled', suspended_by = 'governance' WHERE id = $1")
 		.bind(owners[2].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
 		.bind(owners[1].raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	let resign = fx
@@ -980,7 +960,7 @@ async fn the_floor_counts_the_seats_that_can_still_decide() {
 	// A temporary hold is counted: it lapses, and one operator's brake must not also freeze the roster.
 	sqlx::query("UPDATE users SET status = 'active', suspended_by = NULL WHERE id = $1")
 		.bind(owners[2].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let fourth = fx.user("fourth").await;
@@ -995,12 +975,12 @@ async fn the_floor_counts_the_seats_that_can_still_decide() {
 #[tokio::test]
 async fn a_vote_and_an_opening_are_not_queued_behind_the_executor_s_locks() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(4).await;
+	let owners = fx.owners(4).await;
 	let (first, second) = (fx.user("first").await, fx.user("second").await);
 	fx.at(T0);
 	let live = fx.open(owners[0], Decision::Admin, first).await.unwrap();
 	// What the executor holds on the owners while it works: NO KEY UPDATE.
-	let mut working = fx.pool.begin().await.unwrap();
+	let mut working = fx.db.pool.begin().await.unwrap();
 	sqlx::query("SELECT id FROM users WHERE role = 'owner' ORDER BY id FOR NO KEY UPDATE")
 		.fetch_all(&mut *working)
 		.await
@@ -1021,7 +1001,7 @@ async fn a_vote_and_an_opening_are_not_queued_behind_the_executor_s_locks() {
 #[tokio::test]
 async fn one_owner_holds_only_a_few_decisions_about_people_open() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	fx.at(T0);
 	let mut opened = Vec::new();
 	for _ in 0..concierge_cap() {
@@ -1051,14 +1031,14 @@ fn concierge_cap() -> i64 {
 #[tokio::test]
 async fn an_action_this_binary_cannot_read_reads_as_none_and_is_voided_not_executed() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let subject = fx.user("subject").await;
 	fx.at(T0);
 	let opened = fx.open(owners[0], Decision::Suspend, subject).await.unwrap();
 	fx.carry(&owners[1..3], &opened.id).await;
 	sqlx::query("UPDATE approvals SET action = '{\"type\": \"from_a_newer_release\"}'::jsonb WHERE id = $1::uuid")
 		.bind(&opened.id)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(fx.get(owners[0], &opened.id).await.id, opened.id, "it still reads");
@@ -1071,7 +1051,7 @@ async fn an_action_this_binary_cannot_read_reads_as_none_and_is_voided_not_execu
 #[tokio::test]
 async fn text_and_standing_are_checked_for_an_admin_too_and_the_audit_names_who_asked() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let subject = fx.user("subject").await;
 	fx.at(T0);
 	let ask = |reason: &str, subject: UserId| {
@@ -1095,7 +1075,7 @@ async fn text_and_standing_are_checked_for_an_admin_too_and_the_audit_names_who_
 	fx.execute_at(T0 + 24 * HOUR).await;
 	let detail: serde_json::Value = sqlx::query_scalar("SELECT detail FROM admin_action WHERE approval_id = $1::uuid")
 		.bind(&opened.id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(detail["opened_by"], owners[0].to_string());

@@ -57,8 +57,8 @@ async fn settings_read_every_topic_with_the_callers_choice() {
 	assert_eq!(read.body["email_verified"], true);
 	assert_eq!(read.body["in_app_enabled"], true);
 	let topics = read.body["topics"].as_array().unwrap();
-	// The followable built-ins lead, in their order; whatever scope catalogs are in force on
-	// a shared database follow them. A trace topic is not offered.
+	// The followable built-ins lead, in their order; whatever scope catalogs are in force
+	// follow them. A trace topic is not offered.
 	let followable: Vec<&str> = TOPICS.iter().filter(|t| t.followable).map(|t| t.key).collect();
 	assert_eq!(topics.iter().take(followable.len()).map(|t| t["topic"].as_str().unwrap()).collect::<Vec<_>>(), followable);
 	let first = topics[0].as_object().unwrap();
@@ -182,7 +182,7 @@ async fn a_revoked_token_ends_the_session_on_a_read() {
 		let kept = browser.clone();
 		sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
 			.bind(id)
-			.execute(&fx.pool)
+			.execute(&fx.db.pool)
 			.await
 			.unwrap();
 		let refused = fx.get(path, &mut browser).await;
@@ -200,7 +200,7 @@ async fn a_disabled_account_ends_the_session_on_a_read_and_on_a_write() {
 	let mut writer = signed_in(&fx, &email).await;
 	let id = user_id(&fx, &mut reader).await;
 	let kept = writer.clone();
-	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(id).execute(&fx.pool).await.unwrap();
+	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(id).execute(&fx.db.pool).await.unwrap();
 
 	let write = fx
 		.post("/auth/notifications/settings/channel", ORIGIN, json!({ "channel": "email", "enabled": false }), &mut writer)
@@ -222,7 +222,7 @@ async fn reading_the_settings_writes_nothing() {
 	let rows = || async {
 		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notification_subscribers WHERE user_id = $1")
 			.bind(id)
-			.fetch_one(&fx.pool)
+			.fetch_one(&fx.db.pool)
 			.await
 			.unwrap()
 	};

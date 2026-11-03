@@ -101,7 +101,7 @@ async fn the_code_mail_says_what_it_is_for() {
 	fx.reauth_code(&mut browser).await;
 	let purpose: String = sqlx::query_scalar("SELECT payload->>'purpose' FROM notification_deliveries WHERE kind = 'email_code' AND recipient = $1 ORDER BY id DESC LIMIT 1")
 		.bind(&email)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(purpose, "reauth");
@@ -117,7 +117,7 @@ async fn a_revoked_session_cannot_re_authenticate() {
 	fx.sign_in_with_code(&email, &mut browser).await;
 	sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE email = $1")
 		.bind(&email)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 
@@ -263,12 +263,20 @@ mod passkeys {
 		device
 	}
 
+	/// Date every passkey from before the session, as one from an earlier sign-in is: only
+	/// those re-authenticate, and the clock is in seconds, so one registered a second after
+	/// the sign-in would not.
+	async fn predate(fx: &Surface) {
+		sqlx::query("UPDATE passkey_credentials SET created_at = 0").execute(&fx.db.pool).await.unwrap();
+	}
+
 	#[tokio::test]
 	async fn an_assertion_by_the_accounts_own_passkey_moves_auth_time() {
 		let fx = fixture!();
 		let mut browser = Browser::default();
 		fx.sign_in_with_code(&address("reauth-passkey"), &mut browser).await;
 		let mut device = register(&fx, &mut browser).await;
+		predate(&fx).await;
 		let before = access_claims(&browser);
 
 		let begun = fx.post("/auth/reauth/passkey/options", ORIGIN, json!({}), &mut browser).await;
@@ -336,7 +344,8 @@ mod passkeys {
 		let mut browser = Browser::default();
 		fx.sign_in_with_code(&email, &mut browser).await;
 		let mut device = register(&fx, &mut browser).await;
-		let user: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1").bind(&email).fetch_one(&fx.pool).await.unwrap();
+		predate(&fx).await;
+		let user: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1").bind(&email).fetch_one(&fx.db.pool).await.unwrap();
 
 		// Offered while the passkey still counts as older than the session...
 		let begun = fx.post("/auth/reauth/passkey/options", ORIGIN, json!({}), &mut browser).await;
@@ -344,9 +353,9 @@ mod passkeys {
 		let rcr: RequestChallengeResponse = serde_json::from_value(begun.body["options"].clone()).unwrap();
 		let credential = device.do_authentication(origin(), rcr).unwrap();
 		// ...then made to look planted after it.
-		sqlx::query("UPDATE passkey_credentials SET created_at = created_at + 100000 WHERE user_id = $1")
+		sqlx::query("UPDATE passkey_credentials SET created_at = extract(epoch FROM now())::bigint + 100000 WHERE user_id = $1")
 			.bind(user)
-			.execute(&fx.pool)
+			.execute(&fx.db.pool)
 			.await
 			.unwrap();
 
@@ -369,6 +378,7 @@ mod passkeys {
 		let mut owner = Browser::default();
 		fx.sign_in_with_code(&address("reauth-pk-owner"), &mut owner).await;
 		let mut device = register(&fx, &mut owner).await;
+		predate(&fx).await;
 		let begun = fx.post("/auth/reauth/passkey/options", ORIGIN, json!({}), &mut owner).await;
 		let rcr: RequestChallengeResponse = serde_json::from_value(begun.body["options"].clone()).unwrap();
 		let credential = device.do_authentication(origin(), rcr).unwrap();
