@@ -225,3 +225,135 @@ async fn sessions_survive_a_restart() {
 	assert_eq!(after.forget(&id).await.unwrap().as_deref(), Some("family.secret"));
 	assert!(after.fresh(&id, &auth).await.unwrap().is_none());
 }
+
+/// Issuance stand-in that spends what it rotates, as the real one does: a refresh token
+/// presented twice is the theft upstream revokes a family for. `hold` keeps a rotation in
+/// flight; `None` never answers, as a holder that died mid-call.
+struct Rotating {
+	hold: Option<std::time::Duration>,
+	in_flight: std::sync::atomic::AtomicBool,
+	spent: Mutex<Vec<String>>,
+}
+
+impl Rotating {
+	fn holding(hold: std::time::Duration) -> Self {
+		Self {
+			hold: Some(hold),
+			in_flight: Default::default(),
+			spent: Mutex::default(),
+		}
+	}
+
+	fn hanging() -> Self {
+		Self {
+			hold: None,
+			in_flight: Default::default(),
+			spent: Mutex::default(),
+		}
+	}
+}
+
+impl PrincipalSource for Rotating {
+	async fn principal(&self, user_id: &str) -> Result<UserSummary, AuthError> {
+		Ok(summary(user_id, "investor"))
+	}
+}
+
+#[tonic::async_trait]
+impl AuthRpc for Rotating {
+	async fn refresh(&self, request: Request<RefreshRequest>) -> Result<Response<TokenResponse>, Status> {
+		use std::sync::atomic::Ordering;
+		assert!(!self.in_flight.swap(true, Ordering::SeqCst), "two rotations of one session in flight at once");
+		let presented = request.into_inner().refresh_token;
+		{
+			let mut spent = self.spent.lock().unwrap();
+			assert!(!spent.contains(&presented), "{presented} rotated twice: upstream revokes the family");
+			spent.push(presented.clone());
+		}
+		match self.hold {
+			Some(hold) => tokio::time::sleep(hold).await,
+			None => std::future::pending().await,
+		}
+		self.in_flight.store(false, Ordering::SeqCst);
+		let mut t = tokens("web-sess-flight-user");
+		t.refresh_token = format!("{presented}.next");
+		Ok(Response::new(t))
+	}
+
+	async fn logout(&self, _: Request<LogoutRequest>) -> Result<Response<LogoutResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn list_sessions(&self, _: Request<ListSessionsRequest>) -> Result<Response<ListSessionsResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn revoke_session(&self, _: Request<RevokeSessionRequest>) -> Result<Response<RevokeSessionResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn exchange_code(&self, _: Request<ExchangeCodeRequest>) -> Result<Response<ClientTokenResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn refresh_client_token(&self, _: Request<RefreshClientTokenRequest>) -> Result<Response<ClientTokenResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn publish_catalog(&self, _: Request<PublishCatalogRequest>) -> Result<Response<PublishCatalogResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn jwks(&self, _: Request<JwksRequest>) -> Result<Response<JwksResponse>, Status> {
+		unreachable!()
+	}
+}
+
+/// Two `WebSessions` over one Redis stand for two concierge processes.
+async fn two_processes() -> Option<(WebSessions, WebSessions)> {
+	if std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty()).is_none() {
+		eprintln!("skipped: REDIS_URL unset — without a shared store there is one process by construction");
+		return None;
+	}
+	Some((WebSessions::from_env().await.unwrap(), WebSessions::from_env().await.unwrap()))
+}
+
+// Two processes refreshing one session at once rotate it once: the second serves the
+// pair the first stored, even while that rotation outlives a lease's unrenewed TTL.
+#[tokio::test]
+async fn two_processes_rotate_a_session_once() {
+	let Some((a, b)) = two_processes().await else { return };
+	let mut expiring = tokens("web-sess-flight-user");
+	expiring.access_expires_at = 0;
+	let (id, ..) = a.put(expiring).await.unwrap().expect("token pair carries a user");
+
+	let upstream = Rotating::holding(std::time::Duration::from_secs(6));
+	let (first, second) = tokio::join!(a.fresh(&id, &upstream), b.fresh(&id, &upstream));
+
+	assert!(first.unwrap().is_some() && second.unwrap().is_some(), "both reads serve the session");
+	assert_eq!(*upstream.spent.lock().unwrap(), ["family.secret"]);
+	assert_eq!(b.forget(&id).await.unwrap().as_deref(), Some("family.secret.next"));
+}
+
+// A process that dies holding a session's turn stalls the others only until its lease
+// lapses.
+#[tokio::test]
+async fn a_dead_holders_turn_lapses() {
+	let Some((a, b)) = two_processes().await else { return };
+	let mut expiring = tokens("web-sess-flight-user");
+	expiring.access_expires_at = 0;
+	let (id, ..) = a.put(expiring).await.unwrap().expect("token pair carries a user");
+
+	let hung = Rotating::hanging();
+	assert!(
+		tokio::time::timeout(std::time::Duration::from_millis(300), a.fresh(&id, &hung)).await.is_err(),
+		"the hung rotation holds the turn"
+	);
+	drop(a);
+
+	let started = std::time::Instant::now();
+	let fresh = b.fresh(&id, &Rotating::holding(std::time::Duration::ZERO)).await.unwrap();
+	assert!(fresh.is_some(), "the turn comes back once the lease lapses");
+	assert!(started.elapsed() > std::time::Duration::from_secs(1), "went in while the dead holder's lease was live");
+	b.forget(&id).await.unwrap();
+}

@@ -304,12 +304,11 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   later reads as an abandoned attempt — and a caller past `START_MAX_PER_WINDOW` in
   `START_WINDOW_SECS` is refused 429. Both answers happen without a vendor call; that
   ordering is the entire point, not an optimisation. The gate is a read and not a lock,
-  so the handler single-flights starts PER USER, in process (`web::single_flight`, the
-  same helper the session refresh uses), from the gate read to the row write: a second
-  simultaneous start waits for the first and is then handed its case, exactly as a
-  sequential second call is (#56). In process and not a row lock, because what it spans
-  is the vendor round trip. It does not reach across replicas; there the window cap is
-  what bounds the race.
+  so the handler single-flights starts PER USER across replicas (`web::single_flight`, the
+  same lease in Redis the session refresh takes, with `REDIS_URL` set), from the gate read
+  to the row write: a second simultaneous start waits for the first and is then handed its
+  case, exactly as a sequential second call is (#56). A lease and not a row lock, because
+  what it spans is the vendor round trip.
 - **An unfinished case has a DEADLINE, and the read paths are what enforce it.** A
   `pending` row is what `/kyc/start` writes and what stays there when the applicant
   closes the tab at the vendor: Didit sends no event for a session nobody began, so

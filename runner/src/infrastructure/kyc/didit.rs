@@ -26,7 +26,7 @@ pub const PROVIDER: &str = "didit";
 /// failing, and `/kyc/start` cannot degrade to "temporarily unavailable" for a call that
 /// never returns. Opening a session is a single round trip, so the window is generous
 /// rather than tight.
-const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Where Didit serves the applicant-facing session page from.
 ///
