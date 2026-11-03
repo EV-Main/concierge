@@ -14,7 +14,7 @@ pub const ROOT: &str = "main";
 /// origin is what lets the session cookie ride a cross-origin sign-in request at all.
 pub const SITE: &str = "evinvest.ltd";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScopeState {
 	Active,
 	/// Reversibly stopped; its clients still sign people in, because a direction has to

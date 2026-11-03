@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// The money caps of the scope kinds, in USDT, as canonical amounts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MoneyCaps {
 	per_operation: String,
 	daily: String,

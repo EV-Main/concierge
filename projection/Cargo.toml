@@ -28,7 +28,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 # Every test target sees both adapters, whatever features the command line named.
-evconcierge_projection = { path = ".", features = ["pg", "sqlite"] }
+evconcierge_projection = { workspace = true, features = ["pg", "sqlite"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "test-util"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 uuid = { workspace = true, features = ["v4"] }
