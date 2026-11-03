@@ -191,6 +191,60 @@ impl AuthService {
 		})
 	}
 
+	/// The `Refresh` RPC with the next secret chosen by the caller, which writes it ahead of
+	/// the call: a rotation whose answer was lost is then presented again WITH the secret it
+	/// went to and answers the same pair, instead of reading as reuse. Only that rotation's
+	/// caller knows the secret, and knowing it is holding the live credential, so a thief
+	/// presenting the spent token alone still revokes the family.
+	pub async fn refresh_to(&self, refresh_token: &str, next_secret: &str) -> Result<TokenResponse, Status> {
+		assert!(next_secret.len() >= 32, "a next secret is a credential: CSPRNG-drawn, 32+ characters");
+		let engine = &self.engine;
+		let signer = engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
+
+		// Classify the presented handle WITHOUT rotating it, and run the fallible directory
+		// lookup BEFORE the irreversible rotation. Rotating first would advance `prev`, so a
+		// transient lookup failure would make the client's retry (with the same, now
+		// rotated-out token) trip reuse detection and revoke the whole family. Reuse
+		// detection is preserved: a replayed rotated-out secret is caught here as `Reuse`
+		// and revokes the family, exactly as the destructive rotate would.
+		let user_id = match engine.refresh.inspect(refresh_token, engine.session_bounds).await? {
+			RefreshInspect::Current { user_id } => user_id,
+			RefreshInspect::Reuse { user_id } => {
+				let (family, _) = refresh_token.split_once('.').expect("classified as a family's secret");
+				match engine.refresh.inspect(&format!("{family}.{next_secret}"), engine.session_bounds).await? {
+					RefreshInspect::Current { .. } => user_id,
+					RefreshInspect::Reuse { .. } | RefreshInspect::Invalid => {
+						self.revoke_user_everywhere(&user_id).await?;
+						return Err(AuthError::InvalidToken.into());
+					}
+				}
+			}
+			RefreshInspect::Invalid => return Err(AuthError::InvalidToken.into()),
+		};
+
+		// Same un-wrapped public server as `exchange`: a directory outage here must
+		// alert too, not just render UNAVAILABLE.
+		let summary = engine.provisioner.lookup(user_id).await.inspect_err(crate::telemetry::report_unexpected)?;
+		if summary.is_disabled() {
+			self.revoke_user_everywhere(&summary.user_id).await?;
+			return Err(Status::permission_denied("user is disabled"));
+		}
+
+		// The fallible checks passed — commit the (irreversible) rotation now.
+		let rotated = engine.refresh.rotate(refresh_token, next_secret, engine.session_bounds).await?;
+		// A "revoke all" since this family was issued bumps the authoritative token_version
+		// in Postgres; refuse to mint and drop the family. (A pure comparison, so running it
+		// after the rotation is safe — the family is dropped on mismatch regardless.)
+		if summary.token_version > rotated.token_version_snapshot {
+			self.revoke_user_everywhere(&summary.user_id).await?;
+			return Err(Status::unauthenticated("tokens revoked"));
+		}
+
+		// Refresh keeps the family's original sign-in time; only `iat` moves.
+		let (access_token, access_exp) = signer.mint_access(&summary.user_id, summary.token_version, rotated.refresh.auth_time)?;
+		Ok(token_response(access_token, access_exp, rotated.refresh, &summary))
+	}
+
 	/// Open a refresh family without a sign-in, for integration suites that need
 	/// a real `evinvest.ltd` session to exist. Returns the refresh token.
 	#[cfg(feature = "test-support")]
@@ -275,46 +329,8 @@ fn user_summary(summary: &ProvisionedUser) -> UserSummary {
 #[tonic::async_trait]
 impl AuthServiceRpc for AuthService {
 	async fn refresh(&self, request: Request<RefreshRequest>) -> Result<Response<TokenResponse>, Status> {
-		let engine = &self.engine;
-		let signer = engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
-		let req = request.into_inner();
-
-		// Classify the presented handle WITHOUT rotating it, and run the fallible directory
-		// lookup BEFORE the irreversible rotation. Rotating first would advance `prev`, so a
-		// transient lookup failure would make the client's retry (with the same, now
-		// rotated-out token) trip reuse detection and revoke the whole family. Reuse
-		// detection is preserved: a replayed rotated-out secret is caught here as `Reuse`
-		// and revokes the family, exactly as the destructive rotate would.
-		let user_id = match engine.refresh.inspect(&req.refresh_token, engine.session_bounds).await? {
-			RefreshInspect::Current { user_id } => user_id,
-			RefreshInspect::Reuse { user_id } => {
-				self.revoke_user_everywhere(&user_id).await?;
-				return Err(AuthError::InvalidToken.into());
-			}
-			RefreshInspect::Invalid => return Err(AuthError::InvalidToken.into()),
-		};
-
-		// Same un-wrapped public server as `exchange`: a directory outage here must
-		// alert too, not just render UNAVAILABLE.
-		let summary = engine.provisioner.lookup(user_id).await.inspect_err(crate::telemetry::report_unexpected)?;
-		if summary.is_disabled() {
-			self.revoke_user_everywhere(&summary.user_id).await?;
-			return Err(Status::permission_denied("user is disabled"));
-		}
-
-		// The fallible checks passed — commit the (irreversible) rotation now.
-		let rotated = engine.refresh.rotate(&req.refresh_token, engine.session_bounds).await?;
-		// A "revoke all" since this family was issued bumps the authoritative token_version
-		// in Postgres; refuse to mint and drop the family. (A pure comparison, so running it
-		// after the rotation is safe — the family is dropped on mismatch regardless.)
-		if summary.token_version > rotated.token_version_snapshot {
-			self.revoke_user_everywhere(&summary.user_id).await?;
-			return Err(Status::unauthenticated("tokens revoked"));
-		}
-
-		// Refresh keeps the family's original sign-in time; only `iat` moves.
-		let (access_token, access_exp) = signer.mint_access(&summary.user_id, summary.token_version, rotated.refresh.auth_time)?;
-		Ok(Response::new(token_response(access_token, access_exp, rotated.refresh, &summary)))
+		let next_secret = uuid::Uuid::new_v4().to_string();
+		Ok(Response::new(self.refresh_to(&request.into_inner().refresh_token, &next_secret).await?))
 	}
 
 	async fn logout(&self, request: Request<LogoutRequest>) -> Result<Response<LogoutResponse>, Status> {
@@ -563,7 +579,7 @@ mod tests {
 		let engine = &service.engine;
 		// Open a family directly via the store (provisioning is the directory's job).
 		let issued = engine.refresh.issue("user-reuse", 0, engine.session_bounds, String::new(), String::new()).await.unwrap();
-		let rotated = engine.refresh.rotate(&issued.token, engine.session_bounds).await.unwrap();
+		let rotated = engine.refresh.rotate(&issued.token, &uuid::Uuid::new_v4().to_string(), engine.session_bounds).await.unwrap();
 
 		let status = service.refresh(Request::new(RefreshRequest { refresh_token: issued.token })).await.unwrap_err();
 		assert_eq!(status.code(), tonic::Code::Unauthenticated);
