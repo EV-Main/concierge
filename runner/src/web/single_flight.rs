@@ -120,7 +120,7 @@ impl<K: Hash + Eq + Display> KeyedLocks<K> {
 		let out = tokio::select! {
 			out = section => out,
 			lost = renew => {
-				// The dropped section may have rotated upstream without storing what it got.
+				// A section must survive this drop: the session refresh writes its rotation ahead (`session.rs`).
 				tracing::error!(ns, error = ?lost, "single flight: section cancelled, its lease could not be kept");
 				return Err(lost);
 			}

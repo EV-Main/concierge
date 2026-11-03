@@ -288,7 +288,7 @@ pub(super) async fn live_family_of(st: &super::Inner, session_id: &str) -> color
 	{
 		Some(family) => Ok(Some(family)),
 		None => {
-			st.sessions.forget(session_id).await?;
+			st.sessions.forget(session_id, &st.auth).await?;
 			Ok(None)
 		}
 	}
@@ -296,7 +296,7 @@ pub(super) async fn live_family_of(st: &super::Inner, session_id: &str) -> color
 
 /// Drop a session and revoke its refresh family upstream.
 pub(super) async fn close(st: &super::Inner, id: &str) -> color_eyre::Result<()> {
-	if let Some(refresh) = st.sessions.forget(id).await? {
+	if let Some(refresh) = st.sessions.forget(id, &st.auth).await? {
 		// The session is already gone locally; an upstream blip must not keep it signed in here.
 		let _ = AuthRpc::logout(
 			&st.auth,

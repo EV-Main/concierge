@@ -141,6 +141,17 @@ pub fn sign_in_with_turnstile(pool: &sqlx::PgPool, turnstile: &str) -> concierge
 /// A configured issuer with a throwaway Ed25519 key, reading accounts from `users` over
 /// the same provisioner channel the runner wires.
 pub async fn signing_auth(users: std::sync::Arc<dyn concierge::ports::UserDirectoryRepository>) -> evconcierge_auth::AuthService {
+	let (provisioner, rx) = evconcierge_auth::provisioner_channel();
+	tokio::spawn(concierge::directory::run_provisioner(
+		rx,
+		users,
+		std::sync::Arc::new(concierge::authz::BreakGlass::new(Vec::new())),
+	));
+	issuer(provisioner).await
+}
+
+/// [`signing_auth`] over whatever answers `provisioner`.
+pub async fn issuer(provisioner: evconcierge_auth::Provisioner) -> evconcierge_auth::AuthService {
 	const PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIKolOSMXwE+tafZkX+jkKYJbmJ066f4E12wAwTIkKps6\n-----END PRIVATE KEY-----\n";
 	const JWK_X: &str = "Z6BCmq9-_wo9d7co5CDW84Wn0sAC3BA0XWK2AOstpV4";
 	let config = evconcierge_auth::AuthConfig {
@@ -160,12 +171,6 @@ pub async fn signing_auth(users: std::sync::Arc<dyn concierge::ports::UserDirect
 		google: None,
 		github: None,
 	};
-	let (provisioner, rx) = evconcierge_auth::provisioner_channel();
-	tokio::spawn(concierge::directory::run_provisioner(
-		rx,
-		users,
-		std::sync::Arc::new(concierge::authz::BreakGlass::new(Vec::new())),
-	));
 	evconcierge_auth::AuthService::try_new(config, provisioner).await.expect("auth service")
 }
 

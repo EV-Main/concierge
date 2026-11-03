@@ -61,7 +61,7 @@ pub use kyc::START_MAX_PER_WINDOW;
 pub use passkey::SIGN_IN_STARTS_PER_MINUTE;
 /// Re-exported for the same reason: the suite drives re-authentication up to this budget.
 pub use reauth::ATTEMPTS_PER_WINDOW as REAUTH_ATTEMPTS_PER_WINDOW;
-pub use session::{PrincipalSource, WebSessions};
+pub use session::{Issuer, WebSessions};
 use time::Duration;
 use tokio::sync::Notify;
 pub use turnstile::{SITEVERIFY, Turnstile, is_test_secret};

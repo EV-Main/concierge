@@ -11,17 +11,17 @@
 //!
 //! The stored `user` summary is a login-time COPY, not the truth: every
 //! [`WebSessions::fresh`] re-reads the principal from the directory (through
-//! [`PrincipalSource`]) so a role granted from the console shows up on the next
+//! [`Issuer`]) so a role granted from the console shows up on the next
 //! `/auth/session`, not after the next refresh rotation (up to the access TTL later).
 
 use std::{collections::HashMap, future::Future};
 
 use color_eyre::eyre::{Context, bail};
 use evconcierge_auth::{AuthError, AuthService};
-use evconcierge_contracts::concierge::v1::{RefreshRequest, TokenResponse, UserSummary, auth_service_server::AuthService as AuthRpc};
+use evconcierge_contracts::concierge::v1::{TokenResponse, UserSummary};
 use prost::Message;
 use tokio::sync::Mutex;
-use tonic::{Code, Request};
+use tonic::{Code, Status};
 
 use crate::web::{now_secs, random_token, single_flight::KeyedLocks};
 
@@ -30,6 +30,7 @@ use crate::web::{now_secs, random_token, single_flight::KeyedLocks};
 const ACCESS_SKEW_SECS: i64 = 30;
 
 const FIELDS: [&str; 6] = ["access_token", "access_expires_at", "refresh_token", "refresh_expires_at", "csrf", "user"];
+const NEXT_REFRESH: &str = "next_refresh";
 #[derive(Clone)]
 pub struct WebSession {
 	pub access_token: String,
@@ -38,19 +39,37 @@ pub struct WebSession {
 	pub refresh_expires_at: i64,
 	pub user: UserSummary,
 	pub csrf: String,
+	/// The secret a rotation not yet stored goes to, written ahead of it.
+	next_refresh: Option<String>,
 }
 
-/// The live principal read behind [`WebSessions::fresh`]: the user's CURRENT directory
-/// summary, as opposed to the copy the session stored at login. A seam (rather than
-/// [`AuthService`] itself) so the locker's tests can answer it without a directory.
-pub trait PrincipalSource {
+/// The issuance calls behind the locker. A seam (rather than [`AuthService`] itself) so
+/// the locker's tests can answer it without a directory.
+pub trait Issuer {
+	/// The user's CURRENT directory summary, as opposed to the copy the session stored at login.
 	fn principal(&self, user_id: &str) -> impl Future<Output = Result<UserSummary, AuthError>> + Send;
+	/// [`AuthService::refresh_to`].
+	fn refresh_to(&self, refresh_token: &str, next_secret: &str) -> impl Future<Output = Result<TokenResponse, Status>> + Send;
 }
 
-impl PrincipalSource for AuthService {
+impl Issuer for AuthService {
 	async fn principal(&self, user_id: &str) -> Result<UserSummary, AuthError> {
 		AuthService::principal(self, user_id).await
 	}
+
+	async fn refresh_to(&self, refresh_token: &str, next_secret: &str) -> Result<TokenResponse, Status> {
+		AuthService::refresh_to(self, refresh_token, next_secret).await
+	}
+}
+
+enum Rotation {
+	Stored {
+		user_is_live: bool,
+	},
+	/// Upstream ended the session; it is removed.
+	Ended,
+	/// No verdict came back; the next rotation replays this one.
+	Unsettled,
 }
 
 /// A fresh view of a live session, for the session route and the access cookie.
@@ -267,6 +286,7 @@ impl WebSessions {
 			refresh_expires_at: tokens.refresh_expires_at,
 			user,
 			csrf: csrf.clone(),
+			next_refresh: None,
 		};
 		self.store.save(&id, &session).await?;
 		Ok(Some((id, csrf, max_age)))
@@ -281,43 +301,23 @@ impl WebSessions {
 	/// refresh in the same call already carries it) and written back so the stored copy
 	/// tracks it. A directory failure keeps the stored copy: an outage there must never
 	/// sign anyone out or hide a console they hold.
-	pub async fn fresh(&self, id: &str, auth: &(impl AuthRpc + PrincipalSource)) -> color_eyre::Result<Option<Fresh>> {
+	pub async fn fresh(&self, id: &str, auth: &impl Issuer) -> color_eyre::Result<Option<Fresh>> {
 		self.locks
 			.run(id.to_owned(), async {
 				let Some(mut s) = self.store.load(id).await? else { return Ok(None) };
 				let now = now_secs();
 				let mut user_is_live = false;
 
-				if s.access_expires_at <= now + ACCESS_SKEW_SECS {
+				if s.access_expires_at <= now + ACCESS_SKEW_SECS || s.next_refresh.is_some() {
 					if s.refresh_expires_at <= now {
 						self.store.remove(id).await?;
 						return Ok(None);
 					}
-					match auth
-						.refresh(Request::new(RefreshRequest {
-							refresh_token: s.refresh_token.clone(),
-						}))
-						.await
-					{
-						Ok(response) => {
-							let t = response.into_inner();
-							s.access_token = t.access_token;
-							s.access_expires_at = t.access_expires_at;
-							s.refresh_token = t.refresh_token;
-							s.refresh_expires_at = t.refresh_expires_at;
-							if let Some(user) = t.user {
-								s.user = user;
-								user_is_live = true;
-							}
-							self.store.save(id, &s).await?;
-						}
-						// An auth verdict kills the session; a transport blip keeps it (the
-						// possibly-stale access token is still the best available answer).
-						Err(status) if matches!(status.code(), Code::Unauthenticated | Code::PermissionDenied) => {
-							self.store.remove(id).await?;
-							return Ok(None);
-						}
-						Err(_) => {}
+					match self.rotate(id, &mut s, auth).await? {
+						Rotation::Stored { user_is_live: live } => user_is_live = live,
+						Rotation::Ended => return Ok(None),
+						// The possibly-stale access token is still the best available answer.
+						Rotation::Unsettled => {}
 					}
 				}
 
@@ -325,7 +325,7 @@ impl WebSessions {
 					match auth.principal(&s.user.user_id).await {
 						// Taken as DATA, whatever it says: a summary that has turned `disabled`
 						// is not a verdict on the session here. Ending it stays the refresh path's
-						// job (`AuthService::refresh` revokes the family) — a second place deciding
+						// job (`AuthService::refresh_to` revokes the family) — a second place deciding
 						// when a session dies would be a second place to disagree with the first.
 						Ok(user) =>
 							if user != s.user {
@@ -347,6 +347,39 @@ impl WebSessions {
 			.await?
 	}
 
+	/// Rotate the session's refresh token to a secret written ahead of the call, so a
+	/// rotation whose answer never arrives (the request dropped, its lease lost, the reply
+	/// lost) is replayed by the next one instead of presenting the spent token as theft.
+	async fn rotate(&self, id: &str, s: &mut WebSession, auth: &impl Issuer) -> color_eyre::Result<Rotation> {
+		let next = match &s.next_refresh {
+			Some(next) => next.clone(),
+			None => {
+				let next = random_token(32);
+				s.next_refresh = Some(next.clone());
+				self.store.save(id, s).await?;
+				next
+			}
+		};
+		match auth.refresh_to(&s.refresh_token, &next).await {
+			Ok(t) => {
+				s.access_token = t.access_token;
+				s.access_expires_at = t.access_expires_at;
+				s.refresh_token = t.refresh_token;
+				s.refresh_expires_at = t.refresh_expires_at;
+				s.next_refresh = None;
+				let user_is_live = t.user.map(|user| s.user = user).is_some();
+				self.store.save(id, s).await?;
+				Ok(Rotation::Stored { user_is_live })
+			}
+			// An auth verdict kills the session; a transport blip keeps it.
+			Err(status) if matches!(status.code(), Code::Unauthenticated | Code::PermissionDenied) => {
+				self.store.remove(id).await?;
+				Ok(Rotation::Ended)
+			}
+			Err(_) => Ok(Rotation::Unsettled),
+		}
+	}
+
 	/// Move the session's `auth_time` after a re-authentication the caller has already
 	/// decided, and keep the new access token the issuance service minted for it. The
 	/// whole step runs under the session's single-flight: the refresh handle is read and
@@ -362,6 +395,9 @@ impl WebSessions {
 				};
 				if s.user.user_id != user_id {
 					return Ok(Err(tonic::Status::unauthenticated("no such session")));
+				}
+				if s.next_refresh.is_some() {
+					bail!("web session {id}: a rotation is unsettled, so which refresh token is live is unknown");
 				}
 				let moved = match auth.reauthenticate(&s.refresh_token, user_id).await {
 					Ok(moved) => moved,
@@ -385,17 +421,36 @@ impl WebSessions {
 		Ok(self.store.load(id).await?.map(|s| s.csrf))
 	}
 
-	/// The session's refresh token (proves identity on ListSessions/RevokeSession).
+	/// The session's refresh token (proves identity on ListSessions/RevokeSession). `Err`
+	/// while a rotation is unsettled, until [`Self::fresh`] replays it: which token is live
+	/// upstream is unknown before that.
 	pub async fn refresh_token(&self, id: &str) -> color_eyre::Result<Option<String>> {
-		Ok(self.store.load(id).await?.map(|s| s.refresh_token))
+		let Some(s) = self.store.load(id).await? else { return Ok(None) };
+		if s.next_refresh.is_some() {
+			bail!("web session {id}: a rotation is unsettled, so which refresh token is live is unknown");
+		}
+		Ok(Some(s.refresh_token))
 	}
 
 	/// Drop the session, returning its refresh token for upstream revocation. Waits
 	/// out an in-flight [`Self::fresh`]: otherwise its save re-creates the session
 	/// after this delete, and the token returned here is the one that refresh just
-	/// rotated away from.
-	pub async fn forget(&self, id: &str) -> color_eyre::Result<Option<String>> {
-		self.locks.run(id.to_owned(), self.store.remove(id)).await?
+	/// rotated away from. An unsettled rotation is replayed first, for the same reason.
+	pub async fn forget(&self, id: &str, auth: &impl Issuer) -> color_eyre::Result<Option<String>> {
+		self.locks
+			.run(id.to_owned(), async {
+				let Some(mut s) = self.store.load(id).await? else { return Ok(None) };
+				if s.next_refresh.is_some() {
+					match self.rotate(id, &mut s, auth).await? {
+						Rotation::Stored { .. } => {}
+						Rotation::Ended => return Ok(None),
+						Rotation::Unsettled => bail!("web session {id}: a rotation is unsettled, so which refresh token is live is unknown"),
+					}
+				}
+				self.store.remove(id).await?;
+				Ok(Some(s.refresh_token))
+			})
+			.await?
 	}
 }
 
@@ -404,10 +459,11 @@ enum Store {
 	Redis(redis::aio::ConnectionManager),
 }
 
-/// One `HMGET` reply over [`FIELDS`], in that order. Redis answers a miss with a NIL
-/// per field rather than an error, so every element is optional and "all NIL" is the
-/// only legitimate absence — anything between that and "all present" is a torn hash.
-type SessionFields = (Option<String>, Option<i64>, Option<String>, Option<i64>, Option<String>, Option<Vec<u8>>);
+/// One `HMGET` reply over [`FIELDS`] and [`NEXT_REFRESH`], in that order. Redis answers a
+/// miss with a NIL per field rather than an error, so every element is optional and "all
+/// NIL" is the only legitimate absence — anything between that and all of [`FIELDS`]
+/// present is a torn hash.
+type SessionFields = (Option<String>, Option<i64>, Option<String>, Option<i64>, Option<String>, Option<Vec<u8>>, Option<String>);
 
 impl Store {
 	fn key(id: &str) -> String {
@@ -419,16 +475,23 @@ impl Store {
 			Self::InProcess(map) => Ok(map.lock().await.get(id).cloned()),
 			Self::Redis(conn) => {
 				let mut conn = conn.clone();
-				let fields: SessionFields = redis::cmd("HMGET").arg(Self::key(id)).arg(&FIELDS).query_async(&mut conn).await.context("web session load")?;
+				let fields: SessionFields = redis::cmd("HMGET")
+					.arg(Self::key(id))
+					.arg(&FIELDS)
+					.arg(NEXT_REFRESH)
+					.query_async(&mut conn)
+					.await
+					.context("web session load")?;
 				match fields {
-					(None, None, None, None, None, None) => Ok(None),
-					(Some(access_token), Some(access_expires_at), Some(refresh_token), Some(refresh_expires_at), Some(csrf), Some(user)) => Ok(Some(WebSession {
+					(None, None, None, None, None, None, None) => Ok(None),
+					(Some(access_token), Some(access_expires_at), Some(refresh_token), Some(refresh_expires_at), Some(csrf), Some(user), next_refresh) => Ok(Some(WebSession {
 						access_token,
 						access_expires_at,
 						refresh_token,
 						refresh_expires_at,
 						user: UserSummary::decode(user.as_slice()).context("web session user decode")?,
 						csrf,
+						next_refresh,
 					})),
 					_ => bail!("web session {id}: partial hash — store corrupted"),
 				}
@@ -446,8 +509,8 @@ impl Store {
 			}
 			Self::Redis(conn) => {
 				let mut conn = conn.clone();
-				redis::pipe()
-					.atomic()
+				let mut pipe = redis::pipe();
+				pipe.atomic()
 					.cmd("HSET")
 					.arg(Self::key(id))
 					.arg(FIELDS[0])
@@ -461,13 +524,14 @@ impl Store {
 					.arg(FIELDS[4])
 					.arg(&s.csrf)
 					.arg(FIELDS[5])
-					.arg(s.user.encode_to_vec())
-					// Reap the session with its refresh window: past it, `fresh` would
-					// remove it anyway (mirrors the in-process retain above).
-					.expire_at(Self::key(id), s.refresh_expires_at)
-					.exec_async(&mut conn)
-					.await
-					.context("web session save")?;
+					.arg(s.user.encode_to_vec());
+				match &s.next_refresh {
+					Some(next) => pipe.hset(Self::key(id), NEXT_REFRESH, next),
+					None => pipe.hdel(Self::key(id), NEXT_REFRESH),
+				};
+				// Reap the session with its refresh window: past it, `fresh` would
+				// remove it anyway (mirrors the in-process retain above).
+				pipe.expire_at(Self::key(id), s.refresh_expires_at).exec_async(&mut conn).await.context("web session save")?;
 			}
 		}
 		Ok(())
@@ -502,20 +566,16 @@ impl Store {
 		}
 	}
 
-	async fn remove(&self, id: &str) -> color_eyre::Result<Option<String>> {
+	async fn remove(&self, id: &str) -> color_eyre::Result<()> {
 		match self {
-			Self::InProcess(map) => Ok(map.lock().await.remove(id).map(|s| s.refresh_token)),
+			Self::InProcess(map) => {
+				map.lock().await.remove(id);
+			}
 			Self::Redis(conn) => {
 				let mut conn = conn.clone();
-				let (refresh_token, _deleted): (Option<String>, i64) = redis::pipe()
-					.atomic()
-					.hget(Self::key(id), "refresh_token")
-					.del(Self::key(id))
-					.query_async(&mut conn)
-					.await
-					.context("web session remove")?;
-				Ok(refresh_token)
+				let _deleted: i64 = redis::cmd("DEL").arg(Self::key(id)).query_async(&mut conn).await.context("web session remove")?;
 			}
 		}
+		Ok(())
 	}
 }
