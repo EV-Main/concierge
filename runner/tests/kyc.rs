@@ -26,7 +26,6 @@ use axum::{
 };
 use concierge::{
 	infrastructure::{
-		db,
 		governance::PgGovernance,
 		kyc::{
 			cases::PgKycCases,
@@ -45,7 +44,6 @@ use concierge::{
 use domain::{error::DomainError, users::UserId};
 use evconcierge_auth::AuthService;
 use serde_json::{Value, json};
-use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -229,7 +227,7 @@ struct Harness {
 	users: Arc<PgUsers>,
 	cases: Arc<PgKycCases>,
 	notifications: Arc<PgNotifications>,
-	pool: PgPool,
+	db: common::Db,
 }
 
 async fn setup() -> Option<Harness> {
@@ -239,18 +237,8 @@ async fn setup() -> Option<Harness> {
 /// The same router with the vendor swapped out, so a test can drive the two ways
 /// verification becomes unavailable — absent, and present but refusing.
 async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
-	let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
-		// Every test in this file is gated on a real Postgres and RETURNS when there is
-		// none — which reads as PASSED. That is the right answer on a laptop and the wrong
-		// one anywhere that believes a green run means something: this suite is the only
-		// evidence the KYC gate works at all, and a run without a database proves nothing
-		// while looking exactly like a run that proved everything. Under `CI` the missing
-		// variable is the failure.
-		assert!(std::env::var_os("CI").is_none(), "DATABASE_URL must be set in CI — these tests silently pass without it");
-		return None;
-	};
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let db = common::Db::migrated().await?;
+	let pool = db.pool.clone();
 
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let cases = Arc::new(PgKycCases::new(pool.clone()));
@@ -281,7 +269,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 		users,
 		cases,
 		notifications,
-		pool,
+		db,
 	})
 }
 
@@ -317,7 +305,7 @@ impl Harness {
 	async fn close_open_cases(&self, user: UserId) {
 		sqlx::query("UPDATE kyc_cases SET status = 'abandoned', decision_at = now() WHERE user_id = $1 AND decision_at IS NULL")
 			.bind(user.raw())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("close cases");
 	}
@@ -408,7 +396,7 @@ impl Harness {
 		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.kind = $2")
 			.bind(user.raw())
 			.bind(kind)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.expect("count notices")
 	}
@@ -423,44 +411,15 @@ impl Harness {
 			.await
 			.expect("provision")
 			.id();
-		self.reseat(id).await;
+		sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1")
+			.bind(id.raw())
+			.execute(&self.db.pool)
+			.await
+			.expect("seat the owner");
 		(id, email)
 	}
 
-	/// Seat an owner again.
-	///
-	/// For the ONE interference this suite cannot design away: `authz_gate`, `genesis`,
-	/// `governance` and `user_governance` each run `UPDATE users SET role = 'investor'
-	/// WHERE role = 'owner'` — documented in `tests/common/mod.rs`, and unavoidable
-	/// because ownership is decided GLOBALLY from `users.role`, so those suites cannot
-	/// scope themselves to their own fixtures. `cargo test` runs the binaries in parallel
-	/// against one `DATABASE_URL`, so a roster read here can land in that window and come
-	/// back without this test's owner. Scoping the assertions by `case_id` fixed the
-	/// other half of that family — one test's alert reaching another's owner — but not
-	/// this half.
-	async fn reseat(&self, owner: UserId) {
-		sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1")
-			.bind(owner.raw())
-			.execute(&self.pool)
-			.await
-			.expect("seat the owner");
-	}
-
-	async fn seated(&self, owner: UserId) -> bool {
-		sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
-			.bind(owner.raw())
-			.fetch_one(&self.pool)
-			.await
-			.expect("read the role")
-			== "owner"
-	}
-
 	/// Verdict alerts queued for ONE case, optionally narrowed to one recipient.
-	///
-	/// Scoped to the case because the owner roster is global: every test in this file
-	/// seats its own owner into the same table, so an alert raised by one test is
-	/// correctly mailed to every owner another test created. Counting by recipient alone
-	/// makes those tests fail each other; counting by case counts what the test did.
 	///
 	/// Counted in `notification_deliveries` rather than through the notification topic
 	/// because that is the point of the alert — the governance queue carries no
@@ -472,7 +431,7 @@ impl Harness {
 		)
 		.bind(format!("kyc-contradiction:{case_id}:%"))
 		.bind(recipient)
-		.fetch_one(&self.pool)
+		.fetch_one(&self.db.pool)
 		.await
 		.expect("count verdict alerts")
 	}
@@ -486,7 +445,7 @@ impl Harness {
 	async fn kyc_changed_count(&self, user: UserId) -> i64 {
 		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM user_outbox WHERE user_id = $1 AND kind = 'KYC_CHANGED'")
 			.bind(user.raw())
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.expect("count outbox rows")
 	}
@@ -496,7 +455,7 @@ impl Harness {
 	async fn case_count(&self, user: UserId) -> i64 {
 		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM kyc_cases WHERE user_id = $1")
 			.bind(user.raw())
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.expect("count cases")
 	}
@@ -506,7 +465,7 @@ impl Harness {
 	async fn case_event_at(&self, id: Uuid) -> Option<i64> {
 		sqlx::query_scalar::<_, Option<i64>>("SELECT event_at FROM kyc_cases WHERE id = $1")
 			.bind(id)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.expect("read case")
 	}
@@ -520,7 +479,7 @@ impl Harness {
 	async fn kyc_audit(&self, user: UserId) -> Vec<(Option<Uuid>, Value)> {
 		sqlx::query_as::<_, (Option<Uuid>, Option<Value>)>("SELECT actor_user_id, detail FROM admin_action WHERE subject_user_id = $1 AND action = 'kyc_level_set' ORDER BY position")
 			.bind(user.raw())
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.expect("read admin_action")
 			.into_iter()
@@ -542,7 +501,7 @@ impl Harness {
 		sqlx::query("UPDATE kyc_cases SET created_at = now() - make_interval(secs => $2), updated_at = now() - make_interval(secs => $2) WHERE id = $1")
 			.bind(id)
 			.bind(secs as f64)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("age the case");
 	}
@@ -559,7 +518,7 @@ impl Harness {
 		sqlx::query("UPDATE kyc_cases SET status = $2, updated_at = now() WHERE id = $1")
 			.bind(id)
 			.bind(status.as_str())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("set the status");
 	}
@@ -567,7 +526,7 @@ impl Harness {
 	async fn case_row(&self, id: Uuid) -> (String, bool, Value) {
 		sqlx::query_as::<_, (String, bool, Value)>("SELECT status, decision_at IS NOT NULL, payload FROM kyc_cases WHERE id = $1")
 			.bind(id)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.expect("read case")
 	}
@@ -995,7 +954,11 @@ async fn start_opens_a_case_and_hands_back_a_redirect() {
 	let (status, decided, _) = h.case_row(case_id).await;
 	assert_eq!(status, "pending");
 	assert!(!decided);
-	let owner: Uuid = sqlx::query_scalar("SELECT user_id FROM kyc_cases WHERE id = $1").bind(case_id).fetch_one(&h.pool).await.unwrap();
+	let owner: Uuid = sqlx::query_scalar("SELECT user_id FROM kyc_cases WHERE id = $1")
+		.bind(case_id)
+		.fetch_one(&h.db.pool)
+		.await
+		.unwrap();
 	assert_eq!(owner, user.raw(), "the case belongs to the session's user");
 }
 
@@ -1067,7 +1030,7 @@ async fn a_tier_in_the_body_is_ignored_and_the_case_opens_at_the_entry_tier() {
 
 	let tier: i32 = sqlx::query_scalar("SELECT requested_tier FROM kyc_cases WHERE id = $1")
 		.bind(case_id)
-		.fetch_one(&h.pool)
+		.fetch_one(&h.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(tier, 1, "the body does not decide what the applicant is applying for");
@@ -1456,7 +1419,7 @@ async fn a_vendor_approval_never_overwrites_a_concurrent_human_grant() {
 
 	// Hold the user row exactly where `raise_kyc_level_to` needs it, so both writers line
 	// up behind it instead of interleaving by luck.
-	let mut holder = h.pool.begin().await.unwrap();
+	let mut holder = h.db.pool.begin().await.unwrap();
 	sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
 		.bind(user.raw())
 		.fetch_one(&mut *holder)
@@ -1738,7 +1701,7 @@ async fn two_approvals_on_one_document_at_once_cannot_both_grant_a_level() {
 
 	// The lock the decision transaction takes per document, held here so that neither
 	// delivery can get past it until both have arrived.
-	let mut guard = h.pool.begin().await.expect("open the blocking transaction");
+	let mut guard = h.db.pool.begin().await.expect("open the blocking transaction");
 	sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
 		.bind(&digest)
 		.execute(&mut *guard)
@@ -1749,7 +1712,7 @@ async fn two_approvals_on_one_document_at_once_cannot_both_grant_a_level() {
 	// the other tests in this binary run at the same time and take locks of their own.
 	let key: i64 = sqlx::query_scalar("SELECT hashtextextended($1, 0)")
 		.bind(&digest)
-		.fetch_one(&h.pool)
+		.fetch_one(&h.db.pool)
 		.await
 		.expect("compute the lock key");
 	let (classid, objid) = ((key >> 32) & 0xffff_ffff, key & 0xffff_ffff);
@@ -1764,7 +1727,7 @@ async fn two_approvals_on_one_document_at_once_cannot_both_grant_a_level() {
 				let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND classid::bigint = $1 AND objid::bigint = $2")
 					.bind(classid)
 					.bind(objid)
-					.fetch_one(&h.pool)
+					.fetch_one(&h.db.pool)
 					.await
 					.expect("read pg_locks");
 				if waiting >= 2 {
@@ -1965,7 +1928,7 @@ async fn the_document_number_reaches_neither_the_payload_nor_the_column() {
 
 	let digest: Option<String> = sqlx::query_scalar("SELECT identity_digest FROM kyc_cases WHERE id = $1")
 		.bind(case_id)
-		.fetch_one(&h.pool)
+		.fetch_one(&h.db.pool)
 		.await
 		.expect("read the digest");
 	let digest = digest.expect("an approved verdict naming a document stores one");
@@ -2120,7 +2083,7 @@ async fn a_terminal_verdict_tells_the_user_what_happened() {
 #[tokio::test]
 async fn an_expiry_that_contradicts_a_held_level_reaches_the_owners() {
 	let h = harness!();
-	let (owner, owner_email) = h.owner().await;
+	let (_, owner_email) = h.owner().await;
 	let user = h.subscribed(h.user().await).await;
 	let (case_id, session_id) = h.case(user, 1).await;
 
@@ -2131,24 +2094,9 @@ async fn an_expiry_that_contradicts_a_held_level_reaches_the_owners() {
 
 	let expired_at = now();
 	let expiry = body(&session_id, "Kyc Expired", &case_id.to_string(), expired_at, json!({}));
-
-	// Delivered until the roster read sees this test's owner. A sibling suite clearing
-	// `users.role` between the seat and the read is the documented interference
-	// (`Harness::reseat`), and the loop is not a sleep dressed up: a redelivery re-runs
-	// `alert_owners_if_contradicted` for real, which is exactly how the vendor's own
-	// retry repairs a roster read that missed. An empty result with the owner STILL
-	// seated is the product being wrong, and fails immediately.
-	let mut alerts = 0;
-	for _ in 0..4 {
-		let (status, _) = h.post(expiry.clone(), signed(&expiry), expired_at).await;
-		assert_eq!(status, StatusCode::OK);
-		alerts = h.alerts_for_case(case_id, Some(&owner_email)).await;
-		if alerts > 0 {
-			break;
-		}
-		assert!(!h.seated(owner).await, "the owner holds a seat and was still not mailed — that is the defect, not the race");
-		h.reseat(owner).await;
-	}
+	let (status, _) = h.post(expiry.clone(), signed(&expiry), expired_at).await;
+	assert_eq!(status, StatusCode::OK);
+	let alerts = h.alerts_for_case(case_id, Some(&owner_email)).await;
 
 	assert_eq!(h.kyc_level(user).await, 1, "a vendor still never takes a level away");
 	assert_eq!(h.notices(user, "kyc_expired").await, 1, "the user is told their verification lapsed");
@@ -2173,7 +2121,7 @@ async fn an_expiry_that_contradicts_a_held_level_reaches_the_owners() {
 #[tokio::test]
 async fn a_case_opened_at_a_tier_the_provider_cannot_grant_still_contradicts() {
 	let h = harness!();
-	let (owner, owner_email) = h.owner().await;
+	let (_, owner_email) = h.owner().await;
 	let user = h.subscribed(h.user().await).await;
 	let (case_id, session_id) = h.case(user, 2).await;
 
@@ -2184,16 +2132,8 @@ async fn a_case_opened_at_a_tier_the_provider_cannot_grant_still_contradicts() {
 
 	let expired_at = now();
 	let expiry = body(&session_id, "Kyc Expired", &case_id.to_string(), expired_at, json!({}));
-	let mut alerts = 0;
-	for _ in 0..4 {
-		assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
-		alerts = h.alerts_for_case(case_id, Some(&owner_email)).await;
-		if alerts > 0 {
-			break;
-		}
-		assert!(!h.seated(owner).await, "the owner holds a seat and was still not mailed — that is the defect, not the race");
-		h.reseat(owner).await;
-	}
+	assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
+	let alerts = h.alerts_for_case(case_id, Some(&owner_email)).await;
 	assert_eq!(alerts, 1, "the level this case bought is 1, and 1 is what the verdict contradicts");
 }
 
@@ -2235,7 +2175,7 @@ async fn a_level_another_approved_case_covers_wakes_nobody() {
 	// verdict does raise the alarm.
 	sqlx::query("UPDATE kyc_cases SET status = 'kyc_expired' WHERE id = $1")
 		.bind(second)
-		.execute(&h.pool)
+		.execute(&h.db.pool)
 		.await
 		.expect("retire the covering case");
 	assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
@@ -2433,7 +2373,7 @@ async fn a_stored_redirect_the_plane_would_not_send_a_browser_to_is_not_handed_b
 	sqlx::query("UPDATE kyc_cases SET redirect_url = $2 WHERE id = $1")
 		.bind(case_id)
 		.bind("https://evil.example/session/abc")
-		.execute(&h.pool)
+		.execute(&h.db.pool)
 		.await
 		.expect("store a redirect the plane will refuse");
 
@@ -2502,7 +2442,7 @@ async fn the_status_route_publishes_the_pinned_shape() {
 	// rather than rendering a dead link.
 	sqlx::query("UPDATE kyc_cases SET redirect_url = NULL WHERE id = $1")
 		.bind(case_id)
-		.execute(&h.pool)
+		.execute(&h.db.pool)
 		.await
 		.expect("clear redirect_url");
 	let (_, answer) = h.status(Some(&cookie)).await;
@@ -2917,7 +2857,7 @@ async fn a_dead_account_starts_nothing_and_its_session_ends() {
 			eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 			return;
 		};
-		sqlx::query(bump).bind(user.raw()).execute(&h.pool).await.unwrap();
+		sqlx::query(bump).bind(user.raw()).execute(&h.db.pool).await.unwrap();
 
 		let (status, headers, answer) = h.start_response(&cookie, Some(&csrf), "").await;
 		assert_eq!((status, answer), refusal, "{bump}");
@@ -2927,7 +2867,7 @@ async fn a_dead_account_starts_nothing_and_its_session_ends() {
 		);
 		let cases: i64 = sqlx::query_scalar("SELECT count(*) FROM kyc_cases WHERE user_id = $1")
 			.bind(user.raw())
-			.fetch_one(&h.pool)
+			.fetch_one(&h.db.pool)
 			.await
 			.unwrap();
 		assert_eq!(cases, 0, "{bump}: no case is opened");

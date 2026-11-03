@@ -833,12 +833,15 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot, and refuses
   its configuration BEFORE it connects to the database (`runner/tests/boot_config.rs`).
-- A DB-backed suite takes its URL from `common::database_url()`, never from
-  `std::env::var("DATABASE_URL")` directly. Without `DATABASE_URL` a suite skips
-  and still reports "N passed" — libtest prints nothing for a passing test — so
-  the count alone never says whether anything ran. That helper panics when `CI`
-  is set, and prints a SKIPPED line a local `cargo test -- --nocapture` shows.
-  Quote per-suite counts AND wall time when a PR offers a run as evidence.
+- A DB-backed test takes a database of its own from `common::Db` (created on the
+  server `DATABASE_URL` names, dropped with the value), never `DATABASE_URL`
+  itself: the owner roster, the outbox order and the mail queue are global to a
+  database, so tests sharing one fail each other. The role needs `CREATEDB`.
+  Without `DATABASE_URL` a test skips and still reports "N passed" — libtest
+  prints nothing for a passing test — so the count alone never says whether
+  anything ran. `common::Db` panics when `CI` is set, and prints a SKIPPED line a
+  local `cargo test -- --nocapture` shows. Quote per-suite counts AND wall time
+  when a PR offers a run as evidence.
 - **A migration's `lock_timeout` is `SET LOCAL`, never `SET`.** sqlx runs each migration
   inside its own transaction on a connection borrowed from the service's pool and hands
   that connection back afterwards, so a plain `SET` outlives the migration: the next

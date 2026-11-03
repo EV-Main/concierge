@@ -15,7 +15,6 @@ use common::web::{Browser, address};
 use concierge::{
 	dispatch::{DispatcherConfig, drain_once},
 	infrastructure::{
-		db,
 		email::transport::{EmailTransport, OutgoingEmail},
 		governance::PgGovernance,
 		kyc::cases::PgKycCases,
@@ -27,7 +26,6 @@ use concierge::{
 };
 use domain::error::DomainError;
 use serde_json::{Value, json};
-use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -35,14 +33,13 @@ const ORIGIN: &str = "https://evinvest.test";
 
 struct Fx {
 	router: Router,
-	pool: PgPool,
+	db: common::Db,
 	users: Arc<PgUsers>,
 }
 
 async fn setup() -> Option<Fx> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let db = common::Db::migrated().await?;
+	let pool = db.pool.clone();
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let auth = common::signing_auth(users.clone()).await;
 	let state = web::WebState::try_new(
@@ -65,7 +62,7 @@ async fn setup() -> Option<Fx> {
 	.expect("build the web state");
 	Some(Fx {
 		router: web::router(state),
-		pool,
+		db,
 		users,
 	})
 }
@@ -116,7 +113,7 @@ impl Fx {
 	async fn mailed_code(&self, email: &str) -> String {
 		sqlx::query_scalar("SELECT payload->>'code' FROM notification_deliveries WHERE kind = 'email_code' AND recipient = $1 ORDER BY id DESC LIMIT 1")
 			.bind(email)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.expect("a code was queued")
 	}
@@ -124,7 +121,7 @@ impl Fx {
 	async fn queued_codes(&self, email: &str) -> i64 {
 		sqlx::query_scalar("SELECT count(*) FROM notification_deliveries WHERE kind = 'email_code' AND recipient = $1")
 			.bind(email)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -163,7 +160,7 @@ async fn a_code_signs_a_new_address_into_a_new_verified_account() {
 	assert_eq!(again.status, StatusCode::OK);
 	let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE email = $1 AND email_verified")
 		.bind(&email)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(accounts, 1, "the second code opens the same account");
@@ -242,7 +239,7 @@ async fn an_expired_code_proves_nothing() {
 	let code = fx.mailed_code(&email).await;
 	sqlx::query("UPDATE email_codes SET expires_at = 0 WHERE email = $1")
 		.bind(&email)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let answer = fx.post("/auth/code/verify", json!({ "email": email, "code": code }), &mut Browser::default()).await;
@@ -288,14 +285,14 @@ async fn the_code_leaves_in_a_mail_and_not_in_the_table() {
 		daily_budget: i64::MAX,
 		interval: std::time::Duration::from_secs(60),
 	};
-	while drain_once(&PgNotifications::new(fx.pool.clone()), &outbox, &cfg).await > 0 {}
+	while drain_once(&PgNotifications::new(fx.db.pool.clone()), &outbox, &cfg).await > 0 {}
 
 	let sent = outbox.0.lock().unwrap().iter().find(|m| m.to == email).cloned().expect("the code mail was sent");
 	assert!(sent.subject.contains(&code) && sent.text.contains(&code));
 	assert!(sent.unsubscribe_url.is_empty(), "nobody unsubscribes from their own sign-in code");
 	let stored: Option<Value> = sqlx::query_scalar("SELECT payload FROM notification_deliveries WHERE kind = 'email_code' AND recipient = $1")
 		.bind(&email)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert!(stored.is_none(), "the plaintext is struck once the mail is out");
@@ -538,7 +535,7 @@ impl Fx {
 	async fn user_id(&self, email: &str) -> Uuid {
 		sqlx::query_scalar("SELECT id FROM users WHERE email = $1 ORDER BY created_at DESC LIMIT 1")
 			.bind(email)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -548,7 +545,7 @@ impl Fx {
 		sqlx::query("UPDATE email_codes SET created_at = created_at - $2 WHERE email = $1")
 			.bind(email)
 			.bind(CODE_SEND_WINDOW_SECS + 1)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.unwrap();
 	}
@@ -644,7 +641,7 @@ async fn a_disabled_account_or_a_stale_session_mutates_nothing_and_is_signed_out
 
 	sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
 		.bind(id)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let held = browser.clone();
@@ -652,12 +649,12 @@ async fn a_disabled_account_or_a_stale_session_mutates_nothing_and_is_signed_out
 	assert_eq!((stale.status, stale.body), (StatusCode::UNAUTHORIZED, json!({ "error": "unauthenticated" })));
 	assert!(browser.get("ev_session").is_none(), "the cookies are cleared");
 	assert_eq!(fx.session(&held).await["authenticated"], false, "and the session is closed, not only forgotten by the browser");
-	let username: Option<String> = sqlx::query_scalar("SELECT username FROM users WHERE id = $1").bind(id).fetch_one(&fx.pool).await.unwrap();
+	let username: Option<String> = sqlx::query_scalar("SELECT username FROM users WHERE id = $1").bind(id).fetch_one(&fx.db.pool).await.unwrap();
 	assert_ne!(username.as_deref(), Some("stale_session"));
 
 	let mut browser = Browser::default();
 	fx.sign_in_with_code(&email, &mut browser).await;
-	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(id).execute(&fx.pool).await.unwrap();
+	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(id).execute(&fx.db.pool).await.unwrap();
 	let disabled = fx.post("/auth/username", json!({ "username": "disabled_one" }), &mut browser).await;
 	assert_eq!((disabled.status, disabled.body), (StatusCode::FORBIDDEN, json!({ "error": "disabled" })));
 	assert!(browser.get("ev_session").is_none());

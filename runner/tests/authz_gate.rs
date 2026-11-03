@@ -11,11 +11,6 @@
 //! persisted owner registry is empty, the first owner closes it for good, and every
 //! surface that reports an elevated role reports `role_is_break_glass` beside it. The
 //! persisted `users.role` is never written by any of it.
-//!
-//! ⚠️ LIKE THE CONSILIUM SUITE, THIS ONE OWNS THE OWNER ROSTER — emergency access is
-//! decided against `users.role = 'owner'` globally, so it cannot be scoped to its own
-//! fixtures. Each test takes the SAME session advisory lock `governance.rs` uses and
-//! clears the roster first, so the two suites serialize instead of racing.
 
 use std::sync::Arc;
 
@@ -25,7 +20,6 @@ use concierge::{
 	authz::{BreakGlass, require_permission},
 	directory::{self, Directory},
 	infrastructure::{
-		db,
 		grants::PgGrants,
 		users::{AdminAction, PgUsers},
 	},
@@ -37,46 +31,24 @@ use domain::{
 };
 use evconcierge_auth::{Claims, TokenType, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{GetMeRequest, GetUserRequest, HoldUserRequest, ListUsersRequest, user_directory_server::UserDirectory};
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::PgPool;
 use tonic::{Code, Request};
 use uuid::Uuid;
 
-/// The key `governance.rs` serializes on — deliberately the same one, because both
-/// suites decide against the global owner roster.
-const ROSTER_LOCK: i64 = 0x676f_765f_6974; // "gov_it"
-
 struct Fixture {
 	users: Arc<PgUsers>,
-	pool: PgPool,
-	/// Holding this connection open holds the advisory lock; dropping it releases.
-	_roster_lock: PgConnection,
+	db: common::Db,
 }
 
 async fn setup() -> Option<Fixture> {
-	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
-	// This suite clears the owner registry — a state no API can restore. Never on a
-	// database nobody has declared disposable.
-	common::assert_disposable_database();
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-
-	let mut roster_lock = PgConnection::connect(&url).await.expect("a dedicated connection for the roster lock");
-	sqlx::query("SELECT pg_advisory_lock($1)")
-		.bind(ROSTER_LOCK)
-		.execute(&mut roster_lock)
-		.await
-		.expect("take the roster lock");
-	clear_roster(&pool).await;
-
+	let db = common::Db::migrated().await?;
 	Some(Fixture {
-		users: Arc::new(PgUsers::new(pool.clone())),
-		pool,
-		_roster_lock: roster_lock,
+		users: Arc::new(PgUsers::new(db.pool.clone())),
+		db,
 	})
 }
 
-/// An empty registry is the precondition for every emergency-access assertion, and no
-/// API can produce one — the owner floor exists precisely to stop that.
+/// No API can empty the registry — the owner floor exists precisely to stop that.
 async fn clear_roster(pool: &PgPool) {
 	sqlx::query("UPDATE users SET role = 'investor' WHERE role = 'owner'")
 		.execute(pool)
@@ -235,7 +207,7 @@ async fn the_latch_does_not_reopen_when_the_roster_is_emptied_behind_it() {
 	);
 
 	// Only Postgres can do this; the plane cannot.
-	clear_roster(&fx.pool).await;
+	clear_roster(&fx.db.pool).await;
 	let still_shut = require_permission(users, &allowlist, &request_as(access_claims(&sub, 0)), Roles::Grant).await.unwrap_err();
 	assert_eq!(still_shut.code(), Code::PermissionDenied, "the latch never falls back to open: {still_shut}");
 }
@@ -338,7 +310,7 @@ async fn malformed_admin_target_user_id_is_invalid_argument() {
 	// malformed TARGET field is bad input (code 3), never UNAUTHENTICATED — a code 16 here
 	// reads as an expired session to the console.
 	let sub = Uuid::new_v4().to_string();
-	let directory = Directory::new(fx.port(), Arc::new(PgGrants::new(fx.pool.clone())), Arc::new(BreakGlass::new(vec![sub.clone()])));
+	let directory = Directory::new(fx.port(), Arc::new(PgGrants::new(fx.db.pool.clone())), Arc::new(BreakGlass::new(vec![sub.clone()])));
 
 	let bad_read = directory
 		.get_user(request_with(access_claims(&sub, 0), GetUserRequest { user_id: "123-not-a-uuid".into() }))
@@ -372,7 +344,7 @@ async fn read_surfaces_report_the_role_and_whether_it_is_break_glass() {
 	let elevated = fx.provision("surfaced").await;
 	let plain = fx.provision("plain").await;
 	let sub = elevated.to_string();
-	let directory = Directory::new(fx.port(), Arc::new(PgGrants::new(fx.pool.clone())), Arc::new(BreakGlass::new(vec![sub.clone()])));
+	let directory = Directory::new(fx.port(), Arc::new(PgGrants::new(fx.db.pool.clone())), Arc::new(BreakGlass::new(vec![sub.clone()])));
 
 	// GetMe: the caller's own profile shows the same authority the gate grants, labelled.
 	let me = directory.get_me(request_with(access_claims(&sub, 0), GetMeRequest {})).await.unwrap().into_inner();

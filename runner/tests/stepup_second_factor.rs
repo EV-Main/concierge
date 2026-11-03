@@ -367,7 +367,7 @@ async fn it_needs_a_live_session() {
 	let mut who = fx.holder("su-revoked").await;
 	sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
 		.bind(who.user)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(refusal(&fx.options(SA, &HASH_A, 2, &mut who.browser).await), error(StatusCode::UNAUTHORIZED, "unauthenticated"));

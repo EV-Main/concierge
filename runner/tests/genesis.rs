@@ -6,10 +6,6 @@
 //! commit in ONE transaction, a refusal writes nothing at all, and a successful seed
 //! leaves a `ROLE_CHANGED` row in `user_outbox` for every founder — the row that mirrors
 //! the seat into the money plane.
-//!
-//! ⚠️ LIKE THE CONSILIUM SUITE, THIS ONE OWNS THE OWNER ROSTER. Genesis is decided
-//! against `users.role = 'owner'` globally, so each test takes the SAME session advisory
-//! lock `governance.rs` and `authz_gate.rs` use and clears the roster first.
 
 use std::sync::Arc;
 
@@ -17,48 +13,24 @@ mod common;
 
 use concierge::{
 	genesis::{self, GenesisOutcome, Unseatable, UnseatableReason},
-	infrastructure::{db, governance::PgGovernance, users::PgUsers},
+	infrastructure::{governance::PgGovernance, users::PgUsers},
 	ports::UserDirectoryRepository,
 };
 use domain::{authz::Role, users::UserId};
-use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
-
-/// The key the roster-owning suites serialize on.
-const ROSTER_LOCK: i64 = 0x676f_765f_6974; // "gov_it"
 
 struct Fixture {
 	seeder: Arc<PgGovernance>,
 	users: Arc<PgUsers>,
-	pool: PgPool,
-	/// Holding this connection open holds the advisory lock; dropping it releases.
-	_roster_lock: PgConnection,
+	db: common::Db,
 }
 
 async fn setup() -> Option<Fixture> {
-	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
-	// This suite clears the owner registry — a state no API can restore. Never on a
-	// database nobody has declared disposable.
-	common::assert_disposable_database();
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-
-	let mut roster_lock = PgConnection::connect(&url).await.expect("a dedicated connection for the roster lock");
-	sqlx::query("SELECT pg_advisory_lock($1)")
-		.bind(ROSTER_LOCK)
-		.execute(&mut roster_lock)
-		.await
-		.expect("take the roster lock");
-	sqlx::query("UPDATE users SET role = 'investor' WHERE role = 'owner'")
-		.execute(&pool)
-		.await
-		.expect("clear the roster");
-
+	let db = common::Db::migrated().await?;
 	Some(Fixture {
-		seeder: Arc::new(PgGovernance::new(pool.clone())),
-		users: Arc::new(PgUsers::new(pool.clone())),
-		pool,
-		_roster_lock: roster_lock,
+		seeder: Arc::new(PgGovernance::new(db.pool.clone())),
+		users: Arc::new(PgUsers::new(db.pool.clone())),
+		db,
 	})
 }
 
@@ -102,7 +74,7 @@ impl Fixture {
 	async fn role_changed_events(&self, id: UserId) -> Vec<String> {
 		sqlx::query_scalar::<_, String>("SELECT role FROM user_outbox WHERE user_id = $1 AND kind = 'ROLE_CHANGED' ORDER BY position")
 			.bind(id.raw())
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.expect("read the outbox")
 	}

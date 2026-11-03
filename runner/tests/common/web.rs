@@ -9,11 +9,10 @@ use axum::{
 	http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use concierge::{
-	infrastructure::{db, governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
+	infrastructure::{governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
 	web::{self, KycDeps, allowlist::SignInAllowlist},
 };
 use serde_json::Value;
-use sqlx::PgPool;
 use tower::ServiceExt;
 
 pub const ORIGIN: &str = super::WEBAUTHN_ORIGIN;
@@ -22,42 +21,54 @@ pub const INVEST: &str = "https://invest.evinvest.ltd";
 
 pub struct Surface {
 	pub router: Router,
-	pub pool: PgPool,
+	pub db: Arc<super::Db>,
+	second_factor: bool,
 }
 
 pub async fn surface() -> Option<Surface> {
-	surface_with(None, false).await
+	Some(surface_on(Arc::new(super::Db::migrated().await?)).await)
+}
+
+/// [`surface`] over a database the test has already written to: the allowlist reads the
+/// scope registry once, at construction.
+pub async fn surface_on(db: Arc<super::Db>) -> Surface {
+	build(db, None, false).await
 }
 
 /// [`surface`] with `/auth/second-factor/*` mounted under the suite's throwaway seal key,
 /// which every surface of the suite shares, as replicas do.
 pub async fn surface_with_second_factor(stepup: Option<web::stepup::StepupDeps>) -> Option<Surface> {
-	surface_with(stepup, true).await
+	Some(build(Arc::new(super::Db::migrated().await?), stepup, true).await)
 }
 
-/// A seal key file of 32 random bytes, as `SECOND_FACTOR_SEAL_KEY_FILE` names one: made
-/// once per suite.
-pub fn seal_key_file() -> &'static std::path::Path {
-	static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-	PATH.get_or_init(|| {
+impl Surface {
+	/// Another replica over the same database: its own ceremonies and limiters, no step-up.
+	pub async fn replica(&self) -> Surface {
+		build(self.db.clone(), None, self.second_factor).await
+	}
+}
+
+/// 32 random bytes, as `SECOND_FACTOR_SEAL_KEY_FILE` holds them base64'd: one per process.
+fn seal_key() -> &'static str {
+	static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+	KEY.get_or_init(|| {
 		use base64::{Engine, engine::general_purpose::STANDARD};
 		let mut key = [0u8; 32];
 		getrandom::fill(&mut key).unwrap();
-		let path = std::env::temp_dir().join(format!("concierge-seal-{}", uuid::Uuid::new_v4().simple()));
-		std::fs::write(&path, STANDARD.encode(key)).unwrap();
-		path
+		STANDARD.encode(key)
 	})
 }
 
-async fn surface_with(stepup: Option<web::stepup::StepupDeps>, second_factor: bool) -> Option<Surface> {
-	let url = super::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+async fn build(db: Arc<super::Db>, stepup: Option<web::stepup::StepupDeps>, second_factor: bool) -> Surface {
+	let pool = db.pool.clone();
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let mut sign_in = super::sign_in_with_turnstile(&pool, &super::stub_turnstile().await);
 	sign_in.stepup = stepup;
 	sign_in.second_factor = second_factor.then(|| web::second_factor::SecondFactorDeps {
-		seal: concierge::second_factor::SealKey::from_file(seal_key_file().to_str().unwrap()).expect("a fresh key file reads"),
+		seal: {
+			let file = v_fixtures::Fixture::parse_with_default_path(seal_key(), "/seal.key").write_to_tempdir();
+			concierge::second_factor::SealKey::from_file(file.path("seal.key").to_str().unwrap()).expect("a fresh key file reads")
+		},
 		store: Arc::new(concierge::infrastructure::second_factors::PgSecondFactors::new(pool.clone())),
 	});
 	sign_in.allowlist = Arc::new(SignInAllowlist::live(Arc::new(PgScopes::new(pool.clone())), ORIGIN).await.expect("read the scope registry"));
@@ -79,7 +90,11 @@ async fn surface_with(stepup: Option<web::stepup::StepupDeps>, second_factor: bo
 	)
 	.await
 	.expect("build the web state");
-	Some(Surface { router: web::router(state), pool })
+	Surface {
+		router: web::router(state),
+		db,
+		second_factor,
+	}
 }
 
 #[derive(Clone, Default)]
@@ -181,7 +196,7 @@ impl Surface {
 		sqlx::query_scalar("SELECT payload->>'code' FROM notification_deliveries WHERE kind = 'email_code' AND recipient = $1 AND payload->>'purpose' = $2 ORDER BY id DESC LIMIT 1")
 			.bind(email)
 			.bind(purpose)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.expect("a code was queued")
 	}

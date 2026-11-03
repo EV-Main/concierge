@@ -1,6 +1,5 @@
 //! Migration 0051 drops the legacy governance tables only while they are empty, and its
-//! down step puts them back. Runs on a database of its own, created and dropped here, so
-//! moving the schema back and forth never touches the one the other suites share.
+//! down step puts them back.
 
 use std::str::FromStr;
 
@@ -8,7 +7,7 @@ use concierge::{infrastructure::users::PgUsers, ports::UserDirectoryRepository};
 use sqlx::{
 	Connection, PgConnection, PgPool,
 	migrate::{MigrateError, Migrator},
-	postgres::{PgConnectOptions, PgPoolOptions},
+	postgres::PgConnectOptions,
 };
 
 mod common;
@@ -59,16 +58,9 @@ async fn proposal_fk(pool: &PgPool) -> bool {
 
 #[tokio::test]
 async fn the_legacy_tables_go_only_empty_and_come_back_on_the_way_down() {
-	let Some(url) = common::database_url() else { return };
-	let server = PgConnectOptions::from_str(&url).expect("DATABASE_URL parses");
-	let name = format!("concierge_m0051_{}", uuid::Uuid::new_v4().simple());
-	let mut admin = PgConnection::connect_with(&server).await.expect("connect to the server");
-	sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-		.execute(&mut admin)
-		.await
-		.expect("a database of our own");
-	let db = server.clone().database(&name);
-	let pool = PgPoolOptions::new().max_connections(2).connect_with(db.clone()).await.expect("connect to it");
+	let Some(scratch) = common::Db::empty().await else { return };
+	let db = PgConnectOptions::from_str(&scratch.url).expect("the test database's URL parses");
+	let pool = scratch.pool.clone();
 
 	step(&db, async |c| MIGRATOR.run_to(BEFORE, c).await).await.expect("the schema before 0051");
 	let users = PgUsers::new(pool.clone());
@@ -106,10 +98,4 @@ async fn the_legacy_tables_go_only_empty_and_come_back_on_the_way_down() {
 	assert_eq!(present(&pool).await, LEGACY, "every table is back");
 	assert!(proposal_fk(&pool).await, "and the foreign key into user_proposal");
 	step(&db, async |c| MIGRATOR.run(c).await).await.expect("and up again");
-
-	pool.close().await;
-	sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name} WITH (FORCE)")))
-		.execute(&mut admin)
-		.await
-		.expect("drop it");
 }

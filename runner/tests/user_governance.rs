@@ -9,11 +9,6 @@
 //! reinstate; and that a hold's lapse is a WRITE, because a projection would never reach
 //! the money plane.
 //!
-//! ⚠️ THIS SUITE OWNS THE OWNER ROSTER, like `governance.rs` and `authz_gate.rs`: who may
-//! hold whom is decided from `users.role = 'owner'` globally, so a test cannot scope
-//! itself to its own fixtures. It takes the SAME session advisory lock those two take, so
-//! the three serialize instead of racing.
-//!
 //! The clock is an argument to every call, so time is simulated rather than waited on: a
 //! hold is reached by passing a later `now`, never by sleeping through 24 hours.
 
@@ -25,7 +20,6 @@ use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
 	infrastructure::{
-		db,
 		grants::PgGrants,
 		users::{AdminAction, Audit, PgUsers},
 	},
@@ -37,47 +31,23 @@ use domain::{
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{DisableUserRequest, HoldUserRequest, ReinstateUserRequest, RevokeTokensRequest, SetKycLevelRequest, user_directory_server::UserDirectory};
-use sqlx::{Connection, PgConnection, PgPool, Row};
+use sqlx::Row;
 use tonic::{Code, Request};
 use uuid::Uuid;
 
-/// The key `governance.rs` and `authz_gate.rs` serialize on — deliberately the same one.
-const ROSTER_LOCK: i64 = 0x676f_765f_6974; // "gov_it"
-/// A clock far past any sweep another test in this binary runs. The sweep is GLOBAL —
-/// `lapse_due_holds(now)` releases every hold due by `now` in the database — so a hold
-/// placed at a real-world instant can be released by a neighbour's sweep mid-test. A
-/// hold placed here is due in 2096 and nobody sweeps that far.
+/// A clock far past the real one: a hold placed here is due in 2096.
 const T_FAR: i64 = 4_000_000_000;
 
 struct Fixture {
 	users: Arc<PgUsers>,
-	pool: PgPool,
-	/// Holding this connection open holds the advisory lock; dropping it releases.
-	_roster_lock: PgConnection,
+	db: common::Db,
 }
 
 async fn setup() -> Option<Fixture> {
-	let url = common::database_url()?;
-	common::assert_disposable_database();
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-
-	let mut roster_lock = PgConnection::connect(&url).await.expect("a dedicated connection for the roster lock");
-	sqlx::query("SELECT pg_advisory_lock($1)")
-		.bind(ROSTER_LOCK)
-		.execute(&mut roster_lock)
-		.await
-		.expect("take the roster lock");
-
-	sqlx::query("UPDATE users SET role = 'investor' WHERE role = 'owner'")
-		.execute(&pool)
-		.await
-		.expect("clear the roster");
-
+	let db = common::Db::migrated().await?;
 	Some(Fixture {
-		users: Arc::new(PgUsers::new(pool.clone())),
-		pool,
-		_roster_lock: roster_lock,
+		users: Arc::new(PgUsers::new(db.pool.clone())),
+		db,
 	})
 }
 
@@ -102,7 +72,7 @@ impl Fixture {
 	}
 
 	fn directory(&self) -> Directory {
-		Directory::new(self.users.clone(), Arc::new(PgGrants::new(self.pool.clone())), Arc::new(BreakGlass::new(Vec::new())))
+		Directory::new(self.users.clone(), Arc::new(PgGrants::new(self.db.pool.clone())), Arc::new(BreakGlass::new(Vec::new())))
 	}
 
 	async fn reload(&self, id: UserId) -> domain::users::User {
@@ -114,7 +84,7 @@ impl Fixture {
 	async fn outbox_kinds(&self, id: UserId) -> Vec<String> {
 		sqlx::query("SELECT kind FROM user_outbox WHERE user_id = $1 ORDER BY position")
 			.bind(id.raw())
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.expect("read the outbox")
 			.iter()
@@ -149,7 +119,7 @@ impl Fixture {
 	async fn held_details(&self, id: UserId) -> Vec<serde_json::Value> {
 		sqlx::query_scalar("SELECT detail FROM admin_action WHERE subject_user_id = $1 AND action = 'held' ORDER BY position")
 			.bind(id.raw())
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.expect("read the held rows")
 	}
@@ -158,7 +128,7 @@ impl Fixture {
 	async fn audit(&self, id: UserId) -> Vec<(String, Option<Uuid>, String)> {
 		sqlx::query("SELECT action, actor_user_id, reason FROM admin_action WHERE subject_user_id = $1 ORDER BY position")
 			.bind(id.raw())
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.expect("read the audit log")
 			.iter()
@@ -177,7 +147,7 @@ impl Fixture {
 	async fn stamp_governance_suspension(&self, id: UserId) {
 		sqlx::query("UPDATE users SET status = 'disabled', suspended_by = 'governance', hold_expires_at = NULL WHERE id = $1")
 			.bind(id.raw())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("impose the verdict");
 	}
@@ -269,8 +239,6 @@ async fn a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge() {
 
 	// A minute before the deadline the sweep leaves it alone — the brake is real until it
 	// is not.
-	// Asserted on THIS target: the sweep is global, and what another test left due by
-	// this instant is not this test's business.
 	assert!(
 		!fx.users.lapse_due_holds(held.hold_expires_at - 60, 10).await.expect("sweep").contains(&target),
 		"a hold that is not due must not be released early"
@@ -356,8 +324,8 @@ async fn a_lapsed_hold_starts_a_cooldown() {
 	let owner = fx.owner().await;
 	let target = fx.user().await;
 	fx.hold_at(owner, target, T_FAR).await.expect("hold");
-	// Lifted by one act rather than swept: the sweep is global (see `T_FAR`), and the
-	// aggregate records the end the same way for both — the lapse path is proved in
+	// Lifted by one act rather than swept: the aggregate records the end the same way
+	// for both — the lapse path is proved in
 	// `a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge`. Lifted three
 	// hours AFTER the deadline, as an operator beating a stalled sweep would: the end
 	// is still the deadline, or the cooldown would stretch by however late they were.
@@ -403,7 +371,6 @@ async fn a_seat_is_held_only_by_an_owner() {
 	// The control over a rogue operator: an owner may hold an admin.
 	fx.hold(owner, another_admin, "rogue operator").await.expect("an owner holds a seat");
 	assert_eq!(fx.reload(another_admin).await.status(), UserStatus::Disabled);
-	fx.users.enable_user(another_admin, T_FAR).await.expect("cleanup — see T_FAR");
 }
 
 /// The RPC gate refuses a disabled caller, but it runs before the target's row is
@@ -425,7 +392,6 @@ async fn an_actor_held_in_the_window_holds_nobody() {
 	assert!(matches!(err, domain::error::DomainError::Forbidden(_)), "{err}");
 	assert_eq!(fx.reload(target).await.status(), UserStatus::Active, "nothing was written");
 	assert!(fx.audit(target).await.is_empty(), "a refusal is not an action");
-	fx.users.enable_user(other_owner, T_FAR).await.expect("cleanup — see T_FAR");
 }
 
 /// A hold on yourself ends your own session, and with it your ability to explain, lift
@@ -552,7 +518,7 @@ async fn every_operator_decision_lands_in_the_audit_log() {
 	// command rather than from what the caller asked for.
 	let detail: serde_json::Value = sqlx::query_scalar("SELECT detail FROM admin_action WHERE subject_user_id = $1 ORDER BY position LIMIT 1")
 		.bind(target.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.expect("read the detail");
 	assert_eq!(detail["kyc_level"], 2);
@@ -612,13 +578,11 @@ async fn a_hold_cannot_downgrade_a_governance_suspension() {
 	let user = fx.reload(target).await;
 	assert_eq!(user.suspension(), Some(Suspension::Governance));
 	// The sweep selects on `hold_expires_at IS NOT NULL` and nothing else, so a verdict
-	// with no deadline is invisible to it. Asserted on the column rather than by running
-	// the sweep: `lapse_due_holds` is global, and a far-future sweep here would release
-	// every hold the tests beside this one are in the middle of asserting on.
+	// with no deadline is invisible to it.
 	assert_eq!(user.suspension().unwrap().hold_expires_at(), None, "and no sweep will ever release it");
 	let due: bool = sqlx::query_scalar("SELECT hold_expires_at IS NOT NULL FROM users WHERE id = $1")
 		.bind(target.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert!(!due);

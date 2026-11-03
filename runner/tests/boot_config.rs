@@ -9,21 +9,9 @@ mod common;
 
 use std::process::{Command, Stdio};
 
-use sqlx::{Connection, PgConnection};
-
 /// Cloudflare's always-pass Turnstile secret: the one `web::is_test_secret` refuses in
 /// production, with every other production requirement met.
 const TEST_TURNSTILE_SECRET: &str = "1x0000000000000000000000000000000AA";
-
-/// The scratch database's URL: `url` with its database name swapped.
-fn with_database(url: &str, name: &str) -> String {
-	let (base, query) = url.split_once('?').map_or((url, None), |(base, query)| (base, Some(query)));
-	let (server, _) = base.rsplit_once('/').expect("DATABASE_URL names a database");
-	match query {
-		Some(query) => format!("{server}/{name}?{query}"),
-		None => format!("{server}/{name}"),
-	}
-}
 
 #[tokio::test]
 async fn a_production_boot_with_a_test_turnstile_secret_leaves_the_database_untouched() {
@@ -55,14 +43,7 @@ async fn a_boot_with_a_seal_key_that_is_not_32_bytes_leaves_the_database_untouch
 /// Boot the binary as production with `overrides` over an otherwise valid configuration
 /// and assert it refuses, naming `expected`, before migrating anything.
 async fn refused_boot(overrides: &[(&str, &str)], expected: &str) {
-	let Some(url) = common::database_url() else { return };
-	let name = format!("concierge_boot_{}", uuid::Uuid::new_v4().simple());
-	let mut admin = PgConnection::connect(&url).await.expect("connect to Postgres");
-	sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-		.execute(&mut admin)
-		.await
-		.expect("create the scratch database");
-	let scratch = with_database(&url, &name);
+	let Some(db) = common::Db::empty().await else { return };
 
 	let output = Command::new(env!("CARGO_BIN_EXE_concierge"))
 		// Nothing from the shell the suite runs in: a `.env` or an exported variable would
@@ -71,7 +52,7 @@ async fn refused_boot(overrides: &[(&str, &str)], expected: &str) {
 		.current_dir(std::env::temp_dir())
 		.envs([
 			("APP_ENV", "production"),
-			("DATABASE_URL", scratch.as_str()),
+			("DATABASE_URL", db.url.as_str()),
 			("BRIDGE_SERVICE_TOKEN", "boot-config-bridge-token"),
 			("SENTRY_DSN", "http://public@127.0.0.1:9/1"),
 			("PUBLIC_ORIGIN", "https://evinvest.test"),
@@ -92,16 +73,10 @@ async fn refused_boot(overrides: &[(&str, &str)], expected: &str) {
 		.expect("run the concierge binary");
 
 	let stderr = String::from_utf8_lossy(&output.stderr);
-	let mut probe = PgConnection::connect(&scratch).await.expect("connect to the scratch database");
 	let migrated: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
-		.fetch_one(&mut probe)
+		.fetch_one(&db.pool)
 		.await
 		.expect("read the catalog");
-	probe.close().await.expect("disconnect");
-	sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name} WITH (FORCE)")))
-		.execute(&mut admin)
-		.await
-		.expect("drop the scratch database");
 
 	assert!(!output.status.success(), "the boot is refused: {stderr}");
 	assert!(stderr.contains(expected), "refused for {expected}, not for something else: {stderr}");

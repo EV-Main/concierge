@@ -33,11 +33,8 @@ use uuid::Uuid;
 
 const TOKEN: &str = "test-bridge-token";
 
-async fn setup() -> Option<(PgUsers, PgPool)> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-	Some((PgUsers::new(pool.clone()), pool))
+fn setup(db: &common::Db) -> (PgUsers, PgPool) {
+	(PgUsers::new(db.pool.clone()), db.pool.clone())
 }
 
 fn authed<T>(body: T) -> Request<T> {
@@ -48,16 +45,10 @@ fn authed<T>(body: T) -> Request<T> {
 
 #[tokio::test]
 async fn pull_returns_ordered_events_and_advances_cursor() {
-	let Some((repo, pool)) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
 
-	// Where the outbox already stands. Reading from 0 would fill the page with whatever
-	// a shared development database happens to hold — and once another suite has written
-	// more than `limit` rows, the ones seeded below fall off the end and this test fails
-	// for a reason that has nothing to do with the bridge.
 	let start = sqlx::query_scalar::<_, i64>("SELECT COALESCE(max(position), 0) FROM user_outbox")
 		.fetch_one(&pool)
 		.await
@@ -102,9 +93,8 @@ async fn pull_returns_ordered_events_and_advances_cursor() {
 
 #[tokio::test]
 async fn cursor_pagination_does_not_re_serve() {
-	let Some((repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
 
 	let user = repo.resolve(common::google("page", true), 0).await.unwrap();
@@ -150,9 +140,8 @@ async fn cursor_pagination_does_not_re_serve() {
 
 #[tokio::test]
 async fn empty_pull_returns_cursor_unchanged() {
-	let Some((_repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (_repo, pool) = setup(&db);
 	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
 
 	// A position above any row bigserial can plausibly reach → no events even with
@@ -169,9 +158,8 @@ async fn empty_pull_returns_cursor_unchanged() {
 
 #[tokio::test]
 async fn wrong_token_is_rejected() {
-	let Some((_repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (_repo, pool) = setup(&db);
 	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
 
 	let mut wrong = Request::new(PullUserLifecycleRequest { after_position: 0, limit: 10 });
@@ -182,9 +170,8 @@ async fn wrong_token_is_rejected() {
 
 #[tokio::test]
 async fn equal_length_wrong_token_is_rejected() {
-	let Some((_repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (_repo, pool) = setup(&db);
 	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
 
 	// Flip TOKEN's last byte: same length, shared prefix, so a regression to a
@@ -201,9 +188,8 @@ async fn equal_length_wrong_token_is_rejected() {
 
 #[tokio::test]
 async fn absent_token_is_rejected() {
-	let Some((_repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (_repo, pool) = setup(&db);
 	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
 
 	let err = bridge
@@ -215,9 +201,8 @@ async fn absent_token_is_rejected() {
 
 #[tokio::test]
 async fn unconfigured_bridge_fails_closed() {
-	let Some((_repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (_repo, pool) = setup(&db);
 	let bridge = Bridge::new(pool.clone(), None);
 
 	let err = bridge.pull_user_lifecycle(authed(PullUserLifecycleRequest { after_position: 0, limit: 10 })).await.unwrap_err();
@@ -226,9 +211,8 @@ async fn unconfigured_bridge_fails_closed() {
 
 #[tokio::test]
 async fn outbox_append_serializes_position_with_commit_order() {
-	let Some((repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let repo = Arc::new(repo);
 	let user = repo.resolve(common::google("lock", true), 0).await.unwrap();
 
@@ -316,9 +300,8 @@ async fn define_seat(pool: &PgPool, role: Role, bank: &[&str], generation: i32) 
 
 #[tokio::test]
 async fn the_database_stamps_every_row_whatever_the_writer_sent() {
-	let Some(url) = common::database_url() else { return };
-	let scratch = common::Scratch::create(&url).await;
-	let pool = &scratch.pool;
+	let Some(db) = common::Db::migrated().await else { return };
+	let pool = &db.pool;
 	let user = operator(pool).await;
 	// What a pre-0027 binary writes (no `permissions`), then what a binary with a stale set writes.
 	for permissions in [None, Some(vec!["bank:stale".to_owned()])] {
@@ -344,14 +327,12 @@ async fn the_database_stamps_every_row_whatever_the_writer_sent() {
 			(Kind::KycChanged, bank(Role::Operator)),
 		]
 	);
-	scratch.drop_database().await;
 }
 
 #[tokio::test]
 async fn a_row_written_before_the_set_was_stated_reads_as_unstated_not_empty() {
-	let Some(url) = common::database_url() else { return };
-	let scratch = common::Scratch::create(&url).await;
-	let pool = &scratch.pool;
+	let Some(db) = common::Db::migrated().await else { return };
+	let pool = &db.pool;
 	let user = operator(pool).await;
 	sqlx::query("UPDATE user_outbox SET permissions = NULL WHERE user_id = $1 AND kind = 'CREATED'")
 		.bind(user.raw())
@@ -359,14 +340,12 @@ async fn a_row_written_before_the_set_was_stated_reads_as_unstated_not_empty() {
 		.await
 		.unwrap();
 	assert_eq!(pulled(pool, user).await, [(Kind::Created, None), (Kind::RoleChanged, bank(Role::Operator))]);
-	scratch.drop_database().await;
 }
 
 #[tokio::test]
 async fn an_older_binary_never_overwrites_a_newer_seat_meaning() {
-	let Some(url) = common::database_url() else { return };
-	let scratch = common::Scratch::create(&url).await;
-	let pool = &scratch.pool;
+	let Some(db) = common::Db::migrated().await else { return };
+	let pool = &db.pool;
 	let user = operator(pool).await;
 	let newer = SEAT_GENERATION as i32 + 1;
 	sqlx::query("UPDATE seat_meanings SET bank_permissions = '{bank:newer}', generation = $1 WHERE role = 'operator'")
@@ -395,24 +374,20 @@ async fn an_older_binary_never_overwrites_a_newer_seat_meaning() {
 		Some(&(Kind::PermissionsChanged, Some(vec!["bank:newer".to_owned()]))),
 		"the money plane converges on the newest meaning, whichever binary boots"
 	);
-	scratch.drop_database().await;
 }
 
 #[tokio::test]
 async fn a_seat_redefined_without_a_new_generation_refuses_the_boot() {
-	let Some(url) = common::database_url() else { return };
-	let scratch = common::Scratch::create(&url).await;
-	define_seat(&scratch.pool, Role::Operator, &["bank:other"], SEAT_GENERATION as i32).await;
-	let err = db::migrate(&scratch.pool).await.expect_err("same generation, different set");
+	let Some(db) = common::Db::migrated().await else { return };
+	define_seat(&db.pool, Role::Operator, &["bank:other"], SEAT_GENERATION as i32).await;
+	let err = db::migrate(&db.pool).await.expect_err("same generation, different set");
 	assert!(err.to_string().contains("bump SEAT_GENERATION"), "{err}");
-	scratch.drop_database().await;
 }
 
 #[tokio::test]
 async fn a_set_stated_in_another_order_is_the_same_set() {
-	let Some(url) = common::database_url() else { return };
-	let scratch = common::Scratch::create(&url).await;
-	let pool = &scratch.pool;
+	let Some(db) = common::Db::migrated().await else { return };
+	let pool = &db.pool;
 	let mut reversed = Role::Operator.bank_permissions();
 	reversed.reverse();
 	define_seat(pool, Role::Operator, &reversed, 0).await;
@@ -420,14 +395,12 @@ async fn a_set_stated_in_another_order_is_the_same_set() {
 	db::migrate(pool).await.unwrap();
 	assert_eq!(seat_meaning(pool, Role::Operator).await.1, SEAT_GENERATION as i32);
 	assert_eq!(pulled(pool, user).await.iter().filter(|(kind, _)| *kind == Kind::PermissionsChanged).count(), 0);
-	scratch.drop_database().await;
 }
 
 #[tokio::test]
 async fn a_user_whose_last_row_is_unstated_is_told_once() {
-	let Some(url) = common::database_url() else { return };
-	let scratch = common::Scratch::create(&url).await;
-	let pool = &scratch.pool;
+	let Some(db) = common::Db::migrated().await else { return };
+	let pool = &db.pool;
 	let user = operator(pool).await;
 	sqlx::query("UPDATE user_outbox SET permissions = NULL WHERE user_id = $1 AND kind = 'ROLE_CHANGED'")
 		.bind(user.raw())
@@ -440,5 +413,4 @@ async fn a_user_whose_last_row_is_unstated_is_told_once() {
 		pulled(pool, user).await,
 		[(Kind::Created, bank(Role::Investor)), (Kind::RoleChanged, None), (Kind::PermissionsChanged, bank(Role::Operator))]
 	);
-	scratch.drop_database().await;
 }

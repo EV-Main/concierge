@@ -11,10 +11,7 @@
 //! — and assert both the user row and the `user_outbox` rows it emits in the same tx.
 
 use concierge::{
-	infrastructure::{
-		db,
-		users::{AdminAction, PgUsers},
-	},
+	infrastructure::users::{AdminAction, PgUsers},
 	ports::UserDirectoryRepository,
 };
 use domain::{authz::Role, users::UserStatus};
@@ -23,17 +20,8 @@ use uuid::Uuid;
 
 mod common;
 
-/// The suite's preconditions, or `None` when there is no database to assert against.
-///
-/// A skipped run prints exactly the "N passed" a real one does, and the only tell is the
-/// wall time — so a count quoted as evidence that these assertions ran is evidence of
-/// nothing. [`common::database_url`] answers that where it matters: it panics under CI,
-/// and prints a SKIPPED line a local `--nocapture` run shows.
-async fn setup() -> Option<(PgUsers, PgPool)> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-	Some((PgUsers::new(pool.clone()), pool))
+fn setup(db: &common::Db) -> (PgUsers, PgPool) {
+	(PgUsers::new(db.pool.clone()), db.pool.clone())
 }
 
 #[derive(sqlx::FromRow)]
@@ -58,10 +46,8 @@ async fn outbox_for(pool: &PgPool, user_id: Uuid) -> Vec<OutboxRow> {
 
 #[tokio::test]
 async fn provision_creates_user_and_emits_created() {
-	let Some((repo, pool)) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let address = format!("itest-{}@example.com", Uuid::new_v4().simple());
 	let user = repo.resolve(common::google_as(&format!("itest-{}", Uuid::new_v4()), &address, true), 0).await.unwrap();
 
@@ -85,9 +71,8 @@ async fn provision_creates_user_and_emits_created() {
 
 #[tokio::test]
 async fn reprovision_is_idempotent_and_emits_no_new_event() {
-	let Some((repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let subject = format!("itest-{}", Uuid::new_v4());
 	let tag = Uuid::new_v4().simple();
 	let first = repo.resolve(common::google_as(&subject, &format!("before-{tag}@example.com"), true), 0).await.unwrap();
@@ -101,9 +86,8 @@ async fn reprovision_is_idempotent_and_emits_no_new_event() {
 
 #[tokio::test]
 async fn revoke_bumps_version_and_emits_sessions_revoked() {
-	let Some((repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let user = repo.resolve(common::google("rev", true), 0).await.unwrap();
 	let revoked = repo.revoke_tokens(user.id(), &AdminAction::system("tokens_revoked"), 0).await.unwrap();
 	assert_eq!(revoked.token_version(), 1);
@@ -120,9 +104,8 @@ async fn revoke_bumps_version_and_emits_sessions_revoked() {
 
 #[tokio::test]
 async fn disable_then_enable_emits_suspended_then_reinstated() {
-	let Some((repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let user = repo.resolve(common::google("dis", true), 0).await.unwrap();
 
 	let disabled = repo.disable_user(user.id()).await.unwrap();
@@ -140,9 +123,8 @@ async fn disable_then_enable_emits_suspended_then_reinstated() {
 
 #[tokio::test]
 async fn kyc_change_emits_kyc_changed_with_level() {
-	let Some((repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let user = repo.resolve(common::google("kyc", true), 0).await.unwrap();
 	repo.set_kyc_level(user.id(), 2, &AdminAction::system("kyc_level_set"), 0).await.unwrap();
 
@@ -153,9 +135,8 @@ async fn kyc_change_emits_kyc_changed_with_level() {
 
 #[tokio::test]
 async fn role_change_emits_role_changed_carrying_the_new_role() {
-	let Some((repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let user = repo.resolve(common::google("role", true), 0).await.unwrap();
 
 	// A default-role user is Investor; the CREATED snapshot carries it.
@@ -202,9 +183,8 @@ async fn actions_for(pool: &PgPool, user_id: Uuid) -> Vec<ActionRow> {
 /// modelling choice, not a mechanical one.
 #[tokio::test]
 async fn both_kyc_writers_land_in_one_audit_log_with_the_delta() {
-	let Some((repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let operator = repo.resolve(common::google("kyc-operator", true), 0).await.unwrap();
 	let user = repo.resolve(common::google("kyc-subject", true), 0).await.unwrap();
 
@@ -251,9 +231,8 @@ async fn both_kyc_writers_land_in_one_audit_log_with_the_delta() {
 /// and a history that grows when nothing happened is a history nobody trusts.
 #[tokio::test]
 async fn a_vendor_approval_that_changes_nothing_writes_no_audit_row() {
-	let Some((repo, pool)) = setup().await else {
-		return;
-	};
+	let Some(db) = common::Db::migrated().await else { return };
+	let (repo, pool) = setup(&db);
 	let user = repo.resolve(common::google("kyc-noop", true), 0).await.unwrap();
 	let audit = AdminAction::system("kyc_level_set").with_detail(serde_json::json!({ "source": "didit", "case_id": Uuid::new_v4().to_string() }));
 

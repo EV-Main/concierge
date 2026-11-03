@@ -12,7 +12,6 @@ use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
 	infrastructure::{
-		db,
 		grants::PgGrants,
 		relying_parties::PgRelyingParties,
 		users::{AdminAction, PgUsers},
@@ -26,7 +25,6 @@ use evconcierge_contracts::concierge::v1::{
 	CatalogAlias, GetMeRequest, GrantPermissionRequest, ListGrantsRequest, RevokePermissionRequest, grant_permission_request, revoke_permission_request, user_directory_server::UserDirectory,
 };
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use tonic::{Code, Request};
 use uuid::Uuid;
 
@@ -34,7 +32,7 @@ mod common;
 
 struct Fixture {
 	users: Arc<dyn UserDirectoryRepository>,
-	pool: PgPool,
+	db: common::Db,
 	directory: Directory,
 	rp: RelyingParties,
 	ns: String,
@@ -58,9 +56,8 @@ async fn setup() -> Option<Fixture> {
 }
 
 async fn tenant(granting_seats_hold_all: bool) -> Option<Fixture> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let db = common::Db::migrated().await?;
+	let pool = db.pool.clone();
 	let users: Arc<dyn UserDirectoryRepository> = Arc::new(PgUsers::new(pool.clone()));
 	let grants = Arc::new(PgGrants::new(pool.clone()));
 	let directory = Directory::new(users.clone(), grants.clone(), Arc::new(BreakGlass::new(Vec::new())));
@@ -91,7 +88,7 @@ async fn tenant(granting_seats_hold_all: bool) -> Option<Fixture> {
 		.expect("set the secret");
 	let fx = Fixture {
 		users,
-		pool,
+		db,
 		directory,
 		rp,
 		ns,
@@ -169,7 +166,7 @@ impl Fixture {
 			.bind(delegate.raw())
 			.bind(self.p("admin"))
 			.bind(seat.raw())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("seat the delegate");
 		delegate
@@ -183,7 +180,7 @@ impl Fixture {
 			.bind(holder.raw())
 			.bind(target)
 			.bind(granter.raw())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("grant the target");
 		holder
@@ -207,7 +204,7 @@ impl Fixture {
 			.bind(&self.ns)
 			.bind(version)
 			.bind(catalog)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("plant the catalog");
 	}
@@ -282,7 +279,7 @@ impl Fixture {
 	async fn active_grants(&self, user: UserId) -> Vec<String> {
 		sqlx::query_scalar("SELECT target FROM grants WHERE user_id = $1 AND revoked_at IS NULL ORDER BY target")
 			.bind(user.raw())
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -295,7 +292,7 @@ impl Fixture {
 		let second = self.users.resolve(common::google_as(&format!("iam-shared-{}", Uuid::new_v4()), &email, false), 0).await.unwrap();
 		sqlx::query("INSERT INTO password_credentials (user_id, phc, updated_at) VALUES ($1, '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA', 0)")
 			.bind(second.id().raw())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.unwrap();
 		email
@@ -557,7 +554,7 @@ async fn a_delegate_sees_addresses_and_grants_but_no_names() {
 	let member = fx.user("member").await;
 	sqlx::query("UPDATE users SET legal_name = 'Ada Lovelace' WHERE id = $1")
 		.bind(member.raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	fx.grant(seat, member, &fx.p("work:*")).await.unwrap();
@@ -598,7 +595,7 @@ async fn a_delegate_gets_twenty_grant_writes_an_hour_and_a_seat_is_not_counted()
 #[tokio::test]
 async fn the_write_decides_from_the_actors_persisted_standing() {
 	let Some(fx) = setup().await else { return };
-	let grants = PgGrants::new(fx.pool.clone());
+	let grants = PgGrants::new(fx.db.pool.clone());
 	let member = GrantSubject::Id(fx.user("member").await);
 	let operator = Target::parse(&fx.p("operator")).unwrap();
 	let action = |actor| AdminAction {
@@ -651,7 +648,7 @@ async fn nobody_grants_the_admin_alias_outside_an_approval() {
 	assert!(fx.active_grants(member).await.is_empty());
 	fx.grant(admin, member, &fx.p("operator")).await.expect("other targets stay the seat's");
 
-	let grants = PgGrants::new(fx.pool.clone());
+	let grants = PgGrants::new(fx.db.pool.clone());
 	let elevated = fx.user("elevated").await;
 	let outcome = grants
 		.grant(
@@ -761,13 +758,13 @@ async fn a_grant_is_audited_and_regranting_writes_nothing() {
 	fx.grant(admin, member, &fx.p("operator")).await.unwrap();
 	let rows: Vec<(String, Option<String>)> = sqlx::query_as("SELECT target, reason FROM grants WHERE user_id = $1")
 		.bind(member.raw())
-		.fetch_all(&fx.pool)
+		.fetch_all(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(rows, [(fx.p("operator"), Some("itest".to_owned()))]);
 	let audit: Vec<(String, Option<Uuid>, String)> = sqlx::query_as("SELECT action, actor_user_id, reason FROM admin_action WHERE subject_user_id = $1 ORDER BY position")
 		.bind(member.raw())
-		.fetch_all(&fx.pool)
+		.fetch_all(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(audit, [("permission_granted".to_owned(), Some(admin.raw()), "itest".to_owned())]);
@@ -830,7 +827,7 @@ async fn a_catalog_stays_inside_its_namespace_and_only_moves_forward() {
 
 	let history: Vec<(i64, Option<String>)> = sqlx::query_as("SELECT version, published_by FROM catalogs WHERE tenant_id = $1 ORDER BY version")
 		.bind(&fx.ns)
-		.fetch_all(&fx.pool)
+		.fetch_all(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(history, [(1, Some(fx.client.clone())), (2, Some(fx.client.clone()))], "every catalog ever in force is kept");
@@ -844,7 +841,7 @@ async fn the_table_refuses_a_grant_to_its_own_granter() {
 		.bind(admin.raw())
 		.bind(&fx.ns)
 		.bind(fx.p("operator"))
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await;
 	assert!(refused.is_err());
 }

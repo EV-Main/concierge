@@ -78,7 +78,7 @@ const FORM: Option<&str> = Some("application/x-www-form-urlencoded");
 /// that mail carries.
 async fn pending(fx: &Surface) -> (String, String) {
 	let email = address("edge");
-	let (_, token) = PgNotifications::new(fx.pool.clone())
+	let (_, token) = PgNotifications::new(fx.db.pool.clone())
 		.subscribe_anonymous(&email, TOPIC, 3600)
 		.await
 		.expect("subscribe")
@@ -89,14 +89,14 @@ async fn pending(fx: &Surface) -> (String, String) {
 async fn confirmed(fx: &Surface, email: &str) -> bool {
 	sqlx::query_scalar("SELECT confirmed_at IS NOT NULL FROM notification_subscribers WHERE email = $1 AND user_id IS NULL")
 		.bind(email)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap()
 }
 
 /// A signed-in account's subscriber row following `TOPIC` with mail: its unsubscribe token.
 async fn following(fx: &Surface) -> (Uuid, String) {
-	let repo = PgNotifications::new(fx.pool.clone());
+	let repo = PgNotifications::new(fx.db.pool.clone());
 	let user = Uuid::new_v4();
 	let sub = repo.subscriber_for_user(user, &address("unsub"), true).await.expect("subscriber");
 	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
@@ -106,13 +106,13 @@ async fn following(fx: &Surface) -> (Uuid, String) {
 async fn mail_on(fx: &Surface, subscriber: Uuid) -> (bool, Option<bool>) {
 	let channel: bool = sqlx::query_scalar("SELECT email_enabled FROM notification_subscribers WHERE id = $1")
 		.bind(subscriber)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	let topic: Option<bool> = sqlx::query_scalar("SELECT email_enabled FROM notification_subscriptions WHERE subscriber_id = $1 AND topic = $2")
 		.bind(subscriber)
 		.bind(TOPIC)
-		.fetch_optional(&fx.pool)
+		.fetch_optional(&fx.db.pool)
 		.await
 		.unwrap();
 	(channel, topic)
@@ -217,7 +217,7 @@ async fn the_button_unsubscribes_from_the_topic_it_names() {
 async fn queued_confirmations(fx: &Surface, email: &str) -> i64 {
 	sqlx::query_scalar("SELECT count(*) FROM notification_deliveries WHERE kind = 'confirm' AND recipient = $1")
 		.bind(email)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap()
 }
@@ -295,7 +295,7 @@ async fn the_mailed_links_lead_to_these_pages() {
 		daily_budget: i64::MAX,
 		interval: std::time::Duration::from_secs(60),
 	};
-	while drain_once(&PgNotifications::new(fx.pool.clone()), &outbox, &cfg).await > 0 {}
+	while drain_once(&PgNotifications::new(fx.db.pool.clone()), &outbox, &cfg).await > 0 {}
 	let sent = outbox.0.lock().unwrap().iter().find(|m| m.to == email).cloned().expect("the confirmation was sent");
 
 	let unsubscribe = format!("{ORIGIN}/api/auth/notifications/unsubscribe?token=");

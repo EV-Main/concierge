@@ -16,7 +16,6 @@ use concierge::{
 	bridge::Bridge,
 	directory::Directory,
 	infrastructure::{
-		db,
 		grants::PgGrants,
 		notifications::PgNotifications,
 		relying_parties::PgRelyingParties,
@@ -42,7 +41,6 @@ use evconcierge_contracts::concierge::v1::{
 	scope_events_server::ScopeEvents as _, user_directory_server::UserDirectory, user_events_server::UserEvents, user_lifecycle_event::Kind as LifecycleKind,
 };
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use tonic::{Code, Request, metadata::MetadataValue};
 use uuid::Uuid;
 
@@ -51,7 +49,7 @@ mod common;
 const BRIDGE_TOKEN: &str = "test-bridge-token";
 
 struct Fx {
-	pool: PgPool,
+	db: common::Db,
 	users: Arc<PgUsers>,
 	grants: PgGrants,
 	rp: PgRelyingParties,
@@ -75,9 +73,8 @@ impl Scope {
 }
 
 async fn setup() -> Option<Fx> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let db = common::Db::migrated().await?;
+	let pool = db.pool.clone();
 	let callers = ServiceCallers::new(Some(BRIDGE_TOKEN.into()), Arc::new(PgRelyingParties::new(pool.clone())));
 	Some(Fx {
 		users: Arc::new(PgUsers::new(pool.clone())),
@@ -87,7 +84,7 @@ async fn setup() -> Option<Fx> {
 		bridge: Bridge::new(pool.clone(), Some(BRIDGE_TOKEN.into())),
 		catalogs: ScopeCatalogs::new(callers, Arc::new(PgScopeCatalogs::new(pool.clone()))),
 		directory: Directory::new(Arc::new(PgUsers::new(pool.clone())), Arc::new(PgGrants::new(pool.clone())), Arc::new(BreakGlass::new(Vec::new()))),
-		pool,
+		db,
 	})
 }
 
@@ -127,14 +124,14 @@ impl Fx {
 			.bind(&scope.id)
 			.bind(hold_all)
 			.bind(&observers)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("register the scope");
 		sqlx::query("INSERT INTO rp_clients (client_id, audience, redirect_uris, created_at, tenant_id) VALUES ($1, $1, $2, 0, $3)")
 			.bind(&scope.client)
 			.bind(vec![format!("https://{tag}.test/cb")])
 			.bind(&scope.id)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("register the client");
 		self.rp
@@ -264,11 +261,11 @@ impl Fx {
 	}
 
 	async fn scope_head(&self) -> i64 {
-		sqlx::query_scalar("SELECT COALESCE(max(position), 0) FROM scope_outbox").fetch_one(&self.pool).await.unwrap()
+		sqlx::query_scalar("SELECT COALESCE(max(position), 0) FROM scope_outbox").fetch_one(&self.db.pool).await.unwrap()
 	}
 
 	async fn lifecycle_head(&self) -> i64 {
-		sqlx::query_scalar("SELECT COALESCE(max(position), 0) FROM user_outbox").fetch_one(&self.pool).await.unwrap()
+		sqlx::query_scalar("SELECT COALESCE(max(position), 0) FROM user_outbox").fetch_one(&self.db.pool).await.unwrap()
 	}
 
 	/// Every scope event `request` sees past `after`, following the cursor to the head.
@@ -367,7 +364,6 @@ async fn a_client_sees_its_scope_and_the_scopes_that_name_it_an_observer_and_not
 async fn lifecycle_rows_are_redacted_for_a_client_and_start_after_the_join_snapshot() {
 	let Some(fx) = setup().await else { return };
 	let scope = fx.scope(&[], false).await;
-	// From before the user's first row: a page from 0 overflows on a shared database.
 	let start = fx.lifecycle_head().await;
 	let user = fx.user("redacted").await;
 	assert!(fx.sign_in(&scope, user).await);
@@ -424,7 +420,7 @@ async fn member_joined_then_grants_changed_carry_snapshots_and_per_user_sequence
 
 	let row_version: i64 = sqlx::query_scalar("SELECT row_version FROM users WHERE id = $1")
 		.bind(user.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	let member = mine[0].member.as_ref().unwrap();
@@ -458,7 +454,7 @@ async fn a_sign_in_through_a_client_makes_the_user_visible_once() {
 	let by: String = sqlx::query_scalar("SELECT joined_by FROM scope_members WHERE scope = $1 AND user_id = $2")
 		.bind(&scope.id)
 		.bind(user.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(by, "sign_in");
@@ -517,7 +513,7 @@ async fn the_stream_is_written_with_the_change_or_not_at_all() {
 	let scope = fx.scope(&[], false).await;
 	let start = fx.scope_head().await;
 
-	let mut tx = fx.pool.begin().await.unwrap();
+	let mut tx = fx.db.pool.begin().await.unwrap();
 	sqlx::query("UPDATE tenants SET display_name = 'Rolled back' WHERE id = $1")
 		.bind(&scope.id)
 		.execute(&mut *tx)
@@ -528,7 +524,7 @@ async fn the_stream_is_written_with_the_change_or_not_at_all() {
 
 	sqlx::query("UPDATE tenants SET display_name = 'Committed' WHERE id = $1")
 		.bind(&scope.id)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let events = fx.pull_all(start, |r| as_client(r, &scope)).await;
@@ -542,7 +538,7 @@ async fn the_stream_is_written_with_the_change_or_not_at_all() {
 	assert!(fx.pull_all(start, |r| as_client(r, &scope)).await.len() == 1, "a refused grant makes nobody a member");
 	let members: i64 = sqlx::query_scalar("SELECT count(*) FROM scope_members WHERE scope = $1")
 		.bind(&scope.id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(members, 0);
@@ -651,7 +647,7 @@ async fn a_service_credential_is_the_client_and_its_own_secret_or_the_bridge_tok
 
 	sqlx::query("UPDATE rp_clients SET disabled_at = 1 WHERE client_id = $1")
 		.bind(&scope.client)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -661,7 +657,7 @@ async fn a_service_credential_is_the_client_and_its_own_secret_or_the_bridge_tok
 	);
 	assert!(fx.events.pull_scope_events(as_client(pull(), &other)).await.is_ok());
 
-	let unconfigured = Bridge::new(fx.pool.clone(), None);
+	let unconfigured = Bridge::new(fx.db.pool.clone(), None);
 	assert_eq!(
 		refused(unconfigured.pull_user_lifecycle(as_bridge(PullUserLifecycleRequest { after_position: 0, limit: 1 })).await),
 		Code::Unavailable,
@@ -778,10 +774,14 @@ async fn a_scope_catalog_is_kept_per_version_and_never_rolls_back() {
 	);
 	let got = fx.catalogs.get_scope_catalog(as_client(GetScopeCatalogRequest {}, &scope)).await.unwrap().into_inner();
 	assert_eq!(got.version, 100, "nothing refused replaced the catalog in force");
-	// Withdraw the topic: a scope topic is offered to every subscriber of the shared database.
+	// Withdraw the topic: a scope topic is offered to every subscriber of the database.
 	fx.catalogs.publish_scope_catalog(as_client(publication(101, vec![], vec![]), &scope)).await.unwrap();
 
-	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1").bind(&scope.id).execute(&fx.pool).await.unwrap();
+	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1")
+		.bind(&scope.id)
+		.execute(&fx.db.pool)
+		.await
+		.unwrap();
 	assert_eq!(
 		code(fx.catalogs.publish_scope_catalog(as_client(publication(102, vec![], vec![]), &scope)).await),
 		Some(Code::FailedPrecondition)
@@ -856,21 +856,20 @@ async fn the_bridge_token_publishes_the_money_planes_namespace() {
 		}],
 		proposer: String::new(),
 	};
-	match fx.catalogs.publish_scope_catalog(as_bridge(publication(version, vec![kind], vec![]))).await {
-		Ok(_) => {}
-		// Another run on this shared database already published a newer `bank` catalog.
-		Err(status) => assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}"),
-	}
+	fx.catalogs
+		.publish_scope_catalog(as_bridge(publication(version, vec![kind], vec![])))
+		.await
+		.expect("the bridge publishes the bank catalog");
 	let got = fx.catalogs.get_scope_catalog(as_bridge(GetScopeCatalogRequest {})).await.unwrap().into_inner();
 	assert_eq!(got.namespace, "bank");
-	assert!(got.version >= version);
+	assert_eq!(got.version, version);
 }
 
 #[tokio::test]
 async fn a_scope_topic_is_offered_beside_the_built_in_ones_until_withdrawn() {
 	let Some(fx) = setup().await else { return };
 	let scope = fx.scope(&[], false).await;
-	let notifications = PgNotifications::new(fx.pool.clone());
+	let notifications = PgNotifications::new(fx.db.pool.clone());
 	let topic = scope.p("marks");
 	assert!(!topic_known(&notifications, &topic).await.unwrap());
 

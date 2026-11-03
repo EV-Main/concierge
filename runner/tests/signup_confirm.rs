@@ -46,7 +46,7 @@ async fn resend(fx: &Surface, origin: &str, ticket: &Value, turnstile: &str) -> 
 async fn queued(fx: &Surface, email: &str) -> i64 {
 	sqlx::query_scalar("SELECT count(*) FROM notification_deliveries WHERE kind = 'email_code' AND recipient = $1")
 		.bind(email)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap()
 }
@@ -54,7 +54,7 @@ async fn queued(fx: &Surface, email: &str) -> i64 {
 async fn state_of(fx: &Surface, email: &str) -> (bool, bool) {
 	sqlx::query_as("SELECT u.email_verified, EXISTS (SELECT 1 FROM password_credentials p WHERE p.user_id = u.id) FROM users u WHERE u.email = $1")
 		.bind(email)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap()
 }
@@ -175,7 +175,7 @@ async fn an_expired_code_is_recovered_by_a_resend_under_the_same_ticket() {
 	let first = fx.mailed_code(&email, "verify").await;
 	sqlx::query("UPDATE email_codes SET expires_at = 0 WHERE email = $1 AND purpose = 'verify'")
 		.bind(&email)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let late = confirm(&fx, INVEST, &ticket, &first, &mut Browser::default()).await;
@@ -227,7 +227,7 @@ async fn a_sign_up_whose_code_was_throttled_still_gets_its_ticket() {
 	sqlx::query("INSERT INTO users (id, auth_subject, email, email_verified) VALUES ($1, $1::text, $2, FALSE)")
 		.bind(twin)
 		.bind(&email)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	for _ in 0..concierge::ports::CODE_SENDS_PER_WINDOW {
@@ -238,7 +238,7 @@ async fn a_sign_up_whose_code_was_throttled_still_gets_its_ticket() {
 		.bind(uuid::Uuid::new_v4())
 		.bind(&email)
 		.bind(twin)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	}
@@ -258,7 +258,7 @@ async fn a_disabled_account_confirms_nothing() {
 	let code = fx.mailed_code(&email, "verify").await;
 	let status = |s: &'static str| sqlx::query("UPDATE users SET status = $2 WHERE email = $1").bind(email.clone()).bind(s);
 
-	status("disabled").execute(&fx.pool).await.unwrap();
+	status("disabled").execute(&fx.db.pool).await.unwrap();
 	let refused = confirm(&fx, INVEST, &ticket, &code, &mut Browser::default()).await;
 	assert_eq!((refused.status, refused.body), (StatusCode::FORBIDDEN, json!({ "error": "disabled" })));
 	assert_eq!(state_of(&fx, &email).await, (false, true));
@@ -267,7 +267,7 @@ async fn a_disabled_account_confirms_nothing() {
 	assert_eq!((resent.status, resent.body), (StatusCode::OK, json!({ "ok": true })));
 	assert_eq!(queued(&fx, &email).await, before, "a disabled account is mailed nothing");
 
-	status("active").execute(&fx.pool).await.unwrap();
+	status("active").execute(&fx.db.pool).await.unwrap();
 	let done = confirm(&fx, INVEST, &ticket, &code, &mut Browser::default()).await;
 	assert_eq!(done.status, StatusCode::OK, "the same code and ticket still work: {:?}", done.body);
 }

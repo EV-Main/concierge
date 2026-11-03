@@ -12,7 +12,7 @@ use axum::{
 	http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use concierge::{
-	infrastructure::{db, governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
+	infrastructure::{governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
 	ports::{ScopeRecord, ScopeRepository},
 	scopes::ScopeRegistry,
 	web::{
@@ -34,17 +34,10 @@ use uuid::Uuid;
 const PUBLIC: &str = "https://evinvest.test";
 const INVEST: &str = "https://invest.evinvest.ltd";
 
-async fn pool() -> Option<PgPool> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
-	Some(pool)
-}
-
-macro_rules! pool {
+macro_rules! db {
 	() => {
-		match pool().await {
-			Some(pool) => pool,
+		match common::Db::migrated().await {
+			Some(db) => db,
 			None => return,
 		}
 	};
@@ -62,7 +55,8 @@ async fn version_of(pool: &PgPool, id: &str) -> i64 {
 
 #[tokio::test]
 async fn the_migration_seeds_invest_and_gives_sa_its_host() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	let scopes = PgScopes::new(pool.clone()).scopes().await.expect("read the registry");
 
 	let invest = scopes.iter().find(|s| s.id == "invest").expect("invest is seeded");
@@ -96,7 +90,8 @@ async fn the_migration_seeds_invest_and_gives_sa_its_host() {
 
 #[tokio::test]
 async fn a_scope_moves_its_version_on_any_change_but_a_secret_rotation() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	let id = tag();
 	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, FALSE, 0)")
 		.bind(&id)
@@ -131,7 +126,8 @@ async fn a_scope_moves_its_version_on_any_change_but_a_secret_rotation() {
 
 #[tokio::test]
 async fn the_registry_refuses_what_could_widen_sign_in() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	let id = tag();
 	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, FALSE, 0)")
 		.bind(&id)
@@ -185,7 +181,8 @@ async fn the_registry_refuses_what_could_widen_sign_in() {
 /// and the other enforced.
 #[tokio::test]
 async fn a_tenant_is_its_own_namespace() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	for (id, namespace) in [(tag(), tag()), (tag(), "sa".to_owned())] {
 		let refused = sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $2, FALSE, 0)")
 			.bind(&id)
@@ -227,7 +224,8 @@ fn signed_in<T>(inner: T) -> RpcRequest<T> {
 
 #[tokio::test]
 async fn scope_registry_lists_main_first_and_reads_one_scope() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	let registry = ScopeRegistry::new(Arc::new(PgScopes::new(pool)));
 
 	let scopes = registry.list_scopes(signed_in(ListScopesRequest {})).await.expect("list").into_inner().scopes;
@@ -344,7 +342,8 @@ fn varies_on_origin(headers: &HeaderMap) -> bool {
 
 #[tokio::test]
 async fn a_scope_host_passes_the_preflight_of_a_sign_in_route() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	let (router, _, _) = sign_in_surface(&pool).await;
 
 	let (status, headers) = preflight(&router, "/auth/code/request", INVEST, "POST").await;
@@ -364,7 +363,8 @@ async fn a_scope_host_passes_the_preflight_of_a_sign_in_route() {
 
 #[tokio::test]
 async fn nothing_but_a_registered_live_origin_passes_the_preflight() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	let (router, closed_origin, _) = sign_in_surface(&pool).await;
 	for origin in [
 		"https://evil.example",
@@ -391,7 +391,8 @@ async fn nothing_but_a_registered_live_origin_passes_the_preflight() {
 
 #[tokio::test]
 async fn a_route_acting_on_an_open_session_answers_no_scope_host() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	let (router, _, _) = sign_in_surface(&pool).await;
 	for path in [
 		"/auth/email/verify/request",
@@ -414,7 +415,8 @@ async fn a_route_acting_on_an_open_session_answers_no_scope_host() {
 
 #[tokio::test]
 async fn a_scope_host_requests_a_code_and_reads_the_answer() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	let (router, _, _) = sign_in_surface(&pool).await;
 	let email = format!("scope-{}@example.com", Uuid::new_v4().simple());
 	let (status, headers, body) = call(&router, Method::POST, "/auth/code/request", INVEST, Some(json!({ "email": email, "turnstileToken": "human" }))).await;
@@ -428,7 +430,8 @@ async fn a_scope_host_requests_a_code_and_reads_the_answer() {
 /// registered live scope hosts and nothing else.
 #[tokio::test]
 async fn a_credential_post_from_any_other_origin_is_refused() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	let (router, closed_origin, _) = sign_in_surface(&pool).await;
 	let body = json!({ "email": "x@example.com", "turnstileToken": "human" });
 	for origin in [
@@ -452,7 +455,8 @@ async fn a_credential_post_from_any_other_origin_is_refused() {
 
 #[tokio::test]
 async fn the_session_read_from_a_scope_host_carries_no_token() {
-	let pool = pool!();
+	let db = db!();
+	let pool = db.pool.clone();
 	let (router, _, _) = sign_in_surface(&pool).await;
 	let (status, headers, body) = call(&router, Method::GET, "/auth/session", INVEST, None).await;
 	assert_eq!(status, StatusCode::OK);
@@ -679,13 +683,11 @@ async fn a_missing_bundle_directory_is_not_mounted() {
 // ── a live registry ────────────────────────────────────────────────────────────────
 
 /// Closing a scope, or dropping an origin from it, stops it being let in by the next
-/// reading of the registry — no restart. In a database of its own: whether a refresh
-/// rebuilds is the point, and any scope another suite writes would rebuild it.
+/// reading of the registry — no restart.
 #[tokio::test]
 async fn a_closed_scope_or_a_removed_origin_stops_signing_in_without_a_restart() {
-	let Some(url) = common::database_url() else { return };
-	let scratch = common::Scratch::create(&url).await;
-	let pool = scratch.pool.clone();
+	let db = db!();
+	let pool = db.pool.clone();
 	let (router, _, allowlist) = sign_in_surface(&pool).await;
 	let id = tag();
 	let origin = format!("https://{id}.evinvest.ltd");
@@ -731,38 +733,33 @@ async fn a_closed_scope_or_a_removed_origin_stops_signing_in_without_a_restart()
 		.unwrap();
 	allowlist.refresh().await;
 	assert!(!admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1), "removed");
-	scratch.drop_database().await;
 }
 
 /// A row that does not decode costs its own scope, never the plane's start. The CHECKs
-/// make such a row unwritable, so this one is planted with them dropped — in a database
-/// of its own.
+/// make such a row unwritable, so this one is planted with them dropped.
 #[tokio::test]
 async fn a_malformed_registry_row_is_left_out_not_fatal() {
-	let Some(url) = common::database_url() else { return };
-	let scratch = common::Scratch::create(&url).await;
+	let db = db!();
 	for constraint in ["tenants_origins", "tenants_state"] {
 		sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE tenants DROP CONSTRAINT {constraint}")))
-			.execute(&scratch.pool)
+			.execute(&db.pool)
 			.await
 			.unwrap();
 	}
 	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, origins) VALUES ('nulls', 'nulls', FALSE, 0, ARRAY[NULL]::TEXT[])")
-		.execute(&scratch.pool)
+		.execute(&db.pool)
 		.await
 		.unwrap();
 	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, state) VALUES ('bogus', 'bogus', FALSE, 0, 'paused')")
-		.execute(&scratch.pool)
+		.execute(&db.pool)
 		.await
 		.unwrap();
 
-	let repo = Arc::new(PgScopes::new(scratch.pool.clone()));
+	let repo = Arc::new(PgScopes::new(db.pool.clone()));
 	let ids: Vec<String> = repo.scopes().await.expect("the registry reads").into_iter().map(|s| s.id).collect();
 	assert_eq!(ids, vec!["invest", "sa"], "the two bad rows are left out");
 	assert!(repo.scope("nulls").await.unwrap().is_none());
 	assert!(repo.scope("invest").await.unwrap().is_some());
 	let allowlist = SignInAllowlist::live(repo, PUBLIC).await.expect("the allowlist builds over a bad row");
 	assert!(allowlist.admits(INVEST));
-
-	scratch.drop_database().await;
 }

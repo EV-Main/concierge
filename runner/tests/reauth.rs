@@ -101,7 +101,7 @@ async fn the_code_mail_says_what_it_is_for() {
 	fx.reauth_code(&mut browser).await;
 	let purpose: String = sqlx::query_scalar("SELECT payload->>'purpose' FROM notification_deliveries WHERE kind = 'email_code' AND recipient = $1 ORDER BY id DESC LIMIT 1")
 		.bind(&email)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(purpose, "reauth");
@@ -117,7 +117,7 @@ async fn a_revoked_session_cannot_re_authenticate() {
 	fx.sign_in_with_code(&email, &mut browser).await;
 	sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE email = $1")
 		.bind(&email)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 
@@ -336,7 +336,7 @@ mod passkeys {
 		let mut browser = Browser::default();
 		fx.sign_in_with_code(&email, &mut browser).await;
 		let mut device = register(&fx, &mut browser).await;
-		let user: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1").bind(&email).fetch_one(&fx.pool).await.unwrap();
+		let user: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1").bind(&email).fetch_one(&fx.db.pool).await.unwrap();
 
 		// Offered while the passkey still counts as older than the session...
 		let begun = fx.post("/auth/reauth/passkey/options", ORIGIN, json!({}), &mut browser).await;
@@ -346,7 +346,7 @@ mod passkeys {
 		// ...then made to look planted after it.
 		sqlx::query("UPDATE passkey_credentials SET created_at = created_at + 100000 WHERE user_id = $1")
 			.bind(user)
-			.execute(&fx.pool)
+			.execute(&fx.db.pool)
 			.await
 			.unwrap();
 

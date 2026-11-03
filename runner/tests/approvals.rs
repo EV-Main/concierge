@@ -2,14 +2,8 @@
 //! (`docs/SCOPES-AND-APPROVALS.md` §5).
 //!
 //! Every test registers its own scope (`s_<random>`, namespace = scope id) with a client
-//! and a published catalog, so it shares the database with the other suites without
-//! reading their proposals. The clock is a value the test moves: a delay or a 72h lifetime
+//! and a published catalog. The clock is a value the test moves: a delay or a 72h lifetime
 //! is crossed by setting it, never by sleeping.
-//!
-//! ⚠️ The tests that reach the PLATFORM roster own it: it is every `users.role = 'owner'`
-//! in the database, so they clear it under the session advisory lock `governance.rs`,
-//! `user_governance.rs` and `authz_gate.rs` take, and only against a database the
-//! `CONCIERGE_TEST_DB` marker calls disposable.
 
 use std::sync::{
 	Arc,
@@ -19,7 +13,7 @@ use std::sync::{
 use concierge::{
 	approvals::{ApprovalExecution, Approvals},
 	authz::BreakGlass,
-	infrastructure::{approvals::PgApprovals, db, relying_parties::PgRelyingParties, scope_catalogs::PgScopeCatalogs, users::PgUsers},
+	infrastructure::{approvals::PgApprovals, relying_parties::PgRelyingParties, scope_catalogs::PgScopeCatalogs, users::PgUsers},
 	ports::{ApprovalRepository, RelyingPartyRepository, UserDirectoryRepository},
 	scope_catalog::ScopeCatalogs,
 	service_caller::ServiceCallers,
@@ -35,21 +29,17 @@ use evconcierge_contracts::concierge::v1::{
 	propose_scope_admin_grant_request, scope_catalog_service_server::ScopeCatalogService,
 };
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, PgConnection, PgPool};
 use tonic::{Code, Request, metadata::MetadataValue};
 use uuid::Uuid;
 
 mod common;
 
 const BRIDGE_TOKEN: &str = "test-bridge-token";
-/// The key the roster-owning suites serialize on — deliberately the same one.
-const ROSTER_LOCK: i64 = 0x676f_765f_6974; // "gov_it"
 const T0: i64 = 1_900_000_000;
 const HOUR: i64 = 60 * 60;
 
 struct Fx {
-	pool: PgPool,
-	url: String,
+	db: common::Db,
 	users: Arc<PgUsers>,
 	rp: PgRelyingParties,
 	catalogs: ScopeCatalogs,
@@ -77,9 +67,8 @@ impl Scope {
 }
 
 async fn setup() -> Option<Fx> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 10).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let db = common::Db::migrated().await?;
+	let pool = db.pool.clone();
 	let callers = ServiceCallers::new(Some(BRIDGE_TOKEN.into()), Arc::new(PgRelyingParties::new(pool.clone())));
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let catalog_repo = Arc::new(PgScopeCatalogs::new(pool.clone()));
@@ -98,8 +87,7 @@ async fn setup() -> Option<Fx> {
 		catalogs: ScopeCatalogs::new(callers, catalog_repo),
 		rp: PgRelyingParties::new(pool.clone()),
 		users,
-		pool,
-		url,
+		db,
 		clock,
 	})
 }
@@ -246,7 +234,7 @@ impl Fx {
 	async fn auth_subject(&self, user: UserId) -> String {
 		sqlx::query_scalar("SELECT auth_subject FROM users WHERE id = $1")
 			.bind(user.raw())
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -262,14 +250,14 @@ impl Fx {
 		};
 		sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, FALSE, 0)")
 			.bind(&scope.id)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("register the scope");
 		sqlx::query("INSERT INTO rp_clients (client_id, audience, redirect_uris, created_at, tenant_id) VALUES ($1, $1, $2, 0, $3)")
 			.bind(&scope.client)
 			.bind(vec![format!("https://{tag}.test/cb")])
 			.bind(&scope.id)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("register the client");
 		self.rp
@@ -330,7 +318,7 @@ impl Fx {
 				.bind(admin.raw())
 				.bind(&scope.id)
 				.bind(granter.raw())
-				.execute(&self.pool)
+				.execute(&self.db.pool)
 				.await
 				.expect("grant the admin alias");
 			admins.push(admin);
@@ -338,17 +326,10 @@ impl Fx {
 		admins
 	}
 
-	/// Exactly `n` platform owners, held until the returned connection drops.
-	async fn owners(&self, n: usize) -> (PgConnection, Vec<UserId>) {
-		common::assert_disposable_database();
-		let mut lock = PgConnection::connect(&self.url).await.expect("a connection for the roster lock");
-		sqlx::query("SELECT pg_advisory_lock($1)")
-			.bind(ROSTER_LOCK)
-			.execute(&mut lock)
-			.await
-			.expect("take the roster lock");
+	/// Exactly `n` platform owners: whoever held a seat before holds none.
+	async fn owners(&self, n: usize) -> Vec<UserId> {
 		sqlx::query("UPDATE users SET role = 'investor' WHERE role = 'owner'")
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("clear the roster");
 		let mut owners = Vec::with_capacity(n);
@@ -357,7 +338,7 @@ impl Fx {
 			self.users.set_role(id, Role::Owner).await.expect("seat the owner");
 			owners.push(id);
 		}
-		(lock, owners)
+		owners
 	}
 
 	async fn awaiting(&self, who: UserId, id: &str) -> bool {
@@ -476,7 +457,7 @@ async fn a_scope_proposal_passes_on_more_than_half_waits_out_the_delay_and_is_ex
 
 	let history: Vec<String> = sqlx::query_scalar("SELECT event FROM approval_events WHERE approval_id = $1::uuid ORDER BY id")
 		.bind(&opened.id)
-		.fetch_all(&fx.pool)
+		.fetch_all(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(history, ["opened", "voted", "voted", "passed", "executed"]);
@@ -606,7 +587,7 @@ async fn an_open_proposal_expires_lazily_and_frees_its_subject() {
 	);
 	let stored: String = sqlx::query_scalar("SELECT state FROM approvals WHERE id = $1::uuid")
 		.bind(&opened.id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(stored, "open", "a read writes nothing");
@@ -614,7 +595,7 @@ async fn an_open_proposal_expires_lazily_and_frees_its_subject() {
 	assert_eq!(code(fx.vote(admins[0], &opened.id, ApprovalVote::For).await), Some(Code::FailedPrecondition));
 	let stored: String = sqlx::query_scalar("SELECT state FROM approvals WHERE id = $1::uuid")
 		.bind(&opened.id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(stored, "expired", "the refused vote still wrote the expiry it found");
@@ -626,7 +607,7 @@ async fn an_open_proposal_expires_lazily_and_frees_its_subject() {
 #[tokio::test]
 async fn an_amount_above_the_threshold_goes_to_the_platform_owners() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	fx.admins(&scope, 3).await;
 	fx.at(T0);
@@ -671,7 +652,7 @@ async fn an_amount_above_the_threshold_goes_to_the_platform_owners() {
 #[tokio::test]
 async fn a_scope_with_one_admin_escalates_and_a_platform_of_one_owner_refuses() {
 	let Some(fx) = setup().await else { return };
-	let (lock, _owners) = fx.owners(2).await;
+	fx.owners(2).await;
 	let scope = fx.scope().await;
 	let admin = fx.admins(&scope, 1).await[0];
 	fx.at(T0);
@@ -685,9 +666,8 @@ async fn a_scope_with_one_admin_escalates_and_a_platform_of_one_owner_refuses() 
 		Some(Code::PermissionDenied),
 		"the lone admin sees it and is not on the owners' roster"
 	);
-	drop(lock);
 
-	let (_lock, _owners) = fx.owners(1).await;
+	fx.owners(1).await;
 	assert_eq!(
 		code(fx.services.propose(as_client(transfer(&scope, "10"), &scope)).await),
 		Some(Code::FailedPrecondition),
@@ -700,7 +680,7 @@ async fn a_scope_with_one_admin_escalates_and_a_platform_of_one_owner_refuses() 
 #[tokio::test]
 async fn proposals_opened_together_cannot_split_past_the_daily_window() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, _owners) = fx.owners(2).await;
+	fx.owners(2).await;
 	let scope = fx.scope().await;
 	fx.admins(&scope, 2).await;
 	fx.at(T0);
@@ -739,7 +719,7 @@ async fn proposals_opened_together_cannot_split_past_the_daily_window() {
 #[tokio::test]
 async fn an_execution_counts_against_the_window_for_a_day_after_it_happened() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, _owners) = fx.owners(2).await;
+	fx.owners(2).await;
 	let scope = fx.scope().await;
 	let admins = fx.admins(&scope, 2).await;
 	fx.at(T0);
@@ -952,7 +932,11 @@ async fn propose_refuses_what_it_cannot_render_or_decide() {
 	};
 	assert_eq!(code(fx.services.propose(as_client(huge, &scope)).await), Some(Code::InvalidArgument), "31 whole digits");
 
-	sqlx::query("UPDATE tenants SET state = 'frozen' WHERE id = $1").bind(&scope.id).execute(&fx.pool).await.unwrap();
+	sqlx::query("UPDATE tenants SET state = 'frozen' WHERE id = $1")
+		.bind(&scope.id)
+		.execute(&fx.db.pool)
+		.await
+		.unwrap();
 	assert_eq!(
 		code(fx.services.propose(as_client(transfer(&scope, "1"), &scope)).await),
 		Some(Code::FailedPrecondition),
@@ -985,7 +969,7 @@ async fn a_withdrawn_or_voided_proposal_is_closed_and_a_removed_admin_has_no_say
 	let opened = fx.propose(&scope, transfer(&scope, "10")).await;
 	sqlx::query("UPDATE grants SET revoked_at = 1, revoked_by = granted_by WHERE user_id = $1 AND revoked_at IS NULL")
 		.bind(admins[0].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -1015,7 +999,7 @@ async fn a_withdrawn_or_voided_proposal_is_closed_and_a_removed_admin_has_no_say
 #[tokio::test]
 async fn an_owner_who_lost_the_seat_cannot_vote_on_a_frozen_roster() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	fx.at(T0);
 	let holder = fx.user("holder").await;
@@ -1035,7 +1019,7 @@ async fn an_owner_who_lost_the_seat_cannot_vote_on_a_frozen_roster() {
 	assert_eq!(opened.level, ApprovalLevel::Platform as i32);
 	sqlx::query("UPDATE users SET role = 'investor' WHERE id = $1")
 		.bind(owners[0].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let read = fx.get(owners[1], &opened.id).await;
@@ -1044,7 +1028,7 @@ async fn an_owner_who_lost_the_seat_cannot_vote_on_a_frozen_roster() {
 	assert_eq!(code(fx.vote(owners[1], &opened.id, ApprovalVote::For).await), Some(Code::FailedPrecondition));
 	let event: String = sqlx::query_scalar("SELECT event FROM approval_events WHERE approval_id = $1::uuid ORDER BY id DESC LIMIT 1")
 		.bind(&opened.id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(event, "roster_changed", "written in the transaction that moved the seat");
@@ -1076,7 +1060,7 @@ async fn the_bridge_proposes_in_any_scope() {
 #[tokio::test]
 async fn an_owner_vetoes_a_scope_decision_inside_its_delay() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(2).await;
+	let owners = fx.owners(2).await;
 	let scope = fx.scope().await;
 	let admins = fx.admins(&scope, 2).await;
 	fx.at(T0);
@@ -1128,7 +1112,7 @@ async fn an_unexecuted_decision_lapses_after_its_execution_window() {
 	let (stored, event): (String, String) =
 		sqlx::query_as("SELECT a.state, e.event FROM approvals a JOIN approval_events e ON e.approval_id = a.id WHERE a.id = $1::uuid ORDER BY e.id DESC LIMIT 1")
 			.bind(&opened.id)
-			.fetch_one(&fx.pool)
+			.fetch_one(&fx.db.pool)
 			.await
 			.unwrap();
 	assert_eq!((stored.as_str(), event.as_str()), ("void", "lapsed"), "the refused report wrote the lapse it found");
@@ -1194,7 +1178,7 @@ async fn awaiting_my_vote_forgets_a_member_who_lost_the_seat() {
 	assert!(fx.awaiting(admins[0], &opened.id).await);
 	sqlx::query("UPDATE grants SET revoked_at = 1, revoked_by = granted_by WHERE user_id = $1 AND revoked_at IS NULL")
 		.bind(admins[0].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	assert!(!fx.awaiting(admins[0], &opened.id).await, "a vote they would be refused is not asked of them");
@@ -1231,8 +1215,6 @@ async fn a_namespace_holds_a_bounded_number_of_live_proposals() {
 
 impl Fx {
 	/// One pass of the executor of this plane's own kinds, as the background loop runs it.
-	/// The pass is global — it takes on every due `concierge:*` decision in the database,
-	/// other suites' too — so a test asserts on its own proposals, never on the count.
 	async fn execute(&self) {
 		let mut backoff = concierge::approvals::ExecutorBackoff::default();
 		concierge::approvals::execute_due(self.repo.as_ref(), &mut backoff, std::time::Duration::from_secs(30))
@@ -1279,7 +1261,7 @@ impl Fx {
 		sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM grants WHERE user_id = $1 AND target = $2 || ':admin' AND revoked_at IS NULL)")
 			.bind(user.raw())
 			.bind(&scope.id)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -1345,7 +1327,7 @@ async fn this_planes_own_kinds_are_listed_beside_the_published_ones() {
 #[tokio::test]
 async fn the_owners_grant_a_scope_admin_and_the_opener_does_not_vote() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let subject = fx.user("subject").await;
 	fx.at(T0);
@@ -1376,14 +1358,14 @@ async fn the_owners_grant_a_scope_admin_and_the_opener_does_not_vote() {
 	let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM grants WHERE user_id = $1 AND target = $2 || ':admin'")
 		.bind(subject.raw())
 		.bind(&scope.id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(grants, 1, "one decision, one execution");
 	let granted_by: Uuid = sqlx::query_scalar("SELECT granted_by FROM grants WHERE user_id = $1 AND target = $2 || ':admin' AND revoked_at IS NULL")
 		.bind(subject.raw())
 		.bind(&scope.id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(granted_by, owners[0].raw(), "the grant names who asked for it");
@@ -1395,7 +1377,7 @@ async fn the_owners_grant_a_scope_admin_and_the_opener_does_not_vote() {
 #[tokio::test]
 async fn who_may_open_a_scope_admin_grant() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, _owners) = fx.owners(2).await;
+	fx.owners(2).await;
 	let scope = fx.scope().await;
 	let seat = fx.user("seat").await;
 	fx.users.set_role(seat, Role::Admin).await.unwrap();
@@ -1417,7 +1399,7 @@ async fn who_may_open_a_scope_admin_grant() {
 #[tokio::test]
 async fn only_the_opener_cancels_a_concierge_proposal() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let admins = fx.admins(&scope, 2).await;
 	let subject = fx.user("subject").await;
@@ -1439,7 +1421,7 @@ async fn only_the_opener_cancels_a_concierge_proposal() {
 #[tokio::test]
 async fn a_scope_policy_is_changed_by_the_owners_and_then_measures_its_proposals() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let admins = fx.admins(&scope, 2).await;
 	fx.at(T0);
@@ -1499,7 +1481,7 @@ async fn a_scope_policy_is_changed_by_the_owners_and_then_measures_its_proposals
 #[tokio::test]
 async fn a_policy_is_checked_again_when_it_is_executed() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(2).await;
+	let owners = fx.owners(2).await;
 	let scope = fx.scope().await;
 	let admins = fx.admins(&scope, 2).await;
 	fx.at(T0);
@@ -1544,7 +1526,7 @@ async fn a_for_vote_of_someone_who_lost_the_seat_is_not_counted() {
 	fx.vote(admins[0], &opened.id, ApprovalVote::For).await.unwrap();
 	sqlx::query("UPDATE grants SET revoked_at = 1, revoked_by = granted_by WHERE user_id = $1 AND revoked_at IS NULL")
 		.bind(admins[0].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let one = fx.vote(admins[1], &opened.id, ApprovalVote::For).await.unwrap();
@@ -1612,7 +1594,7 @@ async fn the_live_cap_counts_one_scope() {
 #[tokio::test]
 async fn the_owners_read_the_policy_they_are_asked_to_install() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(2).await;
+	let owners = fx.owners(2).await;
 	let scope = fx.scope().await;
 	let admins = fx.admins(&scope, 2).await;
 	fx.at(T0);
@@ -1644,7 +1626,7 @@ async fn a_policy_only_tightens_the_kinds_thresholds() {
 #[tokio::test]
 async fn a_scope_admin_is_an_account_with_a_proven_address() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let unproven = fx.users.resolve(common::google("unproven", false), 0).await.unwrap().id();
 	fx.at(T0);
@@ -1656,7 +1638,7 @@ async fn a_scope_admin_is_an_account_with_a_proven_address() {
 	fx.vote(owners[2], &opened.id, ApprovalVote::For).await.unwrap();
 	sqlx::query("UPDATE users SET email_verified = FALSE WHERE id = $1")
 		.bind(subject.raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	fx.at(T0 + 24 * HOUR);
@@ -1672,7 +1654,7 @@ async fn a_scope_admin_is_an_account_with_a_proven_address() {
 #[tokio::test]
 async fn a_hold_on_an_owner_is_not_a_change_of_the_owners() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	fx.at(T0);
 	let opened = fx.grant_admin(owners[0], &scope, fx.user("subject").await).await.unwrap();
@@ -1707,7 +1689,7 @@ async fn a_hold_on_an_owner_is_not_a_change_of_the_owners() {
 #[tokio::test]
 async fn a_consilium_suspension_of_an_owner_changes_the_owners() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	fx.at(T0);
 	let opened = fx.grant_admin(owners[0], &scope, fx.user("subject").await).await.unwrap();
@@ -1716,7 +1698,7 @@ async fn a_consilium_suspension_of_an_owner_changes_the_owners() {
 	// The columns the executed suspension verdict writes (`domain::users::User::suspend`).
 	sqlx::query("UPDATE users SET status = 'disabled', suspended_by = 'governance' WHERE id = $1")
 		.bind(owners[1].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(state(&fx.get(owners[0], &opened.id).await), ApprovalState::Void);
@@ -1731,7 +1713,7 @@ async fn a_consilium_suspension_of_an_owner_changes_the_owners() {
 
 	sqlx::query("UPDATE users SET status = 'active', suspended_by = NULL WHERE id = $1")
 		.bind(owners[1].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	assert!(
@@ -1740,7 +1722,7 @@ async fn a_consilium_suspension_of_an_owner_changes_the_owners() {
 	);
 	let changes: i64 = sqlx::query_scalar("SELECT count(*) FROM approval_events WHERE approval_id = $1::uuid AND event = 'roster_changed'")
 		.bind(&opened.id)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(changes, 1, "voided once, by the suspension");
@@ -1750,7 +1732,7 @@ async fn a_consilium_suspension_of_an_owner_changes_the_owners() {
 #[tokio::test]
 async fn the_executor_carries_on_past_a_failing_decision() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(2).await;
+	let owners = fx.owners(2).await;
 	let broken_scope = fx.scope().await;
 	let scope = fx.scope().await;
 	let admins = fx.admins(&broken_scope, 2).await;
@@ -1770,7 +1752,7 @@ async fn the_executor_carries_on_past_a_failing_decision() {
 	)
 	.bind(&broken_scope.id)
 	.bind(&broken.id)
-	.execute(&fx.pool)
+	.execute(&fx.db.pool)
 	.await
 	.unwrap();
 	fx.at(T0 + 25 * HOUR);
@@ -1792,7 +1774,7 @@ async fn only_seated_against_votes_reject() {
 	fx.vote(admins[0], &opened.id, ApprovalVote::For).await.unwrap();
 	sqlx::query("UPDATE grants SET revoked_at = 1, revoked_by = granted_by WHERE user_id = $1 AND revoked_at IS NULL")
 		.bind(admins[0].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let against = fx.vote(admins[1], &opened.id, ApprovalVote::Against).await.unwrap();
@@ -1868,7 +1850,7 @@ impl Fx {
 
 	async fn db_now(&self) -> i64 {
 		sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::BIGINT")
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -1888,7 +1870,7 @@ impl Fx {
 #[tokio::test]
 async fn a_proven_initiator_does_not_vote_on_a_money_decision() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let kind = fx.bank_platform_kind(&scope).await;
 	fx.at(T0);
@@ -1911,7 +1893,7 @@ async fn a_proven_initiator_does_not_vote_on_a_money_decision() {
 	let notice: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.dedupe_key = $2")
 		.bind(owners[0].raw())
 		.bind(format!("approval:{}", proven.id))
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(notice, 1, "the person it names hears that a decision was opened in their name");
@@ -1956,7 +1938,7 @@ async fn a_proven_initiator_does_not_vote_on_a_money_decision() {
 #[tokio::test]
 async fn a_proof_needs_a_re_authentication_within_the_window() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let kind = fx.bank_platform_kind(&scope).await;
 	fx.at(T0);
@@ -1996,7 +1978,7 @@ async fn a_proof_needs_a_re_authentication_within_the_window() {
 #[tokio::test]
 async fn a_proof_dated_ahead_of_the_clock_is_refused() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let kind = fx.bank_platform_kind(&scope).await;
 	fx.at(T0);
@@ -2034,14 +2016,14 @@ async fn a_proof_dated_ahead_of_the_clock_is_refused() {
 #[tokio::test]
 async fn one_re_authentication_proves_one_request() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let kind = fx.bank_platform_kind(&scope).await;
 	fx.at(T0);
 	let in_scope = || async {
 		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM approvals WHERE scope = $1")
 			.bind(&scope.id)
-			.fetch_one(&fx.pool)
+			.fetch_one(&fx.db.pool)
 			.await
 			.unwrap()
 	};
@@ -2068,7 +2050,7 @@ async fn one_re_authentication_proves_one_request() {
 #[tokio::test]
 async fn a_proven_initiator_needs_two_other_owners() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(2).await;
+	let owners = fx.owners(2).await;
 	let scope = fx.scope().await;
 	let kind = fx.bank_platform_kind(&scope).await;
 	fx.at(T0);
@@ -2084,7 +2066,7 @@ async fn a_proven_initiator_needs_two_other_owners() {
 #[tokio::test]
 async fn the_floor_counts_owners_who_can_decide() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let kind = fx.bank_platform_kind(&scope).await;
 	let action = concierge::infrastructure::users::AdminAction {
@@ -2106,7 +2088,7 @@ async fn the_floor_counts_owners_who_can_decide() {
 #[tokio::test]
 async fn the_store_refuses_a_platform_decision_inside_the_pause() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(2).await;
+	let owners = fx.owners(2).await;
 	let policy = fx.platform_policy(owners[0]).await;
 	let inside = policy.roster_changed_at + i64::from(policy.cooldown_secs) - 1;
 	let insert = |created_at: i64| {
@@ -2117,7 +2099,7 @@ async fn the_store_refuses_a_platform_decision_inside_the_pause() {
 			 0, 86400, $1, $1 + 100, gen_random_uuid()::TEXT)",
 		)
 		.bind(created_at)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 	};
 	let refused = insert(inside).await.unwrap_err();
 	assert!(refused.to_string().contains("pause"), "{refused}");
@@ -2129,7 +2111,7 @@ async fn the_store_refuses_a_platform_decision_inside_the_pause() {
 #[tokio::test]
 async fn platform_decisions_pause_after_the_owners_change() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	fx.admins(&scope, 2).await;
 	let kind = fx.bank_platform_kind(&scope).await;
@@ -2159,7 +2141,7 @@ async fn platform_decisions_pause_after_the_owners_change() {
 #[tokio::test]
 async fn the_owners_set_the_platform_cooldown() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	fx.at(T0);
 	let propose = |who: UserId, cooldown_secs: u32| {
 		fx.people.propose_platform_policy_change(as_user(
@@ -2197,7 +2179,7 @@ async fn the_owners_set_the_platform_cooldown() {
 #[tokio::test]
 async fn only_an_owner_taken_off_the_roster_is_told() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, _owners) = fx.owners(3).await;
+	fx.owners(3).await;
 	let scope = fx.scope().await;
 	let admin = fx.admins(&scope, 2).await[0];
 	let kind = fx.bank_platform_kind(&scope).await;
@@ -2211,7 +2193,7 @@ async fn only_an_owner_taken_off_the_roster_is_told() {
 		 WHERE s.user_id = $1 AND n.kind = 'approval_opened_in_your_name'",
 	)
 	.bind(admin.raw())
-	.fetch_one(&fx.pool)
+	.fetch_one(&fx.db.pool)
 	.await
 	.unwrap();
 	assert_eq!(notices, 0, "nothing to veto, nothing to tell");
@@ -2222,7 +2204,7 @@ async fn only_an_owner_taken_off_the_roster_is_told() {
 #[tokio::test]
 async fn a_retry_with_a_token_is_checked_as_the_first_call_was() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let kind = fx.bank_platform_kind(&scope).await;
 	fx.at(T0);
@@ -2342,7 +2324,7 @@ async fn a_known_money_kind_is_published_no_looser_than_the_floor() {
 #[tokio::test]
 async fn the_floor_escalates_what_the_catalog_left_out() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, _owners) = fx.owners(2).await;
+	fx.owners(2).await;
 	let scope = fx.scope().await;
 	fx.admins(&scope, 2).await;
 	fx.publish_bank(bank_spec("bank:account_transfer", ApprovalLevel::Scope, vec![spec("amount", ApprovalFieldType::Amount)], vec![]))
@@ -2431,7 +2413,7 @@ fn payout_spec() -> ApprovalKindSpec {
 #[tokio::test]
 async fn a_kind_escalates_on_a_count() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, _owners) = fx.owners(2).await;
+	fx.owners(2).await;
 	let scope = fx.scope().await;
 	fx.admins(&scope, 2).await;
 	let kind = scope.kind("seats");
@@ -2484,7 +2466,7 @@ async fn a_kind_escalates_on_a_count() {
 #[tokio::test]
 async fn an_owner_named_by_a_grant_does_not_decide_it() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	fx.at(T0);
 	let opened = fx.grant_admin(owners[0], &scope, owners[1]).await.expect("an owner may become a scope's admin");
@@ -2500,7 +2482,7 @@ async fn an_owner_named_by_a_grant_does_not_decide_it() {
 #[tokio::test]
 async fn the_floor_binds_a_stored_catalog_and_policy() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, _owners) = fx.owners(2).await;
+	fx.owners(2).await;
 	let invest = Scope {
 		id: "invest".into(),
 		client: "invest".into(),
@@ -2525,7 +2507,7 @@ async fn the_floor_binds_a_stored_catalog_and_policy() {
 	sqlx::query("INSERT INTO scope_catalogs (namespace, version, catalog, published_at, published_by) VALUES ('invest', $1, $2, 0, 'invest') ON CONFLICT DO NOTHING")
 		.bind(4_000_000_000i64)
 		.bind(&catalog)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.expect("store a catalog written before the floor");
 	let decided: Uuid = sqlx::query_scalar(
@@ -2535,7 +2517,7 @@ async fn the_floor_binds_a_stored_catalog_and_policy() {
 		 repeat('0', 64), 'r', 2, 2, 1, 86400, $1, $1 + 100, gen_random_uuid()::TEXT, 'executed', $1, $1, $1, 'executed') RETURNING id",
 	)
 	.bind(T0)
-	.fetch_one(&fx.pool)
+	.fetch_one(&fx.db.pool)
 	.await
 	.expect("an executed policy change to hang the stored policy off");
 	sqlx::query(
@@ -2545,7 +2527,7 @@ async fn the_floor_binds_a_stored_catalog_and_policy() {
 		 FROM scope_approval_policies WHERE scope = 'invest'",
 	)
 	.bind(decided)
-	.execute(&fx.pool)
+	.execute(&fx.db.pool)
 	.await
 	.expect("store a policy written before the floor");
 	fx.at(T0);
@@ -2589,7 +2571,7 @@ async fn the_floor_binds_a_stored_catalog_and_policy() {
 #[tokio::test]
 async fn the_daily_floor_counts_the_live_transfers() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, _owners) = fx.owners(2).await;
+	fx.owners(2).await;
 	let scope = fx.scope().await;
 	fx.admins(&scope, 2).await;
 	let kind = fx.bank_kind(&scope).await;
@@ -2613,16 +2595,20 @@ impl Fx {
 	async fn mails(&self, prefix: &str) -> Vec<(String, String, serde_json::Value)> {
 		sqlx::query_as("SELECT dedupe_key, recipient, payload FROM notification_deliveries WHERE dedupe_key LIKE $1 || '%' ORDER BY dedupe_key")
 			.bind(prefix)
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.unwrap()
 	}
 
 	async fn email(&self, user: UserId) -> String {
-		sqlx::query_scalar("SELECT email FROM users WHERE id = $1").bind(user.raw()).fetch_one(&self.pool).await.unwrap()
+		sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+			.bind(user.raw())
+			.fetch_one(&self.db.pool)
+			.await
+			.unwrap()
 	}
 
-	/// Run the outcome sweep until it finds nothing: other suites' proposals share it.
+	/// Run the outcome sweep until it finds nothing.
 	async fn sweep(&self) {
 		while self.repo.mail_outcomes(500).await.expect("the outcome sweep") > 0 {}
 	}
@@ -2640,7 +2626,7 @@ async fn opening_mails_each_reachable_roster_member_once() {
 		.bind(unproven.raw())
 		.bind(&scope.id)
 		.bind(admins[0].raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let requester = fx.user("requester").await;
@@ -2733,7 +2719,7 @@ async fn the_requester_is_told_each_outcome_once() {
 #[tokio::test]
 async fn a_client_proves_its_initiator_with_its_own_fresh_token() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(3).await;
+	let owners = fx.owners(3).await;
 	let scope = fx.scope().await;
 	let holder = fx.user("holder").await;
 	fx.at(T0);
@@ -2807,7 +2793,7 @@ async fn a_client_proves_its_initiator_with_its_own_fresh_token() {
 #[tokio::test]
 async fn a_client_proof_with_two_owners_is_refused() {
 	let Some(fx) = setup().await else { return };
-	let (_lock, owners) = fx.owners(2).await;
+	let owners = fx.owners(2).await;
 	let scope = fx.scope().await;
 	let holder = fx.user("holder").await;
 	fx.at(T0);

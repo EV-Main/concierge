@@ -101,7 +101,7 @@ async fn a_disabled_account_reads_nothing_and_its_session_ends() {
 	for _ in 0..=READS.len() {
 		sessions.push(signed_in(&fx, &email).await);
 	}
-	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(id).execute(&fx.pool).await.unwrap();
+	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1").bind(id).execute(&fx.db.pool).await.unwrap();
 
 	every_read_ends_the_session(&fx, sessions, (StatusCode::FORBIDDEN, json!({ "error": "disabled" }))).await;
 }

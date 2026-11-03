@@ -70,6 +70,8 @@ concierge = { path = ".", features = ["test-support"] }
 evconcierge_auth = { workspace = true, features = ["test-support"] }
 # A software authenticator, so the passkey suite drives real WebAuthn ceremonies.
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+# Temporary file trees that remove themselves.
+v_fixtures = "^0.3.4"
 
 [lints]
 workspace = true

@@ -4,14 +4,14 @@
 //! namespace is `PUBLIC_ORIGIN` only and behind `concierge:notifications:read_all`.
 //!
 //! The scopes here are made per test (a tenant row with its own origin and catalog) rather
-//! than the seeded `invest`/`sa`, whose catalogs other suites on a shared database publish.
+//! than the seeded `invest`/`sa`.
 
 use std::sync::Arc;
 
 mod common;
 
 use axum::http::{Method, StatusCode};
-use common::web::{Browser, ORIGIN, Surface, address, surface};
+use common::web::{Browser, ORIGIN, Surface, address, surface_on};
 use concierge::{
 	infrastructure::{notifications::PgNotifications, scope_catalogs::PgScopeCatalogs, users::PgUsers},
 	notification::{INBOX_VIEW_HEADER, MAX_MARK_IDS, Notifications, RateLimiter, TOPICS},
@@ -23,22 +23,18 @@ use evconcierge_contracts::concierge::v1::{
 	GetNotificationSettingsRequest, GetUnreadCountRequest, ListNotificationsRequest, MarkReadRequest, SetTopicSubscriptionRequest, notification_service_server::NotificationService,
 };
 use serde_json::{Value, json};
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::PgPool;
 use tonic::{Code, Request};
 use uuid::Uuid;
 
-macro_rules! fixture {
+macro_rules! db {
 	() => {
-		match surface().await {
-			Some(fx) => fx,
+		match common::Db::migrated().await {
+			Some(db) => Arc::new(db),
 			None => return,
 		}
 	};
 }
-
-/// The key `governance.rs` and `authz_gate.rs` serialize on: both clear the owner roster,
-/// and the summary is checked here with an owner.
-const ROSTER_LOCK: i64 = 0x676f_765f_6974;
 
 struct Scope {
 	id: String,
@@ -95,10 +91,6 @@ async fn scope_with(pool: &PgPool, required: bool) -> Scope {
 const BANK_NOTICE: &str = "bank:notice_test";
 
 /// A `bank:` topic in the money plane's catalog, and the required [`BANK_NOTICE`] beside it.
-/// The catalog is shared with every suite on the database, and `scope_inbox.rs` leaves it a
-/// second ahead of the clock just before this binary runs, so the topics are added to the
-/// catalog in force under a version past both, as that suite does; a race between the tests
-/// here ends in the same content.
 async fn bank_topic(pool: &PgPool) -> String {
 	const TOPIC: &str = "bank:inbox_test";
 	let mine = [
@@ -120,22 +112,16 @@ async fn bank_topic(pool: &PgPool) -> String {
 		},
 	];
 	let catalogs = PgScopeCatalogs::new(pool.clone());
-	for _ in 0..10 {
-		let current = catalogs.current("bank").await.unwrap();
-		if current.as_ref().is_some_and(|c| mine.iter().all(|t| c.notification_topics.contains(t))) {
-			return TOPIC.into();
-		}
-		let mut catalog = current.unwrap_or(ScopeCatalog {
-			version: 0,
-			approval_kinds: Vec::new(),
-			notification_topics: Vec::new(),
-		});
-		catalog.notification_topics.retain(|t| mine.iter().all(|m| m.topic != t.topic));
-		catalog.notification_topics.extend(mine.iter().cloned());
-		catalog.version = catalog.version.max(now() as u64) + 1;
-		catalogs.publish("bank", "bridge", &catalog, now()).await.expect("publish the bank catalog");
-	}
-	panic!("the bank catalog never held this suite's topics");
+	let mut catalog = catalogs.current("bank").await.unwrap().unwrap_or(ScopeCatalog {
+		version: 0,
+		approval_kinds: Vec::new(),
+		notification_topics: Vec::new(),
+	});
+	catalog.notification_topics.retain(|t| mine.iter().all(|m| m.topic != t.topic));
+	catalog.notification_topics.extend(mine);
+	catalog.version = catalog.version.max(now() as u64) + 1;
+	catalogs.publish("bank", "bridge", &catalog, now()).await.expect("publish the bank catalog");
+	TOPIC.into()
 }
 
 async fn join(pool: &PgPool, scope: &Scope, user: Uuid) {
@@ -166,13 +152,12 @@ async fn settings_from(fx: &Surface, origin: &str, query: &str, browser: &mut Br
 
 #[tokio::test]
 async fn a_scope_member_sees_only_the_scope_namespace_on_its_host() {
-	let Some(url) = common::database_url() else { return };
-	let pool = PgPool::connect(&url).await.unwrap();
-	let mine = scope(&pool).await;
-	let other = scope(&pool).await;
-	let fx = fixture!();
+	let db = db!();
+	let mine = scope(&db.pool).await;
+	let other = scope(&db.pool).await;
+	let fx = surface_on(db).await;
 	let (mut browser, id) = signed_in(&fx, "member").await;
-	join(&fx.pool, &mine, id).await;
+	join(&fx.db.pool, &mine, id).await;
 
 	let (status, body) = settings_from(&fx, &mine.origin, "", &mut browser).await;
 	assert_eq!(status, StatusCode::OK, "{body:?}");
@@ -216,10 +201,9 @@ async fn a_scope_member_sees_only_the_scope_namespace_on_its_host() {
 
 #[tokio::test]
 async fn a_scope_host_shows_an_outsider_nothing_and_lets_them_follow_nothing() {
-	let Some(url) = common::database_url() else { return };
-	let pool = PgPool::connect(&url).await.unwrap();
-	let theirs = scope(&pool).await;
-	let fx = fixture!();
+	let db = db!();
+	let theirs = scope(&db.pool).await;
+	let fx = surface_on(db).await;
 	let (mut browser, _) = signed_in(&fx, "outsider").await;
 
 	let (status, body) = settings_from(&fx, &theirs.origin, "", &mut browser).await;
@@ -239,13 +223,12 @@ async fn a_scope_host_shows_an_outsider_nothing_and_lets_them_follow_nothing() {
 
 #[tokio::test]
 async fn the_platform_inbox_holds_the_built_ins_and_the_bank_and_no_scope() {
-	let Some(url) = common::database_url() else { return };
-	let pool = PgPool::connect(&url).await.unwrap();
-	let a_scope = scope(&pool).await;
-	let bank = bank_topic(&pool).await;
-	let fx = fixture!();
+	let db = db!();
+	let a_scope = scope(&db.pool).await;
+	let bank = bank_topic(&db.pool).await;
+	let fx = surface_on(db).await;
 	let (mut browser, id) = signed_in(&fx, "platform").await;
-	join(&fx.pool, &a_scope, id).await;
+	join(&fx.db.pool, &a_scope, id).await;
 
 	for origin in [Some(ORIGIN), None] {
 		let mut request = axum::http::Request::builder().method(Method::GET).uri("/auth/notifications/settings");
@@ -287,25 +270,18 @@ async fn the_platform_inbox_holds_the_built_ins_and_the_bank_and_no_scope() {
 
 #[tokio::test]
 async fn the_summary_needs_the_permission_and_the_public_origin() {
-	let Some(url) = common::database_url() else { return };
-	common::assert_disposable_database();
-	let pool = PgPool::connect(&url).await.unwrap();
-	let a_scope = scope(&pool).await;
-	let fx = fixture!();
+	let db = db!();
+	let a_scope = scope(&db.pool).await;
+	let fx = surface_on(db).await;
 	let (mut browser, id) = signed_in(&fx, "summary").await;
 
 	let (status, body) = settings_from(&fx, ORIGIN, "?all=1", &mut browser).await;
 	assert_eq!((status, body), (StatusCode::FORBIDDEN, json!({ "error": "forbidden" })), "an investor has no summary");
 
-	let mut roster_lock = PgConnection::connect(&url).await.unwrap();
-	sqlx::query("SELECT pg_advisory_lock($1)").bind(ROSTER_LOCK).execute(&mut roster_lock).await.unwrap();
-	sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1").bind(id).execute(&fx.pool).await.unwrap();
+	sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1").bind(id).execute(&fx.db.pool).await.unwrap();
 
 	let (status, body) = settings_from(&fx, ORIGIN, "?all=1", &mut browser).await;
 	let (on_scope_host, _) = settings_from(&fx, &a_scope.origin, "?all=1", &mut browser).await;
-
-	sqlx::query("UPDATE users SET role = 'investor' WHERE id = $1").bind(id).execute(&fx.pool).await.unwrap();
-	sqlx::query("SELECT pg_advisory_unlock($1)").bind(ROSTER_LOCK).execute(&mut roster_lock).await.unwrap();
 
 	assert_eq!(status, StatusCode::OK, "{body:?}");
 	let shown = topics(&body);
@@ -346,10 +322,8 @@ fn grpc<T>(id: Uuid, inner: T, summary: bool) -> Request<T> {
 /// settings leave every scope's notifications alone.
 #[tokio::test]
 async fn a_user_token_on_grpc_reads_the_platform_inbox() {
-	let Some(url) = common::database_url() else { return };
-	common::assert_disposable_database();
-	let pool = concierge::infrastructure::db::connect_sized(&url, 5).await.unwrap();
-	concierge::infrastructure::db::migrate(&pool).await.unwrap();
+	let db = db!();
+	let pool = db.pool.clone();
 	let a_scope = scope(&pool).await;
 	let bank = bank_topic(&pool).await;
 	let users = Arc::new(PgUsers::new(pool.clone()));
@@ -429,12 +403,8 @@ async fn a_user_token_on_grpc_reads_the_platform_inbox() {
 	};
 	assert_eq!(service.mark_read(grpc(id, too_many, false)).await.unwrap_err().code(), Code::InvalidArgument);
 
-	let mut roster_lock = PgConnection::connect(&url).await.unwrap();
-	sqlx::query("SELECT pg_advisory_lock($1)").bind(ROSTER_LOCK).execute(&mut roster_lock).await.unwrap();
 	sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1").bind(id).execute(&pool).await.unwrap();
 	let summary = service.list_notifications(grpc(id, ListNotificationsRequest::default(), true)).await;
-	sqlx::query("UPDATE users SET role = 'investor' WHERE id = $1").bind(id).execute(&pool).await.unwrap();
-	sqlx::query("SELECT pg_advisory_unlock($1)").bind(ROSTER_LOCK).execute(&mut roster_lock).await.unwrap();
 
 	let summary = summary.unwrap().into_inner();
 	assert_eq!(summary.notifications.len(), 3, "an owner's summary holds every namespace");
@@ -447,13 +417,12 @@ async fn a_user_token_on_grpc_reads_the_platform_inbox() {
 /// and both accept following it.
 #[tokio::test]
 async fn a_required_topic_is_locked_on_the_web_and_on_grpc() {
-	let Some(url) = common::database_url() else { return };
-	let pool = PgPool::connect(&url).await.unwrap();
-	let mine = scope_with(&pool, true).await;
-	bank_topic(&pool).await;
-	let fx = fixture!();
+	let db = db!();
+	let mine = scope_with(&db.pool, true).await;
+	bank_topic(&db.pool).await;
+	let fx = surface_on(db).await;
 	let (mut browser, id) = signed_in(&fx, "required").await;
-	join(&fx.pool, &mine, id).await;
+	join(&fx.db.pool, &mine, id).await;
 
 	let (status, body) = settings_from(&fx, &mine.origin, "", &mut browser).await;
 	assert_eq!(status, StatusCode::OK, "{body:?}");
@@ -488,8 +457,8 @@ async fn a_required_topic_is_locked_on_the_web_and_on_grpc() {
 	assert_eq!(followed.status, StatusCode::OK, "following a required topic is accepted: {:?}", followed.body);
 
 	let service = Notifications::new(
-		Arc::new(PgNotifications::new(fx.pool.clone())),
-		Arc::new(PgUsers::new(fx.pool.clone())),
+		Arc::new(PgNotifications::new(fx.db.pool.clone())),
+		Arc::new(PgUsers::new(fx.db.pool.clone())),
 		Arc::new(RateLimiter::new(std::time::Duration::from_secs(60), 10)),
 		Arc::new(concierge::notice_link::NoticeLinkBases::cabinet_only("https://evinvest.ltd/cabinet")),
 	);

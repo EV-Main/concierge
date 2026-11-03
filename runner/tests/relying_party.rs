@@ -23,7 +23,7 @@ use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
 	infrastructure::{
-		db, governance::PgGovernance, grants::PgGrants, kyc::cases::PgKycCases, notifications::PgNotifications, platform::PgPlatform, relying_parties::PgRelyingParties, users::PgUsers,
+		governance::PgGovernance, grants::PgGrants, kyc::cases::PgKycCases, notifications::PgNotifications, platform::PgPlatform, relying_parties::PgRelyingParties, users::PgUsers,
 	},
 	platform::Platform,
 	ports::{ClientRecord, RelyingPartyRepository, UserDirectoryRepository},
@@ -42,7 +42,6 @@ use evconcierge_contracts::concierge::v1::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use tonic::{
 	Code, Request,
 	server::NamedService,
@@ -97,7 +96,7 @@ struct TestClient {
 }
 
 struct Fx {
-	pool: PgPool,
+	db: Arc<common::Db>,
 	users: Arc<PgUsers>,
 	repo: Arc<PgRelyingParties>,
 	rp: Arc<RelyingParties>,
@@ -106,9 +105,12 @@ struct Fx {
 }
 
 async fn setup() -> Option<Fx> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	Some(setup_on(Arc::new(common::Db::migrated().await?)).await)
+}
+
+/// A client of its own over `db`, which another fixture may share.
+async fn setup_on(db: Arc<common::Db>) -> Fx {
+	let pool = db.pool.clone();
 
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let repo = Arc::new(PgRelyingParties::new(pool.clone()));
@@ -152,14 +154,7 @@ async fn setup() -> Option<Fx> {
 	let (provisioner, rx) = provisioner_channel();
 	tokio::spawn(concierge::directory::run_provisioner(rx, users.clone(), Arc::new(BreakGlass::new(Vec::new()))));
 	let auth = AuthService::try_new(auth_config(), provisioner).await.expect("auth service").with_client_grants(rp.clone());
-	Some(Fx {
-		pool,
-		users,
-		repo,
-		rp,
-		auth,
-		client,
-	})
+	Fx { db, users, repo, rp, auth, client }
 }
 
 macro_rules! fixture {
@@ -183,7 +178,7 @@ impl Fx {
 			.bind(user.raw())
 			.bind(&self.client.namespace)
 			.bind(granter.raw())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("grant the operator alias");
 	}
@@ -192,7 +187,7 @@ impl Fx {
 		sqlx::query("UPDATE users SET status = $2 WHERE id = $1")
 			.bind(user.raw())
 			.bind(status)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("set status");
 	}
@@ -200,7 +195,7 @@ impl Fx {
 	async fn bump_token_version(&self, user: UserId) {
 		sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
 			.bind(user.raw())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("bump token_version");
 	}
@@ -287,7 +282,7 @@ impl Fx {
 	async fn revoked_reason(&self, session: Uuid) -> Option<String> {
 		sqlx::query_scalar("SELECT revoked_reason FROM rp_sessions WHERE id = $1")
 			.bind(session)
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -361,7 +356,7 @@ async fn an_expired_code_is_refused() {
 	let (code, verifier) = fx.code_for(user).await;
 	sqlx::query("UPDATE rp_codes SET expires_at = issued_at - 1 WHERE code_hash = $1")
 		.bind(sha256(&code))
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 
@@ -455,7 +450,7 @@ impl Fx {
 		sqlx::query("UPDATE tenants SET state = $2 WHERE id = $1")
 			.bind(&self.client.namespace)
 			.bind(state)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.expect("set the scope state");
 	}
@@ -507,7 +502,7 @@ async fn refresh_after_revoke_all_is_refused() {
 async fn a_refresh_token_is_bound_to_its_client() {
 	let fx = fixture!();
 	let (_, tokens) = fx.signed_in().await;
-	let other = fixture!();
+	let other = setup_on(fx.db.clone()).await;
 
 	let status = AuthRpc::refresh_client_token(
 		&other.auth,
@@ -553,8 +548,8 @@ async fn boot_at(fx: &Fx) -> (Channel, String) {
 
 	let users: Arc<dyn UserDirectoryRepository> = fx.users.clone();
 	let break_glass = Arc::new(BreakGlass::new(Vec::new()));
-	let directory = Directory::new(users.clone(), Arc::new(PgGrants::new(fx.pool.clone())), break_glass.clone());
-	let platform = Platform::new(users, break_glass, Arc::new(PgPlatform::new(fx.pool.clone())));
+	let directory = Directory::new(users.clone(), Arc::new(PgGrants::new(fx.db.pool.clone())), break_glass.clone());
+	let platform = Platform::new(users, break_glass, Arc::new(PgPlatform::new(fx.db.pool.clone())));
 	let issuance = fx.auth.clone();
 	tokio::spawn(async move {
 		Server::builder()
@@ -644,12 +639,12 @@ async fn router(fx: &Fx) -> Router {
 		fx.auth.clone(),
 		"https://evinvest.test".to_string(),
 		false,
-		common::inert_sign_in(&fx.pool),
+		common::inert_sign_in(&fx.db.pool),
 		KycDeps {
 			users: fx.users.clone(),
-			cases: Arc::new(PgKycCases::new(fx.pool.clone())),
-			notifications: Arc::new(PgNotifications::new(fx.pool.clone())),
-			governance: Arc::new(PgGovernance::new(fx.pool.clone())),
+			cases: Arc::new(PgKycCases::new(fx.db.pool.clone())),
+			notifications: Arc::new(PgNotifications::new(fx.db.pool.clone())),
+			governance: Arc::new(PgGovernance::new(fx.db.pool.clone())),
 			provider: None,
 			support_email: "support@evinvest.test".into(),
 			case_ttl_secs: 86_400,
@@ -846,7 +841,7 @@ async fn a_cancelled_sign_in_is_refused_even_with_a_live_session() {
 	}
 	let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM rp_codes WHERE user_id = $1")
 		.bind(user.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(codes, 0);
@@ -957,7 +952,7 @@ async fn a_session_minted_before_a_token_version_bump_gets_no_code_and_ends() {
 	assert!(fx.auth.live_family(&refresh_token).await.unwrap().is_none(), "the family is revoked upstream");
 	let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM rp_codes WHERE user_id = $1")
 		.bind(squatted.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(codes, 0);
@@ -973,7 +968,7 @@ async fn get_me_on_a_client_token_carries_no_identity_document_fields() {
 		"UPDATE users SET legal_name = 'Jane Q Public', preferred_name = 'Jane', phone = '+15550100', date_of_birth = '1990-01-01', nationality = 'DE', tax_residence = 'DE', residential_address = '1 Main St', kyc_level = 1 WHERE id = $1",
 	)
 	.bind(user.raw())
-	.execute(&fx.pool)
+	.execute(&fx.db.pool)
 	.await
 	.expect("fill the profile");
 	let mut directory = UserDirectoryClient::new(boot(&fx).await);
@@ -1017,7 +1012,7 @@ async fn a_session_is_not_opened_off_a_code_whose_replay_is_still_committing() {
 	let code_hash = sha256(&code);
 
 	// The replaying transaction has marked the code but not committed yet.
-	let mut replay = fx.pool.begin().await.unwrap();
+	let mut replay = fx.db.pool.begin().await.unwrap();
 	sqlx::query("SELECT 1 FROM rp_codes WHERE code_hash = $1 FOR UPDATE")
 		.bind(&code_hash)
 		.execute(&mut *replay)
@@ -1053,7 +1048,7 @@ async fn a_session_is_not_opened_off_a_code_whose_replay_is_still_committing() {
 	assert!(!opening.await.unwrap().unwrap(), "open_session must wait for the replay and then refuse");
 	let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM rp_sessions WHERE code_hash = $1")
 		.bind(&code_hash)
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(sessions, 0);
@@ -1221,7 +1216,7 @@ async fn the_registry_refuses_a_redirect_uri_of_the_wrong_shape() {
 	let fx = fixture!();
 	// Each attempt in its own transaction, rolled back: nothing is left registered.
 	let register = |uri: &'static str| {
-		let pool = fx.pool.clone();
+		let pool = fx.db.pool.clone();
 		async move {
 			let mut tx = pool.begin().await.unwrap();
 			let id = format!("shape_{}", uuid::Uuid::new_v4().simple().to_string().get(..12).unwrap());
@@ -1336,7 +1331,7 @@ async fn max_age_sends_a_stale_session_to_confirm_and_only_a_confirmed_trip_stam
 	let codes = || async {
 		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rp_codes WHERE user_id = $1")
 			.bind(user.raw())
-			.fetch_one(&fx.pool)
+			.fetch_one(&fx.db.pool)
 			.await
 			.unwrap()
 	};
@@ -1512,7 +1507,7 @@ async fn the_confirmation_page_reads_the_apps_name_from_the_registry() {
 	let router = router(&fx).await;
 	sqlx::query("UPDATE tenants SET display_name = 'Test App' WHERE id = $1")
 		.bind(&fx.client.namespace)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let read = |path: String| {
@@ -1532,7 +1527,7 @@ async fn the_confirmation_page_reads_the_apps_name_from_the_registry() {
 	assert_eq!(read("/auth/clients/no_such_client".into()).await.0, StatusCode::NOT_FOUND);
 	sqlx::query("UPDATE rp_clients SET disabled_at = 1 WHERE client_id = $1")
 		.bind(&fx.client.id)
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap();
 	let (status, _, body) = read(format!("/auth/clients/{}", fx.client.id)).await;
@@ -1575,8 +1570,8 @@ async fn a_real_client_token_from_a_trip_proves_the_initiator_and_a_plain_one_do
 		fx.rp.clone(),
 	);
 	let callers = ServiceCallers::new(Some("test-bridge-token".into()), fx.repo.clone());
-	let catalogs = Arc::new(PgScopeCatalogs::new(fx.pool.clone()));
-	let services = ApprovalExecution::new(callers.clone(), Arc::new(PgApprovals::new(fx.pool.clone())), catalogs.clone()).with_client_tokens(Arc::new(client_tokens));
+	let catalogs = Arc::new(PgScopeCatalogs::new(fx.db.pool.clone()));
+	let services = ApprovalExecution::new(callers.clone(), Arc::new(PgApprovals::new(fx.db.pool.clone())), catalogs.clone()).with_client_tokens(Arc::new(client_tokens));
 	let as_client = |mut request: Request<ProposeRequest>| {
 		request.metadata_mut().insert("x-ev-client-id", MetadataValue::try_from(fx.client.id.as_str()).unwrap());
 		request
@@ -1610,7 +1605,7 @@ async fn a_real_client_token_from_a_trip_proves_the_initiator_and_a_plain_one_do
 	ScopeCatalogs::new(callers, catalogs).publish_scope_catalog(publish).await.expect("publish the client's kind");
 	let auth_subject: String = sqlx::query_scalar("SELECT auth_subject FROM users WHERE id = $1")
 		.bind(user.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	let propose = |token: String| {

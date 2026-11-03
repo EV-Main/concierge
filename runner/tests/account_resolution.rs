@@ -6,10 +6,7 @@
 mod common;
 
 use concierge::{
-	infrastructure::{
-		db,
-		users::{AdminAction, PgUsers},
-	},
+	infrastructure::users::{AdminAction, PgUsers},
 	ports::UserDirectoryRepository,
 };
 use domain::{
@@ -17,21 +14,19 @@ use domain::{
 	error::DomainError,
 	users::{Email, UserId},
 };
-use sqlx::PgPool;
 use uuid::Uuid;
 
 struct Fx {
 	users: PgUsers,
-	pool: PgPool,
+	db: common::Db,
 }
 
 async fn setup() -> Option<Fx> {
-	let url = common::database_url()?;
-	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
-	db::migrate(&pool).await.expect("apply migrations");
+	let db = common::Db::migrated().await?;
+	let pool = db.pool.clone();
 	Some(Fx {
 		users: PgUsers::new(pool.clone()),
-		pool,
+		db,
 	})
 }
 
@@ -75,12 +70,12 @@ impl Fx {
 		sqlx::query("INSERT INTO users (id, auth_subject, email, email_verified) VALUES ($1, $1::text, $2, FALSE)")
 			.bind(id.raw())
 			.bind(email)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.unwrap();
 		sqlx::query("INSERT INTO password_credentials (user_id, phc, updated_at) VALUES ($1, '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA', 0)")
 			.bind(id.raw())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.unwrap();
 		id
@@ -91,13 +86,13 @@ impl Fx {
 	async fn plant(&self, id: UserId, email: &str) {
 		sqlx::query("UPDATE users SET username = 'squatter_handle', legal_name = 'Not The Owner' WHERE id = $1")
 			.bind(id.raw())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.unwrap();
 		sqlx::query("INSERT INTO passkey_credentials (credential_id, user_id, passkey, name, created_at) VALUES ($1, $2, '{}'::jsonb, 'squatter key', 0)")
 			.bind(format!("cred-{}", Uuid::new_v4().simple()))
 			.bind(id.raw())
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.unwrap();
 		let subscriber: Uuid = sqlx::query_scalar(
@@ -107,12 +102,12 @@ impl Fx {
 		.bind(id.raw())
 		.bind(email)
 		.bind(Uuid::new_v4().simple().to_string())
-		.fetch_one(&self.pool)
+		.fetch_one(&self.db.pool)
 		.await
 		.unwrap();
 		sqlx::query("INSERT INTO notification_subscriptions (subscriber_id, topic) VALUES ($1, 'account:security')")
 			.bind(subscriber)
-			.execute(&self.pool)
+			.execute(&self.db.pool)
 			.await
 			.unwrap();
 	}
@@ -120,7 +115,7 @@ impl Fx {
 	async fn has_password(&self, id: UserId) -> bool {
 		sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM password_credentials WHERE user_id = $1)")
 			.bind(id.raw())
-			.fetch_one(&self.pool)
+			.fetch_one(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -128,7 +123,7 @@ impl Fx {
 	async fn identities(&self, id: UserId) -> Vec<(String, String)> {
 		sqlx::query_as("SELECT provider, subject FROM user_identities WHERE user_id = $1 ORDER BY provider")
 			.bind(id.raw())
-			.fetch_all(&self.pool)
+			.fetch_all(&self.db.pool)
 			.await
 			.unwrap()
 	}
@@ -202,7 +197,7 @@ async fn proving_a_mailbox_takes_over_an_unverified_password_registration() {
 
 	let audited: Vec<serde_json::Value> = sqlx::query_scalar("SELECT detail FROM admin_action WHERE subject_user_id = $1 AND action = 'taken_over_by_mailbox'")
 		.bind(squatted.raw())
-		.fetch_all(&fx.pool)
+		.fetch_all(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(audited.len(), 1);
@@ -210,7 +205,7 @@ async fn proving_a_mailbox_takes_over_an_unverified_password_registration() {
 
 	let passkeys: i64 = sqlx::query_scalar("SELECT count(*) FROM passkey_credentials WHERE user_id = $1")
 		.bind(squatted.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(passkeys, 0, "a passkey the squatter enrolled signs nobody back in");
@@ -222,13 +217,13 @@ async fn proving_a_mailbox_takes_over_an_unverified_password_registration() {
 	assert_eq!(owner.legal_name(), None, "nothing the squatter wrote into the profile stays");
 	let (in_app, mail): (bool, bool) = sqlx::query_as("SELECT in_app_enabled, email_enabled FROM notification_subscribers WHERE user_id = $1")
 		.bind(squatted.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert!(in_app && mail, "a squatter who switched mail off does not silence the owner");
 	let topics: i64 = sqlx::query_scalar("SELECT count(*) FROM notification_subscriptions s JOIN notification_subscribers n ON n.id = s.subscriber_id WHERE n.user_id = $1")
 		.bind(squatted.raw())
-		.fetch_one(&fx.pool)
+		.fetch_one(&fx.db.pool)
 		.await
 		.unwrap();
 	assert_eq!(topics, 0);
@@ -256,7 +251,7 @@ async fn one_verified_mailbox_names_one_account_at_the_column() {
 	let other = fx.users.resolve(common::google_as(&subject(), &email, false), 2).await.unwrap();
 	let err = sqlx::query("UPDATE users SET email_verified = TRUE WHERE id = $1")
 		.bind(other.id().raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap_err();
 	assert!(err.to_string().contains("users_verified_email_idx"), "{err}");
@@ -272,7 +267,7 @@ async fn an_unverified_mailbox_holds_no_kyc_level() {
 
 	let err = sqlx::query("UPDATE users SET kyc_level = 1 WHERE id = $1")
 		.bind(user.id().raw())
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.unwrap_err();
 	assert!(err.to_string().contains("users_kyc_needs_verified_email"), "and so does the column: {err}");
@@ -290,7 +285,7 @@ async fn the_previous_binary_cannot_duplicate_a_linked_google_account() {
 		.bind(Uuid::new_v4())
 		.bind(&sub)
 		.bind(address("dup"))
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await;
 	assert!(old_insert.is_err(), "the mirror trigger refuses a sub that is already linked");
 
@@ -300,7 +295,7 @@ async fn the_previous_binary_cannot_duplicate_a_linked_google_account() {
 		.bind(id)
 		.bind(&fresh)
 		.bind(address("old"))
-		.execute(&fx.pool)
+		.execute(&fx.db.pool)
 		.await
 		.expect("an unlinked sub provisions as before");
 	let reopened = fx.users.resolve(common::google_as(&fresh, &address("old-again"), false), 2).await.unwrap();
