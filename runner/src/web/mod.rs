@@ -164,7 +164,7 @@ impl WebState {
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
-				kyc_starts: KeyedLocks::default(),
+				kyc_starts: KeyedLocks::from_env("kyc").await?,
 				notifications: kyc.notifications,
 				governance: kyc.governance,
 				kyc: kyc.provider,

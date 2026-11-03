@@ -1338,10 +1338,8 @@ pub trait KycCaseRepository: Send + Sync {
 	///
 	/// NOT a lock and not a reservation: it reports what the table says at the instant it
 	/// is read, and two simultaneous readers get the same answer. Serialising them is the
-	/// CALLER's job — `/kyc/start` single-flights per user, in process — because doing it
-	/// here would mean holding a row across the vendor round trip. Where that
-	/// single-flight does not reach (a second replica), the window cap is what bounds the
-	/// race.
+	/// CALLER's job — `/kyc/start` single-flights per user across replicas — because doing
+	/// it here would mean holding a row across the vendor round trip.
 	async fn start_gate(&self, user_id: UserId, window_secs: i64, ttl_secs: i64) -> Result<StartGate, DomainError>;
 
 	/// This caller's still-running attempt, if they are in one.

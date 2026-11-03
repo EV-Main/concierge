@@ -85,8 +85,7 @@ async fn moved(st: &Inner, jar: CookieJar, user: UserId) -> (CookieJar, Result<J
 			(jar, Ok(Json(json!({ "ok": true, "authTime": done.auth_time }))))
 		}
 		Ok(Err(status)) => match status.code() {
-			// "Unauthenticated" also reads as a handle another replica rotated under us. The
-			// session ends only when the family itself is confirmed dead.
+			// The session ends only when the family itself is confirmed dead.
 			Code::Unauthenticated => match live_family_of(st, &session).await {
 				Ok(None) => (end_session(st, jar).await, Err(Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated"))),
 				Ok(Some(_)) => (jar, Err(Refusal::new(StatusCode::CONFLICT, "retry"))),

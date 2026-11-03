@@ -205,159 +205,164 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		return Err(StartError::Refused(StatusCode::FORBIDDEN, EMAIL_UNVERIFIED));
 	}
 
-	// One start per user at a time, from the gate read to the row write. The gate below
-	// is a READ: two requests arriving together would both see "no live case", both
-	// dial the vendor and both insert — two billed sessions, one of which the user can
-	// never finish (#56). Held here, in process, rather than as a database lock, because
-	// what it spans is the vendor round trip, and a transaction kept open across a
-	// network call was the property #55 refused to buy. The second caller waits at most
-	// the vendor timeout, then re-reads the gate and is handed the case the first one
-	// opened — the same answer a sequential second call gets. Across replicas this does
-	// not reach, and there the window cap is still what bounds the spend.
-	let _flight = st.kyc_starts.acquire(user_id).await;
+	// One start per user at a time, across replicas, from the gate read to the row write.
+	// The gate below is a READ: two requests arriving together would both see "no live
+	// case", both dial the vendor and both insert — two billed sessions, one of which the
+	// user can never finish (#56). A lease rather than a database lock, because what it
+	// spans is the vendor round trip, and a transaction kept open across a network call was
+	// the property #55 refused to buy. The second caller waits out the first, then re-reads
+	// the gate and is handed the case the first one opened — the same answer a sequential
+	// second call gets.
+	st.kyc_starts
+		.run(user_id, async {
+			// EVERYTHING below this line happens before the vendor is dialled, and that ordering is
+			// the whole point: `POST /v3/session/` is billed, and the platform's balance is a shared
+			// resource one signed-in account could otherwise drain in a loop. What is behind that
+			// balance is not a feature degrading — it is a fail-closed 503 on every user's
+			// verification, arriving as silence, because a polite "try later" is not something
+			// anyone files a ticket about.
+			let gate = st.kyc_cases.start_gate(user_id, START_WINDOW_SECS, st.kyc_case_ttl_secs).await.map_err(|e| {
+				// Refusing here rather than proceeding: an unreadable gate is exactly the state in
+				// which we do not know whether spending a session is safe.
+				tracing::error!(error = %e, "kyc: could not read the start gate");
+				StartError::unavailable(st)
+			})?;
 
-	// EVERYTHING below this line happens before the vendor is dialled, and that ordering is
-	// the whole point: `POST /v3/session/` is billed, and the platform's balance is a shared
-	// resource one signed-in account could otherwise drain in a loop. What is behind that
-	// balance is not a feature degrading — it is a fail-closed 503 on every user's
-	// verification, arriving as silence, because a polite "try later" is not something
-	// anyone files a ticket about.
-	let gate = st.kyc_cases.start_gate(user_id, START_WINDOW_SECS, st.kyc_case_ttl_secs).await.map_err(|e| {
-		// Refusing here rather than proceeding: an unreadable gate is exactly the state in
-		// which we do not know whether spending a session is safe.
-		tracing::error!(error = %e, "kyc: could not read the start gate");
-		StartError::unavailable(st)
-	})?;
-
-	// An attempt already running gets handed back, not replaced. The user is mid-flow —
-	// they refreshed, came back from the vendor, or clicked twice — and buying a second
-	// session would charge us to give them a worse version of what they have: two open
-	// cases, one of which they will abandon and which will then read as a user who gave up.
-	if let Some(live) = &gate.live {
-		// The STORED url is checked exactly as a fresh one is, and that is the point: the
-		// check at the bottom of this handler only ever saw rows written after it shipped.
-		// A row can predate it (KYC has been in production since v0.7.0), it can be
-		// written by the other replica mid-rollout — `0012_kyc_case_redirect_url.sql`
-		// designs for exactly that mix — or it can predate an operator changing which
-		// vendor origin is configured. A case lives until a verdict, so the window is
-		// days, and what is on the other side of it is a user handing their documents and
-		// a selfie to somebody else's host, under a button this plane vouched for.
-		match live.redirect_url.as_deref().filter(|u| redirect_is_trustworthy(u, &provider.session_origins())) {
-			Some(redirect_url) => {
-				tracing::debug!(case_id = %live.id, "kyc: start reused the caller's running case");
-				return Ok((
-					jar,
-					Json(StartResponse {
-						redirect_url: redirect_url.to_owned(),
-						case_id: live.id.to_string(),
-					}),
-				));
+			// An attempt already running gets handed back, not replaced. The user is mid-flow —
+			// they refreshed, came back from the vendor, or clicked twice — and buying a second
+			// session would charge us to give them a worse version of what they have: two open
+			// cases, one of which they will abandon and which will then read as a user who gave up.
+			if let Some(live) = &gate.live {
+				// The STORED url is checked exactly as a fresh one is, and that is the point: the
+				// check at the bottom of this handler only ever saw rows written after it shipped.
+				// A row can predate it (KYC has been in production since v0.7.0), it can be
+				// written by the other replica mid-rollout — `0012_kyc_case_redirect_url.sql`
+				// designs for exactly that mix — or it can predate an operator changing which
+				// vendor origin is configured. A case lives until a verdict, so the window is
+				// days, and what is on the other side of it is a user handing their documents and
+				// a selfie to somebody else's host, under a button this plane vouched for.
+				match live.redirect_url.as_deref().filter(|u| redirect_is_trustworthy(u, &provider.session_origins())) {
+					Some(redirect_url) => {
+						tracing::debug!(case_id = %live.id, "kyc: start reused the caller's running case");
+						return Ok((
+							jar,
+							Json(StartResponse {
+								redirect_url: redirect_url.to_owned(),
+								case_id: live.id.to_string(),
+							}),
+						));
+					}
+					// Two causes, one answer: a case opened before `kyc_cases.redirect_url`
+					// existed, and a stored URL this plane will not send a browser to. Both leave
+					// nothing to resume, and the choice is then a new session or a dead end —
+					// stranding a user who did nothing wrong is the worse of the two. The window
+					// cap below still applies, so this cannot be looped.
+					None if live.redirect_url.is_some() => {
+						// `error!`, unlike the sibling arm: a row we refuse to hand back is not a
+						// fact of life, it is either an old vendor answer nobody checked or a
+						// configuration that moved under live cases, and both want a human.
+						tracing::error!(
+							case_id = %live.id,
+							provider = provider.name(),
+							stored_origin = ?live.redirect_url.as_deref().and_then(crate::infrastructure::kyc::origin_of),
+							expected_origins = ?provider.session_origins(),
+							"kyc: the caller's running case holds a redirect this plane will not send a browser to — opening a fresh session"
+						);
+					}
+					None => {
+						tracing::info!(case_id = %live.id, "kyc: the caller's running case predates redirect_url — opening a fresh session");
+					}
+				}
 			}
-			// Two causes, one answer: a case opened before `kyc_cases.redirect_url`
-			// existed, and a stored URL this plane will not send a browser to. Both leave
-			// nothing to resume, and the choice is then a new session or a dead end —
-			// stranding a user who did nothing wrong is the worse of the two. The window
-			// cap below still applies, so this cannot be looped.
-			None if live.redirect_url.is_some() => {
-				// `error!`, unlike the sibling arm: a row we refuse to hand back is not a
-				// fact of life, it is either an old vendor answer nobody checked or a
-				// configuration that moved under live cases, and both want a human.
+
+			if gate.recent >= START_MAX_PER_WINDOW {
+				// 429 and not the `Unavailable` 503: this one IS about the caller, it is not a
+				// failure on our side, and telling them so is honest.
+				tracing::warn!(%user_id, opened = gate.recent, "kyc: start refused — the caller is over the per-user window cap");
+				return Err(StartError::Refused(StatusCode::TOO_MANY_REQUESTS, THROTTLED));
+			}
+
+			// The vendor is called BEFORE the row is written, because the row's identity key is
+			// the vendor's session id and there is no meaningful case without one. The cost is a
+			// vendor session nobody claims when the insert fails; its webhook then finds no case
+			// and is refused, which is the safe direction. The reverse order would need either a
+			// placeholder `provider_ref` (colliding on the uniqueness that IS the idempotency
+			// key) or an open transaction held across a network call.
+			//
+			// This ordering is also what keeps a failed vendor call from leaving a `pending` row
+			// behind. A dangling `pending` would later read as "the user started and walked
+			// away", which is a lie about a person who never got the chance, and it would poison
+			// every funnel number computed off these rows.
+			let case_id = Uuid::new_v4();
+			let session = provider.start_session(case_id, ENTRY_TIER).await.map_err(|e| {
+				// `error!` — NOT `warn!` — and the reason is the whole point of this arm. From
+				// the user's side an exhausted vendor balance looks like silence: they simply
+				// cannot verify, and nobody files a ticket about a screen that politely says to
+				// try later. `error!` is what `error_monitoring::tracing_layer()` (wired in
+				// `main::init_tracing`) forwards to Sentry, so this line is the only thing that
+				// will wake a human. The vendor's own text goes here and nowhere else.
+				tracing::error!(error = %e, provider = provider.name(), %case_id, tier = ENTRY_TIER, "kyc: the provider would not open a session — verification is unavailable to users");
+				StartError::unavailable(st)
+			})?;
+
+			// BEFORE the row is written, so a redirect we would not follow is never stored. The
+			// reuse branch above re-checks what IS stored, because rows outlive this check.
+			let allowed = provider.session_origins();
+			if !redirect_is_trustworthy(&session.redirect_url, &allowed) {
+				// `error!` for the same reason the vendor-refusal arm above uses one: the user
+				// sees a polite "try later" and reports nothing, so this line is the only thing
+				// that wakes a human. Both sides are named because the fix is almost always a
+				// configuration one.
+				//
+				// The ORIGIN and never the URL. `0012_kyc_case_redirect_url.sql` calls this
+				// string a capability — whoever holds it can walk that session's flow — and the
+				// reason it is not treated as a secret is that we hand it to its own user's
+				// browser. That reason stops applying the moment it is copied to Sentry, whose
+				// readers and retention are somebody else's. The origin is the whole diagnosis
+				// anyway; for a string that does not parse it is absent, which is also the
+				// diagnosis.
 				tracing::error!(
-					case_id = %live.id,
+					%case_id,
 					provider = provider.name(),
-					stored_origin = ?live.redirect_url.as_deref().and_then(crate::infrastructure::kyc::origin_of),
-					expected_origins = ?provider.session_origins(),
-					"kyc: the caller's running case holds a redirect this plane will not send a browser to — opening a fresh session"
+					answered_origin = ?crate::infrastructure::kyc::origin_of(&session.redirect_url),
+					expected_origins = ?allowed,
+					"kyc: the provider answered with a redirect this plane will not send a browser to"
 				);
+				return Err(StartError::unavailable(st));
 			}
-			None => {
-				tracing::info!(case_id = %live.id, "kyc: the caller's running case predates redirect_url — opening a fresh session");
-			}
-		}
-	}
 
-	if gate.recent >= START_MAX_PER_WINDOW {
-		// 429 and not the `Unavailable` 503: this one IS about the caller, it is not a
-		// failure on our side, and telling them so is honest.
-		tracing::warn!(%user_id, opened = gate.recent, "kyc: start refused — the caller is over the per-user window cap");
-		return Err(StartError::Refused(StatusCode::TOO_MANY_REQUESTS, THROTTLED));
-	}
+			st.kyc_cases
+				.open_case(NewCase {
+					id: case_id,
+					user_id,
+					provider: provider.name(),
+					provider_ref: &session.provider_ref,
+					requested_tier: ENTRY_TIER,
+					redirect_url: &session.redirect_url,
+					ttl_secs: st.kyc_case_ttl_secs,
+				})
+				.await
+				.map_err(|e| {
+					// Same screen as a vendor outage: our store being unreachable is no more the
+					// user's business than the vendor's balance, and it is just as temporary.
+					tracing::error!(error = %e, %case_id, "kyc: failed to record the opened case");
+					StartError::unavailable(st)
+				})?;
 
-	// The vendor is called BEFORE the row is written, because the row's identity key is
-	// the vendor's session id and there is no meaningful case without one. The cost is a
-	// vendor session nobody claims when the insert fails; its webhook then finds no case
-	// and is refused, which is the safe direction. The reverse order would need either a
-	// placeholder `provider_ref` (colliding on the uniqueness that IS the idempotency
-	// key) or an open transaction held across a network call.
-	//
-	// This ordering is also what keeps a failed vendor call from leaving a `pending` row
-	// behind. A dangling `pending` would later read as "the user started and walked
-	// away", which is a lie about a person who never got the chance, and it would poison
-	// every funnel number computed off these rows.
-	let case_id = Uuid::new_v4();
-	let session = provider.start_session(case_id, ENTRY_TIER).await.map_err(|e| {
-		// `error!` — NOT `warn!` — and the reason is the whole point of this arm. From
-		// the user's side an exhausted vendor balance looks like silence: they simply
-		// cannot verify, and nobody files a ticket about a screen that politely says to
-		// try later. `error!` is what `error_monitoring::tracing_layer()` (wired in
-		// `main::init_tracing`) forwards to Sentry, so this line is the only thing that
-		// will wake a human. The vendor's own text goes here and nowhere else.
-		tracing::error!(error = %e, provider = provider.name(), %case_id, tier = ENTRY_TIER, "kyc: the provider would not open a session — verification is unavailable to users");
-		StartError::unavailable(st)
-	})?;
-
-	// BEFORE the row is written, so a redirect we would not follow is never stored. The
-	// reuse branch above re-checks what IS stored, because rows outlive this check.
-	let allowed = provider.session_origins();
-	if !redirect_is_trustworthy(&session.redirect_url, &allowed) {
-		// `error!` for the same reason the vendor-refusal arm above uses one: the user
-		// sees a polite "try later" and reports nothing, so this line is the only thing
-		// that wakes a human. Both sides are named because the fix is almost always a
-		// configuration one.
-		//
-		// The ORIGIN and never the URL. `0012_kyc_case_redirect_url.sql` calls this
-		// string a capability — whoever holds it can walk that session's flow — and the
-		// reason it is not treated as a secret is that we hand it to its own user's
-		// browser. That reason stops applying the moment it is copied to Sentry, whose
-		// readers and retention are somebody else's. The origin is the whole diagnosis
-		// anyway; for a string that does not parse it is absent, which is also the
-		// diagnosis.
-		tracing::error!(
-			%case_id,
-			provider = provider.name(),
-			answered_origin = ?crate::infrastructure::kyc::origin_of(&session.redirect_url),
-			expected_origins = ?allowed,
-			"kyc: the provider answered with a redirect this plane will not send a browser to"
-		);
-		return Err(StartError::unavailable(st));
-	}
-
-	st.kyc_cases
-		.open_case(NewCase {
-			id: case_id,
-			user_id,
-			provider: provider.name(),
-			provider_ref: &session.provider_ref,
-			requested_tier: ENTRY_TIER,
-			redirect_url: &session.redirect_url,
-			ttl_secs: st.kyc_case_ttl_secs,
+			tracing::info!(%case_id, tier = ENTRY_TIER, provider = provider.name(), "kyc: case opened");
+			Ok((
+				jar,
+				Json(StartResponse {
+					redirect_url: session.redirect_url,
+					case_id: case_id.to_string(),
+				}),
+			))
 		})
 		.await
 		.map_err(|e| {
-			// Same screen as a vendor outage: our store being unreachable is no more the
-			// user's business than the vendor's balance, and it is just as temporary.
-			tracing::error!(error = %e, %case_id, "kyc: failed to record the opened case");
+			tracing::error!(error = ?e, %user_id, "kyc: start refused — no single-flight turn");
 			StartError::unavailable(st)
-		})?;
-
-	tracing::info!(%case_id, tier = ENTRY_TIER, provider = provider.name(), "kyc: case opened");
-	Ok((
-		jar,
-		Json(StartResponse {
-			redirect_url: session.redirect_url,
-			case_id: case_id.to_string(),
-		}),
-	))
+		})?
 }
 
 /// Whether the vendor's answer is somewhere we may send a signed-in browser.

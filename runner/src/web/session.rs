@@ -6,7 +6,8 @@
 //!
 //! Storage mirrors the issuance side's `RefreshStore`: `REDIS_URL` set ⇒ one hash
 //! per session in the central Redis, reaped by `EXPIREAT`, surviving restarts and
-//! shared across replicas; unset ⇒ an in-process map (local/CI unaffected).
+//! shared across replicas, as is each session's single flight (`single_flight`); unset ⇒
+//! an in-process map (local/CI unaffected).
 //!
 //! The stored `user` summary is a login-time COPY, not the truth: every
 //! [`WebSessions::fresh`] re-reads the principal from the directory (through
@@ -94,9 +95,8 @@ pub struct WebSessions {
 	reauths: Mutex<HashMap<String, u64>>,
 	/// Without Redis: until when each session counts as having just proved a second factor.
 	factor_fresh: Mutex<HashMap<String, i64>>,
-	/// Per-session single-flight for the refresh path: two racing rotations of one
-	/// refresh token read as theft upstream and revoke the family. In-process — see
-	/// `single_flight` for the one-replica caveat.
+	/// Per-session single flight for the refresh path: two racing rotations of one
+	/// refresh token read as theft upstream and revoke the family.
 	locks: KeyedLocks<String>,
 }
 
@@ -111,12 +111,13 @@ impl WebSessions {
 			}
 			None => Store::InProcess(Mutex::new(HashMap::new())),
 		};
+		let locks = KeyedLocks::from_env("websess").await?;
 		Ok(Self {
 			store,
 			trips: Mutex::new(HashMap::new()),
 			reauths: Mutex::new(HashMap::new()),
 			factor_fresh: Mutex::new(HashMap::new()),
-			locks: KeyedLocks::default(),
+			locks,
 		})
 	}
 
@@ -281,66 +282,69 @@ impl WebSessions {
 	/// tracks it. A directory failure keeps the stored copy: an outage there must never
 	/// sign anyone out or hide a console they hold.
 	pub async fn fresh(&self, id: &str, auth: &(impl AuthRpc + PrincipalSource)) -> color_eyre::Result<Option<Fresh>> {
-		let _flight = self.locks.acquire(id.to_string()).await;
-		let Some(mut s) = self.store.load(id).await? else { return Ok(None) };
-		let now = now_secs();
-		let mut user_is_live = false;
+		self.locks
+			.run(id.to_owned(), async {
+				let Some(mut s) = self.store.load(id).await? else { return Ok(None) };
+				let now = now_secs();
+				let mut user_is_live = false;
 
-		if s.access_expires_at <= now + ACCESS_SKEW_SECS {
-			if s.refresh_expires_at <= now {
-				self.store.remove(id).await?;
-				return Ok(None);
-			}
-			match auth
-				.refresh(Request::new(RefreshRequest {
-					refresh_token: s.refresh_token.clone(),
-				}))
-				.await
-			{
-				Ok(response) => {
-					let t = response.into_inner();
-					s.access_token = t.access_token;
-					s.access_expires_at = t.access_expires_at;
-					s.refresh_token = t.refresh_token;
-					s.refresh_expires_at = t.refresh_expires_at;
-					if let Some(user) = t.user {
-						s.user = user;
-						user_is_live = true;
+				if s.access_expires_at <= now + ACCESS_SKEW_SECS {
+					if s.refresh_expires_at <= now {
+						self.store.remove(id).await?;
+						return Ok(None);
 					}
-					self.store.save(id, &s).await?;
+					match auth
+						.refresh(Request::new(RefreshRequest {
+							refresh_token: s.refresh_token.clone(),
+						}))
+						.await
+					{
+						Ok(response) => {
+							let t = response.into_inner();
+							s.access_token = t.access_token;
+							s.access_expires_at = t.access_expires_at;
+							s.refresh_token = t.refresh_token;
+							s.refresh_expires_at = t.refresh_expires_at;
+							if let Some(user) = t.user {
+								s.user = user;
+								user_is_live = true;
+							}
+							self.store.save(id, &s).await?;
+						}
+						// An auth verdict kills the session; a transport blip keeps it (the
+						// possibly-stale access token is still the best available answer).
+						Err(status) if matches!(status.code(), Code::Unauthenticated | Code::PermissionDenied) => {
+							self.store.remove(id).await?;
+							return Ok(None);
+						}
+						Err(_) => {}
+					}
 				}
-				// An auth verdict kills the session; a transport blip keeps it (the
-				// possibly-stale access token is still the best available answer).
-				Err(status) if matches!(status.code(), Code::Unauthenticated | Code::PermissionDenied) => {
-					self.store.remove(id).await?;
-					return Ok(None);
-				}
-				Err(_) => {}
-			}
-		}
 
-		if !user_is_live {
-			match auth.principal(&s.user.user_id).await {
-				// Taken as DATA, whatever it says: a summary that has turned `disabled`
-				// is not a verdict on the session here. Ending it stays the refresh path's
-				// job (`AuthService::refresh` revokes the family) — a second place deciding
-				// when a session dies would be a second place to disagree with the first.
-				Ok(user) =>
-					if user != s.user {
-						s.user = user;
-						self.store.save(id, &s).await?;
-					},
-				Err(err) => {
-					tracing::warn!(error = %err, user_id = %s.user.user_id, "web session: live principal read failed; serving the stored summary");
+				if !user_is_live {
+					match auth.principal(&s.user.user_id).await {
+						// Taken as DATA, whatever it says: a summary that has turned `disabled`
+						// is not a verdict on the session here. Ending it stays the refresh path's
+						// job (`AuthService::refresh` revokes the family) — a second place deciding
+						// when a session dies would be a second place to disagree with the first.
+						Ok(user) =>
+							if user != s.user {
+								s.user = user;
+								self.store.save(id, &s).await?;
+							},
+						Err(err) => {
+							tracing::warn!(error = %err, user_id = %s.user.user_id, "web session: live principal read failed; serving the stored summary");
+						}
+					}
 				}
-			}
-		}
 
-		Ok(Some(Fresh {
-			user: s.user,
-			access_token: s.access_token,
-			remaining_secs: (s.refresh_expires_at - now).max(0),
-		}))
+				Ok(Some(Fresh {
+					user: s.user,
+					access_token: s.access_token,
+					remaining_secs: (s.refresh_expires_at - now).max(0),
+				}))
+			})
+			.await?
 	}
 
 	/// Move the session's `auth_time` after a re-authentication the caller has already
@@ -351,37 +355,29 @@ impl WebSessions {
 	/// the new one. The inner `Err` is the issuance service's verdict, or `Unauthenticated` when
 	/// the session is gone or is not `user_id`'s.
 	pub async fn reauthenticated(&self, id: &str, user_id: &str, auth: &AuthService) -> color_eyre::Result<Result<Reauthed, tonic::Status>> {
-		let _flight = self.locks.acquire(id.to_string()).await;
-		let mut tried: Option<String> = None;
-		loop {
-			let Some(s) = self.store.load(id).await? else {
-				return Ok(Err(tonic::Status::unauthenticated("no such session")));
-			};
-			if s.user.user_id != user_id {
-				return Ok(Err(tonic::Status::unauthenticated("no such session")));
-			}
-			let moved = match auth.reauthenticate(&s.refresh_token, user_id).await {
-				Ok(moved) => moved,
-				// Another replica may have rotated the handle since the load; read the
-				// session once more and go again, but only if it holds a different handle.
-				Err(status) if status.code() == tonic::Code::Unauthenticated && tried.is_none() => {
-					tried = Some(s.refresh_token);
-					continue;
+		self.locks
+			.run(id.to_owned(), async {
+				let Some(s) = self.store.load(id).await? else {
+					return Ok(Err(tonic::Status::unauthenticated("no such session")));
+				};
+				if s.user.user_id != user_id {
+					return Ok(Err(tonic::Status::unauthenticated("no such session")));
 				}
-				Err(status) => return Ok(Err(status)),
-			};
-			// Only the access half is written: a whole-session save here would put back the
-			// refresh pair this method loaded, over one a rotation elsewhere has since stored.
-			if !self.store.set_access(id, &moved.access_token, moved.access_expires_at).await? {
-				return Ok(Err(tonic::Status::unauthenticated("no such session")));
-			}
-			self.count_reauth(id, s.refresh_expires_at).await?;
-			return Ok(Ok(Reauthed {
-				access_token: moved.access_token,
-				auth_time: moved.auth_time,
-				remaining_secs: (s.refresh_expires_at - now_secs()).max(0),
-			}));
-		}
+				let moved = match auth.reauthenticate(&s.refresh_token, user_id).await {
+					Ok(moved) => moved,
+					Err(status) => return Ok(Err(status)),
+				};
+				if !self.store.set_access(id, &moved.access_token, moved.access_expires_at).await? {
+					return Ok(Err(tonic::Status::unauthenticated("no such session")));
+				}
+				self.count_reauth(id, s.refresh_expires_at).await?;
+				Ok(Ok(Reauthed {
+					access_token: moved.access_token,
+					auth_time: moved.auth_time,
+					remaining_secs: (s.refresh_expires_at - now_secs()).max(0),
+				}))
+			})
+			.await?
 	}
 
 	/// The session's CSRF token (double-submit check).
@@ -399,8 +395,7 @@ impl WebSessions {
 	/// after this delete, and the token returned here is the one that refresh just
 	/// rotated away from.
 	pub async fn forget(&self, id: &str) -> color_eyre::Result<Option<String>> {
-		let _flight = self.locks.acquire(id.to_string()).await;
-		self.store.remove(id).await
+		self.locks.run(id.to_owned(), self.store.remove(id)).await?
 	}
 }
 
