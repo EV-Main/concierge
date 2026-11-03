@@ -31,14 +31,14 @@ pub const BANK_NAMESPACE: &str = "bank";
 /// What `published_by` records for the money plane, which is no client.
 pub const BRIDGE_PUBLISHER: &str = "bridge";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServiceCaller {
 	/// The money plane: namespace `bank`, scope `main`, every stream unfiltered.
 	Bridge,
 	Client(ClientCaller),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientCaller {
 	pub client_id: String,
 	/// The `aud` of the access tokens it is issued for its users.

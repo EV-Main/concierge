@@ -31,7 +31,7 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use crate::config::AppConfig;
 
 /// The four `BRIDGE_TLS_*` variables as read, before any file is touched.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Settings<'a> {
 	pub bind: Option<SocketAddr>,
 	pub cert_pem_file: Option<&'a str>,
@@ -51,7 +51,7 @@ impl<'a> From<&'a AppConfig> for Settings<'a> {
 }
 
 /// A listener whose variables agree with each other. Paths only — nothing read yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Files {
 	pub bind: SocketAddr,
 	pub cert_pem_file: String,

@@ -9,10 +9,21 @@ cargo-features = ["codegen-backend"]
 # `client` (`evconcierge_client`) and `projection` (`evconcierge_projection`) are what a
 # relying party calls this plane with and keeps its users with, published to crates.io
 # on top of `contracts`.
-members = ["auth", "client", "contracts", "domain", "iam", "iam_derive", "projection", "runner"]
+members = [
+    "auth",
+    "client",
+    "contracts",
+    "domain",
+    "iam",
+    "iam_derive",
+    "projection",
+    "runner",
+]
 resolver = "3"
 
 [workspace.dependencies]
+# argon2id for the passwords this plane checks itself.
+argon2 = { version = "0.5", features = ["std"] }
 # Dyn-compatible async port traits (`Arc<dyn …>`), mirroring banking's ports layer.
 async-trait = "0.1.89"
 # The site-level auth HTTP surface (runner/src/web): login redirect, OAuth
@@ -21,9 +32,11 @@ axum = "0.8"
 axum-extra = { version = "0.12", features = ["cookie"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
-concierge_iam = { path = "iam" }
 color-eyre = "0.6"
+concierge_iam = { path = "iam" }
 concierge_iam_derive = { version = "0.1.0", path = "iam_derive" }
+# Base32 for the TOTP secret an authenticator app is handed. Already in the graph.
+data-encoding = "2"
 # Plane-internal crates. Other service repos depend on `evconcierge_contracts` (and,
 # transitively, `evconcierge_auth`) by git, so they get the wire stubs and the shared
 # token-verification flow from one place.
@@ -34,13 +47,7 @@ evconcierge_auth = { path = "auth" }
 # `version` too: the published `evconcierge_client` and `evconcierge_projection` resolve it
 # from crates.io, where a bare path dependency cannot go.
 evconcierge_contracts = { version = "0.8.0", path = "contracts" }
-# argon2id for the passwords this plane checks itself.
-argon2 = { version = "0.5", features = ["std"] }
-# Passkeys (WebAuthn): discoverable sign-in needs `conditional-ui`.
-webauthn-rs = { version = "0.5", features = ["conditional-ui"] }
 form_urlencoded = "1"
-# Base32 for the TOTP secret an authenticator app is handed. Already in the graph.
-data-encoding = "2"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 heck = "0.5"
 # HMAC-SHA256 for the identity provider's webhook signature. Already in the
@@ -67,15 +74,15 @@ quote = "1"
 redis = { version = "1.3", default-features = false, features = ["tokio-rustls-comp", "connection-manager", "script"] }
 # rustls only (no native-tls), matching how `ev` pulls reqwest.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form"] }
+# AES-256-GCM sealing of second-factor material at rest. Already in the graph through
+# rustls, so a manifest line rather than a crate.
+ring = "0.17"
 # Only to name the process-level rustls provider (`bridge_tls::install_crypto_provider`).
 # Already in the dependency graph twice over — sqlx/lettre bring `ring`, reqwest brings
 # `aws-lc-rs` — and with BOTH linked rustls refuses to guess, so tonic's server-side
 # `ServerConfig::builder()` panics unless something picks one first. A manifest line,
 # not a new crate.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-# AES-256-GCM sealing of second-factor material at rest. Already in the graph through
-# rustls, so a manifest line rather than a crate.
-ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 # HMAC-SHA-1 of RFC 6238: the one hash every authenticator app computes. Already in the graph.
@@ -102,6 +109,11 @@ tracing = "^0.1.44"
 tracing-subscriber = "^0.3.23"
 uuid = "^1.23.4"
 v_utils = { version = "=2.15.54", features = ["io", "macros", "cli", "xdg"] }
+# Passkeys (WebAuthn): discoverable sign-in needs `conditional-ui`.
+webauthn-rs = { version = "0.5", features = ["conditional-ui"] }
+concierge = { path = "runner" }
+evconcierge_projection = { path = "projection" }
+webauthn-authenticator-rs = "0.5"
 
 [workspace.lints.rust]
 unused_features = "allow"

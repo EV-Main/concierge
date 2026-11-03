@@ -14,10 +14,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "concierge"
 path = "src/main.rs"
+[features]
+# The raw role writer (`UserDirectoryRepository::set_role`) seats anyone as anything, owner
+# included, past every consilium. Tests need it to build a roster; the binary must not carry it.
+test-support = []
 
 [dependencies]
 argon2.workspace = true
-webauthn-rs.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 axum-extra.workspace = true
@@ -58,18 +61,15 @@ tower-http = { workspace = true, features = ["cors", "fs", "trace"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid.workspace = true
-[features]
-# The raw role writer (`UserDirectoryRepository::set_role`) seats anyone as anything, owner
-# included, past every consilium. Tests need it to build a roster; the binary must not carry it.
-test-support = []
+webauthn-rs.workspace = true
 
 [dev-dependencies]
 # Turns the feature above on for this crate's own tests.
-concierge = { path = ".", features = ["test-support"] }
+concierge = { workspace = true, features = ["test-support"] }
 # Opens real refresh families, so the relying-party suite can sign a browser in and out.
 evconcierge_auth = { workspace = true, features = ["test-support"] }
 # A software authenticator, so the passkey suite drives real WebAuthn ceremonies.
-webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+webauthn-authenticator-rs = { workspace = true, features = ["softpasskey"] }
 # Temporary file trees that remove themselves.
 v_fixtures = "^0.3.4"
 
