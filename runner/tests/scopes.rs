@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
 	Router,
@@ -30,6 +30,7 @@ use sqlx::PgPool;
 use tonic::{Code, Request as RpcRequest};
 use tower::ServiceExt;
 use uuid::Uuid;
+use v_fixtures::{Fixture, TempFixture};
 
 const PUBLIC: &str = "https://evinvest.test";
 const INVEST: &str = "https://invest.evinvest.ltd";
@@ -468,34 +469,24 @@ async fn the_session_read_from_a_scope_host_carries_no_token() {
 
 // ── the micro-frontend bundles ─────────────────────────────────────────────────────
 
-struct Bundles {
-	dir: PathBuf,
-	outside: PathBuf,
-}
-
-impl Drop for Bundles {
-	fn drop(&mut self) {
-		// Best effort: a leftover temp dir fails nothing.
-		let _ = std::fs::remove_dir_all(&self.dir);
-		let _ = std::fs::remove_dir_all(&self.outside);
+/// Written byte for byte rather than parsed: the suite asserts exact bodies and ranges, and a
+/// parsed fixture ends every file but the last in a newline.
+fn bundles() -> (Router, TempFixture) {
+	let tree = Fixture::default().write_to_tempdir();
+	for (path, text) in [
+		("dist/registry.json", r#"{"sign-in":"sign-in-ABCD2345.js"}"#),
+		("dist/sign-in-ABCD2345.js", "export {};"),
+		("dist/chunks/chunk-Q7ZK3M2P.js", "export {};"),
+		("dist/.env", "SECRET=1"),
+		("dist/LICENSES.txt", "MIT"),
+		("dist/sign-in.html", "<!doctype html>"),
+		("dist/account.html", "<!doctype html><title>Account</title>"),
+		("outside/secret.txt", "outside"),
+	] {
+		tree.write(path, text);
 	}
-}
-
-fn bundles() -> (Router, Bundles) {
-	let base = std::env::temp_dir().join(format!("concierge-mfe-{}", Uuid::new_v4().simple()));
-	let dir = base.join("dist");
-	let outside = std::env::temp_dir().join(format!("concierge-mfe-outside-{}", Uuid::new_v4().simple()));
-	std::fs::create_dir_all(dir.join("chunks")).unwrap();
-	std::fs::create_dir_all(&outside).unwrap();
-	std::fs::write(dir.join("registry.json"), r#"{"sign-in":"sign-in-ABCD2345.js"}"#).unwrap();
-	std::fs::write(dir.join("sign-in-ABCD2345.js"), "export {};").unwrap();
-	std::fs::write(dir.join("chunks").join("chunk-Q7ZK3M2P.js"), "export {};").unwrap();
-	std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
-	std::fs::write(dir.join("LICENSES.txt"), "MIT").unwrap();
-	std::fs::write(dir.join("sign-in.html"), "<!doctype html>").unwrap();
-	std::fs::write(dir.join("account.html"), "<!doctype html><title>Account</title>").unwrap();
-	std::fs::write(outside.join("secret.txt"), "outside").unwrap();
-	std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("escape.txt")).unwrap();
+	let dir = tree.path("dist");
+	std::os::unix::fs::symlink(tree.path("outside/secret.txt"), dir.join("escape.txt")).unwrap();
 
 	let origins = ScopeOrigins::from_scopes(&[ScopeRecord {
 		id: "invest".into(),
@@ -512,7 +503,7 @@ fn bundles() -> (Router, Bundles) {
 	}]);
 	let allowlist = Arc::new(SignInAllowlist::fixed(PUBLIC, origins).unwrap());
 	let router = mfe::mount(Router::new(), MfeAssets::open(&dir, allowlist).expect("open the bundle directory"));
-	(router, Bundles { dir: base, outside })
+	(router, tree)
 }
 
 async fn fetch(router: &Router, method: Method, path: &str, origin: Option<&str>) -> (StatusCode, HeaderMap, Vec<u8>) {
@@ -610,7 +601,7 @@ async fn the_bundles_revalidate_and_serve_ranges() {
 #[tokio::test]
 async fn a_manifest_rewritten_under_the_same_size_and_mtime_is_not_revalidated_as_unchanged() {
 	let (router, bundles) = bundles();
-	let manifest = bundles.dir.join("dist").join("registry.json");
+	let manifest = bundles.path("dist/registry.json");
 	let store_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
 	let write = |body: &str| {
 		std::fs::write(&manifest, body).unwrap();
@@ -670,14 +661,10 @@ async fn nothing_outside_the_files_is_served() {
 
 #[tokio::test]
 async fn a_missing_bundle_directory_is_not_mounted() {
-	let missing = std::env::temp_dir().join(format!("concierge-mfe-missing-{}", Uuid::new_v4().simple()));
+	let tree = Fixture::parse("//- /file\nnot a directory").write_to_tempdir();
 	let none = || Arc::new(SignInAllowlist::fixed(PUBLIC, ScopeOrigins::none()).unwrap());
-	assert!(MfeAssets::open(&missing, none()).is_err());
-	let file = std::env::temp_dir().join(format!("concierge-mfe-file-{}", Uuid::new_v4().simple()));
-	std::fs::write(&file, "not a directory").unwrap();
-	assert!(MfeAssets::open(&file, none()).is_err());
-	// Best effort: a leftover temp file fails nothing.
-	let _ = std::fs::remove_file(&file);
+	assert!(MfeAssets::open(&tree.path("missing"), none()).is_err());
+	assert!(MfeAssets::open(&tree.path("file"), none()).is_err());
 }
 
 // ── a live registry ────────────────────────────────────────────────────────────────

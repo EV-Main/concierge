@@ -35,9 +35,8 @@ async fn a_production_boot_with_a_notice_link_base_outside_the_site_leaves_the_d
 
 #[tokio::test]
 async fn a_boot_with_a_seal_key_that_is_not_32_bytes_leaves_the_database_untouched() {
-	let path = std::env::temp_dir().join(format!("concierge-short-seal-{}", uuid::Uuid::new_v4().simple()));
-	std::fs::write(&path, "c2l4dGVlbiBieXRlcyBvbmx5").unwrap();
-	refused_boot(&[("SECOND_FACTOR_SEAL_KEY_FILE", path.to_str().unwrap())], "SECOND_FACTOR_SEAL_KEY_FILE").await;
+	let key = v_fixtures::Fixture::parse("//- /seal.key\nc2l4dGVlbiBieXRlcyBvbmx5").write_to_tempdir();
+	refused_boot(&[("SECOND_FACTOR_SEAL_KEY_FILE", key.path("seal.key").to_str().unwrap())], "SECOND_FACTOR_SEAL_KEY_FILE").await;
 }
 
 /// Boot the binary as production with `overrides` over an otherwise valid configuration
