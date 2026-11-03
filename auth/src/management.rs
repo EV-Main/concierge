@@ -1,9 +1,11 @@
 //! Token management — refresh-token rotation with reuse detection.
 //!
 //! Refresh tokens are opaque `"<family>.<secret>"` handles (not JWTs); the secret
-//! is server-side state. Each presentation rotates the secret; presenting an
-//! already-rotated secret is treated as theft and revokes the whole family
-//! (OWASP refresh-rotation reuse detection).
+//! is server-side state. Each presentation rotates the secret to one the caller chose;
+//! presenting an already-rotated secret is treated as theft and revokes the whole family
+//! (OWASP refresh-rotation reuse detection) — unless it comes with the secret it was
+//! rotated to, which only the rotation's own caller holds: that is the same rotation
+//! replayed after its answer was lost.
 //!
 //! **Backing store.** [`RefreshStore`] is a thin enum over two interchangeable
 //! backends with identical semantics:
@@ -110,10 +112,10 @@ impl RefreshStore {
 		}
 	}
 
-	pub async fn rotate(&self, token: &str, bounds: SessionBounds) -> Result<RotatedRefresh, AuthError> {
+	pub async fn rotate(&self, token: &str, next_secret: &str, bounds: SessionBounds) -> Result<RotatedRefresh, AuthError> {
 		match self {
-			Self::InProcess(s) => s.rotate(token, bounds),
-			Self::Redis(s) => s.rotate(token, bounds).await,
+			Self::InProcess(s) => s.rotate(token, next_secret, bounds),
+			Self::Redis(s) => s.rotate(token, next_secret, bounds).await,
 		}
 	}
 
@@ -223,12 +225,13 @@ impl InProcessRefreshStore {
 		}
 	}
 
-	/// Rotate a presented refresh handle. Reuse of an already-rotated secret
-	/// revokes the family and is reported as [`AuthError::InvalidToken`]. The
+	/// Rotate a presented refresh handle to `next_secret`. Reuse of an already-rotated
+	/// secret revokes the family and is reported as [`AuthError::InvalidToken`], unless
+	/// `next_secret` is what it was rotated to (the same rotation, replayed). The
 	/// immutable absolute deadline and the idle timeout are enforced BEFORE the
 	/// sliding window, so a family that has outlived either bound is dropped no
 	/// matter how recently it slid `expires_at` forward.
-	pub fn rotate(&self, token: &str, bounds: SessionBounds) -> Result<RotatedRefresh, AuthError> {
+	pub fn rotate(&self, token: &str, next_secret: &str, bounds: SessionBounds) -> Result<RotatedRefresh, AuthError> {
 		let (family, secret) = token.split_once('.').ok_or(AuthError::InvalidToken)?;
 		let mut map = self.families.lock().unwrap_or_else(|e| e.into_inner());
 		let fam = map.get_mut(family).ok_or(AuthError::InvalidToken)?;
@@ -240,16 +243,19 @@ impl InProcessRefreshStore {
 			return Err(AuthError::InvalidToken);
 		}
 
-		if ct_eq(&fam.current, secret) {
-			let new_secret = uuid::Uuid::new_v4().to_string();
+		let current = ct_eq(&fam.current, secret);
+		let replayed = !current && fam.prev.as_deref().is_some_and(|prev| ct_eq(prev, secret)) && ct_eq(&fam.current, next_secret);
+		if current || replayed {
 			let expires_at = now + bounds.ttl_secs;
-			fam.prev = Some(std::mem::replace(&mut fam.current, new_secret.clone()));
+			if current {
+				fam.prev = Some(std::mem::replace(&mut fam.current, next_secret.to_owned()));
+			}
 			fam.expires_at = expires_at;
 			fam.last_seen = now;
 			Ok(RotatedRefresh {
 				token_version_snapshot: fam.token_version,
 				refresh: IssuedRefresh {
-					token: format!("{family}.{new_secret}"),
+					token: format!("{family}.{next_secret}"),
 					expires_at,
 					auth_time: fam.auth_time,
 				},
@@ -450,10 +456,9 @@ impl RedisRefreshStore {
 		})
 	}
 
-	pub async fn rotate(&self, token: &str, bounds: SessionBounds) -> Result<RotatedRefresh, AuthError> {
+	pub async fn rotate(&self, token: &str, next_secret: &str, bounds: SessionBounds) -> Result<RotatedRefresh, AuthError> {
 		let (family, secret) = token.split_once('.').ok_or(AuthError::InvalidToken)?;
 		let now = get_current_timestamp();
-		let new_secret = uuid::Uuid::new_v4().to_string();
 		let expires_at = now + bounds.ttl_secs;
 
 		let mut conn = self.conn.clone();
@@ -464,7 +469,7 @@ impl RedisRefreshStore {
 			.arg(secret)
 			.arg(now)
 			.arg(bounds.idle_timeout_secs)
-			.arg(&new_secret)
+			.arg(next_secret)
 			.arg(expires_at)
 			.invoke_async(&mut conn)
 			.await
@@ -476,7 +481,7 @@ impl RedisRefreshStore {
 				Ok(RotatedRefresh {
 					token_version_snapshot,
 					refresh: IssuedRefresh {
-						token: format!("{family}.{new_secret}"),
+						token: format!("{family}.{next_secret}"),
 						expires_at,
 						// Empty for a family opened before the field existed.
 						auth_time: auth_time.parse().ok(),
@@ -652,9 +657,10 @@ impl RedisRefreshStore {
 
 /// The atomic rotate/reuse decision. KEYS[1] = family hash. ARGV = presented secret,
 /// now, idle_timeout_secs, new secret, new sliding expiry. Returns `{"ok", user_id,
-/// token_version, auth_time}` on a successful rotation, `{"reuse", user_id}` when an already-rotated
-/// secret is replayed (caller wipes the family), or nil for any other rejection
-/// (missing/expired/wrong secret).
+/// token_version, auth_time}` on a successful rotation or on the same rotation replayed
+/// (the rotated-out secret with the secret it went to), `{"reuse", user_id}` when an
+/// already-rotated secret is replayed otherwise (caller wipes the family), or nil for any
+/// other rejection (missing/expired/wrong secret).
 static ROTATE_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
 	redis::Script::new(
 		r#"
@@ -676,6 +682,9 @@ end
 
 if h['current'] == ARGV[1] then
   redis.call('HSET', KEYS[1], 'prev', h['current'], 'current', ARGV[4], 'expires_at', ARGV[5], 'last_seen', ARGV[2])
+  return { 'ok', h['user_id'], h['token_version'], h['auth_time'] or '' }
+elseif h['prev'] == ARGV[1] and h['current'] == ARGV[4] then
+  redis.call('HSET', KEYS[1], 'expires_at', ARGV[5], 'last_seen', ARGV[2])
   return { 'ok', h['user_id'], h['token_version'], h['auth_time'] or '' }
 elseif h['prev'] == ARGV[1] then
   return { 'reuse', h['user_id'] }
@@ -770,6 +779,11 @@ struct Family {
 mod tests {
 	use super::*;
 
+	/// A secret no other rotation in the test was sent to.
+	fn next() -> String {
+		uuid::Uuid::new_v4().to_string()
+	}
+
 	/// A wide absolute cap and no idle timeout: the default for tests that exercise
 	/// only the sliding-window / reuse behaviour.
 	fn bounds() -> SessionBounds {
@@ -788,12 +802,12 @@ mod tests {
 	fn rotate_then_reuse_revokes_family() {
 		let store = InProcessRefreshStore::new();
 		let issued = issue(&store, "user-1");
-		let rotated = store.rotate(&issued.token, bounds()).unwrap();
+		let rotated = store.rotate(&issued.token, &next(), bounds()).unwrap();
 		assert!(matches!(store.inspect(&rotated.refresh.token, bounds()), RefreshInspect::Current { user_id } if user_id == "user-1"));
 		// The original (now rotated-out) secret is a reuse → family revoked.
-		assert!(store.rotate(&issued.token, bounds()).is_err());
+		assert!(store.rotate(&issued.token, &next(), bounds()).is_err());
 		// And the just-issued one is now dead too.
-		assert!(store.rotate(&rotated.refresh.token, bounds()).is_err());
+		assert!(store.rotate(&rotated.refresh.token, &next(), bounds()).is_err());
 	}
 
 	#[test]
@@ -801,9 +815,9 @@ mod tests {
 		let store = InProcessRefreshStore::new();
 		let issued = issue(&store, "user-auth-time");
 		assert!(issued.auth_time.is_some());
-		let rotated = store.rotate(&issued.token, bounds()).unwrap();
+		let rotated = store.rotate(&issued.token, &next(), bounds()).unwrap();
 		assert_eq!(rotated.refresh.auth_time, issued.auth_time);
-		let again = store.rotate(&rotated.refresh.token, bounds()).unwrap();
+		let again = store.rotate(&rotated.refresh.token, &next(), bounds()).unwrap();
 		assert_eq!(again.refresh.auth_time, issued.auth_time);
 	}
 
@@ -816,7 +830,7 @@ mod tests {
 		assert_eq!(moved.token_version_snapshot, 9);
 		assert!(moved.auth_time >= issued.auth_time.unwrap(), "the backdated time moved forward to now");
 		// Rotation keeps the moved time and retires the old secret, which then moves nothing.
-		let rotated = store.rotate(&issued.token, bounds()).unwrap();
+		let rotated = store.rotate(&issued.token, &next(), bounds()).unwrap();
 		assert_eq!(rotated.refresh.auth_time, Some(moved.auth_time));
 		assert!(store.touch_auth_time(&issued.token, bounds()).is_none());
 		assert!(store.touch_auth_time("no-dot", bounds()).is_none());
@@ -837,8 +851,8 @@ mod tests {
 		let a = issue(&store, "user-1");
 		let b = issue(&store, "user-1");
 		store.revoke_user("user-1");
-		assert!(store.rotate(&a.token, bounds()).is_err());
-		assert!(store.rotate(&b.token, bounds()).is_err());
+		assert!(store.rotate(&a.token, &next(), bounds()).is_err());
+		assert!(store.rotate(&b.token, &next(), bounds()).is_err());
 	}
 
 	#[test]
@@ -859,7 +873,7 @@ mod tests {
 
 		// After a rotation the prior secret inspects as Reuse (theft signal) WITHOUT being
 		// mutated by the inspection, and the new secret is Current.
-		let rotated = store.rotate(&issued.token, bounds()).unwrap();
+		let rotated = store.rotate(&issued.token, &next(), bounds()).unwrap();
 		assert!(matches!(store.inspect(&issued.token, bounds()), RefreshInspect::Reuse { .. }));
 		assert!(matches!(store.inspect(&rotated.refresh.token, bounds()), RefreshInspect::Current { .. }));
 		// Inspection did not revoke the family (unlike a rotate of the reused secret).
@@ -871,7 +885,7 @@ mod tests {
 		let store = InProcessRefreshStore::new();
 		let issued = store.issue("user-1", 0, bounds(), "agent".into(), "1.2.3.4".into());
 		let id = store.family_id_of(&issued.token).unwrap();
-		let rotated = store.rotate(&issued.token, bounds()).unwrap();
+		let rotated = store.rotate(&issued.token, &next(), bounds()).unwrap();
 		assert_eq!(store.family_id_of(&rotated.refresh.token).as_deref(), Some(id.as_str()));
 		let sessions = store.list_for_user("user-1");
 		assert_eq!(sessions.len(), 1);
@@ -887,7 +901,7 @@ mod tests {
 		let id = store.family_id_of(&mine.token).unwrap();
 		// A different user cannot revoke it.
 		assert!(!store.revoke_by_id("user-2", &id));
-		assert!(store.rotate(&mine.token, bounds()).is_ok());
+		assert!(store.rotate(&mine.token, &next(), bounds()).is_ok());
 		// The owner can; a second attempt is a no-op.
 		let id = store.family_id_of(&mine.token).unwrap();
 		assert!(store.revoke_by_id("user-1", &id));
@@ -906,7 +920,7 @@ mod tests {
 		let store = InProcessRefreshStore::new();
 		let issued = store.issue("user-1", 0, bounds, String::new(), String::new());
 		store.backdate(&issued.token, 3600);
-		assert!(store.rotate(&issued.token, bounds).is_ok());
+		assert!(store.rotate(&issued.token, &next(), bounds).is_ok());
 	}
 
 	#[test]
@@ -922,7 +936,7 @@ mod tests {
 		let store = InProcessRefreshStore::new();
 		let issued = store.issue("user-1", 0, bounds, String::new(), String::new());
 		store.backdate(&issued.token, 86_401);
-		assert!(store.rotate(&issued.token, bounds).is_err());
+		assert!(store.rotate(&issued.token, &next(), bounds).is_err());
 		// The expired family is removed, not merely refused.
 		assert!(store.list_for_user("user-1").is_empty());
 	}
@@ -939,7 +953,7 @@ mod tests {
 		let store = InProcessRefreshStore::new();
 		let issued = store.issue("user-1", 0, bounds, String::new(), String::new());
 		store.backdate(&issued.token, 3601);
-		assert!(store.rotate(&issued.token, bounds).is_err());
+		assert!(store.rotate(&issued.token, &next(), bounds).is_err());
 		assert!(store.list_for_user("user-1").is_empty());
 	}
 
@@ -955,9 +969,9 @@ mod tests {
 		let store = InProcessRefreshStore::new();
 		let issued = store.issue("user-1", 0, bounds, String::new(), String::new());
 		store.backdate(&issued.token, 1800);
-		let rotated = store.rotate(&issued.token, bounds).unwrap();
+		let rotated = store.rotate(&issued.token, &next(), bounds).unwrap();
 		store.backdate(&rotated.refresh.token, 1800);
-		assert!(store.rotate(&rotated.refresh.token, bounds).is_ok());
+		assert!(store.rotate(&rotated.refresh.token, &next(), bounds).is_ok());
 	}
 
 	#[test]
@@ -1019,6 +1033,11 @@ mod tests {
 mod redis_tests {
 	use super::*;
 
+	/// A secret no other rotation in the test was sent to.
+	fn next() -> String {
+		uuid::Uuid::new_v4().to_string()
+	}
+
 	fn bounds() -> SessionBounds {
 		SessionBounds {
 			ttl_secs: 3600,
@@ -1041,13 +1060,13 @@ mod redis_tests {
 			return;
 		};
 		let issued = store.issue(&user, 7, bounds(), "agent".into(), "1.2.3.4".into()).await.unwrap();
-		let rotated = store.rotate(&issued.token, bounds()).await.unwrap();
+		let rotated = store.rotate(&issued.token, &next(), bounds()).await.unwrap();
 		assert_eq!(rotated.token_version_snapshot, 7);
 		assert_eq!(rotated.refresh.auth_time, issued.auth_time);
 		assert!(matches!(store.inspect(&rotated.refresh.token, bounds()).await.unwrap(), RefreshInspect::Current { user_id } if user_id == user));
 		// Reuse of the rotated-out secret revokes the whole family.
-		assert!(store.rotate(&issued.token, bounds()).await.is_err());
-		assert!(store.rotate(&rotated.refresh.token, bounds()).await.is_err());
+		assert!(store.rotate(&issued.token, &next(), bounds()).await.is_err());
+		assert!(store.rotate(&rotated.refresh.token, &next(), bounds()).await.is_err());
 		assert!(store.list_for_user(&user).await.unwrap().is_empty());
 	}
 
@@ -1060,7 +1079,7 @@ mod redis_tests {
 		let moved = store.touch_auth_time(&issued.token, bounds()).await.unwrap().expect("the live secret moves it");
 		assert_eq!(moved.token_version_snapshot, 4);
 		assert!(Some(moved.auth_time) >= issued.auth_time);
-		let rotated = store.rotate(&issued.token, bounds()).await.unwrap();
+		let rotated = store.rotate(&issued.token, &next(), bounds()).await.unwrap();
 		assert_eq!(rotated.refresh.auth_time, Some(moved.auth_time));
 		// A rotated-out secret moves nothing and does not wipe the family.
 		assert!(store.touch_auth_time(&issued.token, bounds()).await.unwrap().is_none());
@@ -1076,8 +1095,8 @@ mod redis_tests {
 		let a = store.issue(&user, 0, bounds(), String::new(), String::new()).await.unwrap();
 		let b = store.issue(&user, 0, bounds(), String::new(), String::new()).await.unwrap();
 		store.revoke_user(&user).await.unwrap();
-		assert!(store.rotate(&a.token, bounds()).await.is_err());
-		assert!(store.rotate(&b.token, bounds()).await.is_err());
+		assert!(store.rotate(&a.token, &next(), bounds()).await.is_err());
+		assert!(store.rotate(&b.token, &next(), bounds()).await.is_err());
 		assert!(store.list_for_user(&user).await.unwrap().is_empty());
 	}
 
@@ -1088,7 +1107,7 @@ mod redis_tests {
 		};
 		let issued = store.issue(&user, 0, bounds(), "agent".into(), "1.2.3.4".into()).await.unwrap();
 		let id = store.family_id_of(&issued.token).await.unwrap().expect("a fresh family has a session id");
-		let rotated = store.rotate(&issued.token, bounds()).await.unwrap();
+		let rotated = store.rotate(&issued.token, &next(), bounds()).await.unwrap();
 		assert_eq!(store.family_id_of(&rotated.refresh.token).await.unwrap().as_deref(), Some(id.as_str()));
 		let sessions = store.list_for_user(&user).await.unwrap();
 		assert_eq!(sessions.len(), 1);
@@ -1107,7 +1126,7 @@ mod redis_tests {
 		let id = store.family_id_of(&mine.token).await.unwrap().unwrap();
 		// A different user cannot revoke it.
 		assert!(!store.revoke_by_id(&other, &id).await.unwrap());
-		assert!(store.rotate(&mine.token, bounds()).await.is_ok());
+		assert!(store.rotate(&mine.token, &next(), bounds()).await.is_ok());
 		// The owner can; a second attempt is a no-op.
 		let id = store.family_id_of(&mine.token).await.unwrap().unwrap();
 		assert!(store.revoke_by_id(&user, &id).await.unwrap());
@@ -1129,7 +1148,7 @@ mod redis_tests {
 		};
 		let issued = store.issue(&user, 0, bounds, String::new(), String::new()).await.unwrap();
 		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-		assert!(store.rotate(&issued.token, bounds).await.is_err());
+		assert!(store.rotate(&issued.token, &next(), bounds).await.is_err());
 		assert!(store.list_for_user(&user).await.unwrap().is_empty());
 	}
 
@@ -1171,7 +1190,7 @@ mod redis_tests {
 		store.revoke_user(&user).await.unwrap();
 		let issued = issuer.await.unwrap();
 		store.revoke_user(&user).await.unwrap();
-		assert!(store.rotate(&issued.token, bounds()).await.is_err(), "no family may survive logout-everywhere");
+		assert!(store.rotate(&issued.token, &next(), bounds()).await.is_err(), "no family may survive logout-everywhere");
 		assert!(store.list_for_user(&user).await.unwrap().is_empty());
 	}
 }
