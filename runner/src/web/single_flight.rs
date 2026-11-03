@@ -14,7 +14,7 @@
 
 use std::{collections::HashMap, fmt::Display, future::Future, hash::Hash, sync::Arc, time::Duration};
 
-use color_eyre::eyre::{Context, bail, eyre};
+use color_eyre::eyre::{Context, eyre};
 use redis::aio::ConnectionManager;
 use tokio::sync::Mutex;
 
@@ -125,15 +125,13 @@ impl<K: Hash + Eq + Display> KeyedLocks<K> {
 				return Err(lost);
 			}
 		};
+		// The section is done and what it did stands; a release that fails only leaves the
+		// lease to lapse, and a lapsed one means exclusion may have broken: loud, not undone.
 		let mut conn = conn.clone();
-		let released: i64 = redis::Script::new(RELEASE)
-			.key(&lease)
-			.arg(&token)
-			.invoke_async(&mut conn)
-			.await
-			.with_context(|| format!("single flight {ns}: release"))?;
-		if released == 0 {
-			bail!("single flight {ns}: lease lapsed under its holder");
+		match redis::Script::new(RELEASE).key(&lease).arg(&token).invoke_async::<i64>(&mut conn).await {
+			Ok(0) => tracing::error!(ns, "single flight: lease lapsed under its holder"),
+			Ok(_) => {}
+			Err(e) => tracing::error!(ns, error = ?e, "single flight: release failed, the lease lapses"),
 		}
 		Ok(out)
 	}
