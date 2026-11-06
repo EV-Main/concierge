@@ -2,7 +2,7 @@
 
 Five self-registering custom elements, each a single ESM file with its own React,
 rendered in the host's light DOM with the shared `@evinvest/uikit` tokens. Hosts mount
-them through [`@evinvest/mfe`](https://github.com/EV-Main/lib/tree/main/ts/mfe) /
+them through [`@evinvest/mfe`](https://github.com/EV-Main/web_std/tree/main/ts/mfe) /
 `@evinvest/concierge` ([`../sdk`](../sdk)) (registry, loader, events, `apiVersion` 2).
 
 | Element | Registry name | Kind |
