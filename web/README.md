@@ -198,3 +198,4 @@ English is written at the call site (`t("key", "English")`); `npm run i18n:extra
 regenerates `messages/en/common.json` and prunes the translations. Each bundle ships only
 the keys its own modules render, resolved by the `@evinvest/i18n` policy at build time.
 The locale is the nearest `[lang]` of the element.
+
