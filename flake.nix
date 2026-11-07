@@ -124,9 +124,16 @@
         # every bundle 404ed. One symlink to the whole store directory is kept as a
         # symlink by lndir: canonical(WEB_MFE_DIR) becomes the store directory itself and
         # the files really are inside it.
+        # Asserted here rather than in a separate check, so no image is built with a layout mfe.rs rejects.
         webMfeRoot = pkgs.runCommand "concierge-web-root" { } ''
           mkdir -p $out/share/concierge
           ln -s ${webMfe}/share/concierge/web $out${webMfeDir}
+          root=$out${webMfeDir}
+          [ -f "$root/registry.json" ] || { echo "registry.json missing" >&2; exit 1; }
+          base="$(readlink -f "$root")"
+          for f in "$root"/*; do
+            case "$(readlink -f "$f")" in "$base"/*) ;; *) echo "$f escapes $base" >&2; exit 1 ;; esac
+          done
         '';
 
         # ONE container: the runner binary serves gRPC (:55670), the auth web
@@ -367,20 +374,7 @@
 
         containers = containerStd.containers;
 
-        # Guards the image layout, not the bundle: the root must hold the bundles behind
-        # ONE symlink and every file must canonicalise inside it, as mfe.rs requires.
-        checks = pkgs.lib.optionalAttrs hasWeb {
-          web-root = pkgs.runCommand "concierge-web-root-check" { } ''
-            root=${webMfeRoot}${webMfeDir}
-            [ -L "$root" ] || { echo "$root must be a single symlink" >&2; exit 1; }
-            [ -f "$root/registry.json" ] || { echo "registry.json missing" >&2; exit 1; }
-            base="$(readlink -f "$root")"
-            for f in "$root"/*; do
-              case "$(readlink -f "$f")" in "$base"/*) ;; *) echo "$f escapes $base" >&2; exit 1 ;; esac
-            done
-            touch $out
-          '';
-        };
+        checks = pkgs.lib.optionalAttrs hasWeb { web-root = webMfeRoot; };
 
         devShells.default =
           with pkgs;
