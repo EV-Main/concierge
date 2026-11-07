@@ -17,4 +17,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/nix-env
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - run: nix build .#checks.aarch64-linux.web-root --no-link --print-build-logs
