@@ -48,7 +48,7 @@ const signIn = entry.value;
 
 The host's CSP allows the bundle directory, not the whole origin (no hash pins,
 D20): `script-src https://evinvest.ltd/api/auth/mfe/` (plus
-`https://evinvest.ltd/wallet/mfe/` for the wallet). `fetchConciergeRegistry`
+`https://evinvest.ltd/api/wallet/mfe/` for the wallet). `fetchConciergeRegistry`
 refuses redirects and any `scriptUrl` outside `CONCIERGE_MFE_PREFIX`.
 
 ## Sign in when the host gets a 401
