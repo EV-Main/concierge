@@ -177,9 +177,7 @@ the directory `WEB_MFE_DIR` names; the manifest hosts read is `registry.json`. I
 public and read-only: the edge answers `Access-Control-Allow-Origin: *` (no credentials),
 files only (no index, no listing, no dotfile, nothing resolving
 outside the directory), esbuild-hashed names cached for a year and everything else for
-five minutes. The old address `/api/auth/mfe/*` (concierge's `/auth/mfe/*`) serves the same
-files for hosts built before the move, its `registry.json` naming its own files
-(`registry.alias.json`) and its CORS a scope origin with `Vary: Origin`. With `WEB_MFE_DIR` unset or unreadable the route is not mounted and sign-in
+five minutes. With `WEB_MFE_DIR` unset or unreadable the route is not mounted and sign-in
 is unaffected; the image sets it only once `web/` exists in this repository. An `.html`
 file there is a platform page (the confirmation of §3.2): it is answered with
 `Cache-Control: no-store`, `Referrer-Policy: no-referrer` and `Content-Security-Policy:

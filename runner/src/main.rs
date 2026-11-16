@@ -229,7 +229,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.await
 		.context("failed to load the relying-party registry")?;
 	// The scope registry. Its origins widen the sign-in routes' CORS and `Origin` check,
-	// the passkey verifier, OAuth `returnTo` and the MFE bundles' CORS; the allowlist is
+	// the passkey verifier and OAuth `returnTo`; the allowlist is
 	// refreshed in the background (below, beside the dispatch loops), so closing a scope
 	// needs no restart.
 	let scope_repo: Arc<dyn concierge::ports::ScopeRepository> = Arc::new(infrastructure::scopes::PgScopes::new(pool.clone()));
@@ -452,7 +452,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	.context("failed to build the auth web state")?;
 	let web_listener = tokio::net::TcpListener::bind(config.web_bind).await.context("failed to bind the auth web listener")?;
 	tracing::info!(bind = %config.web_bind, "auth web surface listening");
-	let web_router = match mfe_assets(config.web_mfe_dir.as_deref(), allowlist) {
+	let web_router = match mfe_assets(config.web_mfe_dir.as_deref()) {
 		Some(assets) => web::mfe::mount(web::router(web_state), assets),
 		None => web::router(web_state),
 	};
@@ -609,12 +609,12 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 /// number behind every stored row. That is precisely the PII `0010_kyc_cases.sql` promises
 /// this database does not hold, handed over by a weak secret rather than by the schema.
 /// The bundles to serve under `/mfe/concierge/*`, or `None` — logged — when there are none.
-fn mfe_assets(dir: Option<&str>, allowlist: Arc<web::allowlist::SignInAllowlist>) -> Option<web::mfe::MfeAssets> {
+fn mfe_assets(dir: Option<&str>) -> Option<web::mfe::MfeAssets> {
 	let Some(dir) = dir else {
 		tracing::info!("WEB_MFE_DIR is unset: /mfe/concierge/* is not served");
 		return None;
 	};
-	match web::mfe::MfeAssets::open(std::path::Path::new(dir), allowlist) {
+	match web::mfe::MfeAssets::open(std::path::Path::new(dir)) {
 		Ok(assets) => Some(assets),
 		Err(e) => {
 			tracing::error!(error = ?e, "micro-frontend bundles unavailable: /mfe/concierge/* is not served");

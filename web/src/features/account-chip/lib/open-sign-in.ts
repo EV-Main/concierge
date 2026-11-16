@@ -1,6 +1,5 @@
 // The signed-out chip opens the platform's sign-in dialog rather than a login page. It
-// always mounts its own, loaded through the registry in this bundle's own directory (either of
-// the addresses concierge serves it under, `runner/src/web/mfe.rs`), and owns
+// always mounts its own, loaded through the registry in this bundle's own directory, and owns
 // its events. It never opens an <mfe-concierge-sign-in> it did not create: the first one in
 // the DOM may be a lookalike or one configured with another origin and return target. The
 // bundle must come from the registry's own origin, so a registry entry cannot pull in a

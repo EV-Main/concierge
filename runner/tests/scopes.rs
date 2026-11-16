@@ -13,13 +13,12 @@ use axum::{
 };
 use concierge::{
 	infrastructure::{governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
-	ports::{ScopeRecord, ScopeRepository},
+	ports::ScopeRepository,
 	scopes::ScopeRegistry,
 	web::{
 		self, KycDeps,
 		allowlist::SignInAllowlist,
 		mfe::{self, MfeAssets},
-		origins::ScopeOrigins,
 	},
 };
 use domain::scopes::ScopeState;
@@ -475,7 +474,6 @@ fn bundles() -> (Router, TempFixture) {
 	let tree = Fixture::default().write_to_tempdir();
 	for (path, text) in [
 		("dist/registry.json", r#"{"sign-in":"sign-in-ABCD2345.js"}"#),
-		("dist/registry.alias.json", r#"{"sign-in":"/api/auth/mfe/sign-in-ABCD2345.js"}"#),
 		("dist/sign-in-ABCD2345.js", "export {};"),
 		("dist/chunks/chunk-Q7ZK3M2P.js", "export {};"),
 		("dist/.env", "SECRET=1"),
@@ -489,21 +487,7 @@ fn bundles() -> (Router, TempFixture) {
 	let dir = tree.path("dist");
 	std::os::unix::fs::symlink(tree.path("outside/secret.txt"), dir.join("escape.txt")).unwrap();
 
-	let origins = ScopeOrigins::from_scopes(&[ScopeRecord {
-		id: "invest".into(),
-		namespace: "invest".into(),
-		parent: "main".into(),
-		display_name: String::new(),
-		origins: vec![INVEST.into()],
-		return_paths: vec!["/cabinet".into()],
-		observers: Vec::new(),
-		clients: Vec::new(),
-		created_at: 0,
-		version: 1,
-		state: ScopeState::Active,
-	}]);
-	let allowlist = Arc::new(SignInAllowlist::fixed(PUBLIC, origins).unwrap());
-	let router = mfe::mount(Router::new(), MfeAssets::open(&dir, allowlist).expect("open the bundle directory"));
+	let router = mfe::mount(Router::new(), MfeAssets::open(&dir).expect("open the bundle directory"));
 	(router, tree)
 }
 
@@ -630,30 +614,6 @@ async fn the_bundles_leave_cors_to_the_edge() {
 	assert!(!varies_on_origin(&headers));
 }
 
-/// The old address serves the same files to the hosts built before the move, with a
-/// manifest naming its own files: their SDK refuses a bundle outside `/api/auth/mfe/`.
-#[tokio::test]
-async fn the_old_address_serves_its_own_manifest_to_a_scope_host() {
-	let (router, _bundles) = bundles();
-	let (status, headers, body) = fetch(&router, Method::GET, "/auth/mfe/registry.json", Some(INVEST)).await;
-	assert_eq!(status, StatusCode::OK);
-	assert_eq!(body, br#"{"sign-in":"/api/auth/mfe/sign-in-ABCD2345.js"}"#);
-	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300");
-	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], INVEST);
-	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
-	assert!(varies_on_origin(&headers));
-
-	let (status, headers, body) = fetch(&router, Method::GET, "/auth/mfe/sign-in-ABCD2345.js", Some("https://evil.example")).await;
-	assert_eq!(status, StatusCode::OK);
-	assert_eq!(body, b"export {};");
-	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
-	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
-
-	assert_eq!(fetch(&router, Method::GET, "/auth/mfe/sign-in.html", None).await.0, StatusCode::OK);
-	assert_eq!(fetch(&router, Method::GET, "/auth/mfe/%2e%2e/secret.txt", None).await.0, StatusCode::NOT_FOUND);
-	assert_eq!(fetch(&router, Method::GET, "/auth/mfe/.env", None).await.0, StatusCode::NOT_FOUND);
-}
-
 #[tokio::test]
 async fn nothing_outside_the_files_is_served() {
 	let (router, _bundles) = bundles();
@@ -684,9 +644,8 @@ async fn nothing_outside_the_files_is_served() {
 #[tokio::test]
 async fn a_missing_bundle_directory_is_not_mounted() {
 	let tree = Fixture::parse("//- /file\nnot a directory").write_to_tempdir();
-	let none = || Arc::new(SignInAllowlist::fixed(PUBLIC, ScopeOrigins::none()).unwrap());
-	assert!(MfeAssets::open(&tree.path("missing"), none()).is_err());
-	assert!(MfeAssets::open(&tree.path("file"), none()).is_err());
+	assert!(MfeAssets::open(&tree.path("missing")).is_err());
+	assert!(MfeAssets::open(&tree.path("file")).is_err());
 }
 
 // ── a live registry ────────────────────────────────────────────────────────────────

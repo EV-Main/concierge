@@ -9,11 +9,7 @@
 //! segment that could climb out of it (`..`, `.`, a dotfile, a backslash) or a symlink
 //! that resolves outside it answers 404, the same as a file that is not there — checked
 //! here because `ServeDir` follows symlinks wherever they point. GET and HEAD only.
-//! CORS on `/mfe/concierge/*` is the edge's (`*`), not set here.
-//!
-//! `/auth/mfe/*` (publicly `/api/auth/mfe/*`) is the directory's old address, kept for the
-//! hosts built before the move: its manifest is [`ALIAS_MANIFEST`], naming the alias's own
-//! files, and CORS answers a scope's origin without credentials.
+//! CORS is the edge's (`*`), not set here.
 //!
 //! One page is also served outside the prefix: `account.html` at `/account`, the platform's
 //! account page. It acts on the session, which this plane accepts only from
@@ -30,8 +26,8 @@ use axum::{
 	http::{
 		HeaderValue, StatusCode, Uri,
 		header::{
-			ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE,
-			LAST_MODIFIED, ORIGIN, REFERRER_POLICY, VARY, X_CONTENT_TYPE_OPTIONS,
+			CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE, LAST_MODIFIED, REFERRER_POLICY,
+			X_CONTENT_TYPE_OPTIONS,
 		},
 	},
 	response::{IntoResponse, Response},
@@ -43,15 +39,11 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use tower_http::services::ServeDir;
 
-use crate::web::allowlist::SignInAllowlist;
-
 /// The manifest hosts read to find the current bundles. It names hashed files, so it is
 /// the one thing that must go stale quickly.
 pub const MANIFEST: &str = "registry.json";
 
 const PREFIX: &str = "/mfe/concierge";
-const ALIAS: &str = "/auth/mfe/";
-const ALIAS_MANIFEST: &str = "registry.alias.json";
 const ACCOUNT_PAGE: &str = "account.html";
 const SHORT_CACHE: &str = "public, max-age=300";
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
@@ -59,16 +51,15 @@ const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 pub struct MfeAssets {
 	root: PathBuf,
 	files: ServeDir,
-	allowlist: Arc<SignInAllowlist>,
 }
 
 impl MfeAssets {
 	// Resolved once, so every request is checked against the directory's real path.
-	pub fn open(dir: &Path, allowlist: Arc<SignInAllowlist>) -> Result<Self> {
+	pub fn open(dir: &Path) -> Result<Self> {
 		let root = std::fs::canonicalize(dir).with_context(|| format!("WEB_MFE_DIR {} cannot be resolved", dir.display()))?;
 		ensure!(root.is_dir(), "WEB_MFE_DIR {} is not a directory", root.display());
 		let files = ServeDir::new(&root).append_index_html_on_directories(false);
-		Ok(Self { root, files, allowlist })
+		Ok(Self { root, files })
 	}
 }
 
@@ -76,7 +67,6 @@ pub fn mount(router: Router, assets: MfeAssets) -> Router {
 	router.merge(
 		Router::new()
 			.route("/mfe/concierge/{*path}", get(serve))
-			.route("/auth/mfe/{*path}", get(alias))
 			.route("/account", get(account))
 			.with_state(Arc::new(assets)),
 	)
@@ -85,27 +75,6 @@ pub fn mount(router: Router, assets: MfeAssets) -> Router {
 async fn account(assets: State<Arc<MfeAssets>>, mut request: Request) -> Response {
 	*request.uri_mut() = Uri::from_static("/mfe/concierge/account.html");
 	serve(assets, UrlPath(ACCOUNT_PAGE.to_owned()), request).await
-}
-
-async fn alias(assets: State<Arc<MfeAssets>>, UrlPath(path): UrlPath<String>, mut request: Request) -> Response {
-	let origin = request.headers().get(ORIGIN).cloned();
-	let path = if path == MANIFEST { ALIAS_MANIFEST.to_owned() } else { path };
-	let rest = request.uri().path().strip_prefix(ALIAS).expect("routed under the alias");
-	let rest = if rest == MANIFEST { ALIAS_MANIFEST } else { rest };
-	match Uri::try_from(format!("{PREFIX}/{rest}")) {
-		Ok(uri) => *request.uri_mut() = uri,
-		Err(_) => return StatusCode::NOT_FOUND.into_response(),
-	}
-	let mut response = serve(assets.clone(), UrlPath(path), request).await;
-	let headers = response.headers_mut();
-	headers.append(VARY, HeaderValue::from_static("Origin"));
-	if let Some(origin) = origin
-		&& let Ok(raw) = origin.to_str()
-		&& assets.allowlist.current().origins.admits(raw)
-	{
-		headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-	}
-	response
 }
 
 async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<String>, mut request: Request) -> Response {

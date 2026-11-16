@@ -146,10 +146,6 @@ for (const element of ELEMENTS) {
 const checked = parseRegistry(registry);
 if (!checked.ok) throw new Error(`registry.json would not parse: ${checked.error}`);
 writeFileSync(path.join(DIST, "registry.json"), `${JSON.stringify(registry, null, 2)}\n`);
-// The same files under their old address, /api/auth/mfe/ (runner/src/web/mfe.rs): a host
-// whose SDK predates the move refuses a scriptUrl outside it.
-const alias = registry.map((entry) => ({ ...entry, scriptUrl: `/api/auth/mfe/${path.basename(entry.scriptUrl)}` }));
-writeFileSync(path.join(DIST, "registry.alias.json"), `${JSON.stringify(alias, null, 2)}\n`);
 
 // The platform pages: dist/reauth.html and dist/sign-in.html, where concierge's authorize
 // route sends a browser (runner/src/web/authorize.rs), and dist/account.html, served at
