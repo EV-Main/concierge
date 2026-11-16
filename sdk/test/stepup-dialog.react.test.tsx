@@ -10,7 +10,7 @@ import type { StepupProofDetail } from '../src/index';
 import { StepupDialog, type StepupRequest } from '../src/react/index';
 
 const TAG = 'mfe-concierge-stepup';
-const SCRIPT = '/auth/mfe/stepup.js';
+const SCRIPT = '/mfe/concierge/stepup.js';
 const REQUEST: StepupRequest = { intentHash: 'ab'.repeat(32), minAal: 2 };
 
 let container: HTMLDivElement;

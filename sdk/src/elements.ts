@@ -12,7 +12,7 @@ export const CONCIERGE_ORIGIN = 'https://evinvest.ltd';
  * refuses a registry with a bundle outside it, and a host's CSP names the same
  * path in `script-src`.
  */
-export const CONCIERGE_MFE_PREFIX = `${CONCIERGE_ORIGIN}/api/auth/mfe/`;
+export const CONCIERGE_MFE_PREFIX = `${CONCIERGE_ORIGIN}/mfe/concierge/`;
 
 /** The published registry of concierge bundles; relative `scriptUrl`s resolve against it. */
 export const CONCIERGE_REGISTRY_URL = `${CONCIERGE_MFE_PREFIX}registry.json`;

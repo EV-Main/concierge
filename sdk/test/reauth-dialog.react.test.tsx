@@ -9,7 +9,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { ReauthDialog } from '../src/react/index';
 
 const TAG = 'mfe-concierge-reauth';
-const SCRIPT = '/auth/mfe/reauth.js';
+const SCRIPT = '/mfe/concierge/reauth.js';
 
 let container: HTMLDivElement;
 let root: Root;

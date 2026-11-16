@@ -5,8 +5,7 @@ account page, the account chip, the re-authentication dialog and the step-up
 dialog — over
 [`@evinvest/mfe`](https://www.npmjs.com/package/@evinvest/mfe). A host
 (invest cabinet, the SA panel, admin) mounts them; the elements themselves are
-built in this repo's `web/` and served from `https://evinvest.ltd/api/auth/mfe/`
-(the site's `/api/auth/*` rewrite to concierge). The package lives next to the
+built in this repo's `web/` and served from `https://evinvest.ltd/mfe/concierge/`. The package lives next to the
 service so a change to the elements' contract and to their host wrappers lands
 in one PR.
 
@@ -47,8 +46,8 @@ const signIn = entry.value;
 ```
 
 The host's CSP allows the bundle directory, not the whole origin (no hash pins,
-D20): `script-src https://evinvest.ltd/api/auth/mfe/` (plus
-`https://evinvest.ltd/api/wallet/mfe/` for the wallet). `fetchConciergeRegistry`
+D20): `script-src https://evinvest.ltd/mfe/concierge/` (plus
+`https://evinvest.ltd/mfe/banking/` for the wallet). `fetchConciergeRegistry`
 refuses redirects and any `scriptUrl` outside `CONCIERGE_MFE_PREFIX`.
 
 ## Sign in when the host gets a 401

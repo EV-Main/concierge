@@ -92,7 +92,7 @@ function navigate(target: Element | null, href: unknown): CustomEvent {
 
 describe('AccountChip attributes', () => {
   it('should_set_data_mode_host_and_the_host_props_when_host_is_given', async () => {
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" host={{ name: 'Valentina', email: 'v@example.com' }} />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" host={{ name: 'Valentina', email: 'v@example.com' }} />);
 
     const chip = container.querySelector(CHIP);
     expect(chip?.getAttribute('data-mode')).toBe('host');
@@ -101,7 +101,7 @@ describe('AccountChip attributes', () => {
   });
 
   it('should_not_set_data_mode_without_host', async () => {
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" intent="signin" returnTo="https://invest.evinvest.ltd/funds" />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" intent="signin" returnTo="https://invest.evinvest.ltd/funds" />);
 
     const chip = container.querySelector(CHIP);
     expect(chip?.hasAttribute('data-mode')).toBe(false);
@@ -110,19 +110,19 @@ describe('AccountChip attributes', () => {
   });
 
   it('should_pass_the_signup_intent', async () => {
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" intent="signup" />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" intent="signup" />);
 
     expect(container.querySelector(CHIP)?.getAttribute('data-intent')).toBe('signup');
   });
 
   it('should_point_the_profile_row_at_the_host_route_in_default_mode', async () => {
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" profileHref="/admin/account" />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" profileHref="/admin/account" />);
 
     expect(container.querySelector(CHIP)?.getAttribute('data-profile-href')).toBe('/admin/account');
   });
 
   it('should_drop_a_root_relative_return_to', async () => {
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" returnTo="/funds" />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" returnTo="/funds" />);
 
     expect(container.querySelector(CHIP)?.hasAttribute('data-return-to')).toBe(false);
   });
@@ -130,13 +130,13 @@ describe('AccountChip attributes', () => {
   it('should_default_return_to_to_the_current_page_without_query_or_hash', async () => {
     stubLocation(HOST_PAGE);
 
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" />);
 
     expect(container.querySelector(CHIP)?.getAttribute('data-return-to')).toBe('https://invest.evinvest.ltd/funds');
   });
 
   it('should_cut_an_explicit_return_to_to_origin_and_path', async () => {
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" returnTo="https://user:pass@invest.evinvest.ltd/funds?token=secret#row-7" />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" returnTo="https://user:pass@invest.evinvest.ltd/funds?token=secret#row-7" />);
 
     expect(container.querySelector(CHIP)?.getAttribute('data-return-to')).toBe('https://invest.evinvest.ltd/funds');
   });
@@ -144,13 +144,13 @@ describe('AccountChip attributes', () => {
   it('should_not_set_return_to_in_host_mode', async () => {
     stubLocation(HOST_PAGE);
 
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" host={{ name: 'V' }} />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" host={{ name: 'V' }} />);
 
     expect(container.querySelector(CHIP)?.hasAttribute('data-return-to')).toBe(false);
   });
 
   it('should_drop_a_return_to_that_leaves_the_origin', async () => {
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" returnTo="//evil.example" />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" returnTo="//evil.example" />);
 
     expect(container.querySelector(CHIP)?.hasAttribute('data-return-to')).toBe(false);
   });
@@ -159,7 +159,7 @@ describe('AccountChip attributes', () => {
 describe('AccountChip events', () => {
   it('should_hand_a_valid_path_to_onNavigate_and_cancel_the_click_when_taken', async () => {
     const onNavigate = vi.fn<NavigateHandler>(() => true);
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" onNavigate={onNavigate} />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" onNavigate={onNavigate} />);
 
     const event = navigate(container.querySelector(CHIP), '/account?tab=security');
 
@@ -168,7 +168,7 @@ describe('AccountChip events', () => {
   });
 
   it('should_leave_the_click_to_the_browser_when_onNavigate_declines', async () => {
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" onNavigate={() => false} />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" onNavigate={() => false} />);
 
     const event = navigate(container.querySelector(CHIP), '/account');
 
@@ -183,7 +183,7 @@ describe('AccountChip events', () => {
     ['not a string', 42],
   ])('should_not_call_onNavigate_for_a_%s_href', async (_label, href) => {
     const onNavigate = vi.fn<NavigateHandler>(() => true);
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" onNavigate={onNavigate} />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" onNavigate={onNavigate} />);
 
     const event = navigate(container.querySelector(CHIP), href);
 
@@ -193,7 +193,7 @@ describe('AccountChip events', () => {
 
   it('should_call_onSignOut_then_send_the_page_to_the_platform_sign_out_back_to_the_host_root', async () => {
     const order: string[] = [];
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" host={{ name: 'V' }} onSignOut={() => void order.push('host')} />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" host={{ name: 'V' }} onSignOut={() => void order.push('host')} />);
     const assign = stubLocation(HOST_PAGE);
     assign.mockImplementation(() => void order.push('platform'));
 
@@ -205,7 +205,7 @@ describe('AccountChip events', () => {
 
   it('should_wait_for_an_async_onSignOut_before_leaving_the_page', async () => {
     const hostDone = deferred();
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" host={{ name: 'V' }} onSignOut={() => hostDone.promise} />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" host={{ name: 'V' }} onSignOut={() => hostDone.promise} />);
     const assign = stubLocation(HOST_PAGE);
 
     signOut(container.querySelector(CHIP));
@@ -225,7 +225,7 @@ describe('AccountChip events', () => {
     const surfaced = new Promise<unknown>(resolve => nodeProcess.once('unhandledRejection', resolve));
     try {
       const failure = new Error('host sign-out failed');
-      await render(<AccountChip scriptUrl="/auth/mfe/chip.js" host={{ name: 'V' }} onSignOut={() => Promise.reject(failure)} />);
+      await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" host={{ name: 'V' }} onSignOut={() => Promise.reject(failure)} />);
       const assign = stubLocation(HOST_PAGE);
 
       signOut(container.querySelector(CHIP));
@@ -246,7 +246,7 @@ describe('AccountChip events', () => {
       const failure = new Error('host sign-out failed');
       await render(
         <AccountChip
-          scriptUrl="/auth/mfe/chip.js"
+          scriptUrl="/mfe/concierge/chip.js"
           host={{ name: 'V' }}
           onSignOut={() => {
             throw failure;
@@ -265,7 +265,7 @@ describe('AccountChip events', () => {
   });
 
   it('should_end_the_platform_session_without_an_onSignOut', async () => {
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" host={{ name: 'V' }} />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" host={{ name: 'V' }} />);
     const assign = stubLocation(HOST_PAGE);
 
     signOut(container.querySelector(CHIP));
@@ -276,7 +276,7 @@ describe('AccountChip events', () => {
   it('should_stay_on_the_page_when_platformSignOut_is_false', async () => {
     const hostDone = Promise.resolve();
     const onSignOut = vi.fn(() => hostDone);
-    await render(<AccountChip scriptUrl="/auth/mfe/chip.js" host={{ name: 'V' }} onSignOut={onSignOut} platformSignOut={false} />);
+    await render(<AccountChip scriptUrl="/mfe/concierge/chip.js" host={{ name: 'V' }} onSignOut={onSignOut} platformSignOut={false} />);
     const assign = stubLocation(HOST_PAGE);
 
     signOut(container.querySelector(CHIP));
@@ -291,7 +291,7 @@ describe('AccountChip events', () => {
 describe('AccountPage events', () => {
   it('should_hand_a_valid_path_to_onNavigate', async () => {
     const onNavigate = vi.fn<NavigateHandler>(() => true);
-    await render(<AccountPage scriptUrl="/auth/mfe/account.js" onNavigate={onNavigate} />);
+    await render(<AccountPage scriptUrl="/mfe/concierge/account.js" onNavigate={onNavigate} />);
 
     const event = navigate(container.querySelector(PAGE), '/funds');
 
@@ -301,7 +301,7 @@ describe('AccountPage events', () => {
 
   it('should_not_call_onNavigate_for_a_protocol_relative_href', async () => {
     const onNavigate = vi.fn<NavigateHandler>(() => true);
-    await render(<AccountPage scriptUrl="/auth/mfe/account.js" onNavigate={onNavigate} />);
+    await render(<AccountPage scriptUrl="/mfe/concierge/account.js" onNavigate={onNavigate} />);
 
     navigate(container.querySelector(PAGE), '//evil.example');
 
@@ -310,7 +310,7 @@ describe('AccountPage events', () => {
 
   it('should_call_onSignOut_then_send_the_page_to_the_platform_sign_out', async () => {
     const onSignOut = vi.fn<() => void>();
-    await render(<AccountPage scriptUrl="/auth/mfe/account.js" onSignOut={onSignOut} />);
+    await render(<AccountPage scriptUrl="/mfe/concierge/account.js" onSignOut={onSignOut} />);
     const assign = stubLocation(HOST_PAGE);
 
     signOut(container.querySelector(PAGE));
@@ -322,7 +322,7 @@ describe('AccountPage events', () => {
   it('should_stay_on_the_page_when_platformSignOut_is_false', async () => {
     const hostDone = Promise.resolve();
     const onSignOut = vi.fn(() => hostDone);
-    await render(<AccountPage scriptUrl="/auth/mfe/account.js" onSignOut={onSignOut} platformSignOut={false} />);
+    await render(<AccountPage scriptUrl="/mfe/concierge/account.js" onSignOut={onSignOut} platformSignOut={false} />);
     const assign = stubLocation(HOST_PAGE);
 
     signOut(container.querySelector(PAGE));
@@ -339,14 +339,14 @@ describe('AccountPage section', () => {
   }
 
   it('should_show_the_section_the_host_gives', async () => {
-    await render(<AccountPage scriptUrl="/auth/mfe/account.js" section="security" />);
+    await render(<AccountPage scriptUrl="/mfe/concierge/account.js" section="security" />);
 
     expect(container.querySelector(PAGE)?.getAttribute('data-section')).toBe('security');
   });
 
   it('should_hand_a_switched_tab_to_onSection', async () => {
     const onSection = vi.fn();
-    await render(<AccountPage scriptUrl="/auth/mfe/account.js" onSection={onSection} />);
+    await render(<AccountPage scriptUrl="/mfe/concierge/account.js" onSection={onSection} />);
 
     switchTab(container.querySelector(PAGE), { section: 'notifications' });
 
@@ -358,7 +358,7 @@ describe('AccountPage section', () => {
     ['missing', null],
   ])('should_not_call_onSection_for_an_%s_section', async (_label, detail) => {
     const onSection = vi.fn();
-    await render(<AccountPage scriptUrl="/auth/mfe/account.js" onSection={onSection} />);
+    await render(<AccountPage scriptUrl="/mfe/concierge/account.js" onSection={onSection} />);
 
     switchTab(container.querySelector(PAGE), detail);
 

@@ -9,21 +9,21 @@ const SIGN_IN: MfeEntry = {
   name: 'concierge.sign-in',
   tag: 'mfe-concierge-sign-in',
   kind: 'component',
-  scriptUrl: '/auth/mfe/sign-in.js',
+  scriptUrl: '/mfe/concierge/sign-in.js',
 };
 
 const ACCOUNT_CHIP: MfeEntry = {
   name: 'concierge.account-chip',
   tag: 'mfe-concierge-account-chip',
   kind: 'component',
-  scriptUrl: '/auth/mfe/account-chip.js',
+  scriptUrl: '/mfe/concierge/account-chip.js',
 };
 
 const REAUTH: MfeEntry = {
   name: 'concierge.reauth',
   tag: 'mfe-concierge-reauth',
   kind: 'component',
-  scriptUrl: '/auth/mfe/reauth.js',
+  scriptUrl: '/mfe/concierge/reauth.js',
 };
 
 describe('conciergeEntry', () => {
@@ -69,7 +69,7 @@ describe('conciergeEntry for reauth', () => {
 });
 
 describe('conciergeEntry for stepup', () => {
-  const STEPUP: MfeEntry = { name: 'concierge.stepup', tag: 'mfe-concierge-stepup', kind: 'component', scriptUrl: '/auth/mfe/stepup.js' };
+  const STEPUP: MfeEntry = { name: 'concierge.stepup', tag: 'mfe-concierge-stepup', kind: 'component', scriptUrl: '/mfe/concierge/stepup.js' };
 
   it('should_return_the_stepup_entry_whose_name_and_tag_match', () => {
     expect(conciergeEntry([REAUTH, STEPUP], 'stepup')).toEqual({ ok: true, value: STEPUP });
@@ -78,17 +78,17 @@ describe('conciergeEntry for stepup', () => {
 
 describe('registry location', () => {
   it('should_point_at_the_concierge_registry_on_evinvest_ltd', () => {
-    expect(CONCIERGE_REGISTRY_URL).toBe('https://evinvest.ltd/api/auth/mfe/registry.json');
+    expect(CONCIERGE_REGISTRY_URL).toBe('https://evinvest.ltd/mfe/concierge/registry.json');
   });
 
   it('should_hold_bundles_to_the_concierge_mfe_directory', () => {
-    expect(CONCIERGE_MFE_PREFIX).toBe('https://evinvest.ltd/api/auth/mfe/');
+    expect(CONCIERGE_MFE_PREFIX).toBe('https://evinvest.ltd/mfe/concierge/');
   });
 });
 
 describe('fetchConciergeRegistry', () => {
   // As concierge publishes it: bundles next to the registry.
-  const PUBLISHED: MfeEntry = { ...SIGN_IN, scriptUrl: '/api/auth/mfe/sign-in.js' };
+  const PUBLISHED: MfeEntry = { ...SIGN_IN, scriptUrl: '/mfe/concierge/sign-in.js' };
 
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -99,7 +99,7 @@ describe('fetchConciergeRegistry', () => {
 
     const result = await fetchConciergeRegistry();
 
-    expect(result).toEqual({ ok: true, value: [{ ...PUBLISHED, scriptUrl: 'https://evinvest.ltd/api/auth/mfe/sign-in.js' }] });
+    expect(result).toEqual({ ok: true, value: [{ ...PUBLISHED, scriptUrl: 'https://evinvest.ltd/mfe/concierge/sign-in.js' }] });
   });
 
   it('should_refuse_a_registry_with_a_bundle_elsewhere_on_evinvest_ltd', async () => {
@@ -109,7 +109,7 @@ describe('fetchConciergeRegistry', () => {
 
     expect(result).toEqual({
       ok: false,
-      error: `registry ${CONCIERGE_REGISTRY_URL}: entry 0: concierge.sign-in: scriptUrl https://evinvest.ltd/uploads/sign-in.js is outside https://evinvest.ltd/api/auth/mfe/`,
+      error: `registry ${CONCIERGE_REGISTRY_URL}: entry 0: concierge.sign-in: scriptUrl https://evinvest.ltd/uploads/sign-in.js is outside https://evinvest.ltd/mfe/concierge/`,
     });
   });
 
@@ -123,7 +123,7 @@ describe('fetchConciergeRegistry', () => {
   });
 
   it('should_hold_a_staging_registry_to_the_prefix_the_caller_names', async () => {
-    const staging = 'https://staging.evinvest.ltd/api/auth/mfe/';
+    const staging = 'https://staging.evinvest.ltd/mfe/concierge/';
     vi.stubGlobal('fetch', vi.fn(async () => Response.json([PUBLISHED])));
 
     const result = await fetchConciergeRegistry(`${staging}registry.json`, { allowedPrefix: staging });
@@ -134,7 +134,7 @@ describe('fetchConciergeRegistry', () => {
   it('should_refuse_a_staging_registry_held_to_the_production_prefix', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json([PUBLISHED])));
 
-    const result = await fetchConciergeRegistry('https://staging.evinvest.ltd/api/auth/mfe/registry.json');
+    const result = await fetchConciergeRegistry('https://staging.evinvest.ltd/mfe/concierge/registry.json');
 
     expect(result.ok).toBe(false);
   });

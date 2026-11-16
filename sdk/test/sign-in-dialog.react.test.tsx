@@ -9,7 +9,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { SignInDialog } from '../src/react/index';
 
 const TAG = 'mfe-concierge-sign-in';
-const SCRIPT = '/auth/mfe/sign-in.js';
+const SCRIPT = '/mfe/concierge/sign-in.js';
 
 let container: HTMLDivElement;
 let root: Root;
