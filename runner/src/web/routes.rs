@@ -7,8 +7,8 @@ use std::net::{IpAddr, SocketAddr};
 use axum::{
 	Json,
 	extract::{ConnectInfo, FromRequestParts, Path, Query, State},
-	http::{HeaderMap, StatusCode, request::Parts},
-	response::Redirect,
+	http::{HeaderMap, HeaderValue, StatusCode, request::Parts},
+	response::{IntoResponse, Redirect, Response},
 };
 use axum_extra::extract::cookie::CookieJar;
 use domain::{
@@ -250,6 +250,55 @@ pub async fn session(State(st): State<WebState>, jar: CookieJar) -> Result<(Cook
 	let jar = jar.add(st.cookies.server_cookie(st.cookies.access.clone(), fresh.access_token, fresh.remaining_secs));
 	Ok((jar, Json(SessionInfo::authenticated(fresh.user))))
 }
+/// `GET /auth/gate` — Traefik's ForwardAuth target for a staff-only page on this origin: 204
+/// with `X-Auth-User` (the account id) for an Operator, Admin or Owner, 403 for an investor,
+/// else a sign-in that comes back to `X-Forwarded-Uri`. The session is read as
+/// `/auth/session` reads it, except that an unreadable directory refuses: a stored copy may
+/// describe a seat that has since been taken away.
+pub async fn staff_gate(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Response {
+	let st = &st.inner;
+	let fresh = match jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
+		Some(id) => match st.sessions.fresh(&id, &st.auth).await {
+			Ok(fresh) => fresh,
+			Err(e) => return store_err(e).into_response(),
+		},
+		None => None,
+	};
+	let Some(fresh) = fresh else {
+		return (clear_session(st, jar), to_sign_in(st, &headers)).into_response();
+	};
+	let Some(caller) = Caller::of(&fresh) else {
+		return (end_session(st, jar).await, to_sign_in(st, &headers)).into_response();
+	};
+	match gate(st, &caller).await {
+		Ok(_) => {}
+		Err(Denied::Other(refusal)) if refusal.is_internal() => return refusal.into_response(),
+		Err(_) => return (end_session(st, jar).await, to_sign_in(st, &headers)).into_response(),
+	}
+	if Role::parse(&caller.role).expect("the directory reports only Role strings") == Role::Investor {
+		return (StatusCode::FORBIDDEN, caller.refreshed(st, jar)).into_response();
+	}
+	let user = HeaderValue::from_str(&fresh.user.user_id).expect("Caller::of parsed it as a uuid");
+	(StatusCode::NO_CONTENT, caller.refreshed(st, jar), [("x-auth-user", user)]).into_response()
+}
+
+/// The zone sign-in (`/api/auth/login`), back to the page Traefik was asked for. A request
+/// that is not a navigation, or that comes back from a failed sign-in, is answered 401
+/// instead: sending it round again would loop.
+fn to_sign_in(st: &super::Inner, headers: &HeaderMap) -> Response {
+	let forwarded = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+	let Some(uri) = forwarded("x-forwarded-uri") else {
+		return (StatusCode::BAD_REQUEST, "not a forward-auth request").into_response();
+	};
+	let navigation = matches!(forwarded("x-forwarded-method"), Some("GET" | "HEAD"));
+	let failed = uri.split_once('?').is_some_and(|(_, q)| form_urlencoded::parse(q.as_bytes()).any(|(k, _)| k == "auth_error"));
+	if !navigation || failed {
+		return StatusCode::UNAUTHORIZED.into_response();
+	}
+	let query = form_urlencoded::Serializer::new(String::new()).append_pair("returnTo", &safe_return_to(Some(uri))).finish();
+	Redirect::to(&format!("{}/api/auth/login?{query}", st.public_origin)).into_response()
+}
+
 /// `POST /auth/logout` — CSRF-checked: drop the session, revoke the refresh family
 /// upstream (best-effort), and clear the cookies. Without a session it only clears the
 /// cookies and answers 200; a session with a bad token is still refused.

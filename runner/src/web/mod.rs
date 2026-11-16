@@ -10,7 +10,9 @@
 //!     backend authenticates a request by verifying it locally against this
 //!     plane's JWKS (`evconcierge_auth::Verifier`) — no per-request round trip and
 //!     no zone-side OAuth. A zone signs a user in by linking to
-//!     `/api/auth/login?returnTo=<path>`; that is the entire zone-side contract.
+//!     `/api/auth/login?returnTo=<path>`; that is the entire zone-side contract. A
+//!     staff-only page with no auth of its own sits behind Traefik's ForwardAuth on
+//!     `/auth/gate` instead (`routes::staff_gate`).
 //!
 //! Besides the sessions, it is the account-less notification edge: the subscribe form
 //! (`POST /auth/notifications/subscribe`, Turnstile, scope hosts allowed) and the confirm
@@ -287,6 +289,8 @@ pub fn router(state: WebState) -> Router {
 		// leaves this origin's session too. A page, not a call: a script on a scope host
 		// must never be able to end the session by itself, so a person presses the button.
 		.route("/auth/logout/confirm", get(logout::page).post(logout::confirm))
+		// No CORS: the answer is for Traefik's ForwardAuth, never for a page's script.
+		.route("/auth/gate", get(routes::staff_gate))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
 		.route("/auth/email/verify/request", post(sign_in::request_verification))
 		.route("/auth/email/verify/confirm", post(sign_in::confirm_verification))
