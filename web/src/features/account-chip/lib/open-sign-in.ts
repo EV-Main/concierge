@@ -1,5 +1,6 @@
 // The signed-out chip opens the platform's sign-in dialog rather than a login page. It
-// always mounts its own, loaded through the published registry beside this bundle, and owns
+// always mounts its own, loaded through the registry in this bundle's own directory (either of
+// the addresses concierge serves it under, `runner/src/web/mfe.rs`), and owns
 // its events. It never opens an <mfe-concierge-sign-in> it did not create: the first one in
 // the DOM may be a lookalike or one configured with another origin and return target. The
 // bundle must come from the registry's own origin, so a registry entry cannot pull in a
@@ -14,9 +15,6 @@ const SIGN_IN = { name: "concierge.sign-in", tag: "mfe-concierge-sign-in" } as c
 const OWNED_ATTR = "data-chip-dialog";
 
 export interface OpenSignIn {
-  /** The identity plane's origin, whose registry names the bundle. */
-  origin: string;
-  registryPath: string;
   intent: string | null;
   returnTo: string | null;
   /** The platform session now exists: re-read it. */
@@ -24,13 +22,13 @@ export interface OpenSignIn {
 }
 
 /** False when the dialog could not be loaded; the caller then follows its plain link. */
-export async function openSignIn({ origin, registryPath, intent, returnTo, onSignedIn }: OpenSignIn): Promise<boolean> {
+export async function openSignIn({ intent, returnTo, onSignedIn }: OpenSignIn): Promise<boolean> {
   const mine = document.querySelector(`${SIGN_IN.tag}[${OWNED_ATTR}]`);
   if (mine) {
     mine.setAttribute("open", "");
     return true;
   }
-  const registryUrl = new URL(registryPath, origin);
+  const registryUrl = new URL("registry.json", import.meta.url);
   const registry = await fetchRegistry(registryUrl, { allowedPrefix: new URL("./", registryUrl).href });
   const entry = registry.ok ? findEntry(registry.value, SIGN_IN.name) : undefined;
   if (!entry || entry.tag !== SIGN_IN.tag || !sameOrigin(entry.scriptUrl, registryUrl)) return false;

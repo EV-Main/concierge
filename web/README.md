@@ -87,7 +87,7 @@ again; a scope host links to the platform's Security page and offers to ask agai
 
 `dist/` holds two pages beside the bundles, `reauth.html` and `sign-in.html`. The
 authorize route sends a browser to them, and concierge serves them at
-`/api/auth/mfe/<page>.html` with `no-store`, `no-referrer` and a full CSP (no inline
+`/mfe/concierge/<page>.html` with `no-store`, `no-referrer` and a full CSP (no inline
 script; `runner/src/web/mfe.rs`). Pages are not elements, so they are not in
 `registry.json`.
 
@@ -190,7 +190,7 @@ Build-time configuration (`scripts/config.mjs`, the only place it is read):
 | `EV_ALLOW_ORIGIN_OVERRIDE` | unset (off) | `1` for dev and stand builds only: elements honour `data-origin`, `EV_PUBLIC_ORIGIN` may be `http:`, and the bare `ev_csrf` cookie is read. Never in production — `data-origin` would let any script on a host page aim the elements' credentialed calls elsewhere |
 | `EV_TURNSTILE_SITEKEY` | unset | unset, the forms stay disabled with "Captcha failed to load" |
 | `EV_SA_PANEL_URL` | unset | the chip's Services entry |
-| `EV_MFE_BASE_PATH` | `/api/auth/mfe/` | where hosts load `dist/` from (concierge's `/auth/mfe/*` behind the conductor's `/api/auth` rewrite); registry `scriptUrl`s are root-relative under it |
+| `EV_MFE_BASE_PATH` | `/mfe/concierge/` | where hosts load `dist/` from; registry `scriptUrl`s are root-relative under it |
 
 ## Copy
 

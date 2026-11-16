@@ -61,11 +61,11 @@ const MAX_STATE_LEN: usize = 512;
 /// The page on this origin that asks the signed-in person to confirm it is them
 /// (`mfe-concierge-reauth`) and then, confirmed or not, sends the browser to its
 /// `return_to` — always a path back to this route, built here.
-pub const CONFIRM_PATH: &str = "/api/auth/mfe/reauth.html";
+pub const CONFIRM_PATH: &str = "/mfe/concierge/reauth.html";
 /// The page on this origin that signs a person in (`mfe-concierge-sign-in`) and then sends
 /// the browser to its `return_to` — always a path back to this route, built here — or, when
 /// the person gives up, to that path with `auth_error` added.
-pub const SIGN_IN_PATH: &str = "/api/auth/mfe/sign-in.html";
+pub const SIGN_IN_PATH: &str = "/mfe/concierge/sign-in.html";
 /// How long a confirmation trip may take. A trip not back by then is forgotten, and the
 /// browser that comes back later starts a new one.
 pub const TRIP_TTL_SECS: u64 = 600;

@@ -93,8 +93,7 @@ message Scope {
   // list of sign-in routes only — `/auth/code/request`, `/auth/code/verify`,
   // `/auth/password/signin`, `/auth/password/signup`, `/auth/password/signup/confirm`,
   // `/auth/password/signup/resend`, `/auth/passkey/signin/*` and `GET /auth/session`, which
-  // answers them `{authenticated, user, permissions}` and never a token — and on the
-  // public, credential-less `GET /auth/mfe/*`. Everything that acts on an open session or
+  // answers them `{authenticated, user, permissions}` and never a token. Everything that acts on an open session or
   // reads the account (`/auth/email/verify/*`, `/auth/password/set`,
   // `/auth/passkey/register|remove`, sessions, username, methods, `/auth/me`,
   // `/auth/notifications/settings*`, logout, `/kyc/*`) accepts PUBLIC_ORIGIN alone; a scope

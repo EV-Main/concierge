@@ -1,5 +1,5 @@
 // The script of the platform sign-in page, `sign-in.html` (publicly
-// `/api/auth/mfe/sign-in.html`). concierge's authorize route sends a browser here when a
+// `/mfe/concierge/sign-in.html`). concierge's authorize route sends a browser here when a
 // relying party needs a session the browser does not have: none at all, `prompt=select_account`,
 // or one minted before the account's `token_version` (`runner/src/web/authorize.rs`). The
 // page names the app, mounts `<mfe-concierge-sign-in open>` from this build, and goes back

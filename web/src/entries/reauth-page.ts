@@ -1,5 +1,5 @@
 // The script of the platform confirmation page, `reauth.html` (publicly
-// `/api/auth/mfe/reauth.html`). concierge's authorize route sends a browser here when a
+// `/mfe/concierge/reauth.html`). concierge's authorize route sends a browser here when a
 // client asked for `max_age` and the session is older (`runner/src/web/authorize.rs`,
 // `CONFIRM_PATH`). The page names the app that asks, mounts `<mfe-concierge-reauth open>`,
 // which this build ships as its own bundle, and goes back to `return_to` on either outcome:

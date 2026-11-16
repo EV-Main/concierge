@@ -1,6 +1,6 @@
 //! The scope registry (migration 0031) and what it opens on the web surface: the
 //! `ScopeRegistry` read service, CORS and the `Origin` check on the closed list of sign-in
-//! routes, and the micro-frontend bundles under `/auth/mfe/*`.
+//! routes, and the micro-frontend bundles under `/mfe/concierge/*`.
 
 mod common;
 
@@ -475,6 +475,7 @@ fn bundles() -> (Router, TempFixture) {
 	let tree = Fixture::default().write_to_tempdir();
 	for (path, text) in [
 		("dist/registry.json", r#"{"sign-in":"sign-in-ABCD2345.js"}"#),
+		("dist/registry.alias.json", r#"{"sign-in":"/api/auth/mfe/sign-in-ABCD2345.js"}"#),
 		("dist/sign-in-ABCD2345.js", "export {};"),
 		("dist/chunks/chunk-Q7ZK3M2P.js", "export {};"),
 		("dist/.env", "SECRET=1"),
@@ -520,24 +521,24 @@ async fn fetch(router: &Router, method: Method, path: &str, origin: Option<&str>
 async fn the_manifest_is_short_lived_and_hashed_bundles_are_immutable() {
 	let (router, _bundles) = bundles();
 
-	let (status, headers, body) = fetch(&router, Method::GET, "/auth/mfe/registry.json", None).await;
+	let (status, headers, body) = fetch(&router, Method::GET, "/mfe/concierge/registry.json", None).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/json");
 	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300");
 	assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
 	assert_eq!(body, br#"{"sign-in":"sign-in-ABCD2345.js"}"#);
 
-	let (status, headers, _) = fetch(&router, Method::GET, "/auth/mfe/chunks/chunk-Q7ZK3M2P.js", None).await;
+	let (status, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/chunks/chunk-Q7ZK3M2P.js", None).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "text/javascript; charset=utf-8");
 	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
 
-	let (status, headers, body) = fetch(&router, Method::HEAD, "/auth/mfe/sign-in-ABCD2345.js", None).await;
+	let (status, headers, body) = fetch(&router, Method::HEAD, "/mfe/concierge/sign-in-ABCD2345.js", None).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
 	assert!(body.is_empty(), "HEAD carries no body");
 
-	let (_, headers, _) = fetch(&router, Method::GET, "/auth/mfe/LICENSES.txt", None).await;
+	let (_, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/LICENSES.txt", None).await;
 	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300", "an all-caps name is no content hash");
 }
 
@@ -547,7 +548,7 @@ async fn the_manifest_is_short_lived_and_hashed_bundles_are_immutable() {
 #[tokio::test]
 async fn the_sign_in_page_is_never_cached_framed_or_referred() {
 	let (router, _bundles) = bundles();
-	let (status, headers, _) = fetch(&router, Method::GET, "/auth/mfe/sign-in.html?return_to=%2Fapi%2Fauth%2Fauthorize%3Fclient_id%3Dsa", None).await;
+	let (status, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/sign-in.html?return_to=%2Fapi%2Fauth%2Fauthorize%3Fclient_id%3Dsa", None).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CACHE_CONTROL], "no-store");
 	assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
@@ -581,16 +582,16 @@ async fn fetch_with(router: &Router, path: &str, name: header::HeaderName, value
 #[tokio::test]
 async fn the_bundles_revalidate_and_serve_ranges() {
 	let (router, _bundles) = bundles();
-	let (_, headers, _) = fetch(&router, Method::GET, "/auth/mfe/registry.json", None).await;
+	let (_, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/registry.json", None).await;
 	let etag = headers[header::ETAG].to_str().unwrap().to_owned();
 	assert!(!headers.contains_key(header::LAST_MODIFIED), "the store mtime is no validator of a manifest");
 
-	let (status, headers, body) = fetch_with(&router, "/auth/mfe/registry.json", header::IF_NONE_MATCH, &etag).await;
+	let (status, headers, body) = fetch_with(&router, "/mfe/concierge/registry.json", header::IF_NONE_MATCH, &etag).await;
 	assert_eq!(status, StatusCode::NOT_MODIFIED);
 	assert!(body.is_empty());
 	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300", "a 304 renews the same lifetime");
 
-	let (status, headers, body) = fetch_with(&router, "/auth/mfe/sign-in-ABCD2345.js", header::RANGE, "bytes=0-5").await;
+	let (status, headers, body) = fetch_with(&router, "/mfe/concierge/sign-in-ABCD2345.js", header::RANGE, "bytes=0-5").await;
 	assert_eq!(status, StatusCode::PARTIAL_CONTENT);
 	assert_eq!(body, b"export");
 	assert_eq!(headers[header::CONTENT_TYPE], "text/javascript; charset=utf-8");
@@ -608,53 +609,74 @@ async fn a_manifest_rewritten_under_the_same_size_and_mtime_is_not_revalidated_a
 		std::fs::File::options().write(true).open(&manifest).unwrap().set_modified(store_mtime).unwrap();
 	};
 	write(r#"{"account":"account-JUWOCNHT.js"}"#);
-	let (_, headers, _) = fetch(&router, Method::GET, "/auth/mfe/registry.json", None).await;
+	let (_, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/registry.json", None).await;
 	let etag = headers[header::ETAG].to_str().unwrap().to_owned();
 
 	write(r#"{"account":"account-V5EIPT5F.js"}"#);
-	let (status, _, body) = fetch_with(&router, "/auth/mfe/registry.json", header::IF_NONE_MATCH, &etag).await;
+	let (status, _, body) = fetch_with(&router, "/mfe/concierge/registry.json", header::IF_NONE_MATCH, &etag).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(body, br#"{"account":"account-V5EIPT5F.js"}"#);
-	let (status, _, body) = fetch_with(&router, "/auth/mfe/registry.json", header::IF_MODIFIED_SINCE, "Thu, 01 Jan 1970 00:00:01 GMT").await;
+	let (status, _, body) = fetch_with(&router, "/mfe/concierge/registry.json", header::IF_MODIFIED_SINCE, "Thu, 01 Jan 1970 00:00:01 GMT").await;
 	assert_eq!(status, StatusCode::OK, "a store mtime says nothing about the bytes");
 	assert_eq!(body, br#"{"account":"account-V5EIPT5F.js"}"#);
 }
 
+/// CORS on the bundles is the edge's: the producer adds none of its own.
 #[tokio::test]
-async fn the_bundles_answer_a_scope_host_without_credentials() {
+async fn the_bundles_leave_cors_to_the_edge() {
 	let (router, _bundles) = bundles();
-	let (_, headers, _) = fetch(&router, Method::GET, "/auth/mfe/registry.json", Some(INVEST)).await;
+	let (_, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/registry.json", Some(INVEST)).await;
+	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+	assert!(!varies_on_origin(&headers));
+}
+
+/// The old address serves the same files to the hosts built before the move, with a
+/// manifest naming its own files: their SDK refuses a bundle outside `/api/auth/mfe/`.
+#[tokio::test]
+async fn the_old_address_serves_its_own_manifest_to_a_scope_host() {
+	let (router, _bundles) = bundles();
+	let (status, headers, body) = fetch(&router, Method::GET, "/auth/mfe/registry.json", Some(INVEST)).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(body, br#"{"sign-in":"/api/auth/mfe/sign-in-ABCD2345.js"}"#);
+	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300");
 	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], INVEST);
 	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
 	assert!(varies_on_origin(&headers));
 
-	let (_, headers, _) = fetch(&router, Method::GET, "/auth/mfe/registry.json", Some("https://evil.example")).await;
+	let (status, headers, body) = fetch(&router, Method::GET, "/auth/mfe/sign-in-ABCD2345.js", Some("https://evil.example")).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(body, b"export {};");
+	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
 	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+
+	assert_eq!(fetch(&router, Method::GET, "/auth/mfe/sign-in.html", None).await.0, StatusCode::OK);
+	assert_eq!(fetch(&router, Method::GET, "/auth/mfe/%2e%2e/secret.txt", None).await.0, StatusCode::NOT_FOUND);
+	assert_eq!(fetch(&router, Method::GET, "/auth/mfe/.env", None).await.0, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn nothing_outside_the_files_is_served() {
 	let (router, _bundles) = bundles();
 	for path in [
-		"/auth/mfe/",
-		"/auth/mfe/chunks",
-		"/auth/mfe/chunks/",
-		"/auth/mfe/../secret.txt",
-		"/auth/mfe/chunks/../registry.json",
-		"/auth/mfe/%2e%2e/secret.txt",
-		"/auth/mfe/chunks/%2e%2e/%2e%2e/secret.txt",
-		"/auth/mfe/..%2fsecret.txt",
-		"/auth/mfe/.env",
-		"/auth/mfe/escape.txt",
-		"/auth/mfe/missing.js",
-		"/auth/mfe/a%5c..%5csecret.txt",
+		"/mfe/concierge/",
+		"/mfe/concierge/chunks",
+		"/mfe/concierge/chunks/",
+		"/mfe/concierge/../secret.txt",
+		"/mfe/concierge/chunks/../registry.json",
+		"/mfe/concierge/%2e%2e/secret.txt",
+		"/mfe/concierge/chunks/%2e%2e/%2e%2e/secret.txt",
+		"/mfe/concierge/..%2fsecret.txt",
+		"/mfe/concierge/.env",
+		"/mfe/concierge/escape.txt",
+		"/mfe/concierge/missing.js",
+		"/mfe/concierge/a%5c..%5csecret.txt",
 	] {
 		let (status, _, body) = fetch(&router, Method::GET, path, None).await;
 		assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
 		assert!(!String::from_utf8_lossy(&body).contains("outside"), "{path}");
 	}
 	for method in [Method::POST, Method::PUT, Method::DELETE] {
-		let (status, _, _) = fetch(&router, method.clone(), "/auth/mfe/registry.json", None).await;
+		let (status, _, _) = fetch(&router, method.clone(), "/mfe/concierge/registry.json", None).await;
 		assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
 	}
 }

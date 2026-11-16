@@ -5,9 +5,7 @@
 import { fetchClientName } from "../api/client-name";
 import { authorizeReturnTo } from "./authorize-return";
 
-// Beside the pages' own directory (`/api/auth/mfe/` → `/api/auth/clients/`), so it also
-// holds where concierge is reached without the conductor's `/api` prefix.
-const CLIENTS_DIR = "../clients/";
+const CLIENTS_DIR = "/api/auth/clients/";
 
 export type AuthorizePage =
   /** `return_to` failed the check, or concierge would not serve its client at authorize. */

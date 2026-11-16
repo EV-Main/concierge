@@ -1,6 +1,5 @@
-//! The platform's micro-frontend bundles (`web/dist`), served under `/auth/mfe/*` —
-//! publicly `/api/auth/mfe/*` — from the directory `WEB_MFE_DIR` names
-//! (`docs/SCOPES-AND-APPROVALS.md` §3.1). Hosts find the current bundles through the
+//! The platform's micro-frontend bundles (`web/dist`), served under `/mfe/concierge/*` from
+//! the directory `WEB_MFE_DIR` names (`docs/SCOPES-AND-APPROVALS.md` §3.1). Hosts find the current bundles through the
 //! manifest, [`MANIFEST`].
 //!
 //! The serving itself — conditional requests (ETag, Last-Modified, 304), ranges, the
@@ -10,8 +9,11 @@
 //! segment that could climb out of it (`..`, `.`, a dotfile, a backslash) or a symlink
 //! that resolves outside it answers 404, the same as a file that is not there — checked
 //! here because `ServeDir` follows symlinks wherever they point. GET and HEAD only.
-//! Read-only and public, so CORS answers a scope's origin without credentials: a host
-//! fetches the manifest and the bundles anonymously.
+//! CORS on `/mfe/concierge/*` is the edge's (`*`), not set here.
+//!
+//! `/auth/mfe/*` (publicly `/api/auth/mfe/*`) is the directory's old address, kept for the
+//! hosts built before the move: its manifest is [`ALIAS_MANIFEST`], naming the alias's own
+//! files, and CORS answers a scope's origin without credentials.
 //!
 //! One page is also served outside the prefix: `account.html` at `/account`, the platform's
 //! account page. It acts on the session, which this plane accepts only from
@@ -47,7 +49,9 @@ use crate::web::allowlist::SignInAllowlist;
 /// the one thing that must go stale quickly.
 pub const MANIFEST: &str = "registry.json";
 
-const PREFIX: &str = "/auth/mfe";
+const PREFIX: &str = "/mfe/concierge";
+const ALIAS: &str = "/auth/mfe/";
+const ALIAS_MANIFEST: &str = "registry.alias.json";
 const ACCOUNT_PAGE: &str = "account.html";
 const SHORT_CACHE: &str = "public, max-age=300";
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
@@ -69,17 +73,43 @@ impl MfeAssets {
 }
 
 pub fn mount(router: Router, assets: MfeAssets) -> Router {
-	router.merge(Router::new().route("/auth/mfe/{*path}", get(serve)).route("/account", get(account)).with_state(Arc::new(assets)))
+	router.merge(
+		Router::new()
+			.route("/mfe/concierge/{*path}", get(serve))
+			.route("/auth/mfe/{*path}", get(alias))
+			.route("/account", get(account))
+			.with_state(Arc::new(assets)),
+	)
 }
 
 async fn account(assets: State<Arc<MfeAssets>>, mut request: Request) -> Response {
-	*request.uri_mut() = Uri::from_static("/auth/mfe/account.html");
+	*request.uri_mut() = Uri::from_static("/mfe/concierge/account.html");
 	serve(assets, UrlPath(ACCOUNT_PAGE.to_owned()), request).await
 }
 
-async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<String>, mut request: Request) -> Response {
+async fn alias(assets: State<Arc<MfeAssets>>, UrlPath(path): UrlPath<String>, mut request: Request) -> Response {
 	let origin = request.headers().get(ORIGIN).cloned();
-	let response = match serveable(&assets.root, &path).await {
+	let path = if path == MANIFEST { ALIAS_MANIFEST.to_owned() } else { path };
+	let rest = request.uri().path().strip_prefix(ALIAS).expect("routed under the alias");
+	let rest = if rest == MANIFEST { ALIAS_MANIFEST } else { rest };
+	match Uri::try_from(format!("{PREFIX}/{rest}")) {
+		Ok(uri) => *request.uri_mut() = uri,
+		Err(_) => return StatusCode::NOT_FOUND.into_response(),
+	}
+	let mut response = serve(assets.clone(), UrlPath(path), request).await;
+	let headers = response.headers_mut();
+	headers.append(VARY, HeaderValue::from_static("Origin"));
+	if let Some(origin) = origin
+		&& let Ok(raw) = origin.to_str()
+		&& assets.allowlist.current().origins.admits(raw)
+	{
+		headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+	}
+	response
+}
+
+async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<String>, mut request: Request) -> Response {
+	match serveable(&assets.root, &path).await {
 		Some((name, resolved)) => {
 			let tag = if is_hashed(&name) {
 				None
@@ -100,7 +130,7 @@ async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<Stri
 			{
 				let mut response = StatusCode::NOT_MODIFIED.into_response();
 				response.headers_mut().insert(ETAG, HeaderValue::from_str(tag).expect("quoted base64url"));
-				return finish(describe(response, &name), origin, &assets);
+				return describe(response, &name);
 			}
 			if tag.is_some() {
 				for conditional in [IF_NONE_MATCH, IF_MODIFIED_SINCE, IF_MATCH, IF_UNMODIFIED_SINCE, IF_RANGE] {
@@ -126,20 +156,7 @@ async fn serve(State(assets): State<Arc<MfeAssets>>, UrlPath(path): UrlPath<Stri
 			describe(response, &name)
 		}
 		None => StatusCode::NOT_FOUND.into_response(),
-	};
-	finish(response, origin, &assets)
-}
-
-fn finish(mut response: Response, origin: Option<HeaderValue>, assets: &MfeAssets) -> Response {
-	let headers = response.headers_mut();
-	headers.append(VARY, HeaderValue::from_static("Origin"));
-	if let Some(origin) = origin
-		&& let Ok(raw) = origin.to_str()
-		&& assets.allowlist.current().origins.admits(raw)
-	{
-		headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
 	}
-	response
 }
 
 /// What a page here may load: its own bundles and the plane's routes, Turnstile (a mailed

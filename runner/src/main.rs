@@ -608,16 +608,16 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 /// account is one) can brute-force a hand-typed key offline and then recover the document
 /// number behind every stored row. That is precisely the PII `0010_kyc_cases.sql` promises
 /// this database does not hold, handed over by a weak secret rather than by the schema.
-/// The bundles to serve under `/auth/mfe/*`, or `None` — logged — when there are none.
+/// The bundles to serve under `/mfe/concierge/*`, or `None` — logged — when there are none.
 fn mfe_assets(dir: Option<&str>, allowlist: Arc<web::allowlist::SignInAllowlist>) -> Option<web::mfe::MfeAssets> {
 	let Some(dir) = dir else {
-		tracing::info!("WEB_MFE_DIR is unset: /auth/mfe/* is not served");
+		tracing::info!("WEB_MFE_DIR is unset: /mfe/concierge/* is not served");
 		return None;
 	};
 	match web::mfe::MfeAssets::open(std::path::Path::new(dir), allowlist) {
 		Ok(assets) => Some(assets),
 		Err(e) => {
-			tracing::error!(error = ?e, "micro-frontend bundles unavailable: /auth/mfe/* is not served");
+			tracing::error!(error = ?e, "micro-frontend bundles unavailable: /mfe/concierge/* is not served");
 			None
 		}
 	}

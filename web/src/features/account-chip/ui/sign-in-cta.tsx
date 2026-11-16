@@ -2,7 +2,6 @@ import { useT } from "@evinvest/i18n/react";
 import { cn } from "@evinvest/uikit";
 import type { MouseEvent } from "react";
 
-import { BUILD } from "../../../shared/config/build";
 import { useElement } from "../../../shared/element/element-context";
 import { loginHref } from "../../../shared/lib/return-to";
 import { CHIP_FOCUS } from "../lib/chip-parts";
@@ -26,7 +25,7 @@ export function SignInCta({ intent, returnTo, onSignedIn }: { intent: string | n
   const open = (e: MouseEvent<HTMLAnchorElement>) => {
     if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     e.preventDefault();
-    void openSignIn({ origin: api.origin, registryPath: BUILD.registryPath, intent, returnTo, onSignedIn }).then((opened) => {
+    void openSignIn({ intent, returnTo, onSignedIn }).then((opened) => {
       if (!opened) location.assign(fallback);
     });
   };

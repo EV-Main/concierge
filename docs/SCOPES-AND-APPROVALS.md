@@ -6,7 +6,7 @@ registry (§3: `tenants` columns from migration 0031, `ScopeRegistry` mounted in
 user auth layer; a CLOSED scope's clients are refused), sign-in from a scope's hosts
 (§3.1: CORS and the `Origin` check on the closed route list, the passkey verifier's
 origins, OAuth `returnTo`, the sign-up ticket of migration 0032), the micro-frontend
-bundles under `/auth/mfe/*` (§3.1), the relying-party streams (§4: `ScopeEvents` and
+bundles under `/mfe/concierge/*` (§3.1), the relying-party streams (§4: `ScopeEvents` and
 `UserEvents` read by a client credential, migration 0034), the scope catalog's storage
 (`ScopeCatalogService`, §5.1, §6), the scope topics in every inbox (§6: emit by namespace,
 `default_subscribed`, the account-less subscribe, the move of the fund and money topics;
@@ -171,13 +171,15 @@ closing a scope or removing an origin takes effect without a restart. An absolut
 matched exactly, or `/auth/login` answers 400; a relative or empty one lands on `/` as it
 always did.
 
-**Micro-frontend bundles.** `GET /auth/mfe/*` — publicly
-`https://evinvest.ltd/api/auth/mfe/*`, under the conductor's `/api/auth/*` rewrite — serves
+**Micro-frontend bundles.** `GET /mfe/concierge/*` — publicly
+`https://evinvest.ltd/mfe/concierge/*`, routed by the edge unstripped — serves
 the directory `WEB_MFE_DIR` names; the manifest hosts read is `registry.json`. It is
-public and read-only: a scope origin gets `Access-Control-Allow-Origin` (no credentials)
-and `Vary: Origin`, files only (no index, no listing, no dotfile, nothing resolving
+public and read-only: the edge answers `Access-Control-Allow-Origin: *` (no credentials),
+files only (no index, no listing, no dotfile, nothing resolving
 outside the directory), esbuild-hashed names cached for a year and everything else for
-five minutes. With `WEB_MFE_DIR` unset or unreadable the route is not mounted and sign-in
+five minutes. The old address `/api/auth/mfe/*` (concierge's `/auth/mfe/*`) serves the same
+files for hosts built before the move, its `registry.json` naming its own files
+(`registry.alias.json`) and its CORS a scope origin with `Vary: Origin`. With `WEB_MFE_DIR` unset or unreadable the route is not mounted and sign-in
 is unaffected; the image sets it only once `web/` exists in this repository. An `.html`
 file there is a platform page (the confirmation of §3.2): it is answered with
 `Cache-Control: no-store`, `Referrer-Policy: no-referrer` and `Content-Security-Policy:
@@ -191,7 +193,7 @@ for the mailed code; inline styles because the elements insert their `<style>`).
 `GET /api/auth/authorize` with no live session — none, signed out elsewhere, or minted
 under an older `token_version` (that one is ended first, cookies cleared) — and with
 `prompt=select_account` answers a 302 to
-`/api/auth/mfe/sign-in.html?return_to=<this request, rebuilt from its parameters>`. The
+`/mfe/concierge/sign-in.html?return_to=<this request, rebuilt from its parameters>`. The
 query carries `return_to` alone; `return_to` is `/api/auth/authorize?client_id&redirect_uri
 &response_type=code[&state]&code_challenge&code_challenge_method=S256[&max_age]` — never
 `prompt`, never `auth_error`. The page signs the person in by any ordinary method (each
@@ -223,7 +225,7 @@ digits, anything else answers `error=invalid_request`; together with `prompt` it
 - otherwise: the plane stores a trip — key `rpconfirm:<session id>:<client_id>:<PKCE
   challenge>`, value the session's re-authentication count at that moment, 600 s — and
   answers a 302 to
-  `/api/auth/mfe/reauth.html?return_to=<this request, rebuilt from its parameters>`. That
+  `/mfe/concierge/reauth.html?return_to=<this request, rebuilt from its parameters>`. That
   page runs the re-authentication of `/auth/reauth/*` (email code, password, passkey;
   `PUBLIC_ORIGIN` only) and navigates to `return_to`, confirmed or dismissed;
 - back with a trip under that key (taken once, so a second return is a new request): a

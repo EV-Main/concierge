@@ -75,7 +75,7 @@ ev::settings! {
 		web_bind: std::net::SocketAddr = "127.0.0.1:55671",
 		/// The user-facing origin the conductor serves; builds the OAuth redirect_uri.
 		public_origin: String,
-		/// The built micro-frontend bundles (`web/dist`), served under `/auth/mfe/*`. Unset,
+		/// The built micro-frontend bundles (`web/dist`), served under `/mfe/concierge/*`. Unset,
 		/// or naming no readable directory, ⇒ the route is not mounted and answers 404 (the
 		/// second at `error!`). Never a boot refusal: sign-in for every zone runs on this
 		/// process, and missing bundles must not take it down.

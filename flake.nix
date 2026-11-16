@@ -79,7 +79,7 @@
           doCheck = false;
           meta.description = "the concierge binary";
         };
-        # ── the platform's micro-frontends (web/ → /auth/mfe/*) ──────────────
+        # ── the platform's micro-frontends (web/ → /mfe/concierge/*) ──────────────
         # Built only when web/ exists: it lands with EV-Main/concierge#128, and main must
         # keep evaluating until then. Once it does exist, a missing lockfile is a hard
         # error rather than an image quietly shipped without the bundles: importNpmLock
@@ -105,7 +105,7 @@
               env = {
                 EV_PUBLIC_ORIGIN = "https://evinvest.ltd";
                 EV_TURNSTILE_SITEKEY = "0x4AAAAAAFSnp3-3WadT45qx";
-                EV_MFE_BASE_PATH = "/api/auth/mfe/";
+                EV_MFE_BASE_PATH = "/mfe/concierge/";
               };
               installPhase = ''
                 runHook preInstall
@@ -186,7 +186,7 @@
               SMTP_HOST = "smtp.gmail.com";
               SMTP_USERNAME = "admin@evinvest.ltd";
             } // pkgs.lib.optionalAttrs hasWeb {
-              # Unset (no web/ yet) leaves /auth/mfe/* unmounted, which the binary allows.
+              # Unset (no web/ yet) leaves /mfe/concierge/* unmounted, which the binary allows.
               WEB_MFE_DIR = webMfeDir;
             };
           };

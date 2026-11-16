@@ -36,7 +36,7 @@ function optional(name) {
 
 function basePath(name, fallback) {
   const raw = process.env[name] ?? fallback;
-  if (!raw.startsWith("/") || !raw.endsWith("/") || raw.startsWith("//")) throw new Error(`${name}: must be a root-relative directory like /auth/mfe/, got ${raw}`);
+  if (!raw.startsWith("/") || !raw.endsWith("/") || raw.startsWith("//")) throw new Error(`${name}: must be a root-relative directory like /mfe/concierge/, got ${raw}`);
   return raw;
 }
 
@@ -48,8 +48,7 @@ export const config = {
   turnstileSiteKey: optional("EV_TURNSTILE_SITEKEY"),
   // The chip's Services entry; unset, it is left out (as NEXT_PUBLIC_SA_PANEL_URL in the cabinet).
   saPanelUrl: optional("EV_SA_PANEL_URL"),
-  // Where hosts load dist/ from: concierge serves it at /auth/mfe/*, reached through the
-  // conductor's existing `/api/auth/:path*` rewrite. The registry's scriptUrls are written
-  // root-relative under it, so they resolve against the registry's own URL.
-  basePath: basePath("EV_MFE_BASE_PATH", "/api/auth/mfe/"),
+  // Where hosts load dist/ from. The registry's scriptUrls are written root-relative under
+  // it, so they resolve against the registry's own URL.
+  basePath: basePath("EV_MFE_BASE_PATH", "/mfe/concierge/"),
 };

@@ -1282,13 +1282,13 @@ async fn a_client_token_carries_the_sessions_auth_time_through_exchange_and_refr
 /// The way `/auth/authorize` sends a browser to the confirmation and back: the public path
 /// of this route with the client's parameters.
 fn confirm_return(location: &str) -> String {
-	page_return(location, "/api/auth/mfe/reauth.html")
+	page_return(location, "/mfe/concierge/reauth.html")
 }
 
 /// The way `/auth/authorize` sends a browser to the sign-in page and back, as
 /// [`confirm_return`].
 fn sign_in_return(location: &str) -> String {
-	page_return(location, "/api/auth/mfe/sign-in.html")
+	page_return(location, "/mfe/concierge/sign-in.html")
 }
 
 fn page_return(location: &str, page: &str) -> String {

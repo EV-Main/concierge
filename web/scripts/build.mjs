@@ -1,8 +1,7 @@
 // Builds the concierge elements into dist/: one self-registering ESM file per
 // element, each with its own React, its own stylesheet inlined (scope-css.mjs) and only
 // the catalogue keys its own modules render, plus registry.json in the @evinvest/mfe
-// format. Hosts load dist/ under EV_MFE_BASE_PATH (default /api/auth/mfe/, concierge's
-// /auth/mfe/* behind the conductor's /api/auth rewrite).
+// format. Hosts load dist/ under EV_MFE_BASE_PATH (default /mfe/concierge/).
 //
 // Per element, two esbuild passes: the first only lists the modules the entry pulls in,
 // which decides both what Tailwind scans (our sources and the uikit components actually
@@ -81,7 +80,6 @@ const common = {
       allowOriginOverride: config.allowOriginOverride,
       turnstileSiteKey: config.turnstileSiteKey,
       saPanelUrl: config.saPanelUrl,
-      registryPath: `${config.basePath}registry.json`,
     }),
   },
   logLevel: "warning",
@@ -148,6 +146,10 @@ for (const element of ELEMENTS) {
 const checked = parseRegistry(registry);
 if (!checked.ok) throw new Error(`registry.json would not parse: ${checked.error}`);
 writeFileSync(path.join(DIST, "registry.json"), `${JSON.stringify(registry, null, 2)}\n`);
+// The same files under their old address, /api/auth/mfe/ (runner/src/web/mfe.rs): a host
+// whose SDK predates the move refuses a scriptUrl outside it.
+const alias = registry.map((entry) => ({ ...entry, scriptUrl: `/api/auth/mfe/${path.basename(entry.scriptUrl)}` }));
+writeFileSync(path.join(DIST, "registry.alias.json"), `${JSON.stringify(alias, null, 2)}\n`);
 
 // The platform pages: dist/reauth.html and dist/sign-in.html, where concierge's authorize
 // route sends a browser (runner/src/web/authorize.rs), and dist/account.html, served at
