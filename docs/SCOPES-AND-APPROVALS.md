@@ -60,7 +60,7 @@ therefore **not** a new field on `PublishCatalogRequest`: it is
 executes approvals but signs nobody in and owns no client secret — somewhere to publish.
 Until it is implemented the new service answers `UNIMPLEMENTED` rather than accepting a
 catalog and dropping half of it, which is what an ignored field on `PublishCatalog`
-would have done. `contracts/tests/user_lifecycle_event.rs` pins
+would have done. `contracts/tests/it/user_lifecycle_event.rs` pins
 `PullUserLifecycleRequest` to its two fields and `UserLifecycleEvent.Kind` to its eight
 values.
 
