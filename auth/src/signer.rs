@@ -65,17 +65,21 @@ impl Signer {
 		header
 	}
 
-	fn mint(&self, sub: &str, audience: &str, typ: TokenType, ttl_secs: u64, token_version: u64) -> Result<(String, u64), AuthError> {
-		self.mint_with_jti(sub, audience, typ, ttl_secs, token_version, uuid::Uuid::new_v4().to_string(), None)
-	}
-
-	fn mint_with_jti(&self, sub: &str, audience: &str, typ: TokenType, ttl_secs: u64, token_version: u64, jti: String, auth_time: Option<u64>) -> Result<(String, u64), AuthError> {
+	fn mint(&self, ttl_secs: u64, grant: Grant) -> Result<(String, u64), AuthError> {
+		let Grant {
+			sub,
+			aud,
+			typ,
+			token_version,
+			jti,
+			auth_time,
+		} = grant;
 		let now = get_current_timestamp();
 		let exp = now + ttl_secs;
 		let claims = Claims {
 			sub: sub.to_owned(),
 			iss: self.issuer.clone(),
-			aud: audience.to_owned(),
+			aud: aud.to_owned(),
 			exp,
 			iat: now,
 			typ,
@@ -92,14 +96,16 @@ impl Signer {
 	/// `auth_time` is the session's last interactive authentication; it comes from the
 	/// server-side refresh family, never from the client.
 	pub fn mint_access(&self, user_id: &str, token_version: u64, auth_time: Option<u64>) -> Result<(String, u64), AuthError> {
-		self.mint_with_jti(
-			user_id,
-			&self.client_audience,
-			TokenType::Access,
+		self.mint(
 			self.access_ttl_secs,
-			token_version,
-			uuid::Uuid::new_v4().to_string(),
-			auth_time,
+			Grant {
+				sub: user_id,
+				aud: &self.client_audience,
+				typ: TokenType::Access,
+				token_version,
+				jti: uuid::Uuid::new_v4().to_string(),
+				auth_time,
+			},
 		)
 	}
 
@@ -111,14 +117,16 @@ impl Signer {
 	/// runner stored for that family, never the client's.
 	pub fn mint_client_access(&self, user_id: &str, audience: &str, token_version: u64, session_id: &str, auth_time: Option<u64>) -> Result<(String, u64), AuthError> {
 		let ttl = self.access_ttl_secs.min(MAX_CLIENT_ACCESS_TTL_SECS);
-		self.mint_with_jti(
-			user_id,
-			audience,
-			TokenType::Access,
+		self.mint(
 			ttl,
-			token_version,
-			format!("{session_id}:{}", uuid::Uuid::new_v4()),
-			auth_time,
+			Grant {
+				sub: user_id,
+				aud: audience,
+				typ: TokenType::Access,
+				token_version,
+				jti: format!("{session_id}:{}", uuid::Uuid::new_v4()),
+				auth_time,
+			},
 		)
 	}
 
@@ -151,8 +159,28 @@ impl Signer {
 	/// Reserved for the deferred `MintServiceToken` RPC; exercised by tests until then.
 	#[allow(dead_code)]
 	pub fn mint_service(&self, service_name: &str) -> Result<(String, u64), AuthError> {
-		self.mint(service_name, &self.service_audience, TokenType::Service, self.service_ttl_secs, 0)
+		self.mint(
+			self.service_ttl_secs,
+			Grant {
+				sub: service_name,
+				aud: &self.service_audience,
+				typ: TokenType::Service,
+				token_version: 0,
+				jti: uuid::Uuid::new_v4().to_string(),
+				auth_time: None,
+			},
+		)
 	}
+}
+
+/// What a minted token says beyond its issuer and lifetime.
+struct Grant<'a> {
+	sub: &'a str,
+	aud: &'a str,
+	typ: TokenType,
+	token_version: u64,
+	jti: String,
+	auth_time: Option<u64>,
 }
 
 impl fmt::Debug for Signer {
@@ -197,7 +225,7 @@ pub fn load_jwks(signing: &SigningConfig) -> Result<(JwksCache, Vec<Jwk>), AuthE
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 	use crate::jwks::{VerifyPolicy, verify_token};
 
@@ -205,7 +233,7 @@ mod tests {
 	const TEST_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIKolOSMXwE+tafZkX+jkKYJbmJ066f4E12wAwTIkKps6\n-----END PRIVATE KEY-----\n";
 	const TEST_JWK_X: &str = "Z6BCmq9-_wo9d7co5CDW84Wn0sAC3BA0XWK2AOstpV4";
 
-	fn config() -> AuthConfig {
+	pub(crate) fn config() -> AuthConfig {
 		AuthConfig {
 			issuer: "https://auth.test".into(),
 			client_audience: "concierge".into(),

@@ -358,7 +358,7 @@ impl RateLimiter {
 
 	fn hit(&self, key: &str, spend: bool) -> bool {
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-		let bucket = now / self.window_secs;
+		let bucket = now.div_euclid(self.window_secs);
 		let Ok(mut hits) = self.hits.lock() else {
 			// A poisoned lock must not become an open door.
 			return false;

@@ -7,10 +7,6 @@
 //! test prints SKIPPED and passes vacuously.
 #![cfg(feature = "pg")]
 
-#[macro_use]
-#[path = "../support/projection_store.rs"]
-mod projection_store;
-
 use evconcierge_projection::{PgProjectionStore, ProjectionStore, StoreError, Stream, pg};
 use sqlx::{
 	AssertSqlSafe, PgPool,

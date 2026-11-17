@@ -1,13 +1,13 @@
 //! Postgres adapter for the owner seats outside `approvals`: the roster, genesis, a
 //! resignation, and the mail queue that bypasses notification preferences.
 //!
-//! Every write path opens with [`lock_governance`], which bumps the single-row
+//! Every write path opens with `lock_governance`, which bumps the single-row
 //! `governance_revision` counter. One row, so it totally orders every write that moves a
 //! seat — genesis, a resignation and an executed people decision in `approvals` — and
 //! `GetApprovalsRevision` moves with it.
 //!
 //! The seat is written through the SAME helpers `PgUsers` uses
-//! ([`super::users::load_for_update`] and friends), so there is one identity writer and one
+//! (`super::users::load_for_update` and friends), so there is one identity writer and one
 //! outbox convention, not two.
 
 use async_trait::async_trait;
@@ -100,15 +100,15 @@ pub(super) async fn grant_seat(conn: &mut PgConnection, candidate: UserId) -> Re
 impl OwnerGenesisRepository for PgGovernance {
 	/// Genesis: the ONE writer that can turn an empty registry into a fund.
 	///
-	/// It takes [`lock_governance`] and then [`owner_ids_for_update`], the same two locks
+	/// It takes `lock_governance` and then `owner_ids_for_update`, the same two locks
 	/// in the same order as every seat write, so a genesis racing a people decision — or
 	/// another replica's genesis — is serialized rather than interleaved. Reading the roster BEFORE that lock would let two pods each see an
 	/// empty registry and seat it twice.
 	///
-	/// The seats go through [`grant_seat`], so every founder gets the `ROLE_CHANGED` outbox row the money plane pulls.
+	/// The seats go through `grant_seat`, so every founder gets the `ROLE_CHANGED` outbox row the money plane pulls.
 	///
 	/// Every refusal returns early WITHOUT committing, so the revision bump
-	/// [`lock_governance`] performs rolls back with it: a boot that seats nobody leaves
+	/// `lock_governance` performs rolls back with it: a boot that seats nobody leaves
 	/// the revision alone.
 	async fn seed_owners(&self, subjects: &[GenesisSubject]) -> Result<GenesisOutcome, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;

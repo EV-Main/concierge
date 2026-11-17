@@ -40,7 +40,7 @@ macro_rules! user_columns {
 /// Stable, arbitrary key for the transaction-scoped advisory lock that serializes
 /// `user_outbox` appends (`pg_advisory_xact_lock`). Every path that appends an outbox
 /// row MUST take this lock, so `position` (BIGSERIAL) order equals commit order — see
-/// [`drain_outbox`]. Exported so integration tests can assert the contention.
+/// `drain_outbox`. Exported so integration tests can assert the contention.
 pub const USER_OUTBOX_ADVISORY_LOCK: i64 = 0x4f55_5442_4f58; // "OUTBOX"
 
 pub struct PgUsers {
@@ -380,7 +380,7 @@ impl UserDirectoryRepository for PgUsers {
 		.await
 	}
 
-	/// The same transaction shape as [`Self::mutate_audited`], written out because the
+	/// The same transaction shape as `Self::mutate_audited`, written out because the
 	/// aggregate needs one more fact decided under the row lock: whether the owners are
 	/// already deciding about this account. Read on a separate connection, that is a
 	/// TOCTOU window in the direction that matters — a proposal cancelled between the read

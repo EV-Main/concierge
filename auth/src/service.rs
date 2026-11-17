@@ -463,34 +463,10 @@ mod tests {
 	use super::*;
 	use crate::{
 		claims::TokenType,
-		config::SigningConfig,
 		jwks::{VerifyPolicy, verify_token},
 		provisioner::{ProvisionCommand, provisioner_channel},
+		signer::tests::config as test_config,
 	};
-
-	// Same throwaway Ed25519 keypair as the signer tests.
-	const TEST_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIKolOSMXwE+tafZkX+jkKYJbmJ066f4E12wAwTIkKps6\n-----END PRIVATE KEY-----\n";
-	const TEST_JWK_X: &str = "Z6BCmq9-_wo9d7co5CDW84Wn0sAC3BA0XWK2AOstpV4";
-
-	fn test_config() -> AuthConfig {
-		AuthConfig {
-			issuer: "https://auth.test".into(),
-			client_audience: "concierge".into(),
-			service_audience: "concierge-services".into(),
-			access_ttl_secs: 900,
-			refresh_ttl_secs: 3600,
-			max_session_secs: 7_776_000,
-			idle_timeout_secs: 0,
-			service_ttl_secs: 300,
-			signing: Some(SigningConfig {
-				signing_key_pem: TEST_PEM.into(),
-				kid: "test-kid".into(),
-				jwks_json: format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","x":"{TEST_JWK_X}","kid":"test-kid","alg":"EdDSA","use":"sig"}}]}}"#),
-			}),
-			google: None,
-			github: None,
-		}
-	}
 
 	async fn configured() -> AuthService {
 		let (provisioner, _rx) = provisioner_channel();

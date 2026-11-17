@@ -1182,7 +1182,7 @@ pub struct ExecutorPass {
 const EXECUTOR_MAX_PAUSE: Duration = Duration::from_secs(15 * 60);
 
 /// The wait after `failing` attempts in a row at one decision: the interval, doubled per
-/// failure, up to [`EXECUTOR_MAX_PAUSE`].
+/// failure, up to `EXECUTOR_MAX_PAUSE`.
 pub fn executor_pause(interval: Duration, failing: u32) -> Duration {
 	interval.saturating_mul(1u32 << failing.min(10)).min(EXECUTOR_MAX_PAUSE.max(interval))
 }

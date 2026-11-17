@@ -8,6 +8,10 @@ repository = "https://github.com/EV-Main/concierge"
 # The protos are the contract; the tests pin this repo's own wire history and stay home.
 include = ["Cargo.toml", "build.rs", "src/**/*.rs", "proto/**/*.proto"]
 
+# the generated stubs (OUT_DIR, which machete does not read) call it
+[package.metadata.cargo-machete]
+ignored = ["tonic-prost"]
+
 [dependencies]
 prost.workspace = true
 tonic.workspace = true

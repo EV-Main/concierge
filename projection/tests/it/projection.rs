@@ -3,10 +3,6 @@
 //! `GrpcSource`'s reading of the wire, against an in-process fake of concierge's streams.
 #![cfg(feature = "sqlite")]
 
-#[macro_use]
-#[path = "../support/projection_store.rs"]
-mod projection_store;
-
 use std::{
 	collections::{BTreeMap, VecDeque},
 	io::Write,
@@ -993,7 +989,7 @@ async fn fresh_memory_store() -> Option<(MemoryStore, ())> {
 }
 
 mod memory_store_contract {
-	use super::{fresh_memory_store, no_teardown, projection_store};
+	use super::{fresh_memory_store, no_teardown};
 	all_store_contract_tests!(fresh_memory_store, no_teardown);
 }
 
@@ -1045,7 +1041,7 @@ async fn run_should_poll_at_the_interval_while_idle_and_after_recovering() {
 // --- the SQLite store ---------------------------------------------------------------------
 
 mod sqlite_store_contract {
-	use super::{fresh_sqlite_store, no_teardown, projection_store};
+	use super::{fresh_sqlite_store, no_teardown};
 	all_store_contract_tests!(fresh_sqlite_store, no_teardown);
 }
 

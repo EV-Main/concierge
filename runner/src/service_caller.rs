@@ -3,7 +3,7 @@
 //!
 //! The answer comes from metadata alone — never from a request field a caller could widen —
 //! and both secrets are compared in constant time: the bridge token by
-//! [`support::authenticate_service`], the client secret as a fixed-width SHA-256 digest
+//! `support::authenticate_service`, the client secret as a fixed-width SHA-256 digest
 //! against the one `rp_clients` stores. An unknown client, a disabled one, one without a
 //! secret and a wrong secret are the same `UNAUTHENTICATED`.
 //!

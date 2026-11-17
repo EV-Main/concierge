@@ -4,7 +4,7 @@
 //!
 //! The serving itself — conditional requests (ETag, Last-Modified, 304), ranges, the
 //! content type — is tower-http's `ServeDir`, except the validator of a file whose name
-//! carries no content hash ([`content_tag`]). What is decided here is what it may be
+//! carries no content hash (`content_tag`). What is decided here is what it may be
 //! asked for: files only, no index, no listing, nothing outside the directory. A path
 //! segment that could climb out of it (`..`, `.`, a dotfile, a backslash) or a symlink
 //! that resolves outside it answers 404, the same as a file that is not there — checked

@@ -2,7 +2,7 @@
 //! level change, outbox row — runs on a laptop and in CI with no vendor account.
 //!
 //! It stubs the ONE thing that needs a vendor (opening a session) and delegates
-//! callback verification to [`super::didit::parse_webhook`] verbatim. That is the point:
+//! callback verification to `super::didit::parse_webhook` verbatim. That is the point:
 //! a stub with its own, laxer signature check would make every local and CI run a test
 //! of code that never ships.
 

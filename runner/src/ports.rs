@@ -784,7 +784,7 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// as one an admin may lift and one that never lapses. It is the raw brake the
 	/// fixtures and the provisioner sit on — a request-driven path calls [`Self::hold_user`]
 	/// or opens a suspension proposal, exactly as a role write must go through
-	/// [`Self::set_role_outside_ownership`] rather than [`Self::set_role`].
+	/// [`Self::set_role_outside_ownership`] rather than `Self::set_role`.
 	async fn disable_user(&self, id: UserId) -> Result<User, DomainError>;
 
 	/// One operator's emergency brake: freeze now, lapse in

@@ -1,7 +1,6 @@
 // The `ProjectionStore` contract, run against both adapters on a real database: every
-// runtime query in `pg.rs` and `sqlite.rs` is executed by one of these. `#[path]`-included
-// by tests/projection.rs (SQLite) and tests/pg.rs; each
-// wraps the cases in `store_contract_tests!` with its own fixture.
+// runtime query in `pg.rs` and `sqlite.rs` is executed by one of these. tests/it/projection.rs
+// (SQLite) and tests/it/pg.rs each wrap the cases in `store_contract_tests!` with its own fixture.
 
 use evconcierge_projection::{ParkReason, Parked, ProjectionStore, StoreError, Stream};
 
@@ -150,7 +149,7 @@ macro_rules! store_contract_tests {
 			#[tokio::test]
 			async fn $case() {
 				let Some((store, fixture)) = $fresh().await else { return };
-				projection_store::$case(&store).await;
+				crate::projection_store::$case(&store).await;
 				$finish(fixture).await;
 			}
 		)+

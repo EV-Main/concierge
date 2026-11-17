@@ -9,8 +9,6 @@
 //! locker is shared with the router only through it (see `web_sessions.rs`). Without
 //! `REDIS_URL` those few print a skip line and return.
 
-use crate::common;
-
 use std::{net::TcpListener, sync::Arc, time::Duration};
 
 use axum::{
@@ -49,6 +47,8 @@ use tonic::{
 };
 use tower::{Layer, ServiceExt};
 use uuid::Uuid;
+
+use crate::common;
 
 // The same throwaway Ed25519 keypair the auth crate's own tests sign with.
 const TEST_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIKolOSMXwE+tafZkX+jkKYJbmJ066f4E12wAwTIkKps6\n-----END PRIVATE KEY-----\n";
@@ -1037,8 +1037,8 @@ async fn a_session_is_not_opened_off_a_code_whose_replay_is_still_committing() {
 			secret_hash: &secret,
 			token_version: 0,
 			now: 10,
-			expires_at: i64::MAX / 2,
-			absolute_expires_at: i64::MAX / 2,
+			expires_at: i64::MAX.div_euclid(2),
+			absolute_expires_at: i64::MAX.div_euclid(2),
 		})
 		.await
 	});

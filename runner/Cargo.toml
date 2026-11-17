@@ -68,10 +68,10 @@ webauthn-rs.workspace = true
 concierge = { workspace = true, features = ["test-support"] }
 # Opens real refresh families, so the relying-party suite can sign a browser in and out.
 evconcierge_auth = { workspace = true, features = ["test-support"] }
+# Temporary file trees that remove themselves.
+v_fixtures.workspace = true
 # A software authenticator, so the passkey suite drives real WebAuthn ceremonies.
 webauthn-authenticator-rs = { workspace = true, features = ["softpasskey"] }
-# Temporary file trees that remove themselves.
-v_fixtures = "^0.3.4"
 
 [lints]
 workspace = true

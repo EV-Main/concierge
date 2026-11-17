@@ -15,7 +15,7 @@ pub fn now() -> u64 {
 /// What an authenticator app shows for `secret` (base32) `steps` thirty-second steps from now.
 pub fn app_code(secret: &str, steps: i64) -> String {
 	let key = data_encoding::BASE32_NOPAD.decode(secret.as_bytes()).unwrap();
-	let counter = (now() / 30).checked_add_signed(steps).unwrap();
+	let counter = now().div_euclid(30).checked_add_signed(steps).unwrap();
 	let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(&key).unwrap();
 	mac.update(&counter.to_be_bytes());
 	let digest = mac.finalize().into_bytes();

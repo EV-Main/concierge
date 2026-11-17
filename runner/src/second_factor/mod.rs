@@ -1,7 +1,7 @@
 //! Second factors: a way the account proves itself beyond its sign-in, enrolled here and
 //! asked for before money leaves (`docs/STEPUP-PROOF.md`).
 //!
-//! A kind is one [`FactorKind`] variant and one [`Factor`] impl. What a kind stores, offers
+//! A kind is one [`FactorKind`] variant and one `Factor` impl. What a kind stores, offers
 //! at enrolment, challenges with and accepts as an answer is its own associated type; the
 //! routes, the store and every consumer see only the kind's name and opaque JSON, so a new
 //! kind changes nothing outside this module.

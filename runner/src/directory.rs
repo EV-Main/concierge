@@ -5,10 +5,10 @@
 //!
 //! - The [`UserDirectory`] gRPC service: `GetMe`/`UpdateProfile` (self-service on the
 //!   caller's own `sub`) and `RevokeTokens`/`DisableUser`/`ReinstateUser`/`SetKycLevel`
-//!   (admin allowlist). Every RPC is authorized from the verified [`Claims`] the inbound
+//!   (admin allowlist). Every RPC is authorized from the verified `Claims` the inbound
 //!   auth layer injected. The admin mutations emit the matching cross-plane lifecycle
 //!   event (SESSIONS_REVOKED/SUSPENDED/REINSTATED/KYC_CHANGED) the money plane pulls.
-//! - [`run_provisioner`]: the receiving end of the auth → directory [`Provisioner`]
+//! - [`run_provisioner`]: the receiving end of the auth → directory `Provisioner`
 //!   channel. The auth task verifies a Google identity, then asks the directory (over
 //!   the in-process channel, never the wire) to upsert/look up/revoke the matching user.
 //!   This is the only place the auth crate's primitive DTOs become domain value objects,

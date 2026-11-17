@@ -395,7 +395,6 @@
               # NOT clang-tools, which ships an unwrapped clang that shadows the wrapper
               clang
               rust
-              sccache
               mold
               postgresql
               redis
@@ -407,7 +406,6 @@
             env.RUST_LIB_BACKTRACE = 0;
             env.PROTOC = "${pkgs.protobuf}/bin/protoc";
             env.DYLD_FALLBACK_LIBRARY_PATH = "${rust}/lib";
-            env.RUSTC_WRAPPER = "sccache";
           };
       }
     );

@@ -486,7 +486,7 @@ fn group_amount(value: &str) -> String {
 	if !whole.bytes().all(|b| b.is_ascii_digit()) {
 		return value.to_owned();
 	}
-	let mut grouped = String::with_capacity(whole.len() + whole.len() / 3);
+	let mut grouped = String::with_capacity(whole.len() + whole.len().div_euclid(3));
 	for (i, c) in whole.chars().enumerate() {
 		if i > 0 && (whole.len() - i) % 3 == 0 {
 			grouped.push(',');
@@ -503,11 +503,11 @@ fn group_amount(value: &str) -> String {
 /// Integer arithmetic on purpose — a float here would print `2.4999999%` at somebody
 /// about to approve a price.
 fn pct(bps: u32) -> String {
-	let (whole, frac) = (bps / 100, bps % 100);
+	let (whole, frac) = (bps.div_euclid(100), bps % 100);
 	if frac == 0 {
 		format!("{whole}%")
 	} else if frac % 10 == 0 {
-		format!("{whole}.{}%", frac / 10)
+		format!("{whole}.{}%", frac.div_euclid(10))
 	} else {
 		format!("{whole}.{frac:02}%")
 	}

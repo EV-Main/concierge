@@ -14,8 +14,8 @@
 //! 2. The inbox row is written even when in-app delivery is switched off. It is the
 //!    durable record of what the platform decided to tell someone, it anchors the
 //!    dedupe key, and it means re-enabling the channel restores history instead of
-//!    showing a gap. Suppression is therefore a READ-path concern: [`list`] and
-//!    [`unread_count`] return nothing while `in_app_enabled` is false.
+//!    showing a gap. Suppression is therefore a READ-path concern: `list` and
+//!    `unread_count` return nothing while `in_app_enabled` is false.
 //!
 //! Timestamps cross the boundary as `EXTRACT(EPOCH FROM …)::BIGINT` unix seconds
 //! rather than `TIMESTAMPTZ`, matching `AdminUserRow::created_at` — it keeps the

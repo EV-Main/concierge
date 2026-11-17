@@ -2,7 +2,7 @@
 //!
 //! Two halves, deliberately unequal in weight. Opening a session is one HTTP POST.
 //! Accepting a verdict is the security-critical half, and it is a PURE function
-//! ([`parse_webhook`]): signature, replay window, shape, status. No network, no
+//! (`parse_webhook`): signature, replay window, shape, status. No network, no
 //! database, no clock of its own — so the code that decides whether an internet-facing,
 //! unauthenticated POST is genuine can be exercised exhaustively by a test.
 
@@ -52,7 +52,7 @@ pub struct DiditConfig {
 	/// Where Didit sends the BROWSER once the flow ends. A public, user-facing page —
 	/// never the webhook path, which answers POST only.
 	pub return_url: String,
-	/// HMAC key for [`identity_digest_of`]. `None` ⇒ no digest is computed and the
+	/// HMAC key for `identity_digest_of`. `None` ⇒ no digest is computed and the
 	/// duplicate-person check is skipped; verification itself is unaffected.
 	pub identity_pepper: Option<String>,
 }
@@ -89,7 +89,7 @@ impl KycProvider for DiditKyc {
 
 	/// Two, and the second is not redundant.
 	///
-	/// [`SESSION_ORIGIN`] is where the vendor actually serves session pages. The origin
+	/// `SESSION_ORIGIN` is where the vendor actually serves session pages. The origin
 	/// of `DIDIT_BASE_URL` is admitted beside it so that a sandbox, a staging tenant or
 	/// a self-hosted base keeps working without an edit here — it is still an origin an
 	/// operator deliberately pointed this adapter at, which is the whole property being

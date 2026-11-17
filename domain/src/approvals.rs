@@ -733,7 +733,7 @@ fn add_digits(a: &[u8], b: &[u8]) -> Vec<u8> {
 			digit += b[j];
 		}
 		sum.push(digit % 10);
-		carry = digit / 10;
+		carry = digit.div_euclid(10);
 	}
 	sum.reverse();
 	sum
@@ -1769,7 +1769,7 @@ mod tests {
 		// frozen onto their rows (floor(n/2)+1).
 		for n in 1..=9usize {
 			assert_eq!(threshold(n, 10_000) as usize, n);
-			assert_eq!(threshold(n, PLATFORM_QUORUM_BPS) as usize, n / 2 + 1, "n = {n}");
+			assert_eq!(threshold(n, PLATFORM_QUORUM_BPS) as usize, n.div_euclid(2) + 1, "n = {n}");
 		}
 	}
 

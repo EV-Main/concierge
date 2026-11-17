@@ -4,7 +4,7 @@
 //! The WRITES are free functions on an open transaction, called by the adapters whose
 //! transactions change what an event describes — a grant or revocation
 //! ([`super::grants`]), a catalog publication (same), a relying-party sign-in
-//! ([`super::relying_parties`]), a role change ([`super::users::drain_outbox`]) — so the
+//! ([`super::relying_parties`]), a role change (`super::users::drain_outbox`) — so the
 //! event commits with the change or not at all. SCOPE_CHANGED alone is written by the
 //! database (a trigger on `tenants`), because the registry has no writer in this binary.
 //!

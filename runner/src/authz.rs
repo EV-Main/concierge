@@ -7,7 +7,7 @@
 //! # Break-glass, and why it switches itself off
 //!
 //! `users.role` is the ONE source of truth about ownership: the consilium
-//! ([`crate::governance`]) counts it, the quorum is taken from it, and the money plane
+//! (`crate::governance`) counts it, the quorum is taken from it, and the money plane
 //! mirrors it. A config allowlist that silently outranked it produced the bug this
 //! module exists to close — the operator console showed three owners while the
 //! consilium saw zero.

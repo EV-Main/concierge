@@ -6,7 +6,7 @@
 //! VERBATIM to the banking money plane over the one-way user-lifecycle bridge (only
 //! the string crosses). The four discriminant strings are therefore a **cross-plane
 //! contract** — keep them byte-identical with banking's `domain::authz::Role`
-//! ([`role_strings_are_canonical`] guards this side; banking guards its own).
+//! (the test `role_strings_are_canonical` guards this side; banking guards its own).
 //!
 //! A seat MEANS a set of permissions ([`Role::permissions`]): `concierge:*` and `iam:*`
 //! enforced here, `bank:*` enforced by the money plane. Every check asks [`Role::may`];

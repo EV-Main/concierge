@@ -175,7 +175,8 @@ pub const HOLD_TTL_SECS: i64 = 24 * 60 * 60;
 /// 72h), so "the owners never got round to it" cannot be bridged by re-holding, and
 /// short enough that a threat which genuinely returns after the owners declined can be
 /// braked again without a change of policy.
-pub const HOLD_COOLDOWN_SECS: i64 = 7 * 24 * 60 * 60;
+pub const HOLD_COOLDOWN_SECS: i64 = HOLD_COOLDOWN_DAYS * 24 * 60 * 60;
+const HOLD_COOLDOWN_DAYS: i64 = 7;
 
 /// WHY a disabled account is disabled — and therefore who is allowed to undo it.
 ///
@@ -274,7 +275,7 @@ impl ProfileFields {
 }
 
 /// The platform's canonical user identity. Construct it with [`User::provision`]
-/// (first sign-in, raises [`UserEvent::Provisioned`]) or [`User::rehydrate`] (load
+/// (first sign-in, raises [`UserEvent::Created`]) or [`User::rehydrate`] (load
 /// from the store, no events). Mutating transitions accumulate [`UserEvent`]s drained
 /// by the adapter into the cross-plane outbox in the same unit of work.
 #[derive(Clone, Debug)]
@@ -494,7 +495,7 @@ impl User {
 			{
 				return Err(DomainError::Forbidden(format!(
 					"a hold on this account ended at {ended_at}, less than {} days ago; a second one needs the owners — open ApprovalService.ProposeUserSuspension, and the account may be held again while they decide",
-					HOLD_COOLDOWN_SECS / (24 * 60 * 60)
+					HOLD_COOLDOWN_DAYS
 				)));
 			}
 		}

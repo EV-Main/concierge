@@ -150,7 +150,7 @@ const ENTRY_TIER: u32 = 1;
 /// How far back [`START_MAX_PER_WINDOW`] counts.
 const START_WINDOW_SECS: i64 = 24 * 60 * 60;
 
-/// How many cases one user may open inside [`START_WINDOW_SECS`].
+/// How many cases one user may open inside `START_WINDOW_SECS`.
 ///
 /// Five, because honest use is bounded and cheap to picture: a rejected document, a
 /// session left open until it expired, a phone that ran out of battery mid-flow, a

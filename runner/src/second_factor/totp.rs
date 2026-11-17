@@ -80,7 +80,7 @@ impl Factor for Totp {
 		if code.len() != DIGITS || !code.bytes().all(|b| b.is_ascii_digit()) {
 			return Err(Wrong);
 		}
-		let current = now / STEP_SECS;
+		let current = now.div_euclid(STEP_SECS);
 		let accepted = (current.saturating_sub(SKEW_STEPS)..=current + SKEW_STEPS)
 			.filter(|step| material.last_step.is_none_or(|last| *step > last))
 			.filter(|step| bool::from(code_at(&material.secret, *step).as_bytes().ct_eq(code.as_bytes())))
@@ -121,7 +121,7 @@ mod tests {
 			(2_000_000_000, "69279037"),
 			(20_000_000_000, "65353130"),
 		] {
-			assert_eq!(code_at(secret, time / STEP_SECS), eight[2..], "T = {time}");
+			assert_eq!(code_at(secret, time.div_euclid(STEP_SECS)), eight[2..], "T = {time}");
 		}
 	}
 
@@ -139,9 +139,9 @@ mod tests {
 	#[test]
 	fn a_code_counts_once_and_an_older_one_never_after_it() {
 		let mut m = material();
-		let now = 1_234_567_890;
-		let current = code_at(&m.secret, now / STEP_SECS);
-		let previous = code_at(&m.secret, now / STEP_SECS - 1);
+		let now: u64 = 1_234_567_890;
+		let current = code_at(&m.secret, now.div_euclid(STEP_SECS));
+		let previous = code_at(&m.secret, now.div_euclid(STEP_SECS) - 1);
 		assert!(Totp::verify(&mut m, (), answer(&current), now).is_ok());
 		assert!(Totp::verify(&mut m, (), answer(&current), now).is_err(), "replayed");
 		assert!(Totp::verify(&mut m, (), answer(&previous), now).is_err(), "older than the last accepted");
@@ -149,8 +149,8 @@ mod tests {
 
 	#[test]
 	fn one_step_of_skew_either_way_and_no_more() {
-		let now = 1_234_567_890;
-		let at = |offset: i64| code_at(b"12345678901234567890", (now / STEP_SECS).checked_add_signed(offset).unwrap());
+		let now: u64 = 1_234_567_890;
+		let at = |offset: i64| code_at(b"12345678901234567890", now.div_euclid(STEP_SECS).checked_add_signed(offset).unwrap());
 		assert!(Totp::verify(&mut material(), (), answer(&at(-1)), now).is_ok());
 		assert!(Totp::verify(&mut material(), (), answer(&at(1)), now).is_ok());
 		assert!(Totp::verify(&mut material(), (), answer(&at(-2)), now).is_err());
