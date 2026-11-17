@@ -31,7 +31,16 @@
           jobs.default = true;
           jobs.errors.exclude = [ "web-test" ]; # web/ has no tests
           jobs.errors.augment = [ (js.script "web" "i18n:check") { name = "checks"; builds = checks; } ];
-          jobs.warnings.exclude = [ "sdk-lint" ]; # sdk/ has no linter
+          jobs.warnings.exclude = [
+            "sdk-lint" # sdk/ has no linter
+            "code-duplication"
+          ];
+          jobs.warnings.augment = [{
+            name = "code-duplication";
+            args.excludePatterns = [
+              "projection/src/sqlite.rs" # pg.rs's store in SQLite's dialect
+            ];
+          }];
           # Public repo → public Cachix (`ev-invest`); pull deps + push built paths.
           cache = { cachix = "ev-invest"; };
           lastSupportedVersion = "nightly-2026-05-12";
