@@ -14,8 +14,8 @@ jobs:
       sdk-test_status: ${{ steps.run.outputs['sdk-test_status'] }}
       sdk-typecheck_seconds: ${{ steps.run.outputs['sdk-typecheck_seconds'] }}
       sdk-typecheck_status: ${{ steps.run.outputs['sdk-typecheck_status'] }}
-      web-i18n_seconds: ${{ steps.run.outputs['web-i18n_seconds'] }}
-      web-i18n_status: ${{ steps.run.outputs['web-i18n_status'] }}
+      web-i18n-check_seconds: ${{ steps.run.outputs['web-i18n-check_seconds'] }}
+      web-i18n-check_status: ${{ steps.run.outputs['web-i18n-check_status'] }}
       web-typecheck_seconds: ${{ steps.run.outputs['web-typecheck_seconds'] }}
       web-typecheck_status: ${{ steps.run.outputs['web-typecheck_status'] }}
     runs-on: ubuntu-latest
@@ -45,7 +45,7 @@ jobs:
           path: ~/.npm
           restore-keys: particles-errors-${{ runner.os }}-
       - id: run
-        run: nix run .#test -- --severity errors --serial web-typecheck sdk-typecheck sdk-test web-i18n checks
+        run: nix run .#test -- --severity errors --serial web-typecheck sdk-typecheck sdk-test web-i18n-check checks
     timeout-minutes: 90
   pre_ci:
     uses: valeratrades/.github/.github/workflows/pre_ci.yml@main
@@ -59,7 +59,7 @@ jobs:
     steps:
       - env:
           NEEDS: ${{ toJSON(needs) }}
-          PARTICLES: '[{"generic":false,"name":"rust-tests"},{"generic":true,"name":"web-typecheck"},{"generic":true,"name":"sdk-typecheck"},{"generic":true,"name":"sdk-test"},{"generic":true,"name":"web-i18n"},{"generic":true,"name":"checks"}]'
+          PARTICLES: '[{"generic":false,"name":"rust-tests"},{"generic":true,"name":"web-typecheck"},{"generic":true,"name":"sdk-typecheck"},{"generic":true,"name":"sdk-test"},{"generic":true,"name":"web-i18n-check"},{"generic":true,"name":"checks"}]'
         name: Tally the particles
         run: |
           read -r failed total seconds incomplete < <(jq -rn --argjson needs "$NEEDS" --argjson spec "$PARTICLES" '

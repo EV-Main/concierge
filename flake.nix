@@ -30,7 +30,7 @@
           enable = true;
           jobs.default = true;
           jobs.errors.exclude = [ "web-test" ]; # web/ has no tests
-          jobs.errors.augment = [ webI18n { name = "checks"; builds = checks; } ];
+          jobs.errors.augment = [ (js.script "web" "i18n:check") { name = "checks"; builds = checks; } ];
           jobs.warnings.exclude = [ "sdk-lint" ]; # sdk/ has no linter
           # Public repo → public Cachix (`ev-invest`); pull deps + push built paths.
           cache = { cachix = "ev-invest"; };
@@ -142,16 +142,6 @@
         '';
 
         checks = pkgs.lib.optionalAttrs hasWeb { web-root = webMfeRoot; };
-        # web/'s catalogues against its call sites; the js module runs only typecheck/test/lint, so this borrows its install
-        webI18n = pkgs.lib.findFirst (p: p.name == "web-typecheck") (throw "js lists web") js.particles.errors // {
-          name = "web-i18n";
-          program = pkgs.writeShellApplication {
-            name = "web-i18n";
-            runtimeInputs = [ js.nodejs pkgs.git ];
-            text = ''cd "$(git rev-parse --show-toplevel)/web" && exec npm run i18n:check'';
-          };
-        };
-
         # ONE container: the runner binary serves gRPC (:55670), the auth web
         # surface (:55671) AND the bridge seams over TLS (:55672) in-process. The
         # contract's port/healthPath describe the web surface (http probes); gitops
