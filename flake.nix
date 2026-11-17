@@ -24,9 +24,14 @@
         runnerCargo = (builtins.fromTOML (builtins.readFile ./runner/Cargo.toml)).package;
 
         rs = v_flakes.rs { inherit pkgs rust; };
+        js = v_flakes.js { inherit pkgs; packages = [ "web" "sdk" ]; };
         github = v_flakes.github {
-          inherit pkgs pname rs;
+          inherit pkgs pname rs js;
           enable = true;
+          jobs.default = true;
+          jobs.errors.exclude = [ "web-test" ]; # web/ has no tests
+          jobs.errors.augment = [ webI18n { name = "checks"; builds = checks; } ];
+          jobs.warnings.exclude = [ "sdk-lint" ]; # sdk/ has no linter
           # Public repo → public Cachix (`ev-invest`); pull deps + push built paths.
           cache = { cachix = "ev-invest"; };
           lastSupportedVersion = "nightly-2026-05-12";
@@ -46,7 +51,7 @@
             .claude/
           '';
         };
-        combined = v_flakes.utils.combine { inherit rust; modules = [ rs github ]; };
+        combined = v_flakes.utils.combine { inherit rust; modules = [ rs js github ]; };
 
         # ── production runner: binary + OCI image ───────────────────────────
         rustPlatform = pkgs.makeRustPlatform { cargo = rustBuild; rustc = rustBuild; };
@@ -135,6 +140,17 @@
             case "$(readlink -f "$f")" in "$base"/*) ;; *) echo "$f escapes $base" >&2; exit 1 ;; esac
           done
         '';
+
+        checks = pkgs.lib.optionalAttrs hasWeb { web-root = webMfeRoot; };
+        # web/'s catalogues against its call sites; the js module runs only typecheck/test/lint, so this borrows its install
+        webI18n = pkgs.lib.findFirst (p: p.name == "web-typecheck") (throw "js lists web") js.particles.errors // {
+          name = "web-i18n";
+          program = pkgs.writeShellApplication {
+            name = "web-i18n";
+            runtimeInputs = [ js.nodejs pkgs.git ];
+            text = ''cd "$(git rev-parse --show-toplevel)/web" && exec npm run i18n:check'';
+          };
+        };
 
         # ONE container: the runner binary serves gRPC (:55670), the auth web
         # surface (:55671) AND the bridge seams over TLS (:55672) in-process. The
@@ -374,7 +390,7 @@
 
         containers = containerStd.containers;
 
-        checks = pkgs.lib.optionalAttrs hasWeb { web-root = webMfeRoot; };
+        inherit checks;
 
         devShells.default =
           with pkgs;
