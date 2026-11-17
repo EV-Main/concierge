@@ -1,0 +1,733 @@
+//! The scope registry (migration 0031) and what it opens on the web surface: the
+//! `ScopeRegistry` read service, CORS and the `Origin` check on the closed list of sign-in
+//! routes, and the micro-frontend bundles under `/mfe/concierge/*`.
+
+use crate::common;
+
+use std::sync::Arc;
+
+use axum::{
+	Router,
+	body::Body,
+	http::{HeaderMap, Method, Request, StatusCode, header},
+};
+use concierge::{
+	infrastructure::{governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, scopes::PgScopes, users::PgUsers},
+	ports::ScopeRepository,
+	scopes::ScopeRegistry,
+	web::{
+		self, KycDeps,
+		allowlist::SignInAllowlist,
+		mfe::{self, MfeAssets},
+	},
+};
+use domain::scopes::ScopeState;
+use evconcierge_auth::{Claims, TokenType};
+use evconcierge_contracts::concierge::v1::{self as cc, GetScopeRequest, ListScopesRequest, scope_registry_server::ScopeRegistry as _};
+use serde_json::{Value, json};
+use sqlx::PgPool;
+use tonic::{Code, Request as RpcRequest};
+use tower::ServiceExt;
+use uuid::Uuid;
+use v_fixtures::{Fixture, TempFixture};
+
+const PUBLIC: &str = "https://evinvest.test";
+const INVEST: &str = "https://invest.evinvest.ltd";
+
+macro_rules! db {
+	() => {
+		match common::Db::migrated().await {
+			Some(db) => db,
+			None => return,
+		}
+	};
+}
+
+fn tag() -> String {
+	format!("t{}", &Uuid::new_v4().simple().to_string()[..12])
+}
+
+async fn version_of(pool: &PgPool, id: &str) -> i64 {
+	sqlx::query_scalar("SELECT version FROM tenants WHERE id = $1").bind(id).fetch_one(pool).await.unwrap()
+}
+
+// ── the registry ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_migration_seeds_invest_and_gives_sa_its_host() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let scopes = PgScopes::new(pool.clone()).scopes().await.expect("read the registry");
+
+	let invest = scopes.iter().find(|s| s.id == "invest").expect("invest is seeded");
+	assert_eq!((invest.namespace.as_str(), invest.parent.as_str(), invest.state), ("invest", "main", ScopeState::Active));
+	assert_eq!(invest.origins, vec![INVEST]);
+	assert_eq!(invest.return_paths, vec!["/cabinet", "/"], "0031 seeded /cabinet, 0035 appended /");
+	assert_eq!(invest.clients.len(), 1);
+	assert_eq!(
+		(invest.clients[0].client_id.as_str(), invest.clients[0].audience.as_str(), invest.clients[0].disabled),
+		("invest", "invest", false)
+	);
+
+	let sa = scopes.iter().find(|s| s.id == "sa").expect("sa is seeded");
+	assert_eq!(sa.origins, vec!["https://sa.evinvest.ltd"]);
+	assert_eq!(sa.return_paths, vec!["/", "/auth/login"]);
+	assert_eq!(sa.observers, vec!["invest"]);
+	assert_eq!(sa.clients.iter().map(|c| c.client_id.as_str()).collect::<Vec<_>>(), vec!["sa"]);
+
+	// The secret is not asserted: it is env, written by whichever suite syncs the registry.
+	let redirects: Vec<String> = sqlx::query_scalar("SELECT redirect_uris FROM rp_clients WHERE client_id = 'invest'")
+		.fetch_one(&pool)
+		.await
+		.unwrap();
+	assert_eq!(redirects, vec!["https://invest.evinvest.ltd/cabinet/auth/callback"]);
+	let hold_all: bool = sqlx::query_scalar("SELECT granting_seats_hold_all FROM tenants WHERE id = 'invest'")
+		.fetch_one(&pool)
+		.await
+		.unwrap();
+	assert!(hold_all);
+}
+
+#[tokio::test]
+async fn a_scope_moves_its_version_on_any_change_but_a_secret_rotation() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let id = tag();
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, FALSE, 0)")
+		.bind(&id)
+		.execute(&pool)
+		.await
+		.unwrap();
+	assert_eq!(version_of(&pool, &id).await, 1);
+
+	sqlx::query("UPDATE tenants SET display_name = 'Renamed' WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
+	assert_eq!(version_of(&pool, &id).await, 2);
+	sqlx::query("UPDATE tenants SET display_name = 'Renamed' WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
+	assert_eq!(version_of(&pool, &id).await, 2, "a write that changes nothing is no new version");
+
+	sqlx::query("INSERT INTO rp_clients (client_id, audience, redirect_uris, tenant_id, created_at) VALUES ($1, $1, ARRAY['https://x.evinvest.ltd/cb'], $1, 0)")
+		.bind(&id)
+		.execute(&pool)
+		.await
+		.unwrap();
+	assert_eq!(version_of(&pool, &id).await, 3, "a new client is part of the scope");
+
+	sqlx::query("UPDATE rp_clients SET secret_hash = $2, secret_set_at = 1 WHERE client_id = $1")
+		.bind(&id)
+		.bind(vec![7u8; 32])
+		.execute(&pool)
+		.await
+		.unwrap();
+	assert_eq!(version_of(&pool, &id).await, 3, "a client's secret is not in the scope message");
+
+	sqlx::query("UPDATE rp_clients SET disabled_at = 1 WHERE client_id = $1").bind(&id).execute(&pool).await.unwrap();
+	assert_eq!(version_of(&pool, &id).await, 4, "disabling a client is");
+}
+
+#[tokio::test]
+async fn the_registry_refuses_what_could_widen_sign_in() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let id = tag();
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, FALSE, 0)")
+		.bind(&id)
+		.execute(&pool)
+		.await
+		.unwrap();
+	for origin in [
+		"http://x.evinvest.ltd",
+		"https://x.evinvest.ltd/",
+		"https://*.evinvest.ltd",
+		"https://xevinvest.ltd",
+		"https://evinvest.ltd.evil.example",
+		"https://x.evinvest.ltd:443",
+		"https://x.evinvest.ltd:0",
+		"https://x.evinvest.ltd:65536",
+		"https://x.evinvest.ltd:99999",
+		"https://evinvest.ltd",
+		"https://evinvest.ltd:8443",
+		"null",
+	] {
+		let refused = sqlx::query("UPDATE tenants SET origins = ARRAY[$2] WHERE id = $1").bind(&id).bind(origin).execute(&pool).await;
+		assert!(refused.is_err(), "{origin}");
+	}
+	for path in ["//evil.example", "/cabinet/", "/cabinet?x=1", "cabinet"] {
+		let refused = sqlx::query("UPDATE tenants SET return_paths = ARRAY[$2] WHERE id = $1").bind(&id).bind(path).execute(&pool).await;
+		assert!(refused.is_err(), "{path}");
+	}
+	// `bool_and` skips NULLs; the CHECKs must not, or the row would fail to decode later.
+	for column in ["origins", "return_paths", "observers"] {
+		let null = sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE tenants SET {column} = ARRAY[NULL]::TEXT[] WHERE id = $1")))
+			.bind(&id)
+			.execute(&pool)
+			.await;
+		assert!(null.is_err(), "a NULL element in {column}");
+	}
+	let accepted = sqlx::query("UPDATE tenants SET origins = ARRAY['https://x.evinvest.ltd:65535'] WHERE id = $1")
+		.bind(&id)
+		.execute(&pool)
+		.await;
+	assert!(accepted.is_ok(), "the highest port is a port");
+	let main = sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ('main', $1, FALSE, 0)")
+		.bind(tag())
+		.execute(&pool)
+		.await;
+	assert!(main.is_err(), "`main` is the implicit root and never a row");
+}
+
+/// `Scope.namespace` equals `id` for every scope but `main` (scopes.proto), and `main` is
+/// never a row. Catalogs and clients are keyed by the id while grants and the catalog
+/// check are keyed by the namespace: a row where the two differ lets one name be checked
+/// and the other enforced.
+#[tokio::test]
+async fn a_tenant_is_its_own_namespace() {
+	let db = db!();
+	let pool = db.pool.clone();
+	for (id, namespace) in [(tag(), tag()), (tag(), "sa".to_owned())] {
+		let refused = sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $2, FALSE, 0)")
+			.bind(&id)
+			.bind(&namespace)
+			.execute(&pool)
+			.await
+			.expect_err("a tenant whose namespace is not its id");
+		assert_eq!(
+			refused.as_database_error().and_then(|e| e.constraint()),
+			Some("tenants_id_is_namespace"),
+			"{id} / {namespace}: {refused}"
+		);
+	}
+	let id = tag();
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, FALSE, 0)")
+		.bind(&id)
+		.execute(&pool)
+		.await
+		.unwrap();
+	let renamed = sqlx::query("UPDATE tenants SET namespace = $2 WHERE id = $1").bind(&id).bind(tag()).execute(&pool).await;
+	assert!(renamed.is_err(), "nor may an update split them");
+}
+
+fn signed_in<T>(inner: T) -> RpcRequest<T> {
+	let mut request = RpcRequest::new(inner);
+	request.extensions_mut().insert(Claims {
+		sub: Uuid::new_v4().to_string(),
+		iss: "https://auth.concierge.test".into(),
+		aud: "concierge".into(),
+		exp: u64::MAX,
+		iat: 0,
+		typ: TokenType::Access,
+		jti: None,
+		token_version: 0,
+		auth_time: None,
+	});
+	request
+}
+
+#[tokio::test]
+async fn scope_registry_lists_main_first_and_reads_one_scope() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let registry = ScopeRegistry::new(Arc::new(PgScopes::new(pool)));
+
+	let scopes = registry.list_scopes(signed_in(ListScopesRequest {})).await.expect("list").into_inner().scopes;
+	assert_eq!(scopes[0].id, "main");
+	assert_eq!((scopes[0].namespace.as_str(), scopes[0].parent.as_str()), ("", ""));
+	assert!(scopes[0].origins.is_empty() && scopes[0].clients.is_empty());
+	let ids: Vec<&str> = scopes[1..].iter().map(|s| s.id.as_str()).collect();
+	assert!(ids.is_sorted(), "{ids:?}");
+	assert!(ids.contains(&"invest") && ids.contains(&"sa"));
+
+	let invest = registry.get_scope(signed_in(GetScopeRequest { scope: "invest".into() })).await.expect("get").into_inner();
+	assert_eq!(invest.parent, "main");
+	assert_eq!(invest.state, cc::ScopeState::Active as i32);
+	assert_eq!(invest.origins, vec![INVEST]);
+	assert_eq!(invest.return_paths, vec!["/cabinet", "/"], "0031 seeded /cabinet, 0035 appended /");
+	assert!(invest.version >= 1);
+	assert_eq!(
+		invest.clients,
+		vec![cc::ScopeClient {
+			client_id: "invest".into(),
+			audience: "invest".into(),
+			disabled: false
+		}]
+	);
+
+	let main = registry.get_scope(signed_in(GetScopeRequest { scope: "main".into() })).await.expect("main").into_inner();
+	assert_eq!(main.id, "main");
+
+	let missing = registry.get_scope(signed_in(GetScopeRequest { scope: "nope".into() })).await.unwrap_err();
+	assert_eq!(missing.code(), Code::NotFound);
+
+	let anonymous = registry.list_scopes(RpcRequest::new(ListScopesRequest {})).await.unwrap_err();
+	assert_eq!(anonymous.code(), Code::Unauthenticated, "a claims-less request reads nothing");
+}
+
+// ── sign-in from a scope's host ────────────────────────────────────────────────────
+
+/// The web surface over the live registry, plus a CLOSED scope whose host must be
+/// treated like any stranger's.
+async fn sign_in_surface(pool: &PgPool) -> (Router, String, Arc<SignInAllowlist>) {
+	let closed = tag();
+	let closed_origin = format!("https://{closed}.evinvest.ltd");
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, origins, return_paths, state) VALUES ($1, $1, FALSE, 0, ARRAY[$2], ARRAY['/'], 'closed')")
+		.bind(&closed)
+		.bind(&closed_origin)
+		.execute(pool)
+		.await
+		.unwrap();
+	let users = Arc::new(PgUsers::new(pool.clone()));
+	let mut sign_in = common::sign_in_with_turnstile(pool, &common::stub_turnstile().await);
+	// Refreshed by the test itself (`refresh`), standing in for the background loop.
+	let allowlist = Arc::new(SignInAllowlist::live(Arc::new(PgScopes::new(pool.clone())), PUBLIC).await.unwrap());
+	sign_in.allowlist = allowlist.clone();
+	let state = web::WebState::try_new(
+		common::signing_auth(users.clone()).await,
+		PUBLIC.to_string(),
+		false,
+		sign_in,
+		KycDeps {
+			users,
+			cases: Arc::new(PgKycCases::new(pool.clone())),
+			notifications: Arc::new(PgNotifications::new(pool.clone())),
+			governance: Arc::new(PgGovernance::new(pool.clone())),
+			provider: None,
+			support_email: "support@evinvest.test".into(),
+			case_ttl_secs: 86_400,
+		},
+		None,
+	)
+	.await
+	.expect("build the web state");
+	(web::router(state), closed_origin, allowlist)
+}
+
+async fn preflight(router: &Router, path: &str, origin: &str, method: &str) -> (StatusCode, HeaderMap) {
+	let response = router
+		.clone()
+		.oneshot(
+			Request::builder()
+				.method(Method::OPTIONS)
+				.uri(path)
+				.header(header::ORIGIN, origin)
+				.header(header::ACCESS_CONTROL_REQUEST_METHOD, method)
+				.header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	(response.status(), response.headers().clone())
+}
+
+async fn call(router: &Router, method: Method, path: &str, origin: &str, body: Option<Value>) -> (StatusCode, HeaderMap, Value) {
+	let mut request = Request::builder().method(method).uri(path).header(header::ORIGIN, origin);
+	if body.is_some() {
+		request = request.header(header::CONTENT_TYPE, "application/json");
+	}
+	let response = router
+		.clone()
+		.oneshot(request.body(body.map_or_else(Body::empty, |b| Body::from(b.to_string()))).unwrap())
+		.await
+		.unwrap();
+	let (status, headers) = (response.status(), response.headers().clone());
+	let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+	(status, headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+fn varies_on_origin(headers: &HeaderMap) -> bool {
+	headers
+		.get_all(header::VARY)
+		.iter()
+		.any(|v| v.to_str().unwrap().split(',').any(|p| p.trim().eq_ignore_ascii_case("origin")))
+}
+
+#[tokio::test]
+async fn a_scope_host_passes_the_preflight_of_a_sign_in_route() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let (router, _, _) = sign_in_surface(&pool).await;
+
+	let (status, headers) = preflight(&router, "/auth/code/request", INVEST, "POST").await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], INVEST, "exactly the origin, never `*`");
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_CREDENTIALS], "true");
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_METHODS], "POST");
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_HEADERS], "content-type");
+	assert_eq!(headers[header::ACCESS_CONTROL_MAX_AGE], "600");
+	assert!(varies_on_origin(&headers));
+
+	let (status, headers) = preflight(&router, "/auth/session", "https://sa.evinvest.ltd", "GET").await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_METHODS], "GET");
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "https://sa.evinvest.ltd");
+}
+
+#[tokio::test]
+async fn nothing_but_a_registered_live_origin_passes_the_preflight() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let (router, closed_origin, _) = sign_in_surface(&pool).await;
+	for origin in [
+		"https://evil.example",
+		"null",
+		"http://invest.evinvest.ltd",
+		"https://invest.evinvest.ltd.evil.example",
+		"https://evil.example.invest.evinvest.ltd",
+		"https://invest.evinvest.ltd:8443",
+		"https://invest.evinvest.ltd/",
+		"https://INVEST.evinvest.ltd",
+		closed_origin.as_str(),
+	] {
+		let (_, headers) = preflight(&router, "/auth/code/request", origin, "POST").await;
+		// The verdict is `Access-Control-Allow-Origin` alone: tower-http's layer sends the
+		// static `Allow-Credentials` on every answer, and without the origin a browser
+		// lets the page read nothing.
+		assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "{origin}");
+	}
+	// A registered origin asking for a method the route does not take is offered only the
+	// one it does, which a browser then refuses to send.
+	let (_, headers) = preflight(&router, "/auth/session", INVEST, "DELETE").await;
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_METHODS], "GET");
+}
+
+#[tokio::test]
+async fn a_route_acting_on_an_open_session_answers_no_scope_host() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let (router, _, _) = sign_in_surface(&pool).await;
+	for path in [
+		"/auth/email/verify/request",
+		"/auth/email/verify/confirm",
+		"/auth/password/set",
+		"/auth/passkey/register/options",
+		"/auth/passkey/remove",
+		"/auth/sessions",
+		"/auth/username",
+		"/auth/logout",
+		"/auth/logout/confirm",
+		"/kyc/start",
+	] {
+		let (_, headers) = preflight(&router, path, INVEST, "POST").await;
+		assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "preflight {path}");
+		let (_, headers, _) = call(&router, Method::POST, path, INVEST, Some(json!({}))).await;
+		assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "{path}");
+	}
+}
+
+#[tokio::test]
+async fn a_scope_host_requests_a_code_and_reads_the_answer() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let (router, _, _) = sign_in_surface(&pool).await;
+	let email = format!("scope-{}@example.com", Uuid::new_v4().simple());
+	let (status, headers, body) = call(&router, Method::POST, "/auth/code/request", INVEST, Some(json!({ "email": email, "turnstileToken": "human" }))).await;
+	assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], INVEST);
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_CREDENTIALS], "true");
+	assert!(varies_on_origin(&headers));
+}
+
+/// The `Origin` check on the credential POSTs is the login-CSRF guard, and it widens to
+/// registered live scope hosts and nothing else.
+#[tokio::test]
+async fn a_credential_post_from_any_other_origin_is_refused() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let (router, closed_origin, _) = sign_in_surface(&pool).await;
+	let body = json!({ "email": "x@example.com", "turnstileToken": "human" });
+	for origin in [
+		"https://evil.example",
+		"null",
+		"http://invest.evinvest.ltd",
+		"https://invest.evinvest.ltd.evil.example",
+		closed_origin.as_str(),
+	] {
+		let (status, headers, answer) = call(&router, Method::POST, "/auth/code/request", origin, Some(body.clone())).await;
+		assert_eq!((status, answer), (StatusCode::FORBIDDEN, json!({ "error": "origin" })), "{origin}");
+		assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN), "{origin}");
+		assert!(varies_on_origin(&headers), "{origin}");
+	}
+	let (status, _, answer) = call(&router, Method::POST, "/auth/passkey/signin/options", "https://evil.example", Some(json!({}))).await;
+	assert_eq!((status, answer), (StatusCode::FORBIDDEN, json!({ "error": "origin" })));
+	let (status, headers, _) = call(&router, Method::POST, "/auth/passkey/signin/options", INVEST, Some(json!({}))).await;
+	assert_eq!(status, StatusCode::OK, "a scope host may begin a passkey sign-in");
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], INVEST);
+}
+
+#[tokio::test]
+async fn the_session_read_from_a_scope_host_carries_no_token() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let (router, _, _) = sign_in_surface(&pool).await;
+	let (status, headers, body) = call(&router, Method::GET, "/auth/session", INVEST, None).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], INVEST);
+	assert_eq!(body["authenticated"], false);
+	let keys: Vec<&str> = body.as_object().unwrap().keys().map(String::as_str).collect();
+	assert!(keys.iter().all(|k| ["authenticated", "user", "permissions"].contains(k)), "{keys:?}");
+}
+
+// ── the micro-frontend bundles ─────────────────────────────────────────────────────
+
+/// Written byte for byte rather than parsed: the suite asserts exact bodies and ranges, and a
+/// parsed fixture ends every file but the last in a newline.
+fn bundles() -> (Router, TempFixture) {
+	let tree = Fixture::default().write_to_tempdir();
+	for (path, text) in [
+		("dist/registry.json", r#"{"sign-in":"sign-in-ABCD2345.js"}"#),
+		("dist/sign-in-ABCD2345.js", "export {};"),
+		("dist/chunks/chunk-Q7ZK3M2P.js", "export {};"),
+		("dist/.env", "SECRET=1"),
+		("dist/LICENSES.txt", "MIT"),
+		("dist/sign-in.html", "<!doctype html>"),
+		("dist/account.html", "<!doctype html><title>Account</title>"),
+		("outside/secret.txt", "outside"),
+	] {
+		tree.write(path, text);
+	}
+	let dir = tree.path("dist");
+	std::os::unix::fs::symlink(tree.path("outside/secret.txt"), dir.join("escape.txt")).unwrap();
+
+	let router = mfe::mount(Router::new(), MfeAssets::open(&dir).expect("open the bundle directory"));
+	(router, tree)
+}
+
+async fn fetch(router: &Router, method: Method, path: &str, origin: Option<&str>) -> (StatusCode, HeaderMap, Vec<u8>) {
+	let mut request = Request::builder().method(method).uri(path);
+	if let Some(origin) = origin {
+		request = request.header(header::ORIGIN, origin);
+	}
+	let response = router.clone().oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+	let (status, headers) = (response.status(), response.headers().clone());
+	(status, headers, axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec())
+}
+
+#[tokio::test]
+async fn the_manifest_is_short_lived_and_hashed_bundles_are_immutable() {
+	let (router, _bundles) = bundles();
+
+	let (status, headers, body) = fetch(&router, Method::GET, "/mfe/concierge/registry.json", None).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300");
+	assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+	assert_eq!(body, br#"{"sign-in":"sign-in-ABCD2345.js"}"#);
+
+	let (status, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/chunks/chunk-Q7ZK3M2P.js", None).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(headers[header::CONTENT_TYPE], "text/javascript; charset=utf-8");
+	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
+
+	let (status, headers, body) = fetch(&router, Method::HEAD, "/mfe/concierge/sign-in-ABCD2345.js", None).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
+	assert!(body.is_empty(), "HEAD carries no body");
+
+	let (_, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/LICENSES.txt", None).await;
+	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300", "an all-caps name is no content hash");
+}
+
+/// The sign-in page `/auth/authorize` sends a browser to carries the client's request in its
+/// URL and asks for a password or a code: never cached, framed or referred, and Turnstile
+/// may load.
+#[tokio::test]
+async fn the_sign_in_page_is_never_cached_framed_or_referred() {
+	let (router, _bundles) = bundles();
+	let (status, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/sign-in.html?return_to=%2Fapi%2Fauth%2Fauthorize%3Fclient_id%3Dsa", None).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+	assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+	assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+	let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+	assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+	assert!(csp.contains("script-src 'self' https://challenges.cloudflare.com;"), "{csp}");
+	assert!(csp.contains("frame-src https://challenges.cloudflare.com;"), "{csp}");
+}
+
+/// The platform's account page lives at `/account`, not under the bundles' prefix, and is a
+/// page like the others: never cached, framed or referred.
+#[tokio::test]
+async fn the_account_page_is_served_at_account() {
+	let (router, _bundles) = bundles();
+	let (status, headers, body) = fetch(&router, Method::GET, "/account?section=security", None).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(body, b"<!doctype html><title>Account</title>");
+	assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+	assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+	assert!(headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("frame-ancestors 'none'"));
+	assert_eq!(fetch(&router, Method::GET, "/account/anything", None).await.0, StatusCode::NOT_FOUND);
+}
+
+async fn fetch_with(router: &Router, path: &str, name: header::HeaderName, value: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
+	let response = router.clone().oneshot(Request::get(path).header(name, value).body(Body::empty()).unwrap()).await.unwrap();
+	let (status, headers) = (response.status(), response.headers().clone());
+	(status, headers, axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec())
+}
+
+#[tokio::test]
+async fn the_bundles_revalidate_and_serve_ranges() {
+	let (router, _bundles) = bundles();
+	let (_, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/registry.json", None).await;
+	let etag = headers[header::ETAG].to_str().unwrap().to_owned();
+	assert!(!headers.contains_key(header::LAST_MODIFIED), "the store mtime is no validator of a manifest");
+
+	let (status, headers, body) = fetch_with(&router, "/mfe/concierge/registry.json", header::IF_NONE_MATCH, &etag).await;
+	assert_eq!(status, StatusCode::NOT_MODIFIED);
+	assert!(body.is_empty());
+	assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=300", "a 304 renews the same lifetime");
+
+	let (status, headers, body) = fetch_with(&router, "/mfe/concierge/sign-in-ABCD2345.js", header::RANGE, "bytes=0-5").await;
+	assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+	assert_eq!(body, b"export");
+	assert_eq!(headers[header::CONTENT_TYPE], "text/javascript; charset=utf-8");
+}
+
+/// A release rewrites the manifest from the nix store, where every file's mtime is 1: a new
+/// manifest the same size as the old one must not revalidate as the old one.
+#[tokio::test]
+async fn a_manifest_rewritten_under_the_same_size_and_mtime_is_not_revalidated_as_unchanged() {
+	let (router, bundles) = bundles();
+	let manifest = bundles.path("dist/registry.json");
+	let store_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+	let write = |body: &str| {
+		std::fs::write(&manifest, body).unwrap();
+		std::fs::File::options().write(true).open(&manifest).unwrap().set_modified(store_mtime).unwrap();
+	};
+	write(r#"{"account":"account-JUWOCNHT.js"}"#);
+	let (_, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/registry.json", None).await;
+	let etag = headers[header::ETAG].to_str().unwrap().to_owned();
+
+	write(r#"{"account":"account-V5EIPT5F.js"}"#);
+	let (status, _, body) = fetch_with(&router, "/mfe/concierge/registry.json", header::IF_NONE_MATCH, &etag).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(body, br#"{"account":"account-V5EIPT5F.js"}"#);
+	let (status, _, body) = fetch_with(&router, "/mfe/concierge/registry.json", header::IF_MODIFIED_SINCE, "Thu, 01 Jan 1970 00:00:01 GMT").await;
+	assert_eq!(status, StatusCode::OK, "a store mtime says nothing about the bytes");
+	assert_eq!(body, br#"{"account":"account-V5EIPT5F.js"}"#);
+}
+
+/// CORS on the bundles is the edge's: the producer adds none of its own.
+#[tokio::test]
+async fn the_bundles_leave_cors_to_the_edge() {
+	let (router, _bundles) = bundles();
+	let (_, headers, _) = fetch(&router, Method::GET, "/mfe/concierge/registry.json", Some(INVEST)).await;
+	assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+	assert!(!varies_on_origin(&headers));
+}
+
+#[tokio::test]
+async fn nothing_outside_the_files_is_served() {
+	let (router, _bundles) = bundles();
+	for path in [
+		"/mfe/concierge/",
+		"/mfe/concierge/chunks",
+		"/mfe/concierge/chunks/",
+		"/mfe/concierge/../secret.txt",
+		"/mfe/concierge/chunks/../registry.json",
+		"/mfe/concierge/%2e%2e/secret.txt",
+		"/mfe/concierge/chunks/%2e%2e/%2e%2e/secret.txt",
+		"/mfe/concierge/..%2fsecret.txt",
+		"/mfe/concierge/.env",
+		"/mfe/concierge/escape.txt",
+		"/mfe/concierge/missing.js",
+		"/mfe/concierge/a%5c..%5csecret.txt",
+	] {
+		let (status, _, body) = fetch(&router, Method::GET, path, None).await;
+		assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+		assert!(!String::from_utf8_lossy(&body).contains("outside"), "{path}");
+	}
+	for method in [Method::POST, Method::PUT, Method::DELETE] {
+		let (status, _, _) = fetch(&router, method.clone(), "/mfe/concierge/registry.json", None).await;
+		assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+	}
+}
+
+#[tokio::test]
+async fn a_missing_bundle_directory_is_not_mounted() {
+	let tree = Fixture::parse("//- /file\nnot a directory").write_to_tempdir();
+	assert!(MfeAssets::open(&tree.path("missing")).is_err());
+	assert!(MfeAssets::open(&tree.path("file")).is_err());
+}
+
+// ── a live registry ────────────────────────────────────────────────────────────────
+
+/// Closing a scope, or dropping an origin from it, stops it being let in by the next
+/// reading of the registry — no restart.
+#[tokio::test]
+async fn a_closed_scope_or_a_removed_origin_stops_signing_in_without_a_restart() {
+	let db = db!();
+	let pool = db.pool.clone();
+	let (router, _, allowlist) = sign_in_surface(&pool).await;
+	let id = tag();
+	let origin = format!("https://{id}.evinvest.ltd");
+	let admitted = |headers: &HeaderMap| headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN);
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, origins, return_paths) VALUES ($1, $1, FALSE, 0, ARRAY[$2], ARRAY['/'])")
+		.bind(&id)
+		.bind(&origin)
+		.execute(&pool)
+		.await
+		.unwrap();
+	assert!(
+		!admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1),
+		"nothing waits on the database: the snapshot in hand answers"
+	);
+	assert!(allowlist.refresh().await, "a new scope is a new snapshot");
+	assert!(
+		admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1),
+		"registered after the router was built"
+	);
+	assert!(!allowlist.refresh().await, "nothing changed, nothing is rebuilt");
+
+	sqlx::query("UPDATE tenants SET state = 'frozen' WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
+	allowlist.refresh().await;
+	assert!(admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1), "a frozen scope still signs in");
+
+	sqlx::query("UPDATE tenants SET state = 'closed' WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
+	assert!(allowlist.refresh().await);
+	assert!(!admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1), "closed");
+	let (status, _, body) = call(
+		&router,
+		Method::POST,
+		"/auth/code/request",
+		&origin,
+		Some(json!({ "email": "x@example.com", "turnstileToken": "human" })),
+	)
+	.await;
+	assert_eq!((status, body), (StatusCode::FORBIDDEN, json!({ "error": "origin" })));
+
+	sqlx::query("UPDATE tenants SET state = 'active', origins = '{}' WHERE id = $1")
+		.bind(&id)
+		.execute(&pool)
+		.await
+		.unwrap();
+	allowlist.refresh().await;
+	assert!(!admitted(&preflight(&router, "/auth/code/request", &origin, "POST").await.1), "removed");
+}
+
+/// A row that does not decode costs its own scope, never the plane's start. The CHECKs
+/// make such a row unwritable, so this one is planted with them dropped.
+#[tokio::test]
+async fn a_malformed_registry_row_is_left_out_not_fatal() {
+	let db = db!();
+	for constraint in ["tenants_origins", "tenants_state"] {
+		sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE tenants DROP CONSTRAINT {constraint}")))
+			.execute(&db.pool)
+			.await
+			.unwrap();
+	}
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, origins) VALUES ('nulls', 'nulls', FALSE, 0, ARRAY[NULL]::TEXT[])")
+		.execute(&db.pool)
+		.await
+		.unwrap();
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at, state) VALUES ('bogus', 'bogus', FALSE, 0, 'paused')")
+		.execute(&db.pool)
+		.await
+		.unwrap();
+
+	let repo = Arc::new(PgScopes::new(db.pool.clone()));
+	let ids: Vec<String> = repo.scopes().await.expect("the registry reads").into_iter().map(|s| s.id).collect();
+	assert_eq!(ids, vec!["invest", "sa"], "the two bad rows are left out");
+	assert!(repo.scope("nulls").await.unwrap().is_none());
+	assert!(repo.scope("invest").await.unwrap().is_some());
+	let allowlist = SignInAllowlist::live(repo, PUBLIC).await.expect("the allowlist builds over a bad row");
+	assert!(allowlist.admits(INVEST));
+}
