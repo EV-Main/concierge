@@ -561,7 +561,10 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   (`scope_members`) with no grant row — in `GetMe` (a session sees it only for scopes it is a
   member of) and on GRANTS_CHANGED alike, so dropping a permission from it is one
   republication that re-states every member's set; it neither delegates nor is delegated,
-  since holding by everyone must never confer granting. Nothing grants anything in `iam`/`concierge`/`bank`/`seat`, so no grant can reach a
+  since holding by everyone must never confer granting. A permission its client derives
+  `bound` speaks of its subject's own sign-in: `everyone` holds it and no other alias
+  (`Catalog::collect` refuses otherwise), and `PermissionSet::lent`, what acting in another's
+  account carries, never does. Nothing grants anything in `iam`/`concierge`/`bank`/`seat`, so no grant can reach a
   seat's permissions, and NOBODY grants to their own account (`grants_not_to_self`, the rule
   `HoldUser` and `SetKycLevel` carry) — a grant made to oneself would outlive the seat that
   made it. Every seat is an account first and holds its own record (`concierge:self:*`,

@@ -4,7 +4,8 @@ use quote::quote;
 use syn::{Data, DeriveInput, Fields, LitStr, parse_macro_input};
 
 /// `#[permission("ns:resource")]` on a fieldless enum: each variant is the permission
-/// `ns:resource:<snake_case(variant)>`.
+/// `ns:resource:<snake_case(variant)>`. `#[permission("ns:resource", bound)]` binds them to their
+/// subject's own sign-in (see `concierge_iam::PermissionSet::lent`).
 #[proc_macro_derive(Permission, attributes(permission))]
 pub fn derive_permission(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
@@ -24,7 +25,20 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 		.iter()
 		.find(|a| a.path().is_ident("permission"))
 		.ok_or_else(|| syn::Error::new_spanned(ident, "missing #[permission(\"<namespace>:<resource…>\")]"))?;
-	let prefix: LitStr = attr.parse_args()?;
+	let (prefix, bound) = attr.parse_args_with(|input: syn::parse::ParseStream| {
+		let prefix: LitStr = input.parse()?;
+		let bound = match input.parse::<Option<syn::Token![,]>>()? {
+			Some(_) => {
+				let flag: syn::Ident = input.parse()?;
+				if flag != "bound" {
+					return Err(syn::Error::new_spanned(flag, "the only flag is `bound`"));
+				}
+				true
+			}
+			None => false,
+		};
+		Ok((prefix, bound))
+	})?;
 	let value = prefix.value();
 	let segments: Vec<&str> = value.split(':').collect();
 	if segments.len() < 2 || !segments.iter().all(|s| is_segment(s)) {
@@ -41,10 +55,14 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 		arms.push(quote! { Self::#v => #name });
 		names.push(name);
 	}
+	let bound_names = names.iter().filter(|_| bound);
 	Ok(quote! {
 		impl #ident {
 			pub const fn as_str(self) -> &'static str {
 				match self { #(#arms,)* }
+			}
+			pub const fn bound(self) -> bool {
+				#bound
 			}
 		}
 		impl ::concierge_iam::Permission for #ident {
@@ -53,6 +71,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 			}
 		}
 		#(::concierge_iam::__submit! { ::concierge_iam::Entry::Permission(#names) })*
+		#(::concierge_iam::__submit! { ::concierge_iam::Entry::Bound(#bound_names) })*
 	})
 }
 

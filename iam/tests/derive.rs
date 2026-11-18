@@ -13,6 +13,13 @@ enum Sources {
 	Manage,
 }
 
+#[derive(Clone, Copy, Permission)]
+#[permission("sa:own", bound)]
+enum Own {
+	Payments,
+}
+
+alias!(SA_EVERYONE = "sa:everyone", [Own::Payments]);
 alias!(SA_OPERATOR = "sa:operator", [Leads::Read, Leads::Edit]);
 alias!(SA_ADMIN = "sa:admin", [Leads::Read, Leads::Edit, Sources::Manage], delegates[SA_OPERATOR]);
 
@@ -27,14 +34,24 @@ fn derived_names_and_may() {
 
 #[cfg(feature = "catalog")]
 #[test]
+fn a_lent_set_never_carries_a_bound_permission() {
+	assert!(Own::Payments.bound() && !Leads::Read.bound());
+	let held: PermissionSet = [Own::Payments.as_str(), Leads::Read.as_str()].into_iter().collect();
+	let lent = held.lent();
+	assert!(lent.may(Leads::Read) && !lent.may(Own::Payments));
+}
+
+#[cfg(feature = "catalog")]
+#[test]
 fn catalog_collects_the_namespace() {
 	let catalog = concierge_iam::Catalog::collect("sa", 7);
 	assert_eq!(
 		serde_json::to_value(&catalog).unwrap(),
 		serde_json::json!({
 			"version": 7,
-			"permissions": ["sa:admin:sources:manage", "sa:work:leads:edit", "sa:work:leads:read"],
+			"permissions": ["sa:admin:sources:manage", "sa:own:payments", "sa:work:leads:edit", "sa:work:leads:read"],
 			"aliases": {
+				"sa:everyone": ["sa:own:payments"],
 				"sa:admin": ["sa:admin:sources:manage", "sa:work:leads:edit", "sa:work:leads:read"],
 				"sa:operator": ["sa:work:leads:edit", "sa:work:leads:read"],
 			},

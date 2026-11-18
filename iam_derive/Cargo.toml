@@ -1,6 +1,6 @@
 [package]
 name = "concierge_iam_derive"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "#[derive(Permission)] for concierge_iam"
 license = "BlueOak-1.0.0"

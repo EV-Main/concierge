@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "concierge_iam"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "concierge_iam_derive",
  "ev_lib",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "concierge_iam_derive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "heck",
  "proc-macro2",

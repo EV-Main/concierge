@@ -34,7 +34,7 @@ base64 = "0.22"
 color-eyre = "0.6"
 concierge = { path = "runner" }
 concierge_iam = { path = "iam" }
-concierge_iam_derive = { version = "0.1.0", path = "iam_derive" }
+concierge_iam_derive = { version = "0.1.1", path = "iam_derive" }
 # Base32 for the TOTP secret an authenticator app is handed. Already in the graph.
 data-encoding = "2"
 # Plane-internal crates. Other service repos depend on `evconcierge_contracts` (and,

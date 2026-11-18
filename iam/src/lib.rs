@@ -53,6 +53,13 @@ impl PermissionSet {
 	pub fn iter(&self) -> impl Iterator<Item = &str> {
 		self.0.iter().map(String::as_str)
 	}
+
+	/// What this set lends to acting in another's account: everything but the permissions
+	/// declared `bound`, which only their subject's own sign-in holds.
+	#[cfg(feature = "catalog")]
+	pub fn lent(&self) -> PermissionSet {
+		Self(self.0.iter().filter(|p| !bound().any(|b| b == p.as_str())).cloned().collect())
+	}
 }
 
 impl<S: Into<String>> FromIterator<S> for PermissionSet {
@@ -177,6 +184,21 @@ impl Catalog {
 		Ok(())
 	}
 
+	/// A bound permission speaks of its subject's own sign-in, so no role can hold it: it is a
+	/// member of `<namespace>:everyone` and of no other alias.
+	fn check_bound(&self, namespace: &str, bound: &BTreeSet<&str>) -> Result<(), String> {
+		let everyone = format!("{namespace}:{EVERYONE_ALIAS}");
+		for p in bound {
+			if !self.aliases.get(&everyone).is_some_and(|m| m.contains(*p)) {
+				return Err(format!("`{p}` is bound, so `{everyone}` holds it"));
+			}
+			if let Some((alias, _)) = self.aliases.iter().find(|(name, m)| **name != everyone && m.contains(*p)) {
+				return Err(format!("`{p}` is bound, so no alias but `{everyone}` holds it, yet `{alias}` does"));
+			}
+		}
+		Ok(())
+	}
+
 	/// Every derived permission and alias of `namespace` linked into this binary.
 	#[cfg(feature = "catalog")]
 	pub fn collect(namespace: &str, version: u64) -> Self {
@@ -207,6 +229,7 @@ impl Catalog {
 			delegations,
 		};
 		catalog.check(namespace).unwrap_or_else(|e| panic!("{e}"));
+		catalog.check_bound(namespace, &bound().filter(|p| ours(p)).collect()).unwrap_or_else(|e| panic!("{e}"));
 		catalog
 	}
 
@@ -231,7 +254,17 @@ impl Catalog {
 #[doc(hidden)]
 pub enum Entry {
 	Permission(&'static str),
+	/// Also submitted as a [`Entry::Permission`]; apart, so an older consumer reads the derive's output unchanged.
+	Bound(&'static str),
 	Alias(Alias),
+}
+
+#[cfg(feature = "catalog")]
+fn bound() -> impl Iterator<Item = &'static str> {
+	inventory::iter::<Entry>.into_iter().filter_map(|e| match e {
+		Entry::Bound(name) => Some(*name),
+		_ => None,
+	})
 }
 
 #[cfg(feature = "catalog")]
@@ -361,6 +394,16 @@ mod tests {
 			delegating(p, aliases, &[("sa:admin", &["sa:everyone"])]),
 		] {
 			assert!(bad.check("sa").is_err(), "{bad:?}");
+		}
+	}
+
+	#[test]
+	fn a_bound_permission_is_held_by_everyone_alone() {
+		let p = &["sa:own:payments", "sa:work:leads:read"][..];
+		let bound = BTreeSet::from(["sa:own:payments"]);
+		assert!(catalog(p, &[("sa:everyone", p), ("sa:admin", &["sa:work:leads:read"])]).check_bound("sa", &bound).is_ok());
+		for bad in [catalog(p, &[("sa:admin", p)]), catalog(p, &[("sa:everyone", p), ("sa:admin", &["sa:own:payments"])])] {
+			assert!(bad.check_bound("sa", &bound).is_err(), "{bad:?}");
 		}
 	}
 
