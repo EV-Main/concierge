@@ -25,6 +25,7 @@
 
         rs = v_flakes.rs { inherit pkgs rust; };
         js = v_flakes.js { inherit pkgs; packages = [ "web" "sdk" ]; };
+        oldestSupportedVersion = "nightly-2026-06-29";
         github = v_flakes.github {
           inherit pkgs pname rs js;
           enable = true;
@@ -43,7 +44,7 @@
           }];
           # Public repo → public Cachix (`ev-invest`); pull deps + push built paths.
           cache = { cachix = "ev-invest"; };
-          lastSupportedVersion = "nightly-2026-05-12";
+          inherit oldestSupportedVersion;
           containerRelease = { registry = "ghcr.io/ev-main"; };
           gitignore.extra = ''
             ## Local Postgres
