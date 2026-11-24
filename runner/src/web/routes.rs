@@ -7,14 +7,14 @@ use std::net::{IpAddr, SocketAddr};
 use axum::{
 	Json,
 	extract::{ConnectInfo, FromRequestParts, Path, Query, State},
-	http::{HeaderMap, HeaderValue, StatusCode, request::Parts},
+	http::{HeaderMap, StatusCode, header, request::Parts},
 	response::{IntoResponse, Redirect, Response},
 };
 use axum_extra::extract::cookie::CookieJar;
 use domain::{
 	auth::{ProvenIdentity, Provider},
 	authz::{Role, SEAT_GUEST},
-	users::{Email, UserId},
+	users::{Email, User, UserId},
 };
 use evconcierge_auth::oauth::OAuthProvider;
 use evconcierge_contracts::concierge::v1::{self as cc, auth_service_server::AuthService as AuthRpc};
@@ -24,7 +24,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::web::{
-	WebState, now_secs,
+	WebState, cli, now_secs,
 	oauth::{Challenge, OAUTH_TX_TTL, safe_return_to},
 	session::Fresh,
 	sign_in::{Answered, Denied, Refusal, Signed, end_session, gate, internal, signed_in_read},
@@ -252,34 +252,85 @@ pub async fn session(State(st): State<WebState>, jar: CookieJar) -> Result<(Cook
 }
 /// `GET /auth/gate` — Traefik's ForwardAuth target for a staff-only page on this origin: 204
 /// with `X-Auth-User` (the account id) for an Operator, Admin or Owner, 403 for an investor,
-/// else a sign-in that comes back to `X-Forwarded-Uri`. The session is read as
-/// `/auth/session` reads it, except that an unreadable directory refuses: a stored copy may
-/// describe a seat that has since been taken away.
+/// else a sign-in that comes back to `X-Forwarded-Uri`. A request with an `Authorization`
+/// header is a tool's: its CLI session (`web::cli`) alone is read, and anything but a live
+/// one of a staff account is 401 naming where to sign in, never a redirect.
 pub async fn staff_gate(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Response {
 	let st = &st.inner;
+	let pass = |user_id: String| (StatusCode::NO_CONTENT, [("x-auth-user", user_id)]);
+	if let Some(authorization) = headers.get(header::AUTHORIZATION) {
+		let session = authorization
+			.to_str()
+			.ok()
+			.and_then(|v| v.split_once(' '))
+			.filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"));
+		let principal = match session {
+			Some((_, session)) => match st.auth.cli_principal(session, |user| is_staff(&user.role)).await {
+				Ok(principal) => principal,
+				Err(e) => return internal("staff gate: CLI session not read", e).into_response(),
+			},
+			None => None,
+		};
+		return match principal {
+			Some(user) => pass(user.user_id).into_response(),
+			None => {
+				let sign_in = format!("Bearer authorization_uri=\"{}{}\"", st.public_origin, cli::PUBLIC_PATH);
+				(StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, sign_in)]).into_response()
+			}
+		};
+	}
+	match staff(st, jar).await {
+		Ok((jar, user)) => (jar, pass(user.id().to_string())).into_response(),
+		Err(NotStaff::SignedOut(jar)) => (jar, to_sign_in(st, &headers)).into_response(),
+		Err(NotStaff::Investor(jar)) => (StatusCode::FORBIDDEN, jar).into_response(),
+		Err(NotStaff::Unknown(refusal)) => refusal.into_response(),
+	}
+}
+
+/// Why a browser is not a staff member's, with the cookies it is left holding.
+pub(super) enum NotStaff {
+	SignedOut(CookieJar),
+	Investor(CookieJar),
+	/// Something on our side failed: no verdict was reached.
+	Unknown(Refusal),
+}
+
+/// The staff account this browser is signed in as. The session is read as `/auth/session`
+/// reads it, except that an unreadable directory refuses: a stored copy may describe a seat
+/// that has since been taken away.
+pub(super) async fn staff(st: &super::Inner, jar: CookieJar) -> Result<(CookieJar, User), NotStaff> {
 	let fresh = match jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
-		Some(id) => match st.sessions.fresh(&id, &st.auth).await {
-			Ok(fresh) => fresh,
-			Err(e) => return store_err(e).into_response(),
-		},
+		Some(id) => st
+			.sessions
+			.fresh(&id, &st.auth)
+			.await
+			.map_err(|e| NotStaff::Unknown(internal("staff: web session store failed", e)))?,
 		None => None,
 	};
 	let Some(fresh) = fresh else {
-		return (clear_session(st, jar), to_sign_in(st, &headers)).into_response();
+		return Err(NotStaff::SignedOut(clear_session(st, jar)));
 	};
 	let Some(caller) = Caller::of(&fresh) else {
-		return (end_session(st, jar).await, to_sign_in(st, &headers)).into_response();
+		return Err(NotStaff::SignedOut(end_session(st, jar).await));
 	};
-	match gate(st, &caller).await {
-		Ok(_) => {}
-		Err(Denied::Other(refusal)) if refusal.is_internal() => return refusal.into_response(),
-		Err(_) => return (end_session(st, jar).await, to_sign_in(st, &headers)).into_response(),
-	}
-	if Role::parse(&caller.role).expect("the directory reports only Role strings") == Role::Investor {
-		return (StatusCode::FORBIDDEN, caller.refreshed(st, jar)).into_response();
-	}
-	let user = HeaderValue::from_str(&fresh.user.user_id).expect("Caller::of parsed it as a uuid");
-	(StatusCode::NO_CONTENT, caller.refreshed(st, jar), [("x-auth-user", user)]).into_response()
+	let user = match gate(st, &caller).await {
+		Ok(user) => user,
+		Err(Denied::Other(refusal)) if refusal.is_internal() => return Err(NotStaff::Unknown(refusal)),
+		Err(_) => return Err(NotStaff::SignedOut(end_session(st, jar).await)),
+	};
+	let staff = is_staff(&caller.role);
+	let jar = caller.refreshed(st, jar);
+	if staff { Ok((jar, user)) } else { Err(NotStaff::Investor(jar)) }
+}
+
+pub(super) fn is_staff(role: &str) -> bool {
+	Role::parse(role).expect("the directory reports only Role strings") != Role::Investor
+}
+
+/// The zone sign-in, coming back to the path `back`.
+pub(super) fn sign_in_at(st: &super::Inner, back: &str) -> Redirect {
+	let query = form_urlencoded::Serializer::new(String::new()).append_pair("returnTo", &safe_return_to(Some(back))).finish();
+	Redirect::to(&format!("{}/api/auth/login?{query}", st.public_origin))
 }
 
 /// The zone sign-in (`/api/auth/login`), back to the page Traefik was asked for. A request
@@ -295,8 +346,7 @@ fn to_sign_in(st: &super::Inner, headers: &HeaderMap) -> Response {
 	if !navigation || failed {
 		return StatusCode::UNAUTHORIZED.into_response();
 	}
-	let query = form_urlencoded::Serializer::new(String::new()).append_pair("returnTo", &safe_return_to(Some(uri))).finish();
-	Redirect::to(&format!("{}/api/auth/login?{query}", st.public_origin)).into_response()
+	sign_in_at(st, uri).into_response()
 }
 
 /// `POST /auth/logout` — CSRF-checked: drop the session, revoke the refresh family

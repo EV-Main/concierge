@@ -305,9 +305,9 @@ async fn live_session(st: &super::Inner, session_id: &str) -> color_eyre::Result
 }
 
 /// The client's redirect_uri, once it is known to be registered.
-struct Back<'a> {
-	redirect_uri: &'a str,
-	state: Option<&'a str>,
+pub(super) struct Back<'a> {
+	pub(super) redirect_uri: &'a str,
+	pub(super) state: Option<&'a str>,
 }
 
 impl Back<'_> {
@@ -316,6 +316,10 @@ impl Back<'_> {
 	}
 
 	fn with(&self, params: &[(&str, &str)]) -> Response {
+		redirect(&self.url(params))
+	}
+
+	pub(super) fn url(&self, params: &[(&str, &str)]) -> String {
 		let mut query = form_urlencoded::Serializer::new(String::new());
 		for (key, value) in params {
 			query.append_pair(key, value);
@@ -324,7 +328,7 @@ impl Back<'_> {
 			query.append_pair("state", state);
 		}
 		let sep = if self.redirect_uri.contains('?') { '&' } else { '?' };
-		redirect(&format!("{}{sep}{}", self.redirect_uri, query.finish()))
+		format!("{}{sep}{}", self.redirect_uri, query.finish())
 	}
 }
 
@@ -422,7 +426,7 @@ fn decide(max_age: u64, auth_time: Option<u64>, trip: Option<Trip>, now: i64) ->
 
 /// A 302 that no cache keeps and no Referer repeats: the Location carries a one-time
 /// code, and the page it lands on must not learn it from this hop either.
-fn redirect(location: &str) -> Response {
+pub(super) fn redirect(location: &str) -> Response {
 	let Ok(location) = HeaderValue::from_str(location) else {
 		return page(StatusCode::BAD_REQUEST, "This sign-in link is not valid.");
 	};
@@ -438,7 +442,7 @@ fn redirect(location: &str) -> Response {
 }
 
 /// An error page on THIS origin. The text is fixed: nothing from the request is echoed.
-fn page(status: StatusCode, message: &'static str) -> Response {
+pub(super) fn page(status: StatusCode, message: &'static str) -> Response {
 	let body = format!(
 		"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Sign-in</title></head>\
 		 <body><main><h1>Sign-in could not continue</h1><p>{message}</p><p><a href=\"/\">Go to evinvest.ltd</a></p></main></body></html>"

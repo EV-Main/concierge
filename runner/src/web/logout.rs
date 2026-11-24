@@ -59,7 +59,13 @@ pub async fn page(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap
 		}
 	};
 	let body = confirm_page(Words::negotiate(&headers), &escape(&csrf), &escape(&target));
-	(StatusCode::OK, guarded(&target), [(header::VARY, HeaderValue::from_static("accept-language"))], Html(body)).into_response()
+	(
+		StatusCode::OK,
+		guarded(origin_of(&target)),
+		[(header::VARY, HeaderValue::from_static("accept-language"))],
+		Html(body),
+	)
+		.into_response()
 }
 
 /// `POST /auth/logout/confirm` — end the session as `/auth/logout` does, then 303 to the
@@ -155,7 +161,7 @@ impl Words {
 /// (the CTA fill, white text) and `--primary-ink` (teal that reads on the dark surfaces).
 /// Hex because this is server-rendered HTML with no token sheet; no font is loaded (CSP),
 /// so Inter is used only where installed.
-const STYLE: &str = "\
+pub(super) const STYLE: &str = "\
 :root{color-scheme:dark light;--bg:#070d18;--card:#16233c;--ink:#e6e1d3;--dim:#a9b3c6;--line:#26375c;--cta:#128377;--cta-hover:#2a9d8f;--on-cta:#fff;--link:#2a9d8f}\
 @media(prefers-color-scheme:light){:root{--bg:#eef2f7;--card:#fff;--ink:#0d1526;--dim:#4a5873;--line:#d5dce8;--link:#0f6d63}}\
 *{box-sizing:border-box}\
@@ -210,10 +216,10 @@ fn origin_of(target: &str) -> &str {
 /// anything. `style-src 'unsafe-inline'` is the one opening, for the page's own `<style>`:
 /// the markup is a fixed template and request-derived text only lands escaped in text and
 /// attribute values, so inline CSS cannot become a script or a fetch (`default-src 'none'`
-/// still bars scripts, images and fonts). `form-action` names the target's origin beside `'self'` because browsers
+/// still bars scripts, images and fonts). `form-action` names `target`, a CSP source, beside `'self'` because browsers
 /// enforce it on the redirect that answers the form, not only on the form's own action.
-fn guarded(target: &str) -> [(header::HeaderName, HeaderValue); 4] {
-	let csp = format!("default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {}; frame-ancestors 'none'", origin_of(target));
+pub(super) fn guarded(target: &str) -> [(header::HeaderName, HeaderValue); 4] {
+	let csp = format!("default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {}; frame-ancestors 'none'", target);
 	[
 		(
 			header::CONTENT_SECURITY_POLICY,

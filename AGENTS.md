@@ -496,7 +496,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   the refresh-token secret
   (`evconcierge_auth::management`), a relying party's client secret and refresh secret
   (`relying_party` and, for the service seams, `service_caller`; compared as fixed-width digests), an emailed sign-in or verification
-  code (`infrastructure::credentials`), an authenticator code (`second_factor::totp`) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
+  code (`infrastructure::credentials`), a CLI's code and session (compared as digests), an authenticator code (`second_factor::totp`) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
   Whether any one of them is a practical timing oracle is not the test — a plane that
   states this discipline and then has one check quietly doing `!=` (#52) is a plane whose
   next reader takes the exception for the rule. The CSRF check is also the STRICTER of the
@@ -805,6 +805,32 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   origin for a registered scope's sign-in and refuses to boot in production. Sign-ins are recorded by
   `rp_codes`/`rp_sessions` and `tracing`, not `admin_action` (nobody acted on anyone); a
   replay or a reused refresh token is `error!` → Sentry.
+- **A command-line tool signs in through the browser and passes `/auth/gate`, nothing else**
+  (`web::cli`, RFC 8252; no client is registered for it). `GET /auth/cli` (publicly
+  `/api/auth/cli`) takes `redirect_uri` (the literal `http://127.0.0.1:<port>/…` or
+  `http://[::1]:<port>/…`, compared as text, never `localhost`), `state`, `code_challenge`,
+  `code_challenge_method=S256`; with no session it goes to the zone sign-in and back, and
+  otherwise shows a page with one button, built as `/auth/logout/confirm`'s is: a GET mints
+  nothing. The POST (the session's CSRF token; the refresh family checked first-hand) answers
+  303 to `redirect_uri?code&state`. Only an account the gate passes gets that far; an investor
+  is refused 403 on both. `POST /auth/cli/token {code, code_verifier}` (no cookie, no CSRF)
+  answers `{session}`, or 400 `invalid_grant` for everything wrong. A code lives
+  `CODE_TTL_SECS`, is BURNED on its first presentation, matching or not, and a second one
+  ends the session it opened (`error!` → Sentry). Both live in the refresh store as ONE family
+  whose credential is of its own kind (`management::Credential::Cli`: digests at rest, and in
+  Redis no `current` field at all), so no RPC takes a CLI session as a refresh token — nor does
+  an older binary — and the gate takes no refresh token; it names no web session, so it is no
+  cookie either. It slides by `AUTH_REFRESH_TTL_SECS` on every use up to
+  `AUTH_MAX_SESSION_SECS` (the idle timeout is a browser's), outlives the browser's sign-out,
+  is listed (`Session.cli`) and revoked like any session, and ends with every revoke-all. The
+  account is re-read at the exchange and on EVERY use: disabled, a moved `token_version` or no
+  staff seat ends the family there, so getting the seat back does not bring it back. At the gate
+  it rides `Authorization: Bearer`; a request with that header is judged by it alone (cookies
+  unread), and anything but a live session is 401 with
+  `WWW-Authenticate: Bearer authorization_uri="<PUBLIC_ORIGIN>/api/auth/cli"` — where the tool
+  discovers both URLs — never a redirect. A ForwardAuth middleware that names `Authorization` in its
+  `authResponseHeaders` strips it from what the page's service is sent: the gate answers
+  without one.
 - **The decisions about USERS pass on a MAJORITY, the ones about OWNER seats on unanimity**,
   and the asymmetry is set in `domain::approvals::platform_quorum_bps`. Unanimity guards the owner
   roster because a minority able to add owners by majority grows itself into a majority;

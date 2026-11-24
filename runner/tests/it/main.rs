@@ -6,6 +6,7 @@ mod authz_gate;
 mod boot_config;
 mod bridge;
 mod bridge_tls;
+mod cli_sign_in;
 mod common;
 mod drop_legacy_governance;
 mod genesis;

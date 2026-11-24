@@ -25,6 +25,7 @@
 mod account;
 pub mod allowlist;
 mod authorize;
+mod cli;
 mod cors;
 mod kyc;
 mod logout;
@@ -289,6 +290,11 @@ pub fn router(state: WebState) -> Router {
 		// leaves this origin's session too. A page, not a call: a script on a scope host
 		// must never be able to end the session by itself, so a person presses the button.
 		.route("/auth/logout/confirm", get(logout::page).post(logout::confirm))
+		// A command-line tool's sign-in: a page with one button, for a logout page's reason — a
+		// plain navigation here must mint nothing — and the tool's own exchange, which no
+		// browser sends: no session, no CSRF, no CORS (`web::cli`).
+		.route("/auth/cli", get(cli::page).post(cli::confirm))
+		.route("/auth/cli/token", post(cli::token))
 		// No CORS: the answer is for Traefik's ForwardAuth, never for a page's script.
 		.route("/auth/gate", get(routes::staff_gate))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
