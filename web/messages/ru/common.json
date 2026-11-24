@@ -795,6 +795,10 @@
     "en": "Browser",
     "t": "Браузер"
   },
+  "settings.device.cli": {
+    "en": "Command-line tool",
+    "t": "Программа командной строки"
+  },
   "settings.device.generic": {
     "en": "device",
     "t": "устройство"

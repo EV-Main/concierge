@@ -795,6 +795,10 @@
     "en": "Browser",
     "t": "Trình duyệt"
   },
+  "settings.device.cli": {
+    "en": "Command-line tool",
+    "t": "Công cụ dòng lệnh"
+  },
   "settings.device.generic": {
     "en": "device",
     "t": "thiết bị"

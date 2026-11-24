@@ -795,6 +795,10 @@
     "en": "Browser",
     "t": "Navigateur"
   },
+  "settings.device.cli": {
+    "en": "Command-line tool",
+    "t": "Outil en ligne de commande"
+  },
   "settings.device.generic": {
     "en": "device",
     "t": "appareil"

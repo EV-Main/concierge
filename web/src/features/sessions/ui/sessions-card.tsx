@@ -26,7 +26,7 @@ export function SessionsCard() {
         ) : (
           <ListRows>
             {sessions.map((s) => {
-              const { label, icon: Icon } = deviceOf(s.userAgent, t);
+              const { label, icon: Icon } = deviceOf(s, t);
               return (
                 // Wraps below `sm`: side by side, the device and its meta line were clipped on a phone.
                 <ListRow key={s.id} className="flex-wrap">

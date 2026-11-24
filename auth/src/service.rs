@@ -22,7 +22,7 @@ use crate::{
 	AuthError,
 	clients::{CatalogPublication, ClientGrant, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation},
 	config::AuthConfig,
-	management::{IssuedRefresh, RefreshInspect, RefreshStore, SessionBounds},
+	management::{CliRedemption, IssuedRefresh, RefreshInspect, RefreshStore, SessionBounds},
 	provisioner::{ProvisionedUser, Provisioner},
 	signer::{Signer, load_jwks},
 	stepup::{Aal, StepupProof},
@@ -245,6 +245,36 @@ impl AuthService {
 		Ok(token_response(access_token, access_exp, rotated.refresh, &summary))
 	}
 
+	/// A one-time code for a command-line tool's sign-in, alive `ttl_secs` and worth a session
+	/// to the holder of the verifier of `challenge` alone.
+	pub async fn issue_cli_code(&self, user_id: &str, token_version: u64, challenge: &str, ttl_secs: u64) -> Result<String, AuthError> {
+		let engine = &self.engine;
+		engine.refresh.issue_cli_code(user_id, token_version, challenge, ttl_secs, engine.session_bounds).await
+	}
+
+	/// Spend a code of [`Self::issue_cli_code`], matching or not.
+	pub async fn redeem_cli_code(&self, code: &str, challenge: &str, user_agent: String, ip: String) -> Result<CliRedemption, AuthError> {
+		let engine = &self.engine;
+		engine.refresh.redeem_cli_code(code, challenge, engine.session_bounds, user_agent, ip).await
+	}
+
+	/// Whose a CLI session is, re-read live on every presentation. One whose account is
+	/// disabled, has revoked its tokens since or is not among those `admits` is ended, so
+	/// regaining what it lost does not bring it back.
+	pub async fn cli_principal(&self, session: &str, admits: impl FnOnce(&UserSummary) -> bool) -> Result<Option<UserSummary>, AuthError> {
+		let engine = &self.engine;
+		let Some(owner) = engine.refresh.use_cli(session, engine.session_bounds).await? else {
+			return Ok(None);
+		};
+		let user = engine.provisioner.lookup(owner.user_id).await.inspect_err(crate::telemetry::report_unexpected)?;
+		let summary = user_summary(&user);
+		if user.is_disabled() || user.token_version > owner.token_version || !admits(&summary) {
+			engine.refresh.revoke(session).await?;
+			return Ok(None);
+		}
+		Ok(Some(summary))
+	}
+
 	/// Open a refresh family without a sign-in, for integration suites that need
 	/// a real `evinvest.ltd` session to exist. Returns the refresh token.
 	#[cfg(feature = "test-support")]
@@ -382,6 +412,7 @@ impl AuthServiceRpc for AuthService {
 				ip: s.ip,
 				created_at: s.created_at as i64,
 				last_seen: s.last_seen as i64,
+				cli: s.cli,
 			})
 			.collect();
 		Ok(Response::new(ListSessionsResponse { sessions }))
@@ -543,6 +574,43 @@ mod tests {
 	async fn an_unconfigured_service_opens_no_session() {
 		let status = AuthService::unconfigured().open_session("x", String::new(), String::new()).await.unwrap_err();
 		assert_eq!(status.code(), tonic::Code::Unavailable);
+	}
+
+	// A CLI session opens the staff gate and no RPC here: not as the refresh token it is
+	// shaped like, nor by its one-time code — and a refused one is not read as reuse.
+	#[tokio::test]
+	async fn a_cli_session_is_no_refresh_token() {
+		let service = configured_with_directory(|_| Ok(active_user("user-cli", 0))).await;
+		let engine = &service.engine;
+		let code = service.issue_cli_code("user-cli", 0, "challenge", 60).await.unwrap();
+		let CliRedemption::Opened(session) = service.redeem_cli_code(&code, "challenge", String::new(), String::new()).await.unwrap() else {
+			panic!("the code's first presentation opens a session");
+		};
+		let pending = service.issue_cli_code("user-cli", 0, "challenge", 60).await.unwrap();
+		for token in [&session, &pending] {
+			let refresh_token = token.clone();
+			assert!(service.refresh(Request::new(RefreshRequest { refresh_token })).await.is_err());
+			let refresh_token = token.clone();
+			assert!(service.list_sessions(Request::new(ListSessionsRequest { refresh_token })).await.is_err());
+			let logout = LogoutRequest {
+				refresh_token: token.clone(),
+				revoke_all: true,
+			};
+			assert!(service.logout(Request::new(logout)).await.is_err());
+			let revoke = RevokeSessionRequest {
+				refresh_token: token.clone(),
+				session_id: String::new(),
+			};
+			assert!(service.revoke_session(Request::new(revoke)).await.is_err());
+			assert!(service.reauthenticate(token, "user-cli").await.is_err());
+			assert!(service.live_family(token).await.unwrap().is_none());
+			assert!(engine.refresh.rotate(token, &uuid::Uuid::new_v4().to_string(), engine.session_bounds).await.is_err());
+		}
+		assert!(service.cli_principal(&session, |_| true).await.unwrap().is_some(), "and none of it ended the session");
+		let refresh = engine.refresh.issue("user-cli", 0, engine.session_bounds, String::new(), String::new()).await.unwrap();
+		assert!(service.cli_principal(&refresh.token, |_| true).await.unwrap().is_none(), "nor is a refresh token a CLI session");
+		service.revoke_user_everywhere("user-cli").await.unwrap();
+		assert!(service.cli_principal(&session, |_| true).await.unwrap().is_none(), "it ends with every session of its account");
 	}
 
 	// Reuse detection through the Refresh RPC itself: replaying a rotated-out handle

@@ -1,12 +1,13 @@
 import type { Translate } from "@evinvest/i18n";
-import { Laptop, Smartphone, type LucideIcon } from "lucide-react";
+import { Laptop, Smartphone, Terminal, type LucideIcon } from "lucide-react";
 
 import type { Session } from "../api/sessions-api";
 
 // Best-effort device label from the captured User-Agent — enough to recognise a device, not
 // a parser. Browser and OS names are proper nouns; only the generic fallbacks are words.
-export function deviceOf(ua: string, t: Translate): { label: string; icon: LucideIcon } {
-  const u = ua.toLowerCase();
+export function deviceOf(s: Session, t: Translate): { label: string; icon: LucideIcon } {
+  if (s.cli) return { label: t("settings.device.cli", "Command-line tool"), icon: Terminal };
+  const u = s.userAgent.toLowerCase();
   if (!u) return { label: t("settings.device.unknown", "Unknown device"), icon: Laptop };
   const mobile = /iphone|android|mobile/.test(u);
   const browser = /edg/.test(u) ? "Edge" : /firefox|fxios/.test(u) ? "Firefox" : /chrome|crios/.test(u) ? "Chrome" : /safari/.test(u) ? "Safari" : t("settings.device.browser", "Browser");

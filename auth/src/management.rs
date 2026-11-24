@@ -7,6 +7,10 @@
 //! rotated to, which only the rotation's own caller holds: that is the same rotation
 //! replayed after its answer was lost.
 //!
+//! A command-line tool's session is a family too, so it is listed, revoked one by one and
+//! ended with every other session of its account, but its credential is none of a refresh
+//! family's ([`Credential`]): nothing that takes a refresh handle accepts one, nor the reverse.
+//!
 //! **Backing store.** [`RefreshStore`] is a thin enum over two interchangeable
 //! backends with identical semantics:
 //!
@@ -25,6 +29,7 @@ use std::{collections::HashMap, sync::Mutex};
 
 use jsonwebtoken::get_current_timestamp;
 use redis::aio::ConnectionManager;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::AuthError;
@@ -66,6 +71,23 @@ pub struct SessionView {
 	pub ip: String,
 	pub created_at: u64,
 	pub last_seen: u64,
+	/// A command-line tool's session rather than a browser's.
+	pub cli: bool,
+}
+
+/// What presenting a CLI sign-in's one-time code came to.
+pub enum CliRedemption {
+	/// The session it opened.
+	Opened(String),
+	/// Presented again after it opened one, which is ended.
+	Replayed,
+	Refused,
+}
+
+/// Whose a presented CLI session is, and the `token_version` its code was issued under.
+pub struct CliOwner {
+	pub user_id: String,
+	pub token_version: u64,
 }
 
 /// The non-mutating classification of a presented refresh handle, keyed on its SECRET
@@ -142,6 +164,32 @@ impl RefreshStore {
 		}
 	}
 
+	/// Open a family with no session yet: a one-time code that opens it for the holder of the
+	/// verifier of `challenge`, within `ttl_secs`.
+	pub async fn issue_cli_code(&self, user_id: &str, token_version: u64, challenge: &str, ttl_secs: u64, bounds: SessionBounds) -> Result<String, AuthError> {
+		match self {
+			Self::InProcess(s) => Ok(s.issue_cli_code(user_id, token_version, challenge, ttl_secs, bounds)),
+			Self::Redis(s) => s.issue_cli_code(user_id, token_version, challenge, ttl_secs, bounds).await,
+		}
+	}
+
+	/// Spend a code, matching or not: a family that does not become a session here is gone.
+	pub async fn redeem_cli_code(&self, code: &str, challenge: &str, bounds: SessionBounds, user_agent: String, ip: String) -> Result<CliRedemption, AuthError> {
+		match self {
+			Self::InProcess(s) => Ok(s.redeem_cli_code(code, challenge, bounds, user_agent, ip)),
+			Self::Redis(s) => s.redeem_cli_code(code, challenge, bounds, user_agent, ip).await,
+		}
+	}
+
+	/// Slide a live CLI session. The idle timeout is a browser's: a tool is used weekly, and
+	/// the sliding window is what bounds how long one lies unused.
+	pub async fn use_cli(&self, session: &str, bounds: SessionBounds) -> Result<Option<CliOwner>, AuthError> {
+		match self {
+			Self::InProcess(s) => Ok(s.use_cli(session, bounds)),
+			Self::Redis(s) => s.use_cli(session, bounds).await,
+		}
+	}
+
 	pub async fn revoke(&self, token: &str) -> Result<(), AuthError> {
 		match self {
 			Self::InProcess(s) => {
@@ -206,8 +254,10 @@ impl InProcessRefreshStore {
 			Family {
 				id: uuid::Uuid::new_v4().to_string(),
 				user_id: user_id.to_owned(),
-				current: secret.clone(),
-				prev: None,
+				credential: Credential::Refresh {
+					current: secret.clone(),
+					prev: None,
+				},
 				token_version,
 				expires_at,
 				absolute_expires_at: now + bounds.max_session_secs,
@@ -235,6 +285,9 @@ impl InProcessRefreshStore {
 		let (family, secret) = token.split_once('.').ok_or(AuthError::InvalidToken)?;
 		let mut map = self.families.lock().unwrap_or_else(|e| e.into_inner());
 		let fam = map.get_mut(family).ok_or(AuthError::InvalidToken)?;
+		let Credential::Refresh { current: live, prev } = &mut fam.credential else {
+			return Err(AuthError::InvalidToken);
+		};
 
 		let now = get_current_timestamp();
 		let idle_expired = bounds.idle_timeout_secs != 0 && now.saturating_sub(fam.last_seen) > bounds.idle_timeout_secs;
@@ -243,12 +296,13 @@ impl InProcessRefreshStore {
 			return Err(AuthError::InvalidToken);
 		}
 
-		let current = ct_eq(&fam.current, secret);
-		let replayed = !current && fam.prev.as_deref().is_some_and(|prev| ct_eq(prev, secret)) && ct_eq(&fam.current, next_secret);
+		let current = ct_eq(live, secret);
+		let rotated_out = prev.as_deref().is_some_and(|prev| ct_eq(prev, secret));
+		let replayed = !current && rotated_out && ct_eq(live, next_secret);
 		if current || replayed {
 			let expires_at = now + bounds.ttl_secs;
 			if current {
-				fam.prev = Some(std::mem::replace(&mut fam.current, next_secret.to_owned()));
+				*prev = Some(std::mem::replace(live, next_secret.to_owned()));
 			}
 			fam.expires_at = expires_at;
 			fam.last_seen = now;
@@ -260,7 +314,7 @@ impl InProcessRefreshStore {
 					auth_time: fam.auth_time,
 				},
 			})
-		} else if fam.prev.as_deref().is_some_and(|prev| ct_eq(prev, secret)) {
+		} else if rotated_out {
 			// Reuse of a rotated-out secret — treat the family as compromised.
 			map.remove(family);
 			Err(AuthError::InvalidToken)
@@ -274,9 +328,10 @@ impl InProcessRefreshStore {
 		let (family, secret) = token.split_once('.')?;
 		let mut map = self.families.lock().unwrap_or_else(|e| e.into_inner());
 		let fam = map.get_mut(family)?;
+		let Credential::Refresh { current, .. } = &fam.credential else { return None };
 		let now = get_current_timestamp();
 		let idle_expired = bounds.idle_timeout_secs != 0 && now.saturating_sub(fam.last_seen) > bounds.idle_timeout_secs;
-		if now >= fam.absolute_expires_at || idle_expired || now >= fam.expires_at || !ct_eq(&fam.current, secret) {
+		if now >= fam.absolute_expires_at || idle_expired || now >= fam.expires_at || !ct_eq(current, secret) {
 			return None;
 		}
 		let auth_time = now.max(fam.auth_time.unwrap_or(0));
@@ -305,13 +360,88 @@ impl InProcessRefreshStore {
 		if now >= fam.absolute_expires_at || idle_expired || now >= fam.expires_at {
 			return RefreshInspect::Invalid;
 		}
-		if ct_eq(&fam.current, secret) {
-			RefreshInspect::Current { user_id: fam.user_id.clone() }
-		} else if fam.prev.as_deref().is_some_and(|prev| ct_eq(prev, secret)) {
-			RefreshInspect::Reuse { user_id: fam.user_id.clone() }
-		} else {
-			RefreshInspect::Invalid
+		match &fam.credential {
+			Credential::Refresh { current, .. } if ct_eq(current, secret) => RefreshInspect::Current { user_id: fam.user_id.clone() },
+			Credential::Refresh { prev: Some(prev), .. } if ct_eq(prev, secret) => RefreshInspect::Reuse { user_id: fam.user_id.clone() },
+			Credential::Refresh { .. } | Credential::Cli { .. } => RefreshInspect::Invalid,
 		}
+	}
+
+	pub fn issue_cli_code(&self, user_id: &str, token_version: u64, challenge: &str, ttl_secs: u64, bounds: SessionBounds) -> String {
+		let family = uuid::Uuid::new_v4().to_string();
+		let secret = uuid::Uuid::new_v4().to_string();
+		let now = get_current_timestamp();
+		let mut map = self.families.lock().unwrap_or_else(|e| e.into_inner());
+		map.retain(|_, fam| now < fam.expires_at || !matches!(fam.credential, Credential::Cli { session: None, .. }));
+		map.insert(
+			family.clone(),
+			Family {
+				id: uuid::Uuid::new_v4().to_string(),
+				user_id: user_id.to_owned(),
+				credential: Credential::Cli {
+					code: digest(&secret),
+					challenge: challenge.to_owned(),
+					session: None,
+				},
+				token_version,
+				expires_at: now + ttl_secs,
+				absolute_expires_at: now + bounds.max_session_secs,
+				user_agent: String::new(),
+				ip: String::new(),
+				created_at: now,
+				last_seen: now,
+				auth_time: None,
+			},
+		);
+		format!("{family}.{secret}")
+	}
+
+	pub fn redeem_cli_code(&self, presented: &str, presented_challenge: &str, bounds: SessionBounds, user_agent: String, ip: String) -> CliRedemption {
+		let Some((family, secret)) = presented.split_once('.') else {
+			return CliRedemption::Refused;
+		};
+		let mut map = self.families.lock().unwrap_or_else(|e| e.into_inner());
+		let Some(fam) = map.get_mut(family) else {
+			return CliRedemption::Refused;
+		};
+		let Credential::Cli { code, challenge, session } = &mut fam.credential else {
+			return CliRedemption::Refused;
+		};
+		if !ct_eq(code, &digest(secret)) {
+			return CliRedemption::Refused;
+		}
+		let now = get_current_timestamp();
+		let replayed = session.is_some();
+		if replayed || now >= fam.expires_at || challenge != presented_challenge {
+			map.remove(family);
+			return if replayed { CliRedemption::Replayed } else { CliRedemption::Refused };
+		}
+		let opened = uuid::Uuid::new_v4().to_string();
+		*session = Some(digest(&opened));
+		fam.expires_at = (now + bounds.ttl_secs).min(fam.absolute_expires_at);
+		fam.last_seen = now;
+		fam.user_agent = user_agent;
+		fam.ip = ip;
+		CliRedemption::Opened(format!("{family}.{opened}"))
+	}
+
+	pub fn use_cli(&self, presented: &str, bounds: SessionBounds) -> Option<CliOwner> {
+		let (family, secret) = presented.split_once('.')?;
+		let mut map = self.families.lock().unwrap_or_else(|e| e.into_inner());
+		let fam = map.get_mut(family)?;
+		let Credential::Cli { session: Some(session), .. } = &fam.credential else {
+			return None;
+		};
+		let now = get_current_timestamp();
+		if !ct_eq(session, &digest(secret)) || now >= fam.expires_at {
+			return None;
+		}
+		fam.expires_at = (now + bounds.ttl_secs).min(fam.absolute_expires_at);
+		fam.last_seen = now;
+		Some(CliOwner {
+			user_id: fam.user_id.clone(),
+			token_version: fam.token_version,
+		})
 	}
 
 	/// Revoke a single refresh family (one logout).
@@ -333,13 +463,14 @@ impl InProcessRefreshStore {
 			.lock()
 			.unwrap_or_else(|e| e.into_inner())
 			.values()
-			.filter(|f| f.user_id == user_id && now < f.expires_at)
+			.filter(|f| f.user_id == user_id && now < f.expires_at && !matches!(f.credential, Credential::Cli { session: None, .. }))
 			.map(|f| SessionView {
 				id: f.id.clone(),
 				user_agent: f.user_agent.clone(),
 				ip: f.ip.clone(),
 				created_at: f.created_at,
 				last_seen: f.last_seen,
+				cli: matches!(f.credential, Credential::Cli { .. }),
 			})
 			.collect()
 	}
@@ -385,7 +516,9 @@ impl InProcessRefreshStore {
 /// Redis-backed refresh-token family store — same semantics as [`InProcessRefreshStore`],
 /// shared across replicas and durable across restarts.
 ///
-/// Layout: each family is a hash `refresh:fam:<family>` (current/prev secret, owner,
+/// Layout: each family is a hash `refresh:fam:<family>` (current/prev secret — of a CLI's,
+/// `cli_code`/`cli_challenge`/`cli_session` digests instead, so no script or read that looks
+/// for `current` can match one — owner,
 /// the per-family `token_version` snapshot, the stable session id, sliding `expires_at`,
 /// the immutable `absolute_expires_at`, `last_seen`, device metadata). A per-user set
 /// `refresh:user:<user_id>` indexes the family ids for listing and bulk revoke. The
@@ -560,6 +693,81 @@ impl RedisRefreshStore {
 		}
 	}
 
+	pub async fn issue_cli_code(&self, user_id: &str, token_version: u64, challenge: &str, ttl_secs: u64, bounds: SessionBounds) -> Result<String, AuthError> {
+		let family = uuid::Uuid::new_v4().to_string();
+		let secret = uuid::Uuid::new_v4().to_string();
+		let now = get_current_timestamp();
+		let expires_at = now + ttl_secs;
+		let absolute_expires_at = now + bounds.max_session_secs;
+
+		let mut conn = self.conn.clone();
+		redis::pipe()
+			.atomic()
+			.hset_multiple(
+				Self::fam_key(&family),
+				&[
+					("id", uuid::Uuid::new_v4().to_string().as_str()),
+					("user_id", user_id),
+					("cli_code", &digest(&secret)),
+					("cli_challenge", challenge),
+					("token_version", &token_version.to_string()),
+					("expires_at", &expires_at.to_string()),
+					("absolute_expires_at", &absolute_expires_at.to_string()),
+					("created_at", &now.to_string()),
+					("last_seen", &now.to_string()),
+				],
+			)
+			.expire_at(Self::fam_key(&family), expires_at as i64)
+			.sadd(Self::user_key(user_id), family.as_str())
+			.expire_at(Self::user_key(user_id), absolute_expires_at as i64)
+			.exec_async(&mut conn)
+			.await
+			.map_err(redis_err)?;
+		Ok(format!("{family}.{secret}"))
+	}
+
+	pub async fn redeem_cli_code(&self, code: &str, challenge: &str, bounds: SessionBounds, user_agent: String, ip: String) -> Result<CliRedemption, AuthError> {
+		let Some((family, secret)) = code.split_once('.') else {
+			return Ok(CliRedemption::Refused);
+		};
+		let opened = uuid::Uuid::new_v4().to_string();
+		let mut conn = self.conn.clone();
+		let outcome: String = REDEEM_CLI_CODE_SCRIPT
+			.key(Self::fam_key(family))
+			.arg(digest(secret))
+			.arg(challenge)
+			.arg(get_current_timestamp())
+			.arg(digest(&opened))
+			.arg(bounds.ttl_secs)
+			.arg(user_agent)
+			.arg(ip)
+			.invoke_async(&mut conn)
+			.await
+			.map_err(redis_err)?;
+		match outcome.as_str() {
+			"opened" => Ok(CliRedemption::Opened(format!("{family}.{opened}"))),
+			"replayed" => Ok(CliRedemption::Replayed),
+			"refused" => Ok(CliRedemption::Refused),
+			other => unreachable!("the script answers one of three words, not {other:?}"),
+		}
+	}
+
+	pub async fn use_cli(&self, session: &str, bounds: SessionBounds) -> Result<Option<CliOwner>, AuthError> {
+		let Some((family, secret)) = session.split_once('.') else {
+			return Ok(None);
+		};
+		let mut conn = self.conn.clone();
+		let owner: Option<(String, u64)> = USE_CLI_SCRIPT
+			.key(Self::fam_key(family))
+			.arg(digest(secret))
+			.arg(get_current_timestamp())
+			.arg(bounds.ttl_secs)
+			.invoke_async(&mut conn)
+			.await
+			.map_err(redis_err)?;
+		Ok(owner.map(|(user_id, token_version)| CliOwner { user_id, token_version }))
+	}
+
 	pub async fn revoke(&self, token: &str) -> Result<(), AuthError> {
 		let Some(family) = token.split_once('.').map(|(f, _)| f) else {
 			return Ok(());
@@ -599,7 +807,8 @@ impl RedisRefreshStore {
 				continue;
 			}
 			let expires_at = fields.get("expires_at").and_then(|v| v.parse().ok()).unwrap_or(0);
-			if now >= expires_at {
+			let cli = fields.contains_key("cli_session");
+			if now >= expires_at || (fields.contains_key("cli_code") && !cli) {
 				continue;
 			}
 			views.push(SessionView {
@@ -608,6 +817,7 @@ impl RedisRefreshStore {
 				ip: fields.get("ip").cloned().unwrap_or_default(),
 				created_at: fields.get("created_at").and_then(|v| v.parse().ok()).unwrap_or(0),
 				last_seen: fields.get("last_seen").and_then(|v| v.parse().ok()).unwrap_or(0),
+				cli,
 			});
 		}
 		if !stale.is_empty() {
@@ -723,6 +933,47 @@ return { h['token_version'], tostring(auth_time) }
 	)
 });
 
+/// KEYS[1] = family hash. ARGV = presented code's digest, its verifier's challenge, now, the
+/// new session's digest, ttl_secs, user agent, ip. Any presentation but the first that
+/// matches deletes the family; its entry in the user's index is pruned by the next listing.
+static REDEEM_CLI_CODE_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+	redis::Script::new(
+		r#"
+local h = redis.call('HMGET', KEYS[1], 'cli_code', 'cli_challenge', 'cli_session', 'expires_at', 'absolute_expires_at')
+if not h[1] or h[1] ~= ARGV[1] then return 'refused' end
+local now = tonumber(ARGV[3])
+if h[3] then
+  redis.call('DEL', KEYS[1])
+  return 'replayed'
+end
+if h[2] ~= ARGV[2] or now >= tonumber(h[4]) then
+  redis.call('DEL', KEYS[1])
+  return 'refused'
+end
+local expires = string.format('%d', math.min(now + tonumber(ARGV[5]), tonumber(h[5])))
+redis.call('HSET', KEYS[1], 'cli_session', ARGV[4], 'expires_at', expires, 'last_seen', ARGV[3], 'user_agent', ARGV[6], 'ip', ARGV[7])
+redis.call('EXPIREAT', KEYS[1], h[5])
+return 'opened'
+"#,
+	)
+});
+
+/// KEYS[1] = family hash. ARGV = presented session's digest, now, ttl_secs. Returns
+/// `{user_id, token_version}`, or nil for anything but a live CLI session's secret.
+static USE_CLI_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+	redis::Script::new(
+		r#"
+local h = redis.call('HMGET', KEYS[1], 'cli_session', 'user_id', 'token_version', 'expires_at', 'absolute_expires_at')
+if not h[1] or h[1] ~= ARGV[1] then return nil end
+local now = tonumber(ARGV[2])
+if now >= tonumber(h[4]) then return nil end
+local expires = string.format('%d', math.min(now + tonumber(ARGV[3]), tonumber(h[5])))
+redis.call('HSET', KEYS[1], 'expires_at', expires, 'last_seen', ARGV[2])
+return { h[2], h[3] }
+"#,
+	)
+});
+
 /// Atomically revoke every refresh family for a user (logout-everywhere / revoke-all).
 /// KEYS[1] = the per-user family index set. ARGV[1] = the family-key prefix. Runs the
 /// member read and the deletes as one script so a concurrent `issue` cannot interleave
@@ -751,13 +1002,27 @@ fn ct_eq(a: &str, b: &str) -> bool {
 	a.len() == b.len() && a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
+/// A code or a CLI session at rest, in hex. A plain digest and not a KDF: what it hides is
+/// CSPRNG output.
+fn digest(secret: &str) -> String {
+	Sha256::digest(secret.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// What a family is presented by. The two never stand in for one another.
+enum Credential {
+	/// A browser's refresh handle, rotated on every presentation.
+	Refresh { current: String, prev: Option<String> },
+	/// A command-line tool's: digests of a one-time code and of the session it opened, `None`
+	/// until it has. The code outlives its redemption, so a second one finds what it bought.
+	Cli { code: String, challenge: String, session: Option<String> },
+}
+
 struct Family {
 	/// Stable session id, preserved across rotations (the token handle changes,
 	/// this does not), so the "sessions & devices" surface can address a session.
 	id: String,
 	user_id: String,
-	current: String,
-	prev: Option<String>,
+	credential: Credential,
 	/// The user's `token_version` at issue time, so a later "revoke all" (which
 	/// bumps the authoritative version in Postgres) is detected on the next refresh.
 	token_version: u64,

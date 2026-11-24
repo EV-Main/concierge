@@ -385,6 +385,7 @@ pub async fn list_sessions(State(st): State<WebState>, jar: CookieJar) -> Answer
 				created_at: s.created_at.to_string(),
 				last_seen: s.last_seen.to_string(),
 				current: s.current,
+				cli: s.cli,
 			})
 			.collect();
 		Ok(Json(json!({ "sessions": sessions })))
@@ -433,6 +434,7 @@ struct SessionEntry {
 	created_at: String,
 	last_seen: String,
 	current: bool,
+	cli: bool,
 }
 
 impl super::Inner {

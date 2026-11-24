@@ -11,6 +11,8 @@ export interface Session {
   /** Unix seconds; the plane sends them as decimal strings. */
   lastSeen: number;
   current: boolean;
+  /** A command-line tool's session, not a browser's. */
+  cli: boolean;
 }
 
 function parseSession(raw: unknown): Session | null {
@@ -20,8 +22,9 @@ function parseSession(raw: unknown): Session | null {
   const ip = str(raw, "ip");
   const lastSeen = str(raw, "last_seen");
   const current = bool(raw, "current");
-  if (id === null || userAgent === null || ip === null || lastSeen === null || current === null) return null;
-  return { id, userAgent, ip, lastSeen: Number(lastSeen), current };
+  const cli = bool(raw, "cli");
+  if (id === null || userAgent === null || ip === null || lastSeen === null || current === null || cli === null) return null;
+  return { id, userAgent, ip, lastSeen: Number(lastSeen), current, cli };
 }
 
 export const listSessions = (api: AuthApi) => api.get("/sessions", (raw) => (isRecord(raw) ? listOf(raw["sessions"], parseSession) : null));

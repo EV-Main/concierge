@@ -198,6 +198,7 @@
   "notif.unavailable": "Notification settings are not available here yet.",
   "notif.whatYouFollow": "What you follow",
   "settings.device.browser": "Browser",
+  "settings.device.cli": "Command-line tool",
   "settings.device.generic": "device",
   "settings.device.label": "{browser} · {os}",
   "settings.device.unknown": "Unknown device",
