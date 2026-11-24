@@ -46,7 +46,7 @@ ev = { version = "0.24.2", package = "ev_lib", default-features = false, feature
 evconcierge_auth = { path = "auth" }
 # `version` too: the published `evconcierge_client` and `evconcierge_projection` resolve it
 # from crates.io, where a bare path dependency cannot go.
-evconcierge_contracts = { version = "0.8.0", path = "contracts" }
+evconcierge_contracts = { version = "0.9.0", path = "contracts" }
 evconcierge_projection = { path = "projection" }
 form_urlencoded = "1"
 getrandom = { version = "0.4", features = ["wasm_js"] }
